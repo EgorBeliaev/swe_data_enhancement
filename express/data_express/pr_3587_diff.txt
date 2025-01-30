@@ -1,0 +1,86 @@
+diff --git a/History.md b/History.md
+index 9b4bf4bce5..d1aa9b3b88 100644
+--- a/History.md
++++ b/History.md
+@@ -5,6 +5,7 @@ unreleased
+   * Allow `options` without `filename` in `res.download`
+   * Deprecate string and non-integer arguments to `res.status`
+   * Ignore `Object.prototype` values in settings through `app.set`/`app.get`
++  * Invoke `default` with same arguments as types in `res.format`
+   * Support proper 205 responses using `res.send`
+   * deps: finalhandler@1.2.0
+     - Remove set content headers that break response
+diff --git a/lib/response.js b/lib/response.js
+index 3713e6f9a9..bfa7871434 100644
+--- a/lib/response.js
++++ b/lib/response.js
+@@ -684,9 +684,8 @@ res.format = function(obj){
+   var req = this.req;
+   var next = req.next;
+ 
+-  var fn = obj.default;
+-  if (fn) delete obj.default;
+-  var keys = Object.keys(obj);
++  var keys = Object.keys(obj)
++    .filter(function (v) { return v !== 'default' })
+ 
+   var key = keys.length > 0
+     ? req.accepts(keys)
+@@ -697,8 +696,8 @@ res.format = function(obj){
+   if (key) {
+     this.set('Content-Type', normalizeType(key).value);
+     obj[key](req, this, next);
+-  } else if (fn) {
+-    fn();
++  } else if (obj.default) {
++    obj.default(req, this, next)
+   } else {
+     var err = new Error('Not Acceptable');
+     err.status = err.statusCode = 406;
+diff --git a/test/res.format.js b/test/res.format.js
+index 24e18d9552..45243d17a1 100644
+--- a/test/res.format.js
++++ b/test/res.format.js
+@@ -50,7 +50,12 @@ var app3 = express();
+ app3.use(function(req, res, next){
+   res.format({
+     text: function(){ res.send('hey') },
+-    default: function(){ res.send('default') }
++    default: function (a, b, c) {
++      assert(req === a)
++      assert(res === b)
++      assert(next === c)
++      res.send('default')
++    }
+   })
+ });
+ 
+@@ -118,6 +123,28 @@ describe('res', function(){
+         .set('Accept', '*/*')
+         .expect('hey', done);
+       })
++
++      it('should be able to invoke other formatter', function (done) {
++        var app = express()
++
++        app.use(function (req, res, next) {
++          res.format({
++            json: function () { res.send('json') },
++            default: function () {
++              res.header('x-default', '1')
++              this.json()
++            }
++          })
++        })
++
++        request(app)
++          .get('/')
++          .set('Accept', 'text/plain')
++          .expect(200)
++          .expect('x-default', '1')
++          .expect('json')
++          .end(done)
++      })
+     })
+ 
+     describe('in router', function(){

@@ -1,0 +1,190 @@
+diff --git a/lib/mocha.js b/lib/mocha.js
+index 1b7101a2a7..f93865df7e 100644
+--- a/lib/mocha.js
++++ b/lib/mocha.js
+@@ -429,6 +429,8 @@ Mocha.prototype.loadFiles = function (fn) {
+  * @see {@link Mocha#addFile}
+  * @see {@link Mocha#run}
+  * @see {@link Mocha#unloadFiles}
++ * @param {Object} [options] - Settings object.
++ * @param {Function} [options.esmDecorator] - Function invoked on esm module name right before importing it. By default will passthrough as is.
+  * @returns {Promise}
+  * @example
+  *
+@@ -437,7 +439,7 @@ Mocha.prototype.loadFiles = function (fn) {
+  *   .then(() => mocha.run(failures => process.exitCode = failures ? 1 : 0))
+  *   .catch(() => process.exitCode = 1);
+  */
+-Mocha.prototype.loadFilesAsync = function () {
++Mocha.prototype.loadFilesAsync = function ({esmDecorator} = {}) {
+   var self = this;
+   var suite = this.suite;
+   this.lazyLoadFiles(true);
+@@ -450,7 +452,8 @@ Mocha.prototype.loadFilesAsync = function () {
+     function (file, resultModule) {
+       suite.emit(EVENT_FILE_REQUIRE, resultModule, file, self);
+       suite.emit(EVENT_FILE_POST_REQUIRE, global, file, self);
+-    }
++    },
++    esmDecorator
+   );
+ };
+ 
+diff --git a/lib/nodejs/esm-utils.js b/lib/nodejs/esm-utils.js
+index 18abe81ff8..5318099365 100644
+--- a/lib/nodejs/esm-utils.js
++++ b/lib/nodejs/esm-utils.js
+@@ -1,10 +1,12 @@
+ const path = require('path');
+ const url = require('url');
+ 
+-const formattedImport = async file => {
++const forward = x => x;
++
++const formattedImport = async (file, esmDecorator = forward) => {
+   if (path.isAbsolute(file)) {
+     try {
+-      return await import(url.pathToFileURL(file));
++      return await exports.doImport(esmDecorator(url.pathToFileURL(file)));
+     } catch (err) {
+       // This is a hack created because ESM in Node.js (at least in Node v15.5.1) does not emit
+       // the location of the syntax error in the error thrown.
+@@ -27,15 +29,17 @@ const formattedImport = async file => {
+       throw err;
+     }
+   }
+-  return import(file);
++  return exports.doImport(esmDecorator(file));
+ };
+ 
+-exports.requireOrImport = async file => {
++exports.doImport = async file => import(file);
++
++exports.requireOrImport = async (file, esmDecorator) => {
+   if (path.extname(file) === '.mjs') {
+-    return formattedImport(file);
++    return formattedImport(file, esmDecorator);
+   }
+   try {
+-    return dealWithExports(await formattedImport(file));
++    return dealWithExports(await formattedImport(file, esmDecorator));
+   } catch (err) {
+     if (
+       err.code === 'ERR_MODULE_NOT_FOUND' ||
+@@ -85,10 +89,18 @@ function dealWithExports(module) {
+   }
+ }
+ 
+-exports.loadFilesAsync = async (files, preLoadFunc, postLoadFunc) => {
++exports.loadFilesAsync = async (
++  files,
++  preLoadFunc,
++  postLoadFunc,
++  esmDecorator
++) => {
+   for (const file of files) {
+     preLoadFunc(file);
+-    const result = await exports.requireOrImport(path.resolve(file));
++    const result = await exports.requireOrImport(
++      path.resolve(file),
++      esmDecorator
++    );
+     postLoadFunc(file, result);
+   }
+ };
+diff --git a/test/node-unit/esm-utils.spec.js b/test/node-unit/esm-utils.spec.js
+new file mode 100644
+index 0000000000..8880b5bceb
+--- /dev/null
++++ b/test/node-unit/esm-utils.spec.js
+@@ -0,0 +1,46 @@
++'use strict';
++
++const esmUtils = require('../../lib/nodejs/esm-utils');
++const sinon = require('sinon');
++const url = require('url');
++
++describe('esm-utils', function () {
++  beforeEach(function () {
++    sinon.stub(esmUtils, 'doImport').resolves({});
++  });
++
++  afterEach(function () {
++    sinon.restore();
++  });
++
++  describe('loadFilesAsync()', function () {
++    it('should not decorate imported module if no decorator passed', async function () {
++      await esmUtils.loadFilesAsync(
++        ['/foo/bar.mjs'],
++        () => {},
++        () => {}
++      );
++
++      expect(
++        esmUtils.doImport.firstCall.args[0].toString(),
++        'to be',
++        url.pathToFileURL('/foo/bar.mjs').toString()
++      );
++    });
++
++    it('should decorate imported module with passed decorator', async function () {
++      await esmUtils.loadFilesAsync(
++        ['/foo/bar.mjs'],
++        () => {},
++        () => {},
++        x => `${x}?foo=bar`
++      );
++
++      expect(
++        esmUtils.doImport.firstCall.args[0].toString(),
++        'to be',
++        `${url.pathToFileURL('/foo/bar.mjs').toString()}?foo=bar`
++      );
++    });
++  });
++});
+diff --git a/test/node-unit/mocha.spec.js b/test/node-unit/mocha.spec.js
+index 8bf48b1b06..78991657e2 100644
+--- a/test/node-unit/mocha.spec.js
++++ b/test/node-unit/mocha.spec.js
+@@ -48,6 +48,9 @@ describe('Mocha', function () {
+     stubs.Suite = sinon.stub().returns(stubs.suite);
+     stubs.Suite.constants = {};
+     stubs.ParallelBufferedRunner = sinon.stub().returns({});
++    stubs.esmUtils = {
++      loadFilesAsync: sinon.stub()
++    };
+     const runner = Object.assign(sinon.createStubInstance(EventEmitter), {
+       runAsync: sinon.stub().resolves(0),
+       globals: sinon.stub(),
+@@ -66,6 +69,7 @@ describe('Mocha', function () {
+         '../../lib/suite.js': stubs.Suite,
+         '../../lib/nodejs/parallel-buffered-runner.js':
+           stubs.ParallelBufferedRunner,
++        '../../lib/nodejs/esm-utils': stubs.esmUtils,
+         '../../lib/runner.js': stubs.Runner,
+         '../../lib/errors.js': stubs.errors
+       })
+@@ -219,6 +223,21 @@ describe('Mocha', function () {
+       });
+     });
+ 
++    describe('loadFilesAsync()', function () {
++      it('shoud pass esmDecorator to actual load function', async function () {
++        const esmDecorator = x => `${x}?foo=bar`;
++
++        await mocha.loadFilesAsync({esmDecorator});
++
++        expect(stubs.esmUtils.loadFilesAsync, 'was called once');
++        expect(
++          stubs.esmUtils.loadFilesAsync.firstCall.args[3],
++          'to be',
++          esmDecorator
++        );
++      });
++    });
++
+     describe('unloadFiles()', function () {
+       it('should delegate Mocha.unloadFile() for each item in its list of files', function () {
+         mocha.files = [DUMB_FIXTURE_PATH, DUMBER_FIXTURE_PATH];

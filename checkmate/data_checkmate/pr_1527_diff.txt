@@ -1,0 +1,314 @@
+diff --git a/Client/src/Pages/Uptime/CreateUptime/index.jsx b/Client/src/Pages/Uptime/CreateUptime/index.jsx
+index c5a9df770..3499a9c73 100644
+--- a/Client/src/Pages/Uptime/CreateUptime/index.jsx
++++ b/Client/src/Pages/Uptime/CreateUptime/index.jsx
+@@ -58,7 +58,7 @@ const CreateMonitor = () => {
+ 	};
+ 
+ 	const { user, authToken } = useSelector((state) => state.auth);
+-	const { monitors, isLoading } = useSelector((state) => state.uptimeMonitors);
++	const { isLoading } = useSelector((state) => state.uptimeMonitors);
+ 	const dispatch = useDispatch();
+ 	const navigate = useNavigate();
+ 	const theme = useTheme();
+@@ -205,7 +205,7 @@ const CreateMonitor = () => {
+ 			}
+ 		};
+ 		fetchMonitor();
+-	}, [monitorId, authToken, monitors, dispatch, navigate]);
++	}, [monitorId, authToken, dispatch, navigate]);
+ 
+ 	return (
+ 		<Box className="create-monitor">
+diff --git a/Client/src/Pages/Uptime/Home/index.jsx b/Client/src/Pages/Uptime/Home/index.jsx
+index 4fc57a7a0..a542c72ff 100644
+--- a/Client/src/Pages/Uptime/Home/index.jsx
++++ b/Client/src/Pages/Uptime/Home/index.jsx
+@@ -20,7 +20,7 @@ const UptimeMonitors = () => {
+ 	const theme = useTheme();
+ 	const navigate = useNavigate();
+ 	const isAdmin = useIsAdmin();
+-	const uptimeMonitorsState = useSelector((state) => state.uptimeMonitors);
++	const { isLoading, monitorsSummary } = useSelector((state) => state.uptimeMonitors);
+ 	const authState = useSelector((state) => state.auth);
+ 	const dispatch = useDispatch({});
+ 	const [monitorUpdateTrigger, setMonitorUpdateTrigger] = useState(false);
+@@ -35,9 +35,9 @@ const UptimeMonitors = () => {
+ 
+ 	//TODO bring fetching to this component, like on pageSpeed
+ 
+-	const loading = uptimeMonitorsState?.isLoading;
++	const loading = isLoading;
+ 
+-	const totalMonitors = uptimeMonitorsState?.monitorsSummary?.monitorCounts?.total;
++	const totalMonitors = monitorsSummary?.monitorCounts?.total;
+ 
+ 	const hasMonitors = totalMonitors > 0;
+ 	const noMonitors = !hasMonitors;
+@@ -86,20 +86,20 @@ const UptimeMonitors = () => {
+ 							>
+ 								<StatusBox
+ 									title="up"
+-									value={uptimeMonitorsState?.monitorsSummary?.monitorCounts?.up ?? 0}
++									value={monitorsSummary?.monitorCounts?.up ?? 0}
+ 								/>
+ 								<StatusBox
+ 									title="down"
+-									value={uptimeMonitorsState?.monitorsSummary?.monitorCounts?.down ?? 0}
++									value={monitorsSummary?.monitorCounts?.down ?? 0}
+ 								/>
+ 								<StatusBox
+ 									title="paused"
+-									value={uptimeMonitorsState?.monitorsSummary?.monitorCounts?.paused ?? 0}
++									value={monitorsSummary?.monitorCounts?.paused ?? 0}
+ 								/>
+ 							</Stack>
+ 							<CurrentMonitoring
+ 								isAdmin={isAdmin}
+-								monitors={uptimeMonitorsState.monitorsSummary.monitors}
++								monitors={monitorsSummary.monitors}
+ 								totalMonitors={totalMonitors}
+ 								handlePause={handlePause}
+ 							/>
+diff --git a/Server/controllers/monitorController.js b/Server/controllers/monitorController.js
+index 5e16b3b18..f5e7994b2 100644
+--- a/Server/controllers/monitorController.js
++++ b/Server/controllers/monitorController.js
+@@ -5,8 +5,8 @@ import {
+ 	createMonitorBodyValidation,
+ 	getMonitorURLByQueryValidation,
+ 	editMonitorBodyValidation,
+-	getMonitorsAndSummaryByTeamIdParamValidation,
+-	getMonitorsAndSummaryByTeamIdQueryValidation,
++	getMonitorsSummaryByTeamIdParamValidation,
++	getMonitorsSummaryByTeamIdQueryValidation,
+ 	getMonitorsByTeamIdQueryValidation,
+ 	pauseMonitorParamValidation,
+ 	getMonitorStatsByIdParamValidation,
+@@ -217,10 +217,10 @@ class MonitorController {
+ 	 * @returns {Object} The response object with a success status, a message, and the data containing the monitors and summary for the team.
+ 	 * @throws {Error} If there is an error during the process, especially if there is a validation error (422).
+ 	 */
+-	getMonitorsAndSummaryByTeamId = async (req, res, next) => {
++	getMonitorsSummaryByTeamId = async (req, res, next) => {
+ 		try {
+-			await getMonitorsAndSummaryByTeamIdParamValidation.validateAsync(req.params);
+-			await getMonitorsAndSummaryByTeamIdQueryValidation.validateAsync(req.query);
++			await getMonitorsSummaryByTeamIdParamValidation.validateAsync(req.params);
++			await getMonitorsSummaryByTeamIdQueryValidation.validateAsync(req.query);
+ 		} catch (error) {
+ 			next(handleValidationError(error, SERVICE_NAME));
+ 			return;
+@@ -229,7 +229,7 @@ class MonitorController {
+ 		try {
+ 			const { teamId } = req.params;
+ 			const { type } = req.query;
+-			const monitorsSummary = await this.db.getMonitorsAndSummaryByTeamId(teamId, type);
++			const monitorsSummary = await this.db.getMonitorsSummaryByTeamId(teamId, type);
+ 			return res.status(200).json({
+ 				success: true,
+ 				msg: successMessages.MONITOR_GET_BY_USER_ID(teamId),
+diff --git a/Server/db/mongo/modules/monitorModule.js b/Server/db/mongo/modules/monitorModule.js
+index 1143b9eeb..6bbb8840a 100644
+--- a/Server/db/mongo/modules/monitorModule.js
++++ b/Server/db/mongo/modules/monitorModule.js
+@@ -1025,24 +1025,32 @@ const getMonitorById = async (monitorId) => {
+  * @throws {Error}
+  */
+ 
+-const getMonitorsAndSummaryByTeamId = async (teamId, type) => {
++const getMonitorsSummaryByTeamId = async (teamId, type) => {
+ 	try {
+-		const monitors = await Monitor.find({ teamId, type });
+-		const monitorCounts = monitors.reduce(
+-			(acc, monitor) => {
+-				if (monitor.status === true) {
+-					acc.up += 1;
+-				} else if (monitor.status === false) {
+-					acc.down += 1;
+-				} else if (monitor.isActive === false) {
+-					acc.paused += 1;
+-				}
+-				return acc;
++		const monitorCounts = await Monitor.aggregate([
++			{
++				$match: {
++					type: { $in: type },
++				},
+ 			},
+-			{ up: 0, down: 0, paused: 0 }
+-		);
+-		monitorCounts.total = monitors.length;
+-		return { monitors, monitorCounts };
++			{
++				$facet: {
++					total: [{ $count: "count" }],
++					up: [{ $match: { status: true } }, { $count: "count" }],
++					down: [{ $match: { status: false } }, { $count: "count" }],
++					paused: [{ $match: { isActive: false } }, { $count: "count" }],
++				},
++			},
++			{
++				$project: {
++					total: { $arrayElemAt: ["$total.count", 0] },
++					up: { $arrayElemAt: ["$up.count", 0] },
++					down: { $arrayElemAt: ["$down.count", 0] },
++					paused: { $arrayElemAt: ["$paused.count", 0] },
++				},
++			},
++		]);
++		return { monitorCounts: monitorCounts[0] };
+ 	} catch (error) {
+ 		error.service = SERVICE_NAME;
+ 		error.method = "getMonitorsAndSummaryByTeamId";
+@@ -1263,7 +1271,7 @@ export {
+ 	getMonitorStatsById,
+ 	getMonitorById,
+ 	getUptimeDetailsById,
+-	getMonitorsAndSummaryByTeamId,
++	getMonitorsSummaryByTeamId,
+ 	getMonitorsByTeamId,
+ 	createMonitor,
+ 	deleteMonitor,
+diff --git a/Server/routes/monitorRoute.js b/Server/routes/monitorRoute.js
+index d47351486..f3af8e806 100644
+--- a/Server/routes/monitorRoute.js
++++ b/Server/routes/monitorRoute.js
+@@ -32,7 +32,7 @@ class MonitorRoutes {
+ 		this.router.get("/:monitorId", this.monitorController.getMonitorById);
+ 		this.router.get(
+ 			"/team/summary/:teamId",
+-			this.monitorController.getMonitorsAndSummaryByTeamId
++			this.monitorController.getMonitorsSummaryByTeamId
+ 		);
+ 		this.router.get("/team/:teamId", this.monitorController.getMonitorsByTeamId);
+ 
+diff --git a/Server/service/jobQueue.js b/Server/service/jobQueue.js
+index fb5c306b1..177ca34c5 100644
+--- a/Server/service/jobQueue.js
++++ b/Server/service/jobQueue.js
+@@ -218,38 +218,50 @@ class NewJobQueue {
+ 			concurrency: 5,
+ 		});
+ 
+-		worker.on("active", (job) => {
+-			this.logger.info({
+-				message: `Worker started processing job: ${job.id}`,
+-				service: SERVICE_NAME,
+-				method: "createWorker",
+-			});
+-		});
+-
+-		worker.on("completed", (job) => {
+-			this.logger.info({
+-				message: `Worker completed job: ${job.id}`,
+-				service: SERVICE_NAME,
+-				method: "createWorker",
+-			});
+-		});
+-
+-		worker.on("failed", (job, err) => {
+-			this.logger.error({
+-				message: `Worker failed job: ${job.id}`,
+-				service: SERVICE_NAME,
+-				method: "createWorker",
+-				stack: err.stack,
+-			});
+-		});
+-
+-		worker.on("stalled", (jobId) => {
+-			this.logger.warn({
+-				message: `Worker stalled job: ${jobId}`,
+-				service: SERVICE_NAME,
+-				method: "createWorker",
+-			});
+-		});
++		// worker.on("active", (job) => {
++		// 	this.logger.info({
++		// 		message: `Worker started processing job: ${job.id}`,
++		// 		service: SERVICE_NAME,
++		// 		method: "createWorker",
++		// 	});
++		// });
++
++		// worker.on("completed", (job) => {
++		// 	this.logger.info({
++		// 		message: `Worker completed job: ${job.id}`,
++		// 		service: SERVICE_NAME,
++		// 		method: "createWorker",
++		// 	});
++		// });
++
++		// // Log job progress updates
++		// worker.on("progress", (job, progress) => {
++		// 	this.logger.info({
++		// 		message: `Job progress: ${job.id}`,
++		// 		service: SERVICE_NAME,
++		// 		method: "createWorker",
++		// 		details: `Progress: ${progress}%`,
++		// 	});
++		// });
++
++		// // Log when a job fails
++		// worker.on("failed", (job, err) => {
++		// 	this.logger.error({
++		// 		message: `Worker failed job: ${job.id}`,
++		// 		service: SERVICE_NAME,
++		// 		method: "createWorker",
++		// 		details: `Error: ${err.message}`,
++		// 		stack: err.stack,
++		// 	});
++		// });
++
++		// worker.on("stalled", (jobId) => {
++		// 	this.logger.warn({
++		// 		message: `Worker stalled job: ${jobId}`,
++		// 		service: SERVICE_NAME,
++		// 		method: "createWorker",
++		// 	});
++		// });
+ 		return worker;
+ 	}
+ 
+diff --git a/Server/service/settingsService.js b/Server/service/settingsService.js
+index fb85939ca..24931f6ce 100644
+--- a/Server/service/settingsService.js
++++ b/Server/service/settingsService.js
+@@ -2,7 +2,7 @@ const SERVICE_NAME = "SettingsService";
+ import dotenv from "dotenv";
+ dotenv.config();
+ const envConfig = {
+-	logLevel: undefined,
++	logLevel: process.env.LOG_LEVEL,
+ 	apiBaseUrl: undefined,
+ 	clientHost: process.env.CLIENT_HOST,
+ 	jwtSecret: process.env.JWT_SECRET,
+diff --git a/Server/validation/joi.js b/Server/validation/joi.js
+index dbffef937..825c90cdb 100644
+--- a/Server/validation/joi.js
++++ b/Server/validation/joi.js
+@@ -136,11 +136,11 @@ const getMonitorByIdQueryValidation = joi.object({
+ 	normalize: joi.boolean(),
+ });
+ 
+-const getMonitorsAndSummaryByTeamIdParamValidation = joi.object({
++const getMonitorsSummaryByTeamIdParamValidation = joi.object({
+ 	teamId: joi.string().required(),
+ });
+ 
+-const getMonitorsAndSummaryByTeamIdQueryValidation = joi.object({
++const getMonitorsSummaryByTeamIdQueryValidation = joi.object({
+ 	type: joi
+ 		.alternatives()
+ 		.try(
+@@ -467,8 +467,8 @@ export {
+ 	createMonitorBodyValidation,
+ 	getMonitorByIdParamValidation,
+ 	getMonitorByIdQueryValidation,
+-	getMonitorsAndSummaryByTeamIdParamValidation,
+-	getMonitorsAndSummaryByTeamIdQueryValidation,
++	getMonitorsSummaryByTeamIdParamValidation,
++	getMonitorsSummaryByTeamIdQueryValidation,
+ 	getMonitorsByTeamIdValidation,
+ 	getMonitorsByTeamIdQueryValidation,
+ 	getMonitorStatsByIdParamValidation,

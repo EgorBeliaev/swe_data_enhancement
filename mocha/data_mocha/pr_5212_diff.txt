@@ -1,0 +1,136 @@
+diff --git a/lib/nodejs/serializer.js b/lib/nodejs/serializer.js
+index 63e1a24e51..a8ed8dfb83 100644
+--- a/lib/nodejs/serializer.js
++++ b/lib/nodejs/serializer.js
+@@ -262,9 +262,15 @@ class SerializableEvent {
+     breakCircularDeps(result.error);
+ 
+     const pairs = Object.keys(result).map(key => [result, key]);
+-
++    const seenPairs = new Set();
+     let pair;
++
+     while ((pair = pairs.shift())) {
++      if (seenPairs.has(pair[1])) {
++        continue;
++      }
++
++      seenPairs.add(pair[1]);
+       SerializableEvent._serialize(pairs, ...pair);
+     }
+ 
+diff --git a/lib/utils.js b/lib/utils.js
+index 1f21edc60d..31b313a6e0 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -675,7 +675,9 @@ exports.breakCircularDeps = inputObj => {
+ 
+     seen.add(obj);
+     for (const k in obj) {
+-      if (Object.prototype.hasOwnProperty.call(obj, k)) {
++      const descriptor = Object.getOwnPropertyDescriptor(obj, k);
++
++      if (descriptor && descriptor.writable) {
+         obj[k] = _breakCircularDeps(obj[k], k);
+       }
+     }
+diff --git a/test/integration/fixtures/parallel/circular-error.mjs b/test/integration/fixtures/parallel/circular-error-array.mjs
+similarity index 100%
+rename from test/integration/fixtures/parallel/circular-error.mjs
+rename to test/integration/fixtures/parallel/circular-error-array.mjs
+diff --git a/test/integration/fixtures/parallel/circular-error-object.mjs b/test/integration/fixtures/parallel/circular-error-object.mjs
+new file mode 100644
+index 0000000000..45ba68a260
+--- /dev/null
++++ b/test/integration/fixtures/parallel/circular-error-object.mjs
+@@ -0,0 +1,15 @@
++import {describe,it} from "../../../../index.js";
++
++describe('test1', () => {
++  it('test', () => {
++    const errorA = {};
++    const objectB = {toA: errorA};
++    errorA.toB = objectB;
++
++    const error = new Error("Oh no!");
++    error.error = errorA;
++    error.values = [errorA];
++
++    throw error;
++  });
++});
+diff --git a/test/integration/fixtures/parallel/getter-error-object.mjs b/test/integration/fixtures/parallel/getter-error-object.mjs
+new file mode 100644
+index 0000000000..477427e64c
+--- /dev/null
++++ b/test/integration/fixtures/parallel/getter-error-object.mjs
+@@ -0,0 +1,15 @@
++import {describe, it} from '../../../../index.js';
++
++describe('test1', () => {
++  it('test', async () => {
++    const error = new Error('Oh no!');
++
++    error.nested = {
++      get inner() {
++        return 'abc';
++      }
++    };
++
++    throw error;
++  });
++});
+diff --git a/test/integration/parallel.spec.js b/test/integration/parallel.spec.js
+index fad184e24b..ed65650046 100644
+--- a/test/integration/parallel.spec.js
++++ b/test/integration/parallel.spec.js
+@@ -31,8 +31,8 @@ describe('parallel run', () => {
+     assert.strictEqual(result.stats.passes, 3);
+   });
+ 
+-  it('should correctly handle circular references in an exception', async () => {
+-    const result = await runMochaJSONAsync('parallel/circular-error.mjs', [
++  it('should correctly handle circular array references in an exception', async () => {
++    const result = await runMochaJSONAsync('parallel/circular-error-array.mjs', [
+       '--parallel',
+       '--jobs',
+       '2',
+@@ -45,7 +45,7 @@ describe('parallel run', () => {
+   });
+ 
+   it('should correctly handle an exception with retries', async () => {
+-    const result = await runMochaJSONAsync('parallel/circular-error.mjs', [
++    const result = await runMochaJSONAsync('parallel/circular-error-array.mjs', [
+       '--parallel',
+       '--jobs',
+       '2',
+@@ -58,4 +58,29 @@ describe('parallel run', () => {
+     assert.strictEqual(result.failures[0].err.message, 'Foo');
+     assert.strictEqual(result.failures[0].err.foo.props[0], '[Circular]');
+   });
++
++  it('should correctly handle circular object references in an exception', async () => {
++    const result = await runMochaJSONAsync('parallel/circular-error-object.mjs', [
++      '--parallel',
++      '--jobs',
++      '2',
++      require.resolve('./fixtures/parallel/testworkerid1.mjs')
++    ]);
++    assert.strictEqual(result.stats.failures, 1);
++    assert.strictEqual(result.stats.passes, 1);
++    assert.strictEqual(result.failures[0].err.message, 'Oh no!');
++    assert.deepStrictEqual(result.failures[0].err.values, [ { toB: { toA: '[Circular]' } } ]);
++  });
++
++  it('should correctly handle a non-writable getter reference in an exception', async () => {
++    const result = await runMochaJSONAsync('parallel/getter-error-object.mjs', [
++      '--parallel',
++      '--jobs',
++      '2',
++      require.resolve('./fixtures/parallel/testworkerid1.mjs')
++    ]);
++    assert.strictEqual(result.stats.failures, 1);
++    assert.strictEqual(result.stats.passes, 1);
++    assert.strictEqual(result.failures[0].err.message, 'Oh no!');
++  });
+ });

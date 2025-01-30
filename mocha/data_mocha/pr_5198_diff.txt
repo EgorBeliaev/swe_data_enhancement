@@ -1,0 +1,108 @@
+diff --git a/lib/cli/options.js b/lib/cli/options.js
+index d238737d37..fc0c951a8c 100644
+--- a/lib/cli/options.js
++++ b/lib/cli/options.js
+@@ -181,8 +181,24 @@ const loadPkgRc = (args = {}) => {
+   result = {};
+   const filepath = args.package || findUp.sync(mocharc.package);
+   if (filepath) {
++    let configData;
+     try {
+-      const pkg = JSON.parse(fs.readFileSync(filepath, 'utf8'));
++      configData = fs.readFileSync(filepath, 'utf8');
++    } catch (err) {
++      // If `args.package` was explicitly specified, throw an error
++      if (filepath == args.package) {
++        throw createUnparsableFileError(
++          `Unable to read ${filepath}: ${err}`,
++          filepath
++        );
++      } else {
++        debug('failed to read default package.json at %s; ignoring',
++              filepath);
++        return result;
++      }
++    }
++    try {
++      const pkg = JSON.parse(configData);
+       if (pkg.mocha) {
+         debug('`mocha` prop of package.json parsed: %O', pkg.mocha);
+         result = pkg.mocha;
+@@ -190,13 +206,11 @@ const loadPkgRc = (args = {}) => {
+         debug('no config found in %s', filepath);
+       }
+     } catch (err) {
+-      if (args.package) {
+-        throw createUnparsableFileError(
+-          `Unable to read/parse ${filepath}: ${err}`,
+-          filepath
+-        );
+-      }
+-      debug('failed to read default package.json at %s; ignoring', filepath);
++      // If JSON failed to parse, throw an error.
++      throw createUnparsableFileError(
++        `Unable to parse ${filepath}: ${err}`,
++        filepath
++      );
+     }
+   }
+   return result;
+diff --git a/test/node-unit/cli/options.spec.js b/test/node-unit/cli/options.spec.js
+index 60357d12ae..7c846a37ed 100644
+--- a/test/node-unit/cli/options.spec.js
++++ b/test/node-unit/cli/options.spec.js
+@@ -149,7 +149,7 @@ describe('options', function () {
+                 loadOptions('--package /something/wherever --require butts');
+               },
+               'to throw',
+-              'Unable to read/parse /something/wherever: bad file message'
++              'Unable to read /something/wherever: bad file message'
+             );
+           });
+         });
+@@ -199,6 +199,36 @@ describe('options', function () {
+           });
+         });
+ 
++        describe('when path to package.json unspecified and package.json exists but is invalid', function () {
++          beforeEach(function () {
++            const filepath = '/some/package.json';
++            readFileSync = sinon.stub();
++            // package.json
++            readFileSync
++              .onFirstCall()
++              .returns('{definitely-invalid');
++            findConfig = sinon.stub().returns('/some/.mocharc.json');
++            loadConfig = sinon.stub().returns({});
++            findupSync = sinon.stub().returns(filepath);
++            loadOptions = proxyLoadOptions({
++              readFileSync,
++              findConfig,
++              loadConfig,
++              findupSync
++            });
++          });
++
++          it('should throw', function () {
++            expect(
++              () => {
++                loadOptions();
++              },
++              'to throw',
++                /SyntaxError/,
++            );
++          });
++        });
++
+         describe('when called with package = false (`--no-package`)', function () {
+           let result;
+           beforeEach(function () {
+@@ -287,7 +317,7 @@ describe('options', function () {
+           });
+ 
+           it('should set config = false', function () {
+-            expect(loadOptions(), 'to have property', 'config', false);
++            expect(result, 'to have property', 'config', false);
+           });
+         });
+ 

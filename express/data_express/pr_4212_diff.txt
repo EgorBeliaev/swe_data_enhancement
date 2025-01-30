@@ -1,0 +1,408 @@
+diff --git a/History.md b/History.md
+index 73fc46b26f..89d5af3ceb 100644
+--- a/History.md
++++ b/History.md
+@@ -1,3 +1,10 @@
++unreleased
++=========================
++* breaking:
++  * `res.status()` accepts only integers, and input must be greater than 99 and less than 1000
++    * will throw a `RangeError: Invalid status code: ${code}. Status code must be greater than 99 and less than 1000.` for inputs outside this range
++    * will throw a `TypeError: Invalid status code: ${code}. Status code must be an integer.` for non integer inputs
++
+ 5.0.0-beta.3 / 2024-03-25
+ =========================
+ 
+diff --git a/lib/response.js b/lib/response.js
+index 14743817a9..6ad54dbfc7 100644
+--- a/lib/response.js
++++ b/lib/response.js
+@@ -15,7 +15,6 @@
+ var Buffer = require('safe-buffer').Buffer
+ var contentDisposition = require('content-disposition');
+ var createError = require('http-errors')
+-var deprecate = require('depd')('express');
+ var encodeUrl = require('encodeurl');
+ var escapeHtml = require('escape-html');
+ var http = require('http');
+@@ -57,17 +56,28 @@ module.exports = res
+ var schemaAndHostRegExp = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:)?\/\/[^\\\/\?]+/;
+ 
+ /**
+- * Set status `code`.
++ * Set the HTTP status code for the response.
+  *
+- * @param {Number} code
+- * @return {ServerResponse}
++ * Expects an integer value between 100 and 999 inclusive.
++ * Throws an error if the provided status code is not an integer or if it's outside the allowable range.
++ *
++ * @param {number} code - The HTTP status code to set.
++ * @return {ServerResponse} - Returns itself for chaining methods.
++ * @throws {TypeError} If `code` is not an integer.
++ * @throws {RangeError} If `code` is outside the range 100 to 999.
+  * @public
+  */
+ 
+ res.status = function status(code) {
+-  if ((typeof code === 'string' || Math.floor(code) !== code) && code > 99 && code < 1000) {
+-    deprecate('res.status(' + JSON.stringify(code) + '): use res.status(' + Math.floor(code) + ') instead')
++  // Check if the status code is not an integer
++  if (!Number.isInteger(code)) {
++    throw new TypeError(`Invalid status code: ${JSON.stringify(code)}. Status code must be an integer.`);
+   }
++  // Check if the status code is outside of Node's valid range
++  if (code < 100 || code > 999) {
++    throw new RangeError(`Invalid status code: ${JSON.stringify(code)}. Status code must be greater than 99 and less than 1000.`);
++  }
++
+   this.statusCode = code;
+   return this;
+ };
+@@ -182,7 +192,7 @@ res.send = function send(body) {
+   }
+ 
+   // freshness
+-  if (req.fresh) this.statusCode = 304;
++  if (req.fresh) this.status(304);
+ 
+   // strip irrelevant headers
+   if (204 === this.statusCode || 304 === this.statusCode) {
+@@ -314,7 +324,7 @@ res.jsonp = function jsonp(obj) {
+ res.sendStatus = function sendStatus(statusCode) {
+   var body = statuses.message[statusCode] || String(statusCode)
+ 
+-  this.statusCode = statusCode;
++  this.status(statusCode);
+   this.type('txt');
+ 
+   return this.send(body);
+@@ -847,7 +857,7 @@ res.redirect = function redirect(url) {
+   });
+ 
+   // Respond
+-  this.statusCode = status;
++  this.status(status);
+   this.set('Content-Length', Buffer.byteLength(body));
+ 
+   if (this.req.method === 'HEAD') {
+diff --git a/test/res.sendStatus.js b/test/res.sendStatus.js
+index 9b1de8385c..b244cf9d17 100644
+--- a/test/res.sendStatus.js
++++ b/test/res.sendStatus.js
+@@ -28,5 +28,17 @@ describe('res', function () {
+       .get('/')
+       .expect(599, '599', done);
+     })
++
++    it('should raise error for invalid status code', function (done) {
++      var app = express()
++
++      app.use(function (req, res) {
++        res.sendStatus(undefined).end()
++      })
++
++      request(app)
++        .get('/')
++        .expect(500, /TypeError: Invalid status code/, done)
++    })
+   })
+ })
+diff --git a/test/res.status.js b/test/res.status.js
+index d2fc6a28c1..59c8a57e70 100644
+--- a/test/res.status.js
++++ b/test/res.status.js
+@@ -1,59 +1,36 @@
+ 'use strict'
+-
+-var express = require('../')
+-var request = require('supertest')
+-
+-var isIoJs = process.release
+-  ? process.release.name === 'io.js'
+-  : ['v1.', 'v2.', 'v3.'].indexOf(process.version.slice(0, 3)) !== -1
++const express = require('../.');
++const request = require('supertest');
+ 
+ describe('res', function () {
+   describe('.status(code)', function () {
+-    // This test fails in node 4.0.0
+-    // https://github.com/expressjs/express/pull/2237/checks
+-    // As this will all be removed when https://github.com/expressjs/express/pull/4212
+-    // lands I am skipping for now and we can delete with that PR
+-    describe.skip('when "code" is undefined', function () {
+-      it('should raise error for invalid status code', function (done) {
+-        var app = express()
+ 
+-        app.use(function (req, res) {
+-          res.status(undefined).end()
+-        })
++    it('should set the status code when valid', function (done) {
++      var app = express();
+ 
+-        request(app)
+-          .get('/')
+-          .expect(500, /Invalid status code/, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
+-      })
+-    })
++      app.use(function (req, res) {
++        res.status(200).end();
++      });
+ 
+-    describe.skip('when "code" is null', function () {
+-      it('should raise error for invalid status code', function (done) {
++      request(app)
++        .get('/')
++        .expect(200, done);
++    });
++
++    describe('accept valid ranges', function() {
++      // not testing w/ 100, because that has specific meaning and behavior in Node as Expect: 100-continue
++      it('should set the response status code to 101', function (done) {
+         var app = express()
+ 
+         app.use(function (req, res) {
+-          res.status(null).end()
++          res.status(101).end()
+         })
+ 
+         request(app)
+           .get('/')
+-          .expect(500, /Invalid status code/, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
++          .expect(101, done)
+       })
+-    })
+ 
+-    describe('when "code" is 201', function () {
+       it('should set the response status code to 201', function (done) {
+         var app = express()
+ 
+@@ -65,9 +42,7 @@ describe('res', function () {
+           .get('/')
+           .expect(201, done)
+       })
+-    })
+ 
+-    describe('when "code" is 302', function () {
+       it('should set the response status code to 302', function (done) {
+         var app = express()
+ 
+@@ -79,9 +54,7 @@ describe('res', function () {
+           .get('/')
+           .expect(302, done)
+       })
+-    })
+ 
+-    describe('when "code" is 403', function () {
+       it('should set the response status code to 403', function (done) {
+         var app = express()
+ 
+@@ -93,9 +66,7 @@ describe('res', function () {
+           .get('/')
+           .expect(403, done)
+       })
+-    })
+ 
+-    describe('when "code" is 501', function () {
+       it('should set the response status code to 501', function (done) {
+         var app = express()
+ 
+@@ -107,100 +78,129 @@ describe('res', function () {
+           .get('/')
+           .expect(501, done)
+       })
+-    })
+ 
+-    describe('when "code" is "410"', function () {
+-      it('should set the response status code to 410', function (done) {
++      it('should set the response status code to 700', function (done) {
+         var app = express()
+ 
+         app.use(function (req, res) {
+-          res.status('410').end()
++          res.status(700).end()
+         })
+ 
+         request(app)
+           .get('/')
+-          .expect(410, done)
++          .expect(700, done)
+       })
+-    })
+ 
+-    describe.skip('when "code" is 410.1', function () {
+-      it('should set the response status code to 410', function (done) {
++      it('should set the response status code to 800', function (done) {
+         var app = express()
+ 
+         app.use(function (req, res) {
+-          res.status(410.1).end()
++          res.status(800).end()
+         })
+ 
+         request(app)
+           .get('/')
+-          .expect(410, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
++          .expect(800, done)
+       })
+-    })
+ 
+-    describe.skip('when "code" is 1000', function () {
+-      it('should raise error for invalid status code', function (done) {
++      it('should set the response status code to 900', function (done) {
+         var app = express()
+ 
+         app.use(function (req, res) {
+-          res.status(1000).end()
++          res.status(900).end()
+         })
+ 
+         request(app)
+           .get('/')
+-          .expect(500, /Invalid status code/, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
++          .expect(900, done)
+       })
+     })
+ 
+-    describe.skip('when "code" is 99', function () {
+-      it('should raise error for invalid status code', function (done) {
+-        var app = express()
++    describe('invalid status codes', function () {
++      it('should raise error for status code below 100', function (done) {
++        var app = express();
+ 
+         app.use(function (req, res) {
+-          res.status(99).end()
+-        })
++          res.status(99).end();
++        });
+ 
+         request(app)
+           .get('/')
+-          .expect(500, /Invalid status code/, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
+-      })
+-    })
++          .expect(500, /Invalid status code/, done);
++      });
+ 
+-    describe.skip('when "code" is -401', function () {
+-      it('should raise error for invalid status code', function (done) {
+-        var app = express()
++      it('should raise error for status code above 999', function (done) {
++        var app = express();
+ 
+         app.use(function (req, res) {
+-          res.status(-401).end()
+-        })
++          res.status(1000).end();
++        });
+ 
+         request(app)
+           .get('/')
+-          .expect(500, /Invalid status code/, function (err) {
+-            if (isIoJs) {
+-              done(err ? null : new Error('expected error'))
+-            } else {
+-              done(err)
+-            }
+-          })
+-      })
+-    })
+-  })
+-})
++          .expect(500, /Invalid status code/, done);
++      });
++
++      it('should raise error for non-integer status codes', function (done) {
++        var app = express();
++
++        app.use(function (req, res) {
++          res.status(200.1).end();
++        });
++
++        request(app)
++          .get('/')
++          .expect(500, /Invalid status code/, done);
++      });
++
++      it('should raise error for undefined status code', function (done) {
++        var app = express();
++
++        app.use(function (req, res) {
++          res.status(undefined).end();
++        });
++
++        request(app)
++          .get('/')
++          .expect(500, /Invalid status code/, done);
++      });
++
++      it('should raise error for null status code', function (done) {
++        var app = express();
++
++        app.use(function (req, res) {
++          res.status(null).end();
++        });
++
++        request(app)
++          .get('/')
++          .expect(500, /Invalid status code/, done);
++      });
++
++      it('should raise error for string status code', function (done) {
++        var app = express();
++
++        app.use(function (req, res) {
++          res.status("200").end();
++        });
++
++        request(app)
++          .get('/')
++          .expect(500, /Invalid status code/, done);
++      });
++
++      it('should raise error for NaN status code', function (done) {
++        var app = express();
++
++        app.use(function (req, res) {
++          res.status(NaN).end();
++        });
++
++        request(app)
++          .get('/')
++          .expect(500, /Invalid status code/, done);
++      });
++    });
++  });
++});
++

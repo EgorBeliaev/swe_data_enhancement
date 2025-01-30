@@ -1,0 +1,122 @@
+diff --git a/History.md b/History.md
+index 2e549136a5..d7a2e43c35 100644
+--- a/History.md
++++ b/History.md
+@@ -1,6 +1,7 @@
+ unreleased
+ ==========
+ 
++  * Add "root" option to `res.download`
+   * Deprecate string and non-integer arguments to `res.status`
+   * Ignore `Object.prototype` values in settings through `app.set`/`app.get`
+   * Support proper 205 responses using `res.send`
+diff --git a/lib/response.js b/lib/response.js
+index 7a9564d262..101311e0eb 100644
+--- a/lib/response.js
++++ b/lib/response.js
+@@ -582,7 +582,9 @@ res.download = function download (path, filename, options, callback) {
+   opts.headers = headers
+ 
+   // Resolve the full path for sendFile
+-  var fullPath = resolve(path);
++  var fullPath = !opts.root
++    ? resolve(path)
++    : path
+ 
+   // send file
+   return this.sendFile(fullPath, opts, done)
+diff --git a/test/res.download.js b/test/res.download.js
+index 1322b0a31f..51380d4ba1 100644
+--- a/test/res.download.js
++++ b/test/res.download.js
+@@ -3,9 +3,12 @@
+ var after = require('after');
+ var Buffer = require('safe-buffer').Buffer
+ var express = require('..');
++var path = require('path')
+ var request = require('supertest');
+ var utils = require('./support/utils')
+ 
++var FIXTURES_PATH = path.join(__dirname, 'fixtures')
++
+ describe('res', function(){
+   describe('.download(path)', function(){
+     it('should transfer as an attachment', function(done){
+@@ -178,6 +181,77 @@ describe('res', function(){
+         .end(done)
+       })
+     })
++
++    describe('with "root" option', function () {
++      it('should allow relative path', function (done) {
++        var app = express()
++
++        app.use(function (req, res) {
++          res.download('name.txt', 'document', {
++            root: FIXTURES_PATH
++          })
++        })
++
++        request(app)
++          .get('/')
++          .expect(200)
++          .expect('Content-Disposition', 'attachment; filename="document"')
++          .expect(utils.shouldHaveBody(Buffer.from('tobi')))
++          .end(done)
++      })
++
++      it('should allow up within root', function (done) {
++        var app = express()
++
++        app.use(function (req, res) {
++          res.download('fake/../name.txt', 'document', {
++            root: FIXTURES_PATH
++          })
++        })
++
++        request(app)
++          .get('/')
++          .expect(200)
++          .expect('Content-Disposition', 'attachment; filename="document"')
++          .expect(utils.shouldHaveBody(Buffer.from('tobi')))
++          .end(done)
++      })
++
++      it('should reject up outside root', function (done) {
++        var app = express()
++
++        app.use(function (req, res) {
++          var p = '..' + path.sep +
++            path.relative(path.dirname(FIXTURES_PATH), path.join(FIXTURES_PATH, 'name.txt'))
++
++          res.download(p, 'document', {
++            root: FIXTURES_PATH
++          })
++        })
++
++        request(app)
++          .get('/')
++          .expect(403)
++          .expect(utils.shouldNotHaveHeader('Content-Disposition'))
++          .end(done)
++      })
++
++      it('should reject reading outside root', function (done) {
++        var app = express()
++
++        app.use(function (req, res) {
++          res.download('../name.txt', 'document', {
++            root: FIXTURES_PATH
++          })
++        })
++
++        request(app)
++          .get('/')
++          .expect(403)
++          .expect(utils.shouldNotHaveHeader('Content-Disposition'))
++          .end(done)
++      })
++    })
+   })
+ 
+   describe('on failure', function(){

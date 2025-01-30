@@ -1,0 +1,348 @@
+diff --git a/lib/browser/progress.js b/lib/browser/progress.js
+deleted file mode 100644
+index c82bc0824e..0000000000
+--- a/lib/browser/progress.js
++++ /dev/null
+@@ -1,138 +0,0 @@
+-'use strict';
+-
+-/**
+- @module browser/Progress
+-*/
+-
+-/**
+- * Expose `Progress`.
+- */
+-
+-module.exports = Progress;
+-
+-/**
+- * Initialize a new `Progress` indicator.
+- */
+-function Progress() {
+-  this.percent = 0;
+-  this.size(0);
+-  this.fontSize(11);
+-  this.font('helvetica, arial, sans-serif');
+-}
+-
+-/**
+- * Set progress size to `size`.
+- *
+- * @public
+- * @param {number} size
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.size = function (size) {
+-  this._size = size;
+-  return this;
+-};
+-
+-/**
+- * Set text to `text`.
+- *
+- * @public
+- * @param {string} text
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.text = function (text) {
+-  this._text = text;
+-  return this;
+-};
+-
+-/**
+- * Set font size to `size`.
+- *
+- * @public
+- * @param {number} size
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.fontSize = function (size) {
+-  this._fontSize = size;
+-  return this;
+-};
+-
+-/**
+- * Set font to `family`.
+- *
+- * @param {string} family
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.font = function (family) {
+-  this._font = family;
+-  return this;
+-};
+-
+-/**
+- * Update percentage to `n`.
+- *
+- * @param {number} n
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.update = function (n) {
+-  this.percent = n;
+-  return this;
+-};
+-
+-/**
+- * Draw on `ctx`.
+- *
+- * @param {CanvasRenderingContext2d} ctx
+- * @return {Progress} Progress instance.
+- */
+-Progress.prototype.draw = function (ctx) {
+-  try {
+-    var darkMatcher = window.matchMedia('(prefers-color-scheme: dark)');
+-    var isDarkMode = !!darkMatcher.matches;
+-    var lightColors = {
+-      outerCircle: '#9f9f9f',
+-      innerCircle: '#eee',
+-      text: '#000'
+-    };
+-    var darkColors = {
+-      outerCircle: '#888',
+-      innerCircle: '#444',
+-      text: '#fff'
+-    };
+-    var colors = isDarkMode ? darkColors : lightColors;
+-
+-    var percent = Math.min(this.percent, 100);
+-    var size = this._size;
+-    var half = size / 2;
+-    var x = half;
+-    var y = half;
+-    var rad = half - 1;
+-    var fontSize = this._fontSize;
+-
+-    ctx.font = fontSize + 'px ' + this._font;
+-
+-    var angle = Math.PI * 2 * (percent / 100);
+-    ctx.clearRect(0, 0, size, size);
+-
+-    // outer circle
+-    ctx.strokeStyle = colors.outerCircle;
+-    ctx.beginPath();
+-    ctx.arc(x, y, rad, 0, angle, false);
+-    ctx.stroke();
+-
+-    // inner circle
+-    ctx.strokeStyle = colors.innerCircle;
+-    ctx.beginPath();
+-    ctx.arc(x, y, rad - 1, 0, angle, true);
+-    ctx.stroke();
+-
+-    // text
+-    var text = this._text || (percent | 0) + '%';
+-    var w = ctx.measureText(text).width;
+-
+-    ctx.fillStyle = colors.text;
+-    ctx.fillText(text, x - w / 2 + 1, y + fontSize / 2 - 1);
+-  } catch (ignore) {
+-    // don't fail if we can't render progress
+-  }
+-  return this;
+-};
+diff --git a/lib/reporters/html.js b/lib/reporters/html.js
+index 034fb07f01..ae4a4546f8 100644
+--- a/lib/reporters/html.js
++++ b/lib/reporters/html.js
+@@ -10,7 +10,6 @@
+ 
+ var Base = require('./base');
+ var utils = require('../utils');
+-var Progress = require('../browser/progress');
+ var escapeRe = require('escape-string-regexp');
+ var constants = require('../runner').constants;
+ var EVENT_TEST_PASS = constants.EVENT_TEST_PASS;
+@@ -38,7 +37,7 @@ exports = module.exports = HTML;
+ 
+ var statsTemplate =
+   '<ul id="mocha-stats">' +
+-  '<li class="progress"><canvas width="40" height="40"></canvas></li>' +
++  '<li class="progress-contain"><progress class="progress-element" max="100" value="0"></progress><svg class="progress-ring"><circle class="ring-flatlight" stroke-dasharray="100%,0%"/><circle class="ring-highlight" stroke-dasharray="0%,100%"/></svg><div class="progress-text">0%</div></li>' +
+   '<li class="passes"><a href="javascript:void(0);">passes:</a> <em>0</em></li>' +
+   '<li class="failures"><a href="javascript:void(0);">failures:</a> <em>0</em></li>' +
+   '<li class="duration">duration: <em>0</em>s</li>' +
+@@ -68,24 +67,16 @@ function HTML(runner, options) {
+   var failures = items[2].getElementsByTagName('em')[0];
+   var failuresLink = items[2].getElementsByTagName('a')[0];
+   var duration = items[3].getElementsByTagName('em')[0];
+-  var canvas = stat.getElementsByTagName('canvas')[0];
+   var report = fragment('<ul id="mocha-report"></ul>');
+   var stack = [report];
+-  var progress;
+-  var ctx;
++  var progressText = items[0].getElementsByTagName('div')[0];
++  var progressBar = items[0].getElementsByTagName('progress')[0];
++  var progressRing = [
++    items[0].getElementsByClassName('ring-flatlight')[0],
++    items[0].getElementsByClassName('ring-highlight')[0]];
++  var progressRingRadius = null; // computed CSS unavailable now, so set later
+   var root = document.getElementById('mocha');
+ 
+-  if (canvas.getContext) {
+-    var ratio = window.devicePixelRatio || 1;
+-    canvas.style.width = canvas.width;
+-    canvas.style.height = canvas.height;
+-    canvas.width *= ratio;
+-    canvas.height *= ratio;
+-    ctx = canvas.getContext('2d');
+-    ctx.scale(ratio, ratio);
+-    progress = new Progress();
+-  }
+-
+   if (!root) {
+     return error('#mocha div missing, add it to your document');
+   }
+@@ -115,10 +106,6 @@ function HTML(runner, options) {
+   root.appendChild(stat);
+   root.appendChild(report);
+ 
+-  if (progress) {
+-    progress.size(40);
+-  }
+-
+   runner.on(EVENT_SUITE_BEGIN, function (suite) {
+     if (suite.root) {
+       return;
+@@ -234,8 +221,26 @@ function HTML(runner, options) {
+   function updateStats() {
+     // TODO: add to stats
+     var percent = ((stats.tests / runner.total) * 100) | 0;
+-    if (progress) {
+-      progress.update(percent).draw(ctx);
++    progressBar.value = percent;
++    if (progressText) {
++      // setting a toFixed that is too low, makes small changes to progress not shown
++      // setting it too high, makes the progress text longer then it needs to
++      // to address this, calculate the toFixed based on the magnitude of total
++      var decimalPlaces = Math.ceil(Math.log10(runner.total / 100));
++      text(
++        progressText,
++        percent.toFixed(Math.min(Math.max(decimalPlaces, 0), 100)) + '%'
++      );
++    }
++    if (progressRing) {
++      var radius = parseFloat(getComputedStyle(progressRing[0]).getPropertyValue('r'));
++      var wholeArc = Math.PI * 2 * radius;
++      var highlightArc = percent * (wholeArc / 100);
++      // The progress ring is in 2 parts, the flatlight color and highlight color.
++      // Rendering both on top of the other, seems to make a 3rd color on the edges.
++      // To create 1 whole ring with 2 colors, both parts are inverse of the other.
++      progressRing[0].style['stroke-dasharray'] = `0,${highlightArc}px,${wholeArc}px`;
++      progressRing[1].style['stroke-dasharray'] = `${highlightArc}px,${wholeArc}px`;
+     }
+ 
+     // update stats
+diff --git a/mocha.css b/mocha.css
+index b4d7e5b207..1e0d22249a 100644
+--- a/mocha.css
++++ b/mocha.css
+@@ -22,6 +22,9 @@
+   --mocha-stats-color: #888;
+   --mocha-stats-em-color: #000;
+   --mocha-stats-hover-color: #eee;
++  --mocha-progress-ring-color: #eee;
++  --mocha-progress-ring-highlight-color: #9f9f9f;
++  --mocha-progress-text-color: #000;
+   --mocha-error-color: #c00;
+ 
+   --mocha-code-comment:  #ddd;
+@@ -54,6 +57,9 @@
+      --mocha-stats-color: #aaa;
+      --mocha-stats-em-color: #fff;
+      --mocha-stats-hover-color: #444;
++     --mocha-progress-ring-color: #444;
++     --mocha-progress-ring-highlight-color: #888;
++     --mocha-progress-text-color: #fff;
+      --mocha-error-color: #f44;
+ 
+      --mocha-code-comment: #ddd;
+@@ -325,6 +331,10 @@ body {
+ }
+ 
+ #mocha-stats {
++  --ring-container-size: 40px;
++  --ring-size: 39px;
++  --ring-radius: calc(var(--ring-size) / 2);
++
+   position: fixed;
+   top: 15px;
+   right: 10px;
+@@ -334,20 +344,52 @@ body {
+   z-index: 1;
+ }
+ 
+-#mocha-stats .progress {
++#mocha-stats .progress-contain {
+   float: right;
+-  padding-top: 0;
++  padding: 0;
++}
++
++#mocha-stats :is(.progress-element, .progress-text) {
++  width: var(--ring-container-size);
++  display: block;
++  top: 12px;
++  position: absolute;
++}
++
++#mocha-stats .progress-element {
++  visibility: hidden;
++  height: calc(var(--ring-container-size) / 2);
++}
++
++#mocha-stats .progress-text {
++  text-align: center;
++  text-overflow: clip;
++  overflow: hidden;
++  color: var(--mocha-stats-em-color);
++  font-size: 11px;
++}
+ 
+-  /**
+-   * Set safe initial values, so mochas .progress does not inherit these
+-   * properties from Bootstrap .progress (which causes .progress height to
+-   * equal line height set in Bootstrap).
+-   */
+-  height: auto;
+-  -webkit-box-shadow: none;
+-  -moz-box-shadow: none;
+-  box-shadow: none;
+-  background-color: initial;
++#mocha-stats .progress-ring {
++  width: var(--ring-container-size);
++  height: var(--ring-container-size);
++}
++
++#mocha-stats :is(.ring-flatlight, .ring-highlight) {
++  --stroke-thickness: 1.65px;
++  --center: calc(var(--ring-container-size) / 2);
++  cx: var(--center);
++  cy: var(--center);
++  r: calc(var(--ring-radius) - calc(var(--stroke-thickness) / 2));
++  fill: hsla(0, 0%, 0%, 0);
++  stroke-width: var(--stroke-thickness);
++}
++
++#mocha-stats .ring-flatlight {
++  stroke: var(--mocha-progress-ring-color);
++}
++
++#mocha-stats .ring-highlight {
++  stroke: var(--mocha-progress-ring-highlight-color);
+ }
+ 
+ #mocha-stats em {
+@@ -370,11 +412,6 @@ body {
+   padding-top: 11px;
+ }
+ 
+-#mocha-stats canvas {
+-  width: 40px;
+-  height: 40px;
+-}
+-
+ #mocha code .comment { color: var(--mocha-code-comment); }
+ #mocha code .init { color: var(--mocha-code-init); }
+ #mocha code .string { color: var(--mocha-code-string); }

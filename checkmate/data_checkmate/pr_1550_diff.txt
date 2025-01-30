@@ -1,0 +1,158 @@
+diff --git a/Client/src/Components/Inputs/Search/index.jsx b/Client/src/Components/Inputs/Search/index.jsx
+index 2491020f0..46c46de3e 100644
+--- a/Client/src/Components/Inputs/Search/index.jsx
++++ b/Client/src/Components/Inputs/Search/index.jsx
+@@ -56,7 +56,6 @@ const Search = ({
+ 	disabled,
+ }) => {
+ 	const theme = useTheme();
+-
+ 	return (
+ 		<Autocomplete
+ 			multiple={multiple}
+diff --git a/Client/src/Pages/Infrastructure/index.jsx b/Client/src/Pages/Infrastructure/index.jsx
+index d9ef7528e..630c80b7d 100644
+--- a/Client/src/Pages/Infrastructure/index.jsx
++++ b/Client/src/Pages/Infrastructure/index.jsx
+@@ -67,7 +67,7 @@ function Infrastructure() {
+ 				page: page,
+ 				rowsPerPage: rowsPerPage,
+ 			});
+-			setMonitors(response?.data?.data?.monitors ?? []);
++			setMonitors(response?.data?.data?.filteredMonitors ?? []);
+ 			setSummary(response?.data?.data?.summary ?? {});
+ 		} catch (error) {
+ 			console.error(error);
+diff --git a/Client/src/Pages/PageSpeed/index.jsx b/Client/src/Pages/PageSpeed/index.jsx
+index 98761be6f..169a01505 100644
+--- a/Client/src/Pages/PageSpeed/index.jsx
++++ b/Client/src/Pages/PageSpeed/index.jsx
+@@ -36,8 +36,8 @@ const PageSpeed = () => {
+ 					field: null,
+ 					order: null,
+ 				});
+-				if (res?.data?.data?.monitors) {
+-					setMonitors(res.data.data.monitors);
++				if (res?.data?.data?.filteredMonitors) {
++					setMonitors(res.data.data.filteredMonitors);
+ 					setSummary(res.data.data.summary);
+ 				}
+ 			} catch (error) {
+diff --git a/Client/src/Pages/Uptime/Home/UptimeDataTable/index.jsx b/Client/src/Pages/Uptime/Home/UptimeDataTable/index.jsx
+index 31b6182fc..a184eb09f 100644
+--- a/Client/src/Pages/Uptime/Home/UptimeDataTable/index.jsx
++++ b/Client/src/Pages/Uptime/Home/UptimeDataTable/index.jsx
+@@ -88,6 +88,7 @@ const UptimeDataTable = ({
+ 	isAdmin,
+ 	isLoading,
+ 	monitors,
++	filteredMonitors,
+ 	monitorCount,
+ 	sort,
+ 	setSort,
+@@ -274,7 +275,7 @@ const UptimeDataTable = ({
+ 				)}
+ 				<DataTable
+ 					headers={headers}
+-					data={monitors}
++					data={filteredMonitors}
+ 					config={{
+ 						rowSX: {
+ 							cursor: "pointer",
+@@ -300,6 +301,7 @@ UptimeDataTable.propTypes = {
+ 	isAdmin: PropTypes.bool,
+ 	isLoading: PropTypes.bool,
+ 	monitors: PropTypes.array,
++	filteredMonitors: PropTypes.array,
+ 	monitorCount: PropTypes.number,
+ 	sort: PropTypes.shape({
+ 		field: PropTypes.string,
+diff --git a/Client/src/Pages/Uptime/Home/index.jsx b/Client/src/Pages/Uptime/Home/index.jsx
+index 4c5656b2c..e61adc397 100644
+--- a/Client/src/Pages/Uptime/Home/index.jsx
++++ b/Client/src/Pages/Uptime/Home/index.jsx
+@@ -25,13 +25,14 @@ const UptimeMonitors = () => {
+ 	// Redux state
+ 	const rowsPerPage = useSelector((state) => state.ui.monitors.rowsPerPage);
+ 	// Local state
+-	const [monitors, setMonitors] = useState([]);
+ 	const [sort, setSort] = useState({});
+ 	const [search, setSearch] = useState("");
+ 	const [page, setPage] = useState(0);
+ 	const [isSearching, setIsSearching] = useState(false);
+ 	const [isLoading, setIsLoading] = useState(false);
+ 	const [monitorUpdateTrigger, setMonitorUpdateTrigger] = useState(false);
++	const [monitors, setMonitors] = useState([]);
++	const [filteredMonitors, setFilteredMonitors] = useState([]);
+ 	const [monitorsSummary, setMonitorsSummary] = useState({});
+ 
+ 	// Utils
+@@ -100,11 +101,12 @@ const UptimeMonitors = () => {
+ 				field: config.sort.field,
+ 				order: config.sort.order,
+ 			});
+-			const { monitors, summary } = res.data.data;
+-			const mappedMonitors = monitors.map((monitor) =>
++			const { monitors, filteredMonitors, summary } = res.data.data;
++			const mappedMonitors = filteredMonitors.map((monitor) =>
+ 				getMonitorWithPercentage(monitor, theme)
+ 			);
+-			setMonitors(mappedMonitors);
++			setMonitors(monitors);
++			setFilteredMonitors(mappedMonitors);
+ 			setMonitorsSummary(summary);
+ 		} catch (error) {
+ 			createToast({
+@@ -199,6 +201,7 @@ const UptimeMonitors = () => {
+ 								<UptimeDataTable
+ 									isAdmin={isAdmin}
+ 									isLoading={isLoading}
++									filteredMonitors={filteredMonitors}
+ 									monitors={monitors}
+ 									monitorCount={totalMonitors}
+ 									sort={sort}
+diff --git a/Server/db/mongo/modules/monitorModule.js b/Server/db/mongo/modules/monitorModule.js
+index b191bd1bc..df80855bd 100644
+--- a/Server/db/mongo/modules/monitorModule.js
++++ b/Server/db/mongo/modules/monitorModule.js
+@@ -545,6 +545,15 @@ const getMonitorsByTeamId = async (req) => {
+ 					},
+ 				],
+ 				monitors: [
++					{ $sort: sort },
++					{
++						$project: {
++							_id: 1,
++							name: 1,
++						},
++					},
++				],
++				filteredMonitors: [
+ 					...(filter !== undefined
+ 						? [
+ 								{
+@@ -657,20 +666,21 @@ const getMonitorsByTeamId = async (req) => {
+ 		{
+ 			$project: {
+ 				summary: { $arrayElemAt: ["$summary", 0] },
++				filteredMonitors: 1,
+ 				monitors: 1,
+ 			},
+ 		},
+ 	]);
+ 
+-	let { monitors, summary } = results[0];
+-	monitors = monitors.map((monitor) => {
++	let { monitors, filteredMonitors, summary } = results[0];
++	filteredMonitors = filteredMonitors.map((monitor) => {
+ 		if (!monitor.checks) {
+ 			return monitor;
+ 		}
+ 		monitor.checks = NormalizeData(monitor.checks, 10, 100);
+ 		return monitor;
+ 	});
+-	return { monitors, summary };
++	return { monitors, filteredMonitors, summary };
+ };
+ 
+ /**

@@ -1,0 +1,967 @@
+diff --git a/Server/controllers/distributedUptimeController.js b/Server/controllers/distributedUptimeController.js
+new file mode 100644
+index 000000000..ce4ee2df5
+--- /dev/null
++++ b/Server/controllers/distributedUptimeController.js
+@@ -0,0 +1,18 @@
++import { handleError } from "./controllerUtils.js";
++import { successMessages } from "../utils/messages.js";
++
++const SERVICE_NAME = "DistributedUptimeQueueController";
++
++class DistributedUptimeController {
++	constructor() {}
++
++	async resultsCallback(req, res, next) {
++		try {
++			console.log(req.body);
++			res.status(200).json({ message: "OK" });
++		} catch (error) {
++			throw handleError(error, SERVICE_NAME, "resultsCallback");
++		}
++	}
++}
++export default DistributedUptimeController;
+diff --git a/Server/db/models/DistributedUptimeCheck.js b/Server/db/models/DistributedUptimeCheck.js
+new file mode 100644
+index 000000000..0c7c25de3
+--- /dev/null
++++ b/Server/db/models/DistributedUptimeCheck.js
+@@ -0,0 +1,15 @@
++import mongoose from "mongoose";
++import { BaseCheckSchema } from "./Check.js";
++
++const DistributedUptimeCheckSchema = mongoose.Schema(
++	{
++		...BaseCheckSchema.obj,
++	},
++	{ timestamps: true }
++);
++
++DistributedUptimeCheckSchema.index({ createdAt: 1 });
++DistributedUptimeCheckSchema.index({ monitorId: 1, createdAt: 1 });
++DistributedUptimeCheckSchema.index({ monitorId: 1, createdAt: -1 });
++
++export default mongoose.model("DistributedUptimeCheck", DistributedUptimeCheckSchema);
+diff --git a/Server/db/models/Monitor.js b/Server/db/models/Monitor.js
+index 904c71b9f..90cbb1d62 100644
+--- a/Server/db/models/Monitor.js
++++ b/Server/db/models/Monitor.js
+@@ -28,7 +28,15 @@ const MonitorSchema = mongoose.Schema(
+ 		type: {
+ 			type: String,
+ 			required: true,
+-			enum: ["http", "ping", "pagespeed", "hardware", "docker", "port"],
++			enum: [
++				"http",
++				"ping",
++				"pagespeed",
++				"hardware",
++				"docker",
++				"port",
++				"distributed_http",
++			],
+ 		},
+ 		url: {
+ 			type: String,
+diff --git a/Server/db/models/User.js b/Server/db/models/User.js
+index a4d90d44a..3ddc5cee0 100644
+--- a/Server/db/models/User.js
++++ b/Server/db/models/User.js
+@@ -84,6 +84,8 @@ const User = mongoose.model("User", UserSchema);
+ User.init().then(() => {
+ 	logger.info({
+ 		message: "User model initialized",
++		service: "UserModel",
++		method: "init",
+ 	});
+ });
+ 
+diff --git a/Server/db/mongo/MongoDB.js b/Server/db/mongo/MongoDB.js
+index 12b32c5db..e62828a41 100644
+--- a/Server/db/mongo/MongoDB.js
++++ b/Server/db/mongo/MongoDB.js
+@@ -98,7 +98,11 @@ class MongoDB {
+ 				await model.syncIndexes();
+ 			}
+ 
+-			logger.info({ message: "Connected to MongoDB" });
++			logger.info({
++				message: "Connected to MongoDB",
++				service: this.SERVICE_NAME,
++				method: "connect",
++			});
+ 		} catch (error) {
+ 			logger.error({
+ 				message: error.message,
+diff --git a/Server/index.js b/Server/index.js
+index abdc22314..aa77fc0f6 100644
+--- a/Server/index.js
++++ b/Server/index.js
+@@ -34,6 +34,9 @@ import StatusPageController from "./controllers/statusPageController.js";
+ import QueueRoutes from "./routes/queueRoute.js";
+ import QueueController from "./controllers/queueController.js";
+ 
++import DistributedUptimeRoutes from "./routes/distributedUptimeRoute.js";
++import DistributedUptimeController from "./controllers/distributedUptimeController.js";
++
+ //JobQueue service and dependencies
+ import JobQueue from "./service/jobQueue.js";
+ import { Queue, Worker } from "bullmq";
+@@ -45,7 +48,7 @@ import ping from "ping";
+ import http from "http";
+ import Docker from "dockerode";
+ import net from "net";
+-
++import ngrok from "ngrok";
+ // Email service and dependencies
+ import EmailService from "./service/emailService.js";
+ import nodemailer from "nodemailer";
+@@ -80,6 +83,7 @@ const openApiSpec = JSON.parse(
+ );
+ 
+ let server;
++let ngrokUrl;
+ 
+ const PORT = 5000;
+ 
+@@ -127,6 +131,29 @@ const shutdown = async () => {
+ // Need to wrap server setup in a function to handle async nature of JobQueue
+ const startApp = async () => {
+ 	const app = express();
++	if (process.env.NODE_ENV === "development") {
++		try {
++			ngrokUrl = await ngrok.connect({
++				proto: "http",
++				addr: PORT,
++				authtoken: process.env.NGROK_AUTH_TOKEN,
++				api_addr: false,
++			});
++			process.env.NGROK_URL = ngrokUrl;
++			logger.info({
++				message: `ngrok url: ${ngrokUrl}`,
++				service: SERVICE_NAME,
++				method: "startApp",
++			});
++		} catch (error) {
++			logger.error({
++				message: `Error connecting to ngrok`,
++				service: SERVICE_NAME,
++				method: "startApp",
++				stack: error.stack,
++			});
++		}
++	}
+ 
+ 	// Create DB
+ 	const db = new MongoDB();
+@@ -216,6 +243,8 @@ const startApp = async () => {
+ 		ServiceRegistry.get(MongoDB.SERVICE_NAME)
+ 	);
+ 
++	const distributedUptimeController = new DistributedUptimeController();
++
+ 	//Create routes
+ 	const authRoutes = new AuthRoutes(authController);
+ 	const monitorRoutes = new MonitorRoutes(monitorController);
+@@ -227,6 +256,9 @@ const startApp = async () => {
+ 	);
+ 	const queueRoutes = new QueueRoutes(queueController);
+ 	const statusPageRoutes = new StatusPageRoutes(statusPageController);
++	const distributedUptimeRoutes = new DistributedUptimeRoutes(
++		distributedUptimeController
++	);
+ 	// Init job queue
+ 	await jobQueue.initJobQueue();
+ 	// Middleware
+@@ -247,6 +279,7 @@ const startApp = async () => {
+ 	app.use("/api/v1/checks", verifyJWT, checkRoutes.getRouter());
+ 	app.use("/api/v1/maintenance-window", verifyJWT, maintenanceWindowRoutes.getRouter());
+ 	app.use("/api/v1/queue", verifyJWT, queueRoutes.getRouter());
++	app.use("/api/v1/distributed-uptime", distributedUptimeRoutes.getRouter());
+ 	app.use("/api/v1/status-page", statusPageRoutes.getRouter());
+ 	app.use(handleErrors);
+ };
+diff --git a/Server/package-lock.json b/Server/package-lock.json
+index caeab0813..01ca7d510 100644
+--- a/Server/package-lock.json
++++ b/Server/package-lock.json
+@@ -41,6 +41,7 @@
+ 				"esm": "3.2.25",
+ 				"globals": "^15.14.0",
+ 				"mocha": "11.0.1",
++				"ngrok": "5.0.0-beta.2",
+ 				"nodemon": "3.1.9",
+ 				"prettier": "^3.3.3",
+ 				"sinon": "19.0.2"
+@@ -994,6 +995,19 @@
+ 			"integrity": "sha512-RNiOoTPkptFtSVzQevY/yWtZwf/RxyVnPy/OcA9HBM3MlGDnBEYL5B41H0MTn0Uec8Hi+2qUtTfG2WWZBmMejQ==",
+ 			"license": "BSD-3-Clause"
+ 		},
++		"node_modules/@sindresorhus/is": {
++			"version": "4.6.0",
++			"resolved": "https://registry.npmjs.org/@sindresorhus/is/-/is-4.6.0.tgz",
++			"integrity": "sha512-t09vSN3MdfsyCHoFcTRCH/iUtG7OJ0CsjzB8cjAmKc/va/kIgeDI/TxsigdncE/4be734m0cvIYwNaV4i2XqAw==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10"
++			},
++			"funding": {
++				"url": "https://github.com/sindresorhus/is?sponsor=1"
++			}
++		},
+ 		"node_modules/@sinonjs/commons": {
+ 			"version": "3.0.1",
+ 			"resolved": "https://registry.npmjs.org/@sinonjs/commons/-/commons-3.0.1.tgz",
+@@ -1043,6 +1057,19 @@
+ 			"dev": true,
+ 			"license": "(Unlicense OR Apache-2.0)"
+ 		},
++		"node_modules/@szmarczak/http-timer": {
++			"version": "4.0.6",
++			"resolved": "https://registry.npmjs.org/@szmarczak/http-timer/-/http-timer-4.0.6.tgz",
++			"integrity": "sha512-4BAffykYOgO+5nzBWYwE3W90sBgLJoUPRWWcL8wlyiM8IB8ipJz3UMJ9KXQd1RKQXpKp8Tutn80HZtWsu2u76w==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"defer-to-connect": "^2.0.0"
++			},
++			"engines": {
++				"node": ">=10"
++			}
++		},
+ 		"node_modules/@trysound/sax": {
+ 			"version": "0.2.0",
+ 			"resolved": "https://registry.npmjs.org/@trysound/sax/-/sax-0.2.0.tgz",
+@@ -1052,12 +1079,32 @@
+ 				"node": ">=10.13.0"
+ 			}
+ 		},
++		"node_modules/@types/cacheable-request": {
++			"version": "6.0.3",
++			"resolved": "https://registry.npmjs.org/@types/cacheable-request/-/cacheable-request-6.0.3.tgz",
++			"integrity": "sha512-IQ3EbTzGxIigb1I3qPZc1rWJnH0BmSKv5QYTalEwweFvyBDLSAe24zP0le/hyi7ecGfZVlIVAg4BZqb8WBwKqw==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"@types/http-cache-semantics": "*",
++				"@types/keyv": "^3.1.4",
++				"@types/node": "*",
++				"@types/responselike": "^1.0.0"
++			}
++		},
+ 		"node_modules/@types/estree": {
+ 			"version": "1.0.6",
+ 			"resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.6.tgz",
+ 			"integrity": "sha512-AYnb1nQyY49te+VRAVgmzfcgjYS91mY5P0TKUDCLEM+gNnA+3T6rWITXRLYCpahpqSQbN5cE+gHpnPyXjHWxcw==",
+ 			"dev": true
+ 		},
++		"node_modules/@types/http-cache-semantics": {
++			"version": "4.0.4",
++			"resolved": "https://registry.npmjs.org/@types/http-cache-semantics/-/http-cache-semantics-4.0.4.tgz",
++			"integrity": "sha512-1m0bIFVc7eJWyve9S0RnuRgcQqF/Xd5QsUZAZeQFr1Q3/p9JWoQQEqmVy+DPTNpGXwhgIetAoYF8JSc33q29QA==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/@types/istanbul-lib-coverage": {
+ 			"version": "2.0.6",
+ 			"resolved": "https://registry.npmjs.org/@types/istanbul-lib-coverage/-/istanbul-lib-coverage-2.0.6.tgz",
+@@ -1071,6 +1118,36 @@
+ 			"integrity": "sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==",
+ 			"dev": true
+ 		},
++		"node_modules/@types/keyv": {
++			"version": "3.1.4",
++			"resolved": "https://registry.npmjs.org/@types/keyv/-/keyv-3.1.4.tgz",
++			"integrity": "sha512-BQ5aZNSCpj7D6K2ksrRCTmKRLEpnPvWDiLPfoGyhZ++8YtiK9d/3DBKPJgry359X/P1PfruyYwvnvwFjuEiEIg==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"@types/node": "*"
++			}
++		},
++		"node_modules/@types/node": {
++			"version": "22.10.4",
++			"resolved": "https://registry.npmjs.org/@types/node/-/node-22.10.4.tgz",
++			"integrity": "sha512-99l6wv4HEzBQhvaU/UGoeBoCK61SCROQaCCGyQSgX2tEQ3rKkNZ2S7CEWnS/4s1LV+8ODdK21UeyR1fHP2mXug==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"undici-types": "~6.20.0"
++			}
++		},
++		"node_modules/@types/responselike": {
++			"version": "1.0.3",
++			"resolved": "https://registry.npmjs.org/@types/responselike/-/responselike-1.0.3.tgz",
++			"integrity": "sha512-H/+L+UkTV33uf49PH5pCAUBVPNj2nDBXTN+qS1dOwyyg24l3CcicicCA7ca+HMvJBZcFgl5r8e+RR6elsb4Lyw==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"@types/node": "*"
++			}
++		},
+ 		"node_modules/@types/triple-beam": {
+ 			"version": "1.3.5",
+ 			"resolved": "https://registry.npmjs.org/@types/triple-beam/-/triple-beam-1.3.5.tgz",
+@@ -1092,6 +1169,17 @@
+ 				"@types/webidl-conversions": "*"
+ 			}
+ 		},
++		"node_modules/@types/yauzl": {
++			"version": "2.10.3",
++			"resolved": "https://registry.npmjs.org/@types/yauzl/-/yauzl-2.10.3.tgz",
++			"integrity": "sha512-oJoftv0LSuaDZE3Le4DbKX+KS9G36NzOeSap90UIK0yMA/NhKJhqlSGtNDORNRaIbQfzjXDrQa0ytJ6mNRGz/Q==",
++			"dev": true,
++			"license": "MIT",
++			"optional": true,
++			"dependencies": {
++				"@types/node": "*"
++			}
++		},
+ 		"node_modules/abbrev": {
+ 			"version": "1.1.1",
+ 			"resolved": "https://registry.npmjs.org/abbrev/-/abbrev-1.1.1.tgz",
+@@ -1520,6 +1608,16 @@
+ 				"ieee754": "^1.1.13"
+ 			}
+ 		},
++		"node_modules/buffer-crc32": {
++			"version": "0.2.13",
++			"resolved": "https://registry.npmjs.org/buffer-crc32/-/buffer-crc32-0.2.13.tgz",
++			"integrity": "sha512-VO9Ht/+p3SN7SKWqcrgEzjGbRSJYTx+Q1pTQC0wrWqHx0vpJraQ6GtHx8tvcg1rlK1byhU5gccxgOgj7B0TDkQ==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": "*"
++			}
++		},
+ 		"node_modules/buffer-equal-constant-time": {
+ 			"version": "1.0.1",
+ 			"resolved": "https://registry.npmjs.org/buffer-equal-constant-time/-/buffer-equal-constant-time-1.0.1.tgz",
+@@ -1610,6 +1708,35 @@
+ 				}
+ 			}
+ 		},
++		"node_modules/cacheable-lookup": {
++			"version": "5.0.4",
++			"resolved": "https://registry.npmjs.org/cacheable-lookup/-/cacheable-lookup-5.0.4.tgz",
++			"integrity": "sha512-2/kNscPhpcxrOigMZzbiWF7dz8ilhb/nIHU3EyZiXWXpeq/au8qJ8VhdftMkty3n7Gj6HIGalQG8oiBNB3AJgA==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10.6.0"
++			}
++		},
++		"node_modules/cacheable-request": {
++			"version": "7.0.4",
++			"resolved": "https://registry.npmjs.org/cacheable-request/-/cacheable-request-7.0.4.tgz",
++			"integrity": "sha512-v+p6ongsrp0yTGbJXjgxPow2+DL93DASP4kXCDKb8/bwRtt9OEF3whggkkDkGNzgcWy2XaF4a8nZglC7uElscg==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"clone-response": "^1.0.2",
++				"get-stream": "^5.1.0",
++				"http-cache-semantics": "^4.0.0",
++				"keyv": "^4.0.0",
++				"lowercase-keys": "^2.0.0",
++				"normalize-url": "^6.0.1",
++				"responselike": "^2.0.0"
++			},
++			"engines": {
++				"node": ">=8"
++			}
++		},
+ 		"node_modules/call-bind-apply-helpers": {
+ 			"version": "1.0.1",
+ 			"resolved": "https://registry.npmjs.org/call-bind-apply-helpers/-/call-bind-apply-helpers-1.0.1.tgz",
+@@ -1880,6 +2007,19 @@
+ 				"url": "https://github.com/chalk/wrap-ansi?sponsor=1"
+ 			}
+ 		},
++		"node_modules/clone-response": {
++			"version": "1.0.3",
++			"resolved": "https://registry.npmjs.org/clone-response/-/clone-response-1.0.3.tgz",
++			"integrity": "sha512-ROoL94jJH2dUVML2Y/5PEDNaSHgeOdSDicUyS7izcF63G6sTc/FTjLub4b8Il9S8S0beOfYt0TaA5qvFK+w0wA==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"mimic-response": "^1.0.0"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/cluster-key-slot": {
+ 			"version": "1.1.2",
+ 			"resolved": "https://registry.npmjs.org/cluster-key-slot/-/cluster-key-slot-1.1.2.tgz",
+@@ -2390,6 +2530,35 @@
+ 				"url": "https://github.com/sponsors/sindresorhus"
+ 			}
+ 		},
++		"node_modules/decompress-response": {
++			"version": "6.0.0",
++			"resolved": "https://registry.npmjs.org/decompress-response/-/decompress-response-6.0.0.tgz",
++			"integrity": "sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"mimic-response": "^3.1.0"
++			},
++			"engines": {
++				"node": ">=10"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
++		"node_modules/decompress-response/node_modules/mimic-response": {
++			"version": "3.1.0",
++			"resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-3.1.0.tgz",
++			"integrity": "sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/deep-eql": {
+ 			"version": "5.0.2",
+ 			"resolved": "https://registry.npmjs.org/deep-eql/-/deep-eql-5.0.2.tgz",
+@@ -2406,6 +2575,16 @@
+ 			"integrity": "sha512-oIPzksmTg4/MriiaYGO+okXDT7ztn/w3Eptv/+gSIdMdKsJo0u4CfYNFJPy+4SKMuCqGw2wxnA+URMg3t8a/bQ==",
+ 			"dev": true
+ 		},
++		"node_modules/defer-to-connect": {
++			"version": "2.0.1",
++			"resolved": "https://registry.npmjs.org/defer-to-connect/-/defer-to-connect-2.0.1.tgz",
++			"integrity": "sha512-4tvttepXG1VaYGrRibk5EwJd1t4udunSOVMdLSAL6mId1ix438oPwPZMALY41FCijukO1L0twNcGsdzS7dHgDg==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10"
++			}
++		},
+ 		"node_modules/delayed-stream": {
+ 			"version": "1.0.0",
+ 			"resolved": "https://registry.npmjs.org/delayed-stream/-/delayed-stream-1.0.0.tgz",
+@@ -3198,6 +3377,27 @@
+ 			"integrity": "sha512-fjquC59cD7CyW6urNXK0FBufkZcoiGG80wTuPujX590cB5Ttln20E2UB4S/WARVqhXffZl2LNgS+gQdPIIim/g==",
+ 			"license": "MIT"
+ 		},
++		"node_modules/extract-zip": {
++			"version": "2.0.1",
++			"resolved": "https://registry.npmjs.org/extract-zip/-/extract-zip-2.0.1.tgz",
++			"integrity": "sha512-GDhU9ntwuKyGXdZBUgTIe+vXnWj0fppUEtMDL0+idd5Sta8TGpHssn/eusA9mrPr9qNDym6SxAYZjNvCn/9RBg==",
++			"dev": true,
++			"license": "BSD-2-Clause",
++			"dependencies": {
++				"debug": "^4.1.1",
++				"get-stream": "^5.1.0",
++				"yauzl": "^2.10.0"
++			},
++			"bin": {
++				"extract-zip": "cli.js"
++			},
++			"engines": {
++				"node": ">= 10.17.0"
++			},
++			"optionalDependencies": {
++				"@types/yauzl": "^2.9.1"
++			}
++		},
+ 		"node_modules/fast-deep-equal": {
+ 			"version": "3.1.3",
+ 			"resolved": "https://registry.npmjs.org/fast-deep-equal/-/fast-deep-equal-3.1.3.tgz",
+@@ -3216,6 +3416,16 @@
+ 			"integrity": "sha512-DCXu6Ifhqcks7TZKY3Hxp3y6qphY5SJZmrWMDrKcERSOXWQdMhU9Ig/PYrzyw/ul9jOIyh0N4M0tbC5hodg8dw==",
+ 			"dev": true
+ 		},
++		"node_modules/fd-slicer": {
++			"version": "1.1.0",
++			"resolved": "https://registry.npmjs.org/fd-slicer/-/fd-slicer-1.1.0.tgz",
++			"integrity": "sha512-cE1qsB/VwyQozZ+q1dGxR8LBYNZeofhEdUNGSMbQD3Gw2lAzX9Zb3uIU6Ebc/Fmyjo9AWWfnn0AUCHqtevs/8g==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"pend": "~1.2.0"
++			}
++		},
+ 		"node_modules/fecha": {
+ 			"version": "4.2.3",
+ 			"resolved": "https://registry.npmjs.org/fecha/-/fecha-4.2.3.tgz",
+@@ -3574,6 +3784,22 @@
+ 				"url": "https://github.com/sponsors/ljharb"
+ 			}
+ 		},
++		"node_modules/get-stream": {
++			"version": "5.2.0",
++			"resolved": "https://registry.npmjs.org/get-stream/-/get-stream-5.2.0.tgz",
++			"integrity": "sha512-nBF+F1rAZVCu/p7rjzgA+Yb4lfYXrpl7a6VmJrU8wF9I1CKvP/QwPNZHnOlwbTkY6dvtFIzFMSyQXbLoTQPRpA==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"pump": "^3.0.0"
++			},
++			"engines": {
++				"node": ">=8"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/glob": {
+ 			"version": "10.4.5",
+ 			"resolved": "https://registry.npmjs.org/glob/-/glob-10.4.5.tgz",
+@@ -3630,6 +3856,32 @@
+ 				"url": "https://github.com/sponsors/ljharb"
+ 			}
+ 		},
++		"node_modules/got": {
++			"version": "11.8.6",
++			"resolved": "https://registry.npmjs.org/got/-/got-11.8.6.tgz",
++			"integrity": "sha512-6tfZ91bOr7bOXnK7PRDCGBLa1H4U080YHNaAQ2KsMGlLEzRbk44nsZF2E1IeRc3vtJHPVbKCYgdFbaGO2ljd8g==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"@sindresorhus/is": "^4.0.0",
++				"@szmarczak/http-timer": "^4.0.5",
++				"@types/cacheable-request": "^6.0.1",
++				"@types/responselike": "^1.0.0",
++				"cacheable-lookup": "^5.0.3",
++				"cacheable-request": "^7.0.2",
++				"decompress-response": "^6.0.0",
++				"http2-wrapper": "^1.0.0-beta.5.2",
++				"lowercase-keys": "^2.0.0",
++				"p-cancelable": "^2.0.0",
++				"responselike": "^2.0.0"
++			},
++			"engines": {
++				"node": ">=10.19.0"
++			},
++			"funding": {
++				"url": "https://github.com/sindresorhus/got?sponsor=1"
++			}
++		},
+ 		"node_modules/handlebars": {
+ 			"version": "4.7.8",
+ 			"resolved": "https://registry.npmjs.org/handlebars/-/handlebars-4.7.8.tgz",
+@@ -3710,6 +3962,14 @@
+ 				"node": ">=18.0.0"
+ 			}
+ 		},
++		"node_modules/hpagent": {
++			"version": "0.1.2",
++			"resolved": "https://registry.npmjs.org/hpagent/-/hpagent-0.1.2.tgz",
++			"integrity": "sha512-ePqFXHtSQWAFXYmj+JtOTHr84iNrII4/QRlAAPPE+zqnKy4xJo7Ie1Y4kC7AdB+LxLxSTTzBMASsEcy0q8YyvQ==",
++			"dev": true,
++			"license": "MIT",
++			"optional": true
++		},
+ 		"node_modules/html-escaper": {
+ 			"version": "2.0.2",
+ 			"resolved": "https://registry.npmjs.org/html-escaper/-/html-escaper-2.0.2.tgz",
+@@ -3783,6 +4043,13 @@
+ 				"entities": "^4.4.0"
+ 			}
+ 		},
++		"node_modules/http-cache-semantics": {
++			"version": "4.1.1",
++			"resolved": "https://registry.npmjs.org/http-cache-semantics/-/http-cache-semantics-4.1.1.tgz",
++			"integrity": "sha512-er295DKPVsV82j5kw1Gjt+ADA/XYHsajl82cGNQG2eyoPkvgUhX+nDIyelzhIWbbsXP39EHcI6l5tYs2FYqYXQ==",
++			"dev": true,
++			"license": "BSD-2-Clause"
++		},
+ 		"node_modules/http-errors": {
+ 			"version": "2.0.0",
+ 			"resolved": "https://registry.npmjs.org/http-errors/-/http-errors-2.0.0.tgz",
+@@ -3799,6 +4066,20 @@
+ 				"node": ">= 0.8"
+ 			}
+ 		},
++		"node_modules/http2-wrapper": {
++			"version": "1.0.3",
++			"resolved": "https://registry.npmjs.org/http2-wrapper/-/http2-wrapper-1.0.3.tgz",
++			"integrity": "sha512-V+23sDMr12Wnz7iTcDeJr3O6AIxlnvT/bmaAAAP/Xda35C90p9599p0F1eHR/N1KILWSoWVAiOMFjBBXaXSMxg==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"quick-lru": "^5.1.1",
++				"resolve-alpn": "^1.0.0"
++			},
++			"engines": {
++				"node": ">=10.19.0"
++			}
++		},
+ 		"node_modules/https-proxy-agent": {
+ 			"version": "5.0.1",
+ 			"resolved": "https://registry.npmjs.org/https-proxy-agent/-/https-proxy-agent-5.0.1.tgz",
+@@ -4369,6 +4650,13 @@
+ 			"integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg==",
+ 			"license": "MIT"
+ 		},
++		"node_modules/lodash.clonedeep": {
++			"version": "4.5.0",
++			"resolved": "https://registry.npmjs.org/lodash.clonedeep/-/lodash.clonedeep-4.5.0.tgz",
++			"integrity": "sha512-H5ZhCF25riFd9uB5UCkVKo61m3S/xZk1x4wA6yp/L3RFP6Z/eHH1ymQcGLo7J3GMPfm0V/7m1tryHuGVxpqEBQ==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/lodash.defaults": {
+ 			"version": "4.2.0",
+ 			"resolved": "https://registry.npmjs.org/lodash.defaults/-/lodash.defaults-4.2.0.tgz",
+@@ -4489,6 +4777,16 @@
+ 			"dev": true,
+ 			"license": "MIT"
+ 		},
++		"node_modules/lowercase-keys": {
++			"version": "2.0.0",
++			"resolved": "https://registry.npmjs.org/lowercase-keys/-/lowercase-keys-2.0.0.tgz",
++			"integrity": "sha512-tqNXrS78oMOE73NMxK4EMLQsQowWf8jKooH9g7xPavRT706R6bkQJ6DY2Te7QukaZsulxa30wQ7bk0pm4XiHmA==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=8"
++			}
++		},
+ 		"node_modules/lru-cache": {
+ 			"version": "10.4.3",
+ 			"resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-10.4.3.tgz",
+@@ -4626,6 +4924,16 @@
+ 				"node": ">= 0.6"
+ 			}
+ 		},
++		"node_modules/mimic-response": {
++			"version": "1.0.1",
++			"resolved": "https://registry.npmjs.org/mimic-response/-/mimic-response-1.0.1.tgz",
++			"integrity": "sha512-j5EctnkH7amfV/q5Hgmoal1g2QHFJRraOtmx0JpIqkxhBhI/lJSl1nMpQ45hVarwNETOoWEimndZ4QK0RHxuxQ==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=4"
++			}
++		},
+ 		"node_modules/minimatch": {
+ 			"version": "9.0.5",
+ 			"resolved": "https://registry.npmjs.org/minimatch/-/minimatch-9.0.5.tgz",
+@@ -5476,6 +5784,40 @@
+ 			"integrity": "sha512-Yd3UES5mWCSqR+qNT93S3UoYUkqAZ9lLg8a7g9rimsWmYGK8cVToA4/sF3RrshdyV3sAGMXVUmpMYOw+dLpOuw==",
+ 			"license": "MIT"
+ 		},
++		"node_modules/ngrok": {
++			"version": "5.0.0-beta.2",
++			"resolved": "https://registry.npmjs.org/ngrok/-/ngrok-5.0.0-beta.2.tgz",
++			"integrity": "sha512-UzsyGiJ4yTTQLCQD11k1DQaMwq2/SsztBg2b34zAqcyjS25qjDpogMKPaCKHwe/APRTHeel3iDXcVctk5CNaCQ==",
++			"dev": true,
++			"hasInstallScript": true,
++			"license": "BSD-2-Clause",
++			"dependencies": {
++				"extract-zip": "^2.0.1",
++				"got": "^11.8.5",
++				"lodash.clonedeep": "^4.5.0",
++				"uuid": "^7.0.0 || ^8.0.0",
++				"yaml": "^2.2.2"
++			},
++			"bin": {
++				"ngrok": "bin/ngrok"
++			},
++			"engines": {
++				"node": ">=14.2"
++			},
++			"optionalDependencies": {
++				"hpagent": "^0.1.2"
++			}
++		},
++		"node_modules/ngrok/node_modules/uuid": {
++			"version": "8.3.2",
++			"resolved": "https://registry.npmjs.org/uuid/-/uuid-8.3.2.tgz",
++			"integrity": "sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==",
++			"dev": true,
++			"license": "MIT",
++			"bin": {
++				"uuid": "dist/bin/uuid"
++			}
++		},
+ 		"node_modules/nise": {
+ 			"version": "6.1.1",
+ 			"resolved": "https://registry.npmjs.org/nise/-/nise-6.1.1.tgz",
+@@ -5684,6 +6026,19 @@
+ 				"node": ">=0.10.0"
+ 			}
+ 		},
++		"node_modules/normalize-url": {
++			"version": "6.1.0",
++			"resolved": "https://registry.npmjs.org/normalize-url/-/normalize-url-6.1.0.tgz",
++			"integrity": "sha512-DlL+XwOy3NxAQ8xuC0okPgK46iuVNAK01YN7RueYBqqFeGsBjV9XmCAzAdgt+667bCl5kPh9EqKKDwnaPG1I7A==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/npmlog": {
+ 			"version": "5.0.1",
+ 			"resolved": "https://registry.npmjs.org/npmlog/-/npmlog-5.0.1.tgz",
+@@ -5777,6 +6132,16 @@
+ 				"node": ">= 0.8.0"
+ 			}
+ 		},
++		"node_modules/p-cancelable": {
++			"version": "2.1.1",
++			"resolved": "https://registry.npmjs.org/p-cancelable/-/p-cancelable-2.1.1.tgz",
++			"integrity": "sha512-BZOr3nRQHOntUjTrH8+Lh54smKHoHyur8We1V8DSMVrl5A2malOOwuJRnKRDjSnkoeBh4at6BwEnb5I7Jl31wg==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=8"
++			}
++		},
+ 		"node_modules/p-limit": {
+ 			"version": "3.1.0",
+ 			"resolved": "https://registry.npmjs.org/p-limit/-/p-limit-3.1.0.tgz",
+@@ -5951,6 +6316,13 @@
+ 				"node": ">= 14.16"
+ 			}
+ 		},
++		"node_modules/pend": {
++			"version": "1.2.0",
++			"resolved": "https://registry.npmjs.org/pend/-/pend-1.2.0.tgz",
++			"integrity": "sha512-F3asv42UuXchdzt+xXqfW1OGlVBe+mxa2mqI0pg5yAHZPvFmY3Y6drSf/GQ1A86WgWEN9Kzh/WrgKa6iGcHXLg==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/picocolors": {
+ 			"version": "1.1.1",
+ 			"resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+@@ -6646,6 +7018,19 @@
+ 				"url": "https://github.com/sponsors/ljharb"
+ 			}
+ 		},
++		"node_modules/quick-lru": {
++			"version": "5.1.1",
++			"resolved": "https://registry.npmjs.org/quick-lru/-/quick-lru-5.1.1.tgz",
++			"integrity": "sha512-WuyALRjWPDGtt/wzJiadO5AXY+8hZ80hVpe6MyivgraREW751X3SbhRvG3eLKOYN+8VEvqLcf3wdnt44Z4S4SA==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">=10"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/rambda": {
+ 			"version": "7.5.0",
+ 			"resolved": "https://registry.npmjs.org/rambda/-/rambda-7.5.0.tgz",
+@@ -6748,6 +7133,13 @@
+ 				"node": ">=0.10.0"
+ 			}
+ 		},
++		"node_modules/resolve-alpn": {
++			"version": "1.2.1",
++			"resolved": "https://registry.npmjs.org/resolve-alpn/-/resolve-alpn-1.2.1.tgz",
++			"integrity": "sha512-0a1F4l73/ZFZOakJnQ3FvkJ2+gSTQWz/r2KE5OdDY0TxPm5h4GkqkWWfM47T7HsbnOtcJVEF4epCVy6u7Q3K+g==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/resolve-from": {
+ 			"version": "4.0.0",
+ 			"resolved": "https://registry.npmjs.org/resolve-from/-/resolve-from-4.0.0.tgz",
+@@ -6757,6 +7149,19 @@
+ 				"node": ">=4"
+ 			}
+ 		},
++		"node_modules/responselike": {
++			"version": "2.0.1",
++			"resolved": "https://registry.npmjs.org/responselike/-/responselike-2.0.1.tgz",
++			"integrity": "sha512-4gl03wn3hj1HP3yzgdI7d3lCkF95F21Pz4BPGvKHinyQzALR5CapwC8yIi0Rh58DEMQ/SguC03wFj2k0M/mHhw==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"lowercase-keys": "^2.0.0"
++			},
++			"funding": {
++				"url": "https://github.com/sponsors/sindresorhus"
++			}
++		},
+ 		"node_modules/rimraf": {
+ 			"version": "3.0.2",
+ 			"resolved": "https://registry.npmjs.org/rimraf/-/rimraf-3.0.2.tgz",
+@@ -7702,6 +8107,13 @@
+ 				"node": ">=18.17"
+ 			}
+ 		},
++		"node_modules/undici-types": {
++			"version": "6.20.0",
++			"resolved": "https://registry.npmjs.org/undici-types/-/undici-types-6.20.0.tgz",
++			"integrity": "sha512-Ny6QZ2Nju20vw1SRHe3d9jVu6gJ+4e3+MMpqu7pqE5HT6WsTSlce++GQmK5UXS8mzV8DSYHrQH+Xrf2jVcuKNg==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/unfetch": {
+ 			"version": "4.2.0",
+ 			"resolved": "https://registry.npmjs.org/unfetch/-/unfetch-4.2.0.tgz",
+@@ -8238,6 +8650,19 @@
+ 			"integrity": "sha512-3wdGidZyq5PB084XLES5TpOSRA3wjXAlIWMhum2kRcv/41Sn2emQ0dycQW4uZXLejwKvg6EsvbdlVL+FYEct7A==",
+ 			"license": "ISC"
+ 		},
++		"node_modules/yaml": {
++			"version": "2.7.0",
++			"resolved": "https://registry.npmjs.org/yaml/-/yaml-2.7.0.tgz",
++			"integrity": "sha512-+hSoy/QHluxmC9kCIJyL/uyFmLmc+e5CFR5Wa+bpIhIj85LVb9ZH2nVnqrHoSvKogwODv0ClqZkmiSSaIH5LTA==",
++			"dev": true,
++			"license": "ISC",
++			"bin": {
++				"yaml": "bin.mjs"
++			},
++			"engines": {
++				"node": ">= 14"
++			}
++		},
+ 		"node_modules/yargs": {
+ 			"version": "17.7.2",
+ 			"resolved": "https://registry.npmjs.org/yargs/-/yargs-17.7.2.tgz",
+@@ -8322,6 +8747,17 @@
+ 				"node": ">=8"
+ 			}
+ 		},
++		"node_modules/yauzl": {
++			"version": "2.10.0",
++			"resolved": "https://registry.npmjs.org/yauzl/-/yauzl-2.10.0.tgz",
++			"integrity": "sha512-p4a9I6X6nu6IhoGmBqAcbJy1mlC4j27vEPZX9F4L4/vZT3Lyq1VkFHw/V/PUcB9Buo+DG3iHkT0x3Qya58zc3g==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"buffer-crc32": "~0.2.3",
++				"fd-slicer": "~1.1.0"
++			}
++		},
+ 		"node_modules/yocto-queue": {
+ 			"version": "0.1.0",
+ 			"resolved": "https://registry.npmjs.org/yocto-queue/-/yocto-queue-0.1.0.tgz",
+diff --git a/Server/package.json b/Server/package.json
+index 75bfde65a..d93c6c640 100644
+--- a/Server/package.json
++++ b/Server/package.json
+@@ -48,6 +48,7 @@
+ 		"esm": "3.2.25",
+ 		"globals": "^15.14.0",
+ 		"mocha": "11.0.1",
++		"ngrok": "5.0.0-beta.2",
+ 		"nodemon": "3.1.9",
+ 		"prettier": "^3.3.3",
+ 		"sinon": "19.0.2"
+diff --git a/Server/routes/distributedUptimeRoute.js b/Server/routes/distributedUptimeRoute.js
+new file mode 100644
+index 000000000..eac4cb675
+--- /dev/null
++++ b/Server/routes/distributedUptimeRoute.js
+@@ -0,0 +1,18 @@
++import { Router } from "express";
++
++class DistributedUptimeRoutes {
++	constructor(distributedUptimeController) {
++		this.router = Router();
++		this.distributedUptimeController = distributedUptimeController;
++		this.initRoutes();
++	}
++	initRoutes() {
++		this.router.post("/callback", this.distributedUptimeController.resultsCallback);
++	}
++
++	getRouter() {
++		return this.router;
++	}
++}
++
++export default DistributedUptimeRoutes;
+diff --git a/Server/service/jobQueue.js b/Server/service/jobQueue.js
+index ca457b9ee..9b5663350 100644
+--- a/Server/service/jobQueue.js
++++ b/Server/service/jobQueue.js
+@@ -1,5 +1,5 @@
+ const QUEUE_NAMES = ["uptime", "pagespeed", "hardware"];
+-const SERVICE_NAME = "NewJobQueue";
++const SERVICE_NAME = "JobQueue";
+ const JOBS_PER_WORKER = 5;
+ const QUEUE_LOOKUP = {
+ 	hardware: "hardware",
+@@ -63,12 +63,14 @@ class NewJobQueue {
+ 				.filter((monitor) => monitor.isActive)
+ 				.map(async (monitor) => {
+ 					try {
+-						console.log(`Adding job for monitor: ${monitor._id} (${monitor.type})`);
+ 						await this.addJob(monitor._id, monitor);
+-						console.log(`Successfully added job for monitor: ${monitor._id}`);
+ 					} catch (error) {
+-						console.error(`Failed to add job for monitor ${monitor._id}:`, error);
+-						// Don't throw here to allow other jobs to continue
++						this.logger.error({
++							message: `Failed to add job for monitor ${monitor._id}:`,
++							service: SERVICE_NAME,
++							method: "initJobQueue",
++							stack: error.stack,
++						});
+ 					}
+ 				})
+ 		);
+@@ -387,7 +389,11 @@ class NewJobQueue {
+ 	 */
+ 	async addJob(jobName, monitor) {
+ 		try {
+-			this.logger.info({ message: `Adding job ${monitor?.url ?? "No URL"}` });
++			this.logger.info({
++				message: `Adding job ${monitor?.url ?? "No URL"}`,
++				service: SERVICE_NAME,
++				method: "addJob",
++			});
+ 
+ 			// Find the correct queue
+ 
+@@ -545,7 +551,11 @@ class NewJobQueue {
+ 
+ 	async obliterate() {
+ 		try {
+-			this.logger.info({ message: "Attempting to obliterate job queue..." });
++			this.logger.info({
++				message: "Attempting to obliterate job queue...",
++				service: SERVICE_NAME,
++				method: "obliterate",
++			});
+ 			await Promise.all(
+ 				QUEUE_NAMES.map(async (name) => {
+ 					const queue = this.queues[name];
+diff --git a/guides/users-guide/quickstart.md b/guides/users-guide/quickstart.md
+index 506cdb178..afdff91f6 100644
+--- a/guides/users-guide/quickstart.md
++++ b/guides/users-guide/quickstart.md
+@@ -117,7 +117,22 @@ VITE_APP_LOG_LEVEL="debug"
+ 
+ Configure the server with the following environmental variables:
+ 
+-<table><thead><tr><th width="239">ENV Variable Name</th><th width="149">Required/Optional</th><th width="116">Type</th><th>Description</th><th>Accepted Values</th></tr></thead><tbody><tr><td>CLIENT_HOST</td><td>Required</td><td><code>string</code></td><td>Frontend Host</td><td></td></tr><tr><td>JWT_SECRET</td><td>Required</td><td><code>string</code></td><td>JWT secret</td><td></td></tr><tr><td>REFRESH_TOKEN_SECRET</td><td>Required</td><td><code>string</code></td><td>Refresh JWT secret</td><td></td></tr><tr><td>DB_TYPE</td><td>Optional</td><td><code>string</code></td><td>Specify DB to use</td><td><code>MongoDB | FakeDB</code></td></tr><tr><td>DB_CONNECTION_STRING</td><td>Required</td><td><code>string</code></td><td>Specifies URL for MongoDB Database</td><td></td></tr><tr><td>PORT</td><td>Optional</td><td><code>integer</code></td><td>Specifies Port for Server</td><td></td></tr><tr><td>LOGIN_PAGE_URL</td><td>Required</td><td><code>string</code></td><td>Login url to be used in emailing service</td><td></td></tr><tr><td>REDIS_HOST</td><td>Required</td><td><code>string</code></td><td>Host address for Redis database</td><td></td></tr><tr><td>REDIS_PORT</td><td>Required</td><td><code>integer</code></td><td>Port for Redis database</td><td></td></tr><tr><td>TOKEN_TTL</td><td>Optional</td><td><code>string</code></td><td>Time for token to live</td><td>In vercel/ms format https://github.com/vercel/ms</td></tr><tr><td>REFRESH_TOKEN_TTL</td><td>Optional</td><td><code>string</code></td><td>Time for refresh token to live</td><td></td></tr><tr><td>PAGESPEED_API_KEY</td><td>Optional</td><td><code>string</code></td><td>API Key for PageSpeed requests</td><td></td></tr><tr><td>SYSTEM_EMAIL_HOST</td><td>Required</td><td><code>string</code></td><td>Host to send System Emails From</td><td></td></tr><tr><td>SYSTEM_EMAIL_PORT</td><td>Required</td><td><code>number</code></td><td>Port for System Email Host</td><td></td></tr><tr><td>SYSTEM_EMAIL_ADDRESS</td><td>Required</td><td><code>string</code></td><td>System Email Address</td><td></td></tr><tr><td>SYSTEM_EMAIL_PASSWORD</td><td>Required</td><td><code>string</code></td><td>System Email Password</td><td></td></tr></tbody></table>
++<table><thead><tr><th width="239">ENV Variable Name</th><th width="149">Required/Optional</th><th width="116">Type</th><th>Description</th><th>Accepted Values</th></tr></thead><tbody><tr><td>CLIENT_HOST</td><td>Required</td><td><code>string</code></td><td>Frontend Host</td><td></td></tr><tr><td>JWT_SECRET</td><td>Required</td><td><code>string</code></td><td>JWT secret</td><td></td></tr><tr><td>REFRESH_TOKEN_SECRET</td><td>Required</td><td><code>string</code></td><td>Refresh JWT secret</td><td></td></tr><tr><td>DB_TYPE</td><td>Optional</td><td><code>string</code></td><td>Specify DB to use</td><td><code>MongoDB | FakeDB</code></td></tr><tr><td>DB_CONNECTION_STRING</td><td>Required</td><td><code>string</code></td><td>Specifies URL for MongoDB Database</td><td></td></tr><tr><td>PORT</td><td>Optional</td><td><code>integer</code></td><td>Specifies Port for Server</td><td></td></tr><tr><td>LOGIN_PAGE_URL</td><td>Required</td><td><code>string</code></td><td>Login url to be used in emailing service</td><td></td></tr><tr><td>REDIS_HOST</td><td>Required</td><td><code>string</code></td><td>Host address for Redis database</td><td></td></tr><tr><td>REDIS_PORT</td><td>Required</td><td><code>integer</code></td><td>Port for Redis database</td><td></td></tr><tr><td>TOKEN_TTL</td><td>Optional</td><td><code>string</code></td><td>Time for token to live</td><td>In vercel/ms format https://github.com/vercel/ms</td></tr><tr><td>REFRESH_TOKEN_TTL</td><td>Optional</td><td><code>string</code></td><td>Time for refresh token to live</td><td></td></tr><tr><td>PAGESPEED_API_KEY</td><td>Optional</td><td><code>string</code></td><td>API Key for PageSpeed requests</td><td></td></tr><tr><td>SYSTEM_EMAIL_HOST</td><td>Required</td><td><code>string</code></td><td>Host to send System Emails From</td><td></td></tr><tr><td>SYSTEM_EMAIL_PORT</td><td>Required</td><td><code>number</code></td><td>Port for System Email Host</td><td></td></tr><tr><td>SYSTEM_EMAIL_ADDRESS</td><td>Required</td><td><code>string</code></td><td>System Email Address</td><td></td></tr><tr><td>SYSTEM_EMAIL_PASSWORD</td><td>Required</td><td><code>string</code></td><td>System Email Password</td><td></td></tr>  
++<tr>
++            <td>NODE_ENV</td>
++            <td>Optional</td>
++            <td><code>string</code></td>
++            <td>Application mode</td>
++            <td><code>development | production</code></td>
++        </tr>
++        <tr>
++            <td>NGROK_AUTH_TOKEN</td>
++            <td>Optional</td>
++            <td><code>string</code></td>
++            <td>Auth token for ngrok</td>
++            <td><code>"auth_token"</code></td>
++        </tr>
++</tbody></table>
+ 
+ Sample env file
+ 
