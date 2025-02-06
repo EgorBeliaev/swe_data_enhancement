@@ -193,5 +193,21 @@ def process_repo(repo_url, repo_name):
             else:
                 print(f"Error for PR {pr_number}\n\n")
 
-# Example usage
-process_repo("https://github.com/HabitRPG/habitica", 'habitica')
+# Explore subfolders in the "java" directory
+java_directory = 'java'
+subfolders = [name for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
+
+for subfolder in subfolders:
+    subfolder_path = os.path.join(java_directory, subfolder)
+    prs_js_path = os.path.join(subfolder_path, 'prs_js.txt')
+    
+    if os.path.exists(prs_js_path):
+        with open(prs_js_path, 'r') as file:
+            first_line = file.readline().strip()
+            if first_line:
+                # Extract the repository URL from the first line
+                repo_url = first_line.split('/pull/')[0]  # Assuming the URL format is consistent
+                # Form the second argument
+                repo_name = f"{java_directory}/{subfolder}"
+                # Call process_repo with the extracted URL and constructed repo_name
+                process_repo(repo_url, repo_name)

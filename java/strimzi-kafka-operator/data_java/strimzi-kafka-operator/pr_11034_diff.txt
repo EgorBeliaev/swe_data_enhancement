@@ -1,0 +1,733 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index eaaf688caf..18f19b0338 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,7 @@
+ 
+ * Support for ZooKeeper-based Apache Kafka clusters and for KRaft migration has been removed
+ * Support for MirrorMaker 1 has been removed
++* Support for storage class overrides has been removed
+ * Added support to configure `dnsPolicy` and `dnsConfig` using the `template` sections.
+ 
+ ### Major changes, deprecations and removals
+@@ -16,6 +17,9 @@
+   Please use the Apache Kafka [EnvVarConfigProvider](https://github.com/strimzi/kafka-env-var-config-provider?tab=readme-ov-file#deprecation-notice) and [Identity Replication Policy](https://github.com/strimzi/mirror-maker-2-extensions?tab=readme-ov-file#identity-replication-policy) instead.
+ * When using Kafka Connect or Kafka MirrorMaker 2 operands and upgrading from Strimzi 0.38 or older, make sure the `StableConnectIdentities` feature gate is enabled and `StrimziPodSets` are used before upgrading.
+ * When using the Kafka operand and upgrading from Strimzi 0.34 or older, make sure the `UseStrimziPodSets` feature gate is enabled and `StrimziPodSet` resources are used before upgrading.
++* The storage overrides for configuring per-broker storage class are not supported anymore.
++  If you are using the storage overrides, you should instead use multiple KafkaNodePool resources with a different storage class each.
++  For more details about migrating from storage overrides, please follow the [documentation](https://strimzi.io/docs/operators/0.45.0/full/deploying.html#con-config-storage-zookeeper-str).
+ 
+ ## 0.45.0
+ 
+diff --git a/api/src/main/java/io/strimzi/api/kafka/model/kafka/PersistentClaimStorage.java b/api/src/main/java/io/strimzi/api/kafka/model/kafka/PersistentClaimStorage.java
+index ca1eec9ba8..2902fb8881 100644
+--- a/api/src/main/java/io/strimzi/api/kafka/model/kafka/PersistentClaimStorage.java
++++ b/api/src/main/java/io/strimzi/api/kafka/model/kafka/PersistentClaimStorage.java
+@@ -11,6 +11,7 @@
+ import io.strimzi.api.kafka.model.common.Constants;
+ import io.strimzi.crdgenerator.annotations.Description;
+ import io.strimzi.crdgenerator.annotations.Minimum;
++import io.strimzi.crdgenerator.annotations.PresentInVersions;
+ import io.sundr.builder.annotations.Buildable;
+ import lombok.EqualsAndHashCode;
+ import lombok.ToString;
+@@ -112,12 +113,11 @@ public void setDeleteClaim(boolean deleteClaim) {
+         this.deleteClaim = deleteClaim;
+     }
+ 
+-    @Description("Overrides for individual brokers. " +
+-            "The `overrides` field allows you to specify a different configuration for different brokers.")
++    @Description("As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored.")
+     @JsonInclude(JsonInclude.Include.NON_NULL)
++    @PresentInVersions("v1alpha1-v1beta2")
+     @Deprecated
+-    @DeprecatedProperty(description = "The storage overrides for individual brokers are deprecated and will be removed in the future. " +
+-            "Please use multiple `KafkaNodePool` custom resources with different storage classes instead.")
++    @DeprecatedProperty(description = "The storage overrides for individual brokers are not supported anymore since Strimzi 0.46.0.")
+     public List<PersistentClaimStorageOverride> getOverrides() {
+         return overrides;
+     }
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtils.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtils.java
+index 98316b4418..445e9f0e6e 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtils.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtils.java
+@@ -12,7 +12,6 @@
+ import io.strimzi.api.kafka.model.common.template.ResourceTemplate;
+ import io.strimzi.api.kafka.model.kafka.JbodStorage;
+ import io.strimzi.api.kafka.model.kafka.PersistentClaimStorage;
+-import io.strimzi.api.kafka.model.kafka.PersistentClaimStorageOverride;
+ import io.strimzi.api.kafka.model.kafka.SingleVolumeStorage;
+ import io.strimzi.api.kafka.model.kafka.Storage;
+ import io.strimzi.operator.common.Annotations;
+@@ -61,7 +60,7 @@ public static List<PersistentVolumeClaim> createPersistentVolumeClaims(
+                 String namePrefix = VolumeUtils.createVolumePrefix(persistentStorage.getId(), jbod);
+ 
+                 for (NodeRef node : nodes) {
+-                    pvcs.add(createPersistentVolumeClaim(namePrefix + "-" + node.podName(), namespace, node.nodeId(), persistentStorage, labels, ownerReference, template));
++                    pvcs.add(createPersistentVolumeClaim(namePrefix + "-" + node.podName(), namespace, persistentStorage, labels, ownerReference, template));
+                 }
+             } else if (storage instanceof JbodStorage jbodStorage) {
+                 for (SingleVolumeStorage volume : jbodStorage.getVolumes()) {
+@@ -74,43 +73,11 @@ public static List<PersistentVolumeClaim> createPersistentVolumeClaims(
+         return pvcs;
+     }
+ 
+-    /**
+-     * Gets the storage class configured for given PVC. This either the regularly configured storage class or the
+-     * storage class from the per-broker configuration overrides. If not storage class is specified, it returns null
+-     * and the default storage class will be used.
+-     *
+-     * @param brokerId          ID of the broker to which this PVC belongs. It is used to find configuration overrides
+-     *                          for Storage class.
+-     * @param storage           The user supplied configuration of the PersistentClaimStorage
+-     *
+-     * @return  Storage class which should be used for this PVC
+-     */
+-    @SuppressWarnings("deprecation") // Storage overrides are deprecated
+-    private static String storageClassNameForBrokerId(int brokerId, PersistentClaimStorage storage)    {
+-        String storageClass = storage.getStorageClass();
+-
+-        if (storage.getOverrides() != null) {
+-            storageClass = storage.getOverrides().stream()
+-                    .filter(broker -> broker != null
+-                            && broker.getBroker() != null
+-                            && broker.getBroker() == brokerId
+-                            && broker.getStorageClass() != null)
+-                    .map(PersistentClaimStorageOverride::getStorageClass)
+-                    .findAny()
+-                    // if none are found for broker do not change storage class from overrides
+-                    .orElse(storageClass);
+-        }
+-
+-        return storageClass;
+-    }
+-
+     /**
+      * Generates a persistent volume claim for a given broker ID.
+      *
+      * @param name              Name of the PVC
+      * @param namespace         Namespace of the PVC
+-     * @param brokerId          ID of the broker to which this PVC belongs. It is used to find configuration
+-     *                          overrides for Storage class.
+      * @param storage           The user supplied configuration of the PersistentClaimStorage
+      * @param labels            Labels of the PVC
+      * @param ownerReference    OwnerReference of the PVC
+@@ -121,7 +88,6 @@ private static String storageClassNameForBrokerId(int brokerId, PersistentClaimS
+     private static PersistentVolumeClaim createPersistentVolumeClaim(
+             String name,
+             String namespace,
+-            int brokerId,
+             PersistentClaimStorage storage,
+             Labels labels,
+             OwnerReference ownerReference,
+@@ -147,7 +113,7 @@ private static PersistentVolumeClaim createPersistentVolumeClaim(
+                     .withNewResources()
+                         .withRequests(requests)
+                     .endResources()
+-                    .withStorageClassName(storageClassNameForBrokerId(brokerId, storage))
++                    .withStorageClassName(storage.getStorageClass())
+                     .withSelector(storageSelector)
+                     .withVolumeMode("Filesystem")
+                 .endSpec()
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/StorageDiff.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/StorageDiff.java
+index a322140a5a..1f659839af 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/StorageDiff.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/model/StorageDiff.java
+@@ -8,18 +8,14 @@
+ import io.fabric8.zjsonpatch.JsonDiff;
+ import io.strimzi.api.kafka.model.kafka.JbodStorage;
+ import io.strimzi.api.kafka.model.kafka.PersistentClaimStorage;
+-import io.strimzi.api.kafka.model.kafka.PersistentClaimStorageOverride;
+ import io.strimzi.api.kafka.model.kafka.SingleVolumeStorage;
+ import io.strimzi.api.kafka.model.kafka.Storage;
+ import io.strimzi.operator.common.Reconciliation;
+ import io.strimzi.operator.common.ReconciliationLogger;
+ import io.strimzi.operator.common.model.AbstractJsonDiff;
+ 
+-import java.util.Collections;
+ import java.util.HashSet;
+-import java.util.List;
+ import java.util.Set;
+-import java.util.TreeSet;
+ import java.util.regex.Pattern;
+ import java.util.stream.Collectors;
+ 
+@@ -32,7 +28,7 @@ public class StorageDiff extends AbstractJsonDiff {
+     private static final ReconciliationLogger LOGGER = ReconciliationLogger.create(StorageDiff.class.getName());
+ 
+     private static final Pattern IGNORABLE_PATHS = Pattern.compile(
+-            "^(/deleteClaim|/kraftMetadata|/)$");
++            "^(/deleteClaim|/kraftMetadata|/overrides.*|/)$");
+ 
+     private final boolean isEmpty;
+     private final boolean changesType;
+@@ -133,15 +129,6 @@ private StorageDiff(Reconciliation reconciliation, Storage current, Storage desi
+                     }
+                 }
+ 
+-                // Some changes to overrides are allowed:
+-                // * When scaling up or down, you can set the overrides for new nodes
+-                // * You can set overrides for nodes which do nto exist (yet)
+-                if (pathValue.startsWith("/overrides")) {
+-                    if (isOverrideChangeAllowed(current, desired, currentNodeIds, desiredNodeIds))    {
+-                        continue;
+-                    }
+-                }
+-
+                 if (LOGGER.isDebugEnabled()) {
+                     LOGGER.debugCr(reconciliation, "Storage {}differs: {}", volumeDesc, d);
+                     LOGGER.debugCr(reconciliation, "Current Storage {}path {} has value {}", volumeDesc, pathValue, lookupPath(source, pathValue));
+@@ -263,56 +250,4 @@ protected boolean isDuplicateVolumeIds() {
+     public boolean issuesDetected() {
+         return !isEmpty || duplicateVolumeIds || tooManyKRaftMetadataVolumes;
+     }
+-
+-    /**
+-     * Validates the changes to the storage overrides and decides whether they are allowed or not. Allowed changes are
+-     * those to nodes which will be added, removed or which do nto exist yet.
+-     *
+-     * @param current           Current Storage configuration
+-     * @param desired           New storage configuration
+-     * @param currentNodeIds    Node IDs currently used by this node pool
+-     * @param desiredNodeIds    Node IDs used in the future by this node pool
+-     *
+-     * @return                  True if only allowed override changes were done, false otherwise
+-     */
+-    @SuppressWarnings("deprecation") // Storage overrides are deprecated
+-    private boolean isOverrideChangeAllowed(Storage current, Storage desired, Set<Integer> currentNodeIds, Set<Integer> desiredNodeIds)   {
+-        List<PersistentClaimStorageOverride> currentOverrides = ((PersistentClaimStorage) current).getOverrides();
+-        if (currentOverrides == null)   {
+-            currentOverrides = Collections.emptyList();
+-        }
+-
+-        List<PersistentClaimStorageOverride> desiredOverrides = ((PersistentClaimStorage) desired).getOverrides();
+-        if (desiredOverrides == null)   {
+-            desiredOverrides = Collections.emptyList();
+-        }
+-
+-        // We care only about the nodes which existed before this reconciliation and will still exist after it
+-        Set<Integer> existedAndWillExist = new TreeSet<>(currentNodeIds);
+-        existedAndWillExist.retainAll(desiredNodeIds);
+-
+-        for (int nodeId : existedAndWillExist)   {
+-            PersistentClaimStorageOverride currentOverride = currentOverrides.stream()
+-                    .filter(override -> override.getBroker() == nodeId)
+-                    .findFirst()
+-                    .orElse(null);
+-
+-            PersistentClaimStorageOverride desiredOverride = desiredOverrides.stream()
+-                    .filter(override -> override.getBroker() == nodeId)
+-                    .findFirst()
+-                    .orElse(null);
+-
+-            if (currentOverride != null && desiredOverride != null) {
+-                // Both overrides exist but are not equal
+-                if (!currentOverride.equals(desiredOverride)) {
+-                    return false;
+-                }
+-            } else if (currentOverride != null || desiredOverride != null) {
+-                // One of them is null while the other is not null => they differ
+-                return false;
+-            }
+-        }
+-
+-        return true;
+-    }
+ }
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaClusterStorageTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaClusterStorageTest.java
+index 7ee5c083a9..1c10bf77bb 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaClusterStorageTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaClusterStorageTest.java
+@@ -206,44 +206,6 @@ public void testGeneratePersistentVolumeClaimsPersistentWithoutClaimDeletion() {
+         }
+     }
+ 
+-    @ParallelTest
+-    public void testGeneratePersistentVolumeClaimsPersistentWithOverride() {
+-        KafkaNodePool brokers = new KafkaNodePoolBuilder(POOL_BROKERS)
+-                .editSpec()
+-                    .withNewPersistentClaimStorage()
+-                        .withStorageClass("gp2-ssd")
+-                        .withDeleteClaim(false)
+-                        .withSize("100Gi")
+-                        .withOverrides(new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(6)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build())
+-                    .endPersistentClaimStorage()
+-                .endSpec()
+-                .build();
+-        List<KafkaPool> pools = NodePoolUtils.createKafkaPools(Reconciliation.DUMMY_RECONCILIATION, KAFKA, List.of(POOL_CONTROLLERS, POOL_MIXED, brokers), Map.of(), KafkaVersionTestUtils.DEFAULT_KRAFT_VERSION_CHANGE, SHARED_ENV_PROVIDER);
+-        KafkaCluster kc = KafkaCluster.fromCrd(Reconciliation.DUMMY_RECONCILIATION, KAFKA, pools, VERSIONS, KafkaVersionTestUtils.DEFAULT_KRAFT_VERSION_CHANGE, null, SHARED_ENV_PROVIDER);
+-
+-        // Check PVCs
+-        List<PersistentVolumeClaim> pvcs = kc.generatePersistentVolumeClaims();
+-        assertThat(pvcs.size(), is(8));
+-
+-        for (PersistentVolumeClaim pvc : pvcs) {
+-            if (pvc.getMetadata().getName().contains("brokers")) {
+-                assertThat(pvc.getSpec().getResources().getRequests().get("storage"), is(new Quantity("100Gi")));
+-                assertThat(pvc.getMetadata().getName().startsWith(VolumeUtils.DATA_VOLUME_NAME), is(true));
+-                assertThat(pvc.getMetadata().getOwnerReferences().size(), is(0));
+-                assertThat(pvc.getMetadata().getAnnotations().get(Annotations.ANNO_STRIMZI_IO_DELETE_CLAIM), is("false"));
+-
+-                if (pvc.getMetadata().getName().contains("brokers-6"))  {
+-                    assertThat(pvc.getSpec().getStorageClassName(), is("gp2-ssd-az1"));
+-                } else {
+-                    assertThat(pvc.getSpec().getStorageClassName(), is("gp2-ssd"));
+-                }
+-            }
+-        }
+-    }
+-
+     @ParallelTest
+     public void testGeneratePersistentVolumeClaimsJbod() {
+         KafkaNodePool brokers = new KafkaNodePoolBuilder(POOL_BROKERS)
+@@ -298,14 +260,14 @@ public void testGeneratePersistentVolumeClaimsJbodWithOverrides() {
+                                         .withDeleteClaim(false)
+                                         .withId(0)
+                                         .withSize("100Gi")
+-                                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(6).withStorageClass("gp2-ssd-az1").build())
++                                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(6).withStorageClass("gp2-ssd-az1").build()) // The override is set, but the test checks that it is ignored
+                                         .build(),
+                                 new PersistentClaimStorageBuilder()
+                                         .withStorageClass("gp2-st1")
+                                         .withDeleteClaim(true)
+                                         .withId(1)
+                                         .withSize("1000Gi")
+-                                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(6).withStorageClass("gp2-st1-az1").build())
++                                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(6).withStorageClass("gp2-st1-az1").build()) // The override is set, but the test checks that it is ignored
+                                         .build())
+                     .endJbodStorage()
+                 .endSpec()
+@@ -324,23 +286,13 @@ public void testGeneratePersistentVolumeClaimsJbodWithOverrides() {
+                     assertThat(pvc.getMetadata().getName().startsWith(VolumeUtils.DATA_VOLUME_NAME), is(true));
+                     assertThat(pvc.getMetadata().getOwnerReferences().size(), is(0));
+                     assertThat(pvc.getMetadata().getAnnotations().get(Annotations.ANNO_STRIMZI_IO_DELETE_CLAIM), is("false"));
+-
+-                    if (pvc.getMetadata().getName().contains("brokers-6")) {
+-                        assertThat(pvc.getSpec().getStorageClassName(), is("gp2-ssd-az1"));
+-                    } else {
+-                        assertThat(pvc.getSpec().getStorageClassName(), is("gp2-ssd"));
+-                    }
++                    assertThat(pvc.getSpec().getStorageClassName(), is("gp2-ssd"));
+                 } else if (pvc.getMetadata().getName().contains("data-1")) {
+                     assertThat(pvc.getSpec().getResources().getRequests().get("storage"), is(new Quantity("1000Gi")));
+                     assertThat(pvc.getMetadata().getName().startsWith(VolumeUtils.DATA_VOLUME_NAME), is(true));
+                     assertThat(pvc.getMetadata().getOwnerReferences().size(), is(1));
+                     assertThat(pvc.getMetadata().getAnnotations().get(Annotations.ANNO_STRIMZI_IO_DELETE_CLAIM), is("true"));
+-
+-                    if (pvc.getMetadata().getName().contains("brokers-6")) {
+-                        assertThat(pvc.getSpec().getStorageClassName(), is("gp2-st1-az1"));
+-                    } else {
+-                        assertThat(pvc.getSpec().getStorageClassName(), is("gp2-st1"));
+-                    }
++                    assertThat(pvc.getSpec().getStorageClassName(), is("gp2-st1"));
+                 }
+             }
+         }
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtilsTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtilsTest.java
+index 189d8c1292..6ea1ccb7e4 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtilsTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/PersistentVolumeClaimUtilsTest.java
+@@ -250,7 +250,7 @@ public void testWithStorageClassOverrides()  {
+                         .withId(0)
+                         .withStorageClass("my-storage-class")
+                         .withSize("100Gi")
+-                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(0).withStorageClass("special-storage-class").build())
++                        .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(0).withStorageClass("special-storage-class").build()) // The override is set, but the test checks that it is ignored
+                         .build())
+                 .build();
+ 
+@@ -268,7 +268,7 @@ public void testWithStorageClassOverrides()  {
+         assertThat(pvcs.get(0).getSpec().getAccessModes(), is(List.of("ReadWriteOnce")));
+         assertThat(pvcs.get(0).getSpec().getSelector(), is(nullValue()));
+         assertThat(pvcs.get(0).getSpec().getResources().getRequests(), is(Map.of("storage", new Quantity("100Gi", null))));
+-        assertThat(pvcs.get(0).getSpec().getStorageClassName(), is("special-storage-class"));
++        assertThat(pvcs.get(0).getSpec().getStorageClassName(), is("my-storage-class"));
+     }
+ 
+     @ParallelTest
+@@ -280,7 +280,7 @@ public void testJbodWithClassOverridesAndDeleteClaims()  {
+                                 .withStorageClass("my-storage-class")
+                                 .withSize("100Gi")
+                                 .withDeleteClaim(false)
+-                                .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(0).withStorageClass("special-storage-class").build())
++                                .withOverrides(new PersistentClaimStorageOverrideBuilder().withBroker(0).withStorageClass("special-storage-class").build()) // The override is set, but the test checks that it is ignored
+                                 .build(),
+                         new PersistentClaimStorageBuilder()
+                                 .withId(1)
+@@ -306,7 +306,7 @@ public void testJbodWithClassOverridesAndDeleteClaims()  {
+             assertThat(pvcs.get(i).getSpec().getAccessModes(), is(List.of("ReadWriteOnce")));
+             assertThat(pvcs.get(i).getSpec().getSelector(), is(nullValue()));
+             assertThat(pvcs.get(i).getSpec().getResources().getRequests(), is(Map.of("storage", new Quantity("100Gi", null))));
+-            assertThat(pvcs.get(i).getSpec().getStorageClassName(), is(i == 0 ? "special-storage-class" : "my-storage-class"));
++            assertThat(pvcs.get(i).getSpec().getStorageClassName(), is("my-storage-class"));
+         }
+ 
+         for (int i = 3; i < 6; i++)  {
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/StorageDiffTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/StorageDiffTest.java
+index dad656af1f..1ee4b4ef80 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/StorageDiffTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/StorageDiffTest.java
+@@ -65,7 +65,7 @@ public void testPersistentDiff()    {
+     }
+ 
+     @ParallelTest
+-    public void testPersistentDiffWithOverrides()    {
++    public void testOverridesAreIgnoredInDiff()    {
+         Storage persistent = new PersistentClaimStorageBuilder()
+                 .withStorageClass("gp2-ssd")
+                 .withDeleteClaim(false)
+@@ -99,14 +99,14 @@ public void testPersistentDiffWithOverrides()    {
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent, Set.of(0, 1, 5), Set.of(0, 1, 5)).issuesDetected(), is(false));
+ 
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).changesType(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).isEmpty(), is(false));
++        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).isEmpty(), is(true));
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).shrinkSize(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).issuesDetected(), is(true));
++        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 1, 5), Set.of(0, 1, 5)).issuesDetected(), is(false));
+ 
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).changesType(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).isEmpty(), is(false));
++        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).isEmpty(), is(true));
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).shrinkSize(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).issuesDetected(), is(true));
++        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 1, 5), Set.of(0, 1, 5)).issuesDetected(), is(false));
+     }
+ 
+     @ParallelTest
+@@ -291,212 +291,6 @@ public void testSizeChangesInJbod()    {
+         assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, jbod, jbod3, Set.of(0, 1, 5), Set.of(0, 1, 5)).shrinkSize(), is(true));
+     }
+ 
+-    @ParallelTest
+-    public void testPersistentDiffWithOverridesChangesToExistingOverrides()    {
+-        Storage persistent = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build(),
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(3)
+-                                .withStorageClass("gp2-ssd-az2")
+-                                .build())
+-                .build();
+-
+-        Storage persistent2 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build(),
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(3)
+-                                .withStorageClass("new-sc")
+-                                .build())
+-                .build();
+-
+-        // Test no changes when the diff is the same
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Override changed for node which does not exist => is allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0), Set.of(0)).isEmpty(), is(true));
+-
+-        // Override changed for node which is being scaled up => is allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Override changed for existing node  => is not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-
+-        // Override changed for node being scaled down => is allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 3), Set.of(0)).isEmpty(), is(true));
+-    }
+-
+-    @ParallelTest
+-    public void testPersistentDiffWithOverridesBeingAdded()    {
+-        Storage persistent = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .build();
+-
+-        Storage persistent2 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build())
+-                .build();
+-
+-        Storage persistent3 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build(),
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(3)
+-                                .withStorageClass("gp2-ssd-az2")
+-                                .build())
+-                .build();
+-
+-        // Test no changes
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent3, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Overrides added for existing nodes => not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent3, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-
+-        // Overrides added for new nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Overrides added for removed nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0, 3), Set.of(0)).isEmpty(), is(true));
+-
+-        // Overrides added for non-existing nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent3, Set.of(0), Set.of(0)).isEmpty(), is(true));
+-    }
+-
+-    @ParallelTest
+-    public void testPersistentDiffWithOverridesBeingRemoved()    {
+-        Storage persistent = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .build();
+-
+-        Storage persistent2 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build())
+-                .build();
+-
+-        Storage persistent3 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build(),
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(3)
+-                                .withStorageClass("gp2-ssd-az2")
+-                                .build())
+-                .build();
+-
+-        // Test no changes
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent3, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Overrides removed for existing nodes => not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-
+-        // Overrides removed for new nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent2, Set.of(0), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Overrides removed for removed nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent2, Set.of(0, 3), Set.of(0)).isEmpty(), is(true));
+-
+-        // Overrides removed for non-existing nodes => allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent3, persistent2, Set.of(0), Set.of(0)).isEmpty(), is(true));
+-    }
+-
+-    @ParallelTest
+-    public void testPersistentDiffWithOverridesBeingAddedAndRemoved()    {
+-        Storage persistent = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(0)
+-                                .withStorageClass("gp2-ssd-az1")
+-                                .build())
+-                .build();
+-
+-        Storage persistent2 = new PersistentClaimStorageBuilder()
+-                .withStorageClass("gp2-ssd")
+-                .withDeleteClaim(false)
+-                .withId(0)
+-                .withSize("100Gi")
+-                .withOverrides(
+-                        new PersistentClaimStorageOverrideBuilder()
+-                                .withBroker(1)
+-                                .withStorageClass("gp2-ssd-az2")
+-                                .build())
+-                .build();
+-
+-        // Test no changes
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(true));
+-
+-        // Overrides added and removed for existing nodes => not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0, 3), Set.of(0, 3)).isEmpty(), is(false));
+-
+-        // Overrides added for new nodes but removed for old => not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent, persistent2, Set.of(0), Set.of(0, 3)).isEmpty(), is(false));
+-
+-        // Overrides removed for new nodes but added for old => not allowed
+-        assertThat(new StorageDiff(Reconciliation.DUMMY_RECONCILIATION, persistent2, persistent, Set.of(0), Set.of(0, 3)).isEmpty(), is(false));
+-    }
+-
+     @ParallelTest
+     public void testKraftMetadataChanges()    {
+         Storage jbod = new JbodStorageBuilder().withVolumes(
+diff --git a/documentation/modules/appendix_crds.adoc b/documentation/modules/appendix_crds.adoc
+index 6a05465628..c13778dfcd 100644
+--- a/documentation/modules/appendix_crds.adoc
++++ b/documentation/modules/appendix_crds.adoc
+@@ -679,7 +679,7 @@ It must have the value `persistent-claim` for the type `PersistentClaimStorage`.
+ |Specifies if the persistent volume claim has to be deleted when the cluster is un-deployed.
+ |overrides
+ |xref:type-PersistentClaimStorageOverride-{context}[`PersistentClaimStorageOverride`] array
+-|**The `overrides` property has been deprecated.** The storage overrides for individual brokers are deprecated and will be removed in the future. Please use multiple `KafkaNodePool` custom resources with different storage classes instead. Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++|**The `overrides` property has been deprecated.** The storage overrides for individual brokers are not supported anymore since Strimzi 0.46.0. As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored.
+ |====
+ 
+ [id='type-PersistentClaimStorageOverride-{context}']
+diff --git a/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/040-Crd-kafka.yaml b/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/040-Crd-kafka.yaml
+index a7707980bf..2a4935d876 100644
+--- a/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/040-Crd-kafka.yaml
++++ b/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/040-Crd-kafka.yaml
+@@ -583,7 +583,7 @@ spec:
+                               broker:
+                                 type: integer
+                                 description: Id of the kafka broker (broker identifier).
+-                          description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                          description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                         selector:
+                           additionalProperties:
+                             type: string
+@@ -634,7 +634,7 @@ spec:
+                                     broker:
+                                       type: integer
+                                       description: Id of the kafka broker (broker identifier).
+-                                description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                                description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                               selector:
+                                 additionalProperties:
+                                   type: string
+@@ -2327,7 +2327,7 @@ spec:
+                               broker:
+                                 type: integer
+                                 description: Id of the kafka broker (broker identifier).
+-                          description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                          description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                         selector:
+                           additionalProperties:
+                             type: string
+diff --git a/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/045-Crd-kafkanodepool.yaml b/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/045-Crd-kafkanodepool.yaml
+index cc2bfd5907..46a86bc2d1 100644
+--- a/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/045-Crd-kafkanodepool.yaml
++++ b/packaging/helm-charts/helm3/strimzi-kafka-operator/crds/045-Crd-kafkanodepool.yaml
+@@ -91,7 +91,7 @@ spec:
+                           broker:
+                             type: integer
+                             description: Id of the kafka broker (broker identifier).
+-                      description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                      description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                     selector:
+                       additionalProperties:
+                         type: string
+@@ -142,7 +142,7 @@ spec:
+                                 broker:
+                                   type: integer
+                                   description: Id of the kafka broker (broker identifier).
+-                            description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                            description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                           selector:
+                             additionalProperties:
+                               type: string
+diff --git a/packaging/install/cluster-operator/040-Crd-kafka.yaml b/packaging/install/cluster-operator/040-Crd-kafka.yaml
+index 9831144eb0..b3e9d294db 100644
+--- a/packaging/install/cluster-operator/040-Crd-kafka.yaml
++++ b/packaging/install/cluster-operator/040-Crd-kafka.yaml
+@@ -582,7 +582,7 @@ spec:
+                             broker:
+                               type: integer
+                               description: Id of the kafka broker (broker identifier).
+-                        description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                        description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                       selector:
+                         additionalProperties:
+                           type: string
+@@ -633,7 +633,7 @@ spec:
+                                   broker:
+                                     type: integer
+                                     description: Id of the kafka broker (broker identifier).
+-                              description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                              description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                             selector:
+                               additionalProperties:
+                                 type: string
+@@ -2326,7 +2326,7 @@ spec:
+                             broker:
+                               type: integer
+                               description: Id of the kafka broker (broker identifier).
+-                        description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                        description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                       selector:
+                         additionalProperties:
+                           type: string
+diff --git a/packaging/install/cluster-operator/045-Crd-kafkanodepool.yaml b/packaging/install/cluster-operator/045-Crd-kafkanodepool.yaml
+index 52790f653b..0864a4b31b 100644
+--- a/packaging/install/cluster-operator/045-Crd-kafkanodepool.yaml
++++ b/packaging/install/cluster-operator/045-Crd-kafkanodepool.yaml
+@@ -90,7 +90,7 @@ spec:
+                         broker:
+                           type: integer
+                           description: Id of the kafka broker (broker identifier).
+-                    description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                    description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                   selector:
+                     additionalProperties:
+                       type: string
+@@ -141,7 +141,7 @@ spec:
+                               broker:
+                                 type: integer
+                                 description: Id of the kafka broker (broker identifier).
+-                          description: Overrides for individual brokers. The `overrides` field allows you to specify a different configuration for different brokers.
++                          description: "As of Strimzi 0.46.0, the storage overrides for individual brokers are not supported anymore and this option is ignored."
+                         selector:
+                           additionalProperties:
+                             type: string

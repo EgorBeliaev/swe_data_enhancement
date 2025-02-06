@@ -2,7 +2,10 @@ from download import process_pull_request, extract_repo_and_pr
 from summarization import summarize_changes
 import os
 
-folders = ['habitica', 'mocha', 'express', 'checkmate', 'transformers.js']
+# Explore subfolders in the "java" directory
+java_directory = 'java'
+folders = [os.path.join(java_directory, name) for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
+
 
 
 for folder in folders:
@@ -13,7 +16,11 @@ for folder in folders:
         for line in f.readlines():
             print(line.strip())
             owner, repo, pr_number = extract_repo_and_pr(line.strip())
-            data = process_pull_request(line.strip(), folder)
+            try:
+                data = process_pull_request(line.strip(), folder)
+            except Exception as e:
+                print(e)
+                data = None
             if data:
                 summary = summarize_changes(data)
                 if summary:
@@ -24,5 +31,6 @@ for folder in folders:
                     import sys; sys.exit(1)
 
             else:
-                print("Error")
-                import sys; sys.exit(1)
+                #print("Error")
+                #import sys; sys.exit(1)
+                continue

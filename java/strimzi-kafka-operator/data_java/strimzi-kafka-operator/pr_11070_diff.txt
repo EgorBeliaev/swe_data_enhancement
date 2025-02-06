@@ -1,0 +1,133 @@
+diff --git a/topic-operator/src/test/java/io/strimzi/operator/topic/KafkaHandlerIT.java b/topic-operator/src/test/java/io/strimzi/operator/topic/KafkaHandlerIT.java
+index d950b71c54..09fe3db85b 100644
+--- a/topic-operator/src/test/java/io/strimzi/operator/topic/KafkaHandlerIT.java
++++ b/topic-operator/src/test/java/io/strimzi/operator/topic/KafkaHandlerIT.java
+@@ -12,6 +12,7 @@
+ import io.strimzi.operator.topic.model.Pair;
+ import io.strimzi.operator.topic.model.ReconcilableTopic;
+ import io.strimzi.operator.topic.model.TopicState;
++import io.strimzi.test.TestUtils;
+ import io.strimzi.test.container.StrimziKafkaCluster;
+ import io.strimzi.test.interfaces.TestSeparator;
+ import org.apache.kafka.clients.admin.Admin;
+@@ -29,6 +30,7 @@
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ 
++import java.time.Duration;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.Map;
+@@ -149,9 +151,9 @@ public void shouldFilterByReassignmentTargetReplicas() {
+     @Test
+     public void shouldAlterConfigs() throws ExecutionException, InterruptedException {
+         String t1Name = "should-alter-configs-1";
+-        createKafkaTopic(t1Name, Map.of(TopicConfig.RETENTION_MS_CONFIG, "604800000"));
++        createKafkaTopicWithWait(t1Name, Map.of(TopicConfig.RETENTION_MS_CONFIG, "604800000"));
+         String t2Name = "should-alter-configs-2";
+-        createKafkaTopic(t2Name, Map.of(TopicConfig.CLEANUP_POLICY_CONFIG, "delete"));
++        createKafkaTopicWithWait(t2Name, Map.of(TopicConfig.CLEANUP_POLICY_CONFIG, "delete"));
+ 
+         try (var kafkaAdminClientSpy = spy(Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaCluster.getBootstrapServers())))) {
+             var config = TopicOperatorConfig.buildFromMap(Map.of(
+@@ -183,9 +185,9 @@ public void shouldAlterConfigs() throws ExecutionException, InterruptedException
+     @Test
+     public void shouldCreatePartitions() throws ExecutionException, InterruptedException {
+         String t1Name = "should-create-partitions-1";
+-        createKafkaTopic(t1Name, Map.of());
++        createKafkaTopicWithWait(t1Name, Map.of());
+         String t2Name = "should-create-partitions-2";
+-        createKafkaTopic(t2Name, Map.of());
++        createKafkaTopicWithWait(t2Name, Map.of());
+ 
+         try (var kafkaAdminClientSpy = spy(Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaCluster.getBootstrapServers())))) {
+             var config = TopicOperatorConfig.buildFromMap(Map.of(
+@@ -214,9 +216,9 @@ public void shouldCreatePartitions() throws ExecutionException, InterruptedExcep
+     @Test
+     public void shouldDescribeTopics() throws ExecutionException, InterruptedException {
+         String t1Name = "should-describe-topics-1";
+-        createKafkaTopic(t1Name, Map.of());
++        createKafkaTopicWithWait(t1Name, Map.of());
+         String t2Name = "should-describe-topics-2";
+-        createKafkaTopic(t2Name, Map.of());
++        createKafkaTopicWithWait(t2Name, Map.of());
+ 
+         try (var kafkaAdminClientSpy = spy(Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaCluster.getBootstrapServers())))) {
+             var config = TopicOperatorConfig.buildFromMap(Map.of(
+@@ -250,11 +252,11 @@ public void shouldDescribeTopics() throws ExecutionException, InterruptedExcepti
+     @Test
+     public void shouldDeleteTopics() throws ExecutionException, InterruptedException {
+         String t1Name = "should-delete-topics-1";
+-        createKafkaTopic(t1Name, Map.of());
++        createKafkaTopicWithWait(t1Name, Map.of());
+         String t2Name = "should-delete-topics-2";
+-        createKafkaTopic(t2Name, Map.of());
++        createKafkaTopicWithWait(t2Name, Map.of());
+         String t3Name = "should-delete-topics-3";
+-        createKafkaTopic(t3Name, Map.of());
++        createKafkaTopicWithWait(t3Name, Map.of());
+ 
+         try (var kafkaAdminClientSpy = spy(Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaCluster.getBootstrapServers())))) {
+             var config = TopicOperatorConfig.buildFromMap(Map.of(
+@@ -283,13 +285,23 @@ public void shouldDeleteTopics() throws ExecutionException, InterruptedException
+         }
+     }
+ 
+-    private void createKafkaTopic(String name, Map<String, String> config) throws ExecutionException, InterruptedException {
++    private void createKafkaTopicWithWait(String name, Map<String, String> config) throws ExecutionException, InterruptedException {
+         try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaCluster.getBootstrapServers()))) {
+ 
+             NewTopic topic = new NewTopic(name, 1, (short) 1);
+             topic.configs(config);
+ 
+             admin.createTopics(List.of(topic)).all().get();
++
++            // Wait until the topic actually exists
++            TestUtils.waitFor("topic creation", Duration.ofMillis(500).toMillis(), Duration.ofSeconds(30).toMillis(), () -> {
++                try {
++                    var existingTopics = admin.listTopics().names().get();
++                    return existingTopics.contains(name);
++                } catch (Exception e) {
++                    return false;
++                }
++            });
+         }
+     }
+ 
+diff --git a/topic-operator/src/test/java/io/strimzi/operator/topic/TopicControllerIT.java b/topic-operator/src/test/java/io/strimzi/operator/topic/TopicControllerIT.java
+index 0aff79230b..5d9d1d836e 100644
+--- a/topic-operator/src/test/java/io/strimzi/operator/topic/TopicControllerIT.java
++++ b/topic-operator/src/test/java/io/strimzi/operator/topic/TopicControllerIT.java
+@@ -16,6 +16,7 @@
+ import io.strimzi.operator.common.model.Labels;
+ import io.strimzi.operator.topic.model.KubeRef;
+ import io.strimzi.operator.topic.model.TopicOperatorException;
++import io.strimzi.test.TestUtils;
+ import io.strimzi.test.container.StrimziKafkaCluster;
+ import io.strimzi.test.interfaces.TestSeparator;
+ import org.apache.kafka.clients.admin.Admin;
+@@ -59,6 +60,7 @@
+ import org.junit.jupiter.params.provider.MethodSource;
+ import org.mockito.Mockito;
+ 
++import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashMap;
+@@ -863,8 +865,14 @@ private void shouldUpdateTopicInKafkaWhenConfigChangedInKube(StrimziKafkaCluster
+         // when
+         modifyTopicAndAwait(kt, changer, readyIsTrue());
+ 
+-        // then
+-        assertEquals(expectedConfigs, topicConfigMap(expectedTopicName));
++        // then with dynamic wait (ensuring that race-condition never happen)
++        TestUtils.waitFor("config update", Duration.ofMillis(500).toMillis(), Duration.ofSeconds(30).toMillis(), () -> {
++            try {
++                return topicConfigMap(expectedTopicName).equals(expectedConfigs);
++            } catch (InterruptedException | ExecutionException e) {
++                throw new RuntimeException(e);
++            }
++        });
+     }
+ 
+     @Test

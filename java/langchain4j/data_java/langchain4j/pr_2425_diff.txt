@@ -1,0 +1,1746 @@
+diff --git a/.github/workflows/main.yaml b/.github/workflows/main.yaml
+index b22f2f4e1a1..949dcc9ff56 100644
+--- a/.github/workflows/main.yaml
++++ b/.github/workflows/main.yaml
+@@ -69,7 +69,8 @@ jobs:
+         run: |
+           mvn -B -U -T8C test javadoc:aggregate \
+             ${{ matrix.mvn_opts }}
+-
++      - name: Setup JBang
++        uses: jbangdev/setup-jbang@main
+       - name: Integration test with JDK ${{ matrix.java_version }}
+         ## The step or job will only run if the `experimental` variable
+         ## in the matrix is false (not set to true)
+diff --git a/.github/workflows/nightly_jdk17.yaml b/.github/workflows/nightly_jdk17.yaml
+index 4944681bc2d..bece276d4df 100644
+--- a/.github/workflows/nightly_jdk17.yaml
++++ b/.github/workflows/nightly_jdk17.yaml
+@@ -35,6 +35,8 @@ jobs:
+           project_id: ${{ secrets.GCP_PROJECT_ID }}
+           credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+ 
++      - name: Setup JBang
++        uses: jbangdev/setup-jbang@main
+       - name: Build with JDK ${{ matrix.java_version }}
+         run: |
+           ## compile and verify javadocs on ALL modules
+diff --git a/.github/workflows/nightly_jdk21.yaml b/.github/workflows/nightly_jdk21.yaml
+index f3bdedd040c..4a86ec99c93 100644
+--- a/.github/workflows/nightly_jdk21.yaml
++++ b/.github/workflows/nightly_jdk21.yaml
+@@ -35,6 +35,8 @@ jobs:
+           project_id: ${{ secrets.GCP_PROJECT_ID }}
+           credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
+ 
++      - name: Setup JBang
++        uses: jbangdev/setup-jbang@main
+       - name: Build with JDK ${{ matrix.java_version }}
+         run: |
+           ## compile and verify javadocs on ALL modules
+diff --git a/langchain4j-mcp/pom.xml b/langchain4j-mcp/pom.xml
+index aa8547fefe6..c8844eb6023 100644
+--- a/langchain4j-mcp/pom.xml
++++ b/langchain4j-mcp/pom.xml
+@@ -38,12 +38,6 @@
+             <scope>test</scope>
+         </dependency>
+ 
+-        <dependency>
+-            <groupId>org.junit.jupiter</groupId>
+-            <artifactId>junit-jupiter-params</artifactId>
+-            <scope>test</scope>
+-        </dependency>
+-
+         <dependency>
+             <groupId>org.assertj</groupId>
+             <artifactId>assertj-core</artifactId>
+@@ -61,18 +55,6 @@
+             <scope>test</scope>
+         </dependency>
+ 
+-        <dependency>
+-            <groupId>org.testcontainers</groupId>
+-            <artifactId>testcontainers</artifactId>
+-            <scope>test</scope>
+-            <exclusions>
+-                <exclusion>
+-                    <groupId>org.jetbrains</groupId>
+-                    <artifactId>annotations</artifactId>
+-                </exclusion>
+-            </exclusions>
+-        </dependency>
+-
+     </dependencies>
+ 
+ </project>
+diff --git a/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpHttpTransportIT.java b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpHttpTransportIT.java
+new file mode 100644
+index 00000000000..3e06b1c86dc
+--- /dev/null
++++ b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpHttpTransportIT.java
+@@ -0,0 +1,98 @@
++package dev.langchain4j.mcp.client.integration;
++
++import static org.assertj.core.api.Assertions.fail;
++
++import dev.langchain4j.mcp.client.DefaultMcpClient;
++import dev.langchain4j.mcp.client.McpClient;
++import dev.langchain4j.mcp.client.transport.McpTransport;
++import dev.langchain4j.mcp.client.transport.http.HttpMcpTransport;
++import java.io.IOException;
++import java.net.URISyntaxException;
++import java.time.Duration;
++import java.util.Arrays;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class McpHttpTransportIT extends McpTransportTestBase {
++
++    private static final Logger log = LoggerFactory.getLogger(McpHttpTransportIT.class);
++    private static Process process;
++
++    @BeforeAll
++    public static void setup() throws IOException, InterruptedException, TimeoutException, URISyntaxException {
++        skipTestsIfJbangNotAvailable();
++        String path = getPathToScript("tools_mcp_server.java");
++        String[] command = new String[] {getJBangCommand(), "--quiet", "--fresh", "run", path};
++        log.info("Starting the MCP server using command: " + Arrays.toString(command));
++        process = new ProcessBuilder().command(command).inheritIO().start();
++        waitForPort(8080, 120);
++        log.info("MCP server has started");
++        McpTransport transport = new HttpMcpTransport.Builder()
++                .sseUrl("http://localhost:8080/mcp/sse")
++                .logRequests(true)
++                .logResponses(true)
++                .build();
++        mcpClient = new DefaultMcpClient.Builder()
++                .transport(transport)
++                .toolExecutionTimeout(Duration.ofSeconds(4))
++                .build();
++    }
++
++    private static void waitForPort(int port, int timeoutSeconds) throws InterruptedException, TimeoutException {
++        Request request = new Request.Builder().url("http://localhost:" + port).build();
++        long start = System.currentTimeMillis();
++        OkHttpClient client = new OkHttpClient();
++        while (System.currentTimeMillis() - start < timeoutSeconds * 1000) {
++            try {
++                client.newCall(request).execute();
++                return;
++            } catch (IOException e) {
++                TimeUnit.SECONDS.sleep(1);
++            }
++        }
++        throw new TimeoutException("Port " + port + " did not open within " + timeoutSeconds + " seconds");
++    }
++
++    @AfterAll
++    public static void teardown() throws Exception {
++        if (mcpClient != null) {
++            mcpClient.close();
++        }
++        if (process != null && process.isAlive()) {
++            process.destroyForcibly();
++        }
++    }
++
++    /**
++     * Verify that the MCP client fails gracefully when the server returns a 404.
++     */
++    @Test
++    public void wrongUrl() throws Exception {
++        McpClient badClient = null;
++        try {
++            McpTransport transport = new HttpMcpTransport.Builder()
++                    .sseUrl("http://localhost:8080/WRONG")
++                    .logRequests(true)
++                    .logResponses(true)
++                    .build();
++            badClient = new DefaultMcpClient.Builder()
++                    .transport(transport)
++                    .toolExecutionTimeout(Duration.ofSeconds(4))
++                    .build();
++            fail("Expected an exception");
++        } catch (Exception e) {
++            // ok
++        } finally {
++            if (badClient != null) {
++                badClient.close();
++            }
++        }
++    }
++}
+diff --git a/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpStdioTransportIT.java b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpStdioTransportIT.java
+new file mode 100644
+index 00000000000..8e36c9fe8f7
+--- /dev/null
++++ b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpStdioTransportIT.java
+@@ -0,0 +1,35 @@
++package dev.langchain4j.mcp.client.integration;
++
++import dev.langchain4j.mcp.client.DefaultMcpClient;
++import dev.langchain4j.mcp.client.transport.McpTransport;
++import dev.langchain4j.mcp.client.transport.stdio.StdioMcpTransport;
++import java.net.URISyntaxException;
++import java.time.Duration;
++import java.util.List;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++
++public class McpStdioTransportIT extends McpTransportTestBase {
++
++    @BeforeAll
++    public static void setup() throws URISyntaxException {
++        skipTestsIfJbangNotAvailable();
++        String path = getPathToScript("tools_mcp_server.java");
++        System.out.println(path);
++        McpTransport transport = new StdioMcpTransport.Builder()
++                .command(List.of(getJBangCommand(), "--quiet", "--fresh", "run", path))
++                .logEvents(true)
++                .build();
++        mcpClient = new DefaultMcpClient.Builder()
++                .transport(transport)
++                .toolExecutionTimeout(Duration.ofSeconds(4))
++                .build();
++    }
++
++    @AfterAll
++    public static void teardown() throws Exception {
++        if (mcpClient != null) {
++            mcpClient.close();
++        }
++    }
++}
+diff --git a/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpTransportTestBase.java b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpTransportTestBase.java
+new file mode 100644
+index 00000000000..dfb2a90a694
+--- /dev/null
++++ b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/integration/McpTransportTestBase.java
+@@ -0,0 +1,173 @@
++package dev.langchain4j.mcp.client.integration;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.junit.jupiter.api.Assumptions.*;
++
++import dev.langchain4j.agent.tool.ToolExecutionRequest;
++import dev.langchain4j.agent.tool.ToolSpecification;
++import dev.langchain4j.mcp.McpToolProvider;
++import dev.langchain4j.mcp.client.McpClient;
++import dev.langchain4j.model.chat.request.json.JsonBooleanSchema;
++import dev.langchain4j.model.chat.request.json.JsonIntegerSchema;
++import dev.langchain4j.model.chat.request.json.JsonStringSchema;
++import dev.langchain4j.service.tool.ToolExecutor;
++import dev.langchain4j.service.tool.ToolProvider;
++import dev.langchain4j.service.tool.ToolProviderResult;
++import java.io.File;
++import java.util.List;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public abstract class McpTransportTestBase {
++
++    static McpClient mcpClient;
++
++    private static final Logger log = LoggerFactory.getLogger(McpTransportTestBase.class);
++
++    @Test
++    public void verifyToolSpecifications() {
++        ToolProviderResult toolProviderResult = obtainTools();
++
++        Map<ToolSpecification, ToolExecutor> tools = toolProviderResult.tools();
++        assertThat(tools.size()).isEqualTo(5);
++
++        ToolSpecification echoString = findToolSpecificationByName(toolProviderResult, "echoString");
++        assertThat(echoString.description()).isEqualTo("Echoes a string");
++        JsonStringSchema echoStringParam =
++                (JsonStringSchema) echoString.parameters().properties().get("input");
++        assertThat(echoStringParam.description()).isEqualTo("The string to be echoed");
++
++        ToolSpecification echoInteger = findToolSpecificationByName(toolProviderResult, "echoInteger");
++        assertThat(echoInteger.description()).isEqualTo("Echoes an integer");
++        JsonIntegerSchema echoIntegerParam =
++                (JsonIntegerSchema) echoInteger.parameters().properties().get("input");
++        assertThat(echoIntegerParam.description()).isEqualTo("The integer to be echoed");
++
++        ToolSpecification echoBoolean = findToolSpecificationByName(toolProviderResult, "echoBoolean");
++        assertThat(echoBoolean.description()).isEqualTo("Echoes a boolean");
++        JsonBooleanSchema echoBooleanParam =
++                (JsonBooleanSchema) echoBoolean.parameters().properties().get("input");
++        assertThat(echoBooleanParam.description()).isEqualTo("The boolean to be echoed");
++
++        ToolSpecification longOperation = findToolSpecificationByName(toolProviderResult, "longOperation");
++        assertThat(longOperation.description()).isEqualTo("Takes 10 seconds to complete");
++        assertThat(longOperation.parameters().properties()).isEmpty();
++
++        ToolSpecification error = findToolSpecificationByName(toolProviderResult, "error");
++        assertThat(error.description()).isEqualTo("Throws a business error");
++        assertThat(error.parameters().properties()).isEmpty();
++    }
++
++    @Test
++    public void executeTool() {
++        ToolProviderResult toolProviderResult = obtainTools();
++        ToolExecutor executor = findToolExecutorByName(toolProviderResult, "echoString");
++        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
++                .name("echoString")
++                .arguments("{\"input\": \"abc\"}")
++                .build();
++        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
++        assertThat(toolExecutionResultString).isEqualTo("abc");
++    }
++
++    @Test
++    public void executeToolWithWrongArgumentType() {
++        ToolProviderResult toolProviderResult = obtainTools();
++        ToolExecutor executor = findToolExecutorByName(toolProviderResult, "echoString");
++        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
++                .name("echoString")
++                .arguments("{\"input\": 1}") // wrong argument type
++                .build();
++        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
++        assertThat(toolExecutionResultString).isEqualTo("There was an error executing the tool");
++    }
++
++    @Test
++    public void executeNonExistentTool() {
++        ToolProviderResult toolProviderResult = obtainTools();
++        ToolExecutor executor = findToolExecutorByName(toolProviderResult, "echoString");
++        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
++                .name("THIS-TOOL-DOES-NOT-EXIST")
++                .arguments("{\"input\": 1}")
++                .build();
++        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
++        assertThat(toolExecutionResultString).isEqualTo("There was an error executing the tool");
++    }
++
++    @Test
++    public void executeToolThatThrowsBusinessError() {
++        ToolProviderResult toolProviderResult = obtainTools();
++        ToolExecutor executor = findToolExecutorByName(toolProviderResult, "error");
++        ToolExecutionRequest toolExecutionRequest =
++                ToolExecutionRequest.builder().name("error").arguments("{}").build();
++        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
++        assertThat(toolExecutionResultString).isEqualTo("There was an error executing the tool");
++    }
++
++    @Test
++    public void timeout() {
++        ToolProviderResult toolProviderResult = obtainTools();
++        ToolExecutor executor = findToolExecutorByName(toolProviderResult, "longOperation");
++        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
++                .name("longOperation")
++                .arguments("{}")
++                .build();
++        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
++        assertThat(toolExecutionResultString).isEqualTo("There was a timeout executing the tool");
++    }
++
++    ToolProviderResult obtainTools() {
++        ToolProvider toolProvider =
++                McpToolProvider.builder().mcpClients(List.of(mcpClient)).build();
++        return toolProvider.provideTools(null);
++    }
++
++    ToolSpecification findToolSpecificationByName(ToolProviderResult toolProviderResult, String name) {
++        return toolProviderResult.tools().keySet().stream()
++                .filter(toolSpecification -> toolSpecification.name().equals(name))
++                .findFirst()
++                .get();
++    }
++
++    ToolExecutor findToolExecutorByName(ToolProviderResult toolProviderResult, String name) {
++        return toolProviderResult.tools().entrySet().stream()
++                .filter(entry -> entry.getKey().name().equals(name))
++                .findFirst()
++                .get()
++                .getValue();
++    }
++
++    static String getJBangCommand() {
++        String command = System.getProperty("jbang.command");
++        if (command == null || command.isEmpty()) {
++            command = isWindows() ? "jbang.cmd" : "jbang";
++        }
++        return command;
++    }
++
++    static void skipTestsIfJbangNotAvailable() {
++        String command = getJBangCommand();
++        try {
++            new ProcessBuilder().command(command, "--version").start().waitFor();
++        } catch (Exception e) {
++            String message = "jbang is not available (could not execute command '" + command
++                    + "', MCP integration tests will be skipped. "
++                    + "The command may be overridden via the system property 'jbang.command'";
++            log.warn(message, e);
++            assumeTrue(false, message);
++        }
++    }
++
++    static String getPathToScript(String script) {
++        return ClassLoader.getSystemResource(script)
++                .getFile()
++                .substring(isWindows() ? 1 : 0)
++                .replace("/", File.separator);
++    }
++
++    private static boolean isWindows() {
++        return System.getProperty("os.name").toLowerCase().contains("windows");
++    }
++}
+diff --git a/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/transport/http/McpHttpTransportTest.java b/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/transport/http/McpHttpTransportTest.java
+deleted file mode 100644
+index d6a5e7fff8e..00000000000
+--- a/langchain4j-mcp/src/test/java/dev/langchain4j/mcp/client/transport/http/McpHttpTransportTest.java
++++ /dev/null
+@@ -1,178 +0,0 @@
+-package dev.langchain4j.mcp.client.transport.http;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+-import static org.assertj.core.api.Assertions.assertThatIterable;
+-
+-import dev.langchain4j.agent.tool.ToolExecutionRequest;
+-import dev.langchain4j.agent.tool.ToolSpecification;
+-import dev.langchain4j.mcp.McpToolProvider;
+-import dev.langchain4j.mcp.client.DefaultMcpClient;
+-import dev.langchain4j.mcp.client.McpClient;
+-import dev.langchain4j.mcp.client.transport.McpTransport;
+-import dev.langchain4j.model.chat.request.json.JsonNumberSchema;
+-import dev.langchain4j.model.chat.request.json.JsonStringSchema;
+-import dev.langchain4j.service.tool.ToolExecutor;
+-import dev.langchain4j.service.tool.ToolProvider;
+-import dev.langchain4j.service.tool.ToolProviderResult;
+-import java.time.Duration;
+-import java.util.List;
+-import java.util.Set;
+-import java.util.stream.Collectors;
+-import org.junit.jupiter.api.AfterAll;
+-import org.junit.jupiter.api.BeforeAll;
+-import org.junit.jupiter.api.Test;
+-import org.testcontainers.containers.GenericContainer;
+-import org.testcontainers.containers.wait.strategy.Wait;
+-import org.testcontainers.utility.MountableFile;
+-
+-public class McpHttpTransportTest {
+-
+-    // FIXME: we have a full copy of the project's sources here because the
+-    // official node.js server-everything npm package does not include the
+-    // HTTP transport. Once we find a suitable and maintained MCP server
+-    // image (preferably docker image) that supports the HTTP transport, the
+-    // test could be rewritten to use that.
+-    static GenericContainer<?> container = new GenericContainer<>("docker.io/node:23")
+-            .withCopyFileToContainer(MountableFile.forClasspathResource("everything"), "/everything")
+-            .withLogConsumer(outputFrame -> System.out.println(outputFrame.getUtf8String()))
+-            .withWorkingDirectory("/everything")
+-            .withCommand("sh", "-c", "npm install && npm run build && node dist/sse.js")
+-            .withExposedPorts(3001)
+-            .waitingFor(Wait.forHttp("/").forStatusCode(404));
+-
+-    static Integer port;
+-
+-    static McpClient mcpClient;
+-
+-    @BeforeAll
+-    public static void setup() {
+-        container.start();
+-        port = container.getMappedPort(3001);
+-        McpTransport transport = new HttpMcpTransport.Builder()
+-                .sseUrl("http://localhost:" + port + "/sse")
+-                .logRequests(true)
+-                .logResponses(true)
+-                .build();
+-        mcpClient = new DefaultMcpClient.Builder()
+-                .transport(transport)
+-                .toolExecutionTimeout(Duration.ofSeconds(4))
+-                .build();
+-    }
+-
+-    @AfterAll
+-    public static void cleanup() {
+-        container.stop();
+-    }
+-
+-    @Test
+-    public void providingTools() throws Exception {
+-        // obtain a list of tools from the MCP server
+-        ToolProvider toolProvider =
+-                McpToolProvider.builder().mcpClients(List.of(mcpClient)).build();
+-        ToolProviderResult toolProviderResult = toolProvider.provideTools(null);
+-
+-        // verify the list of tools
+-        assertThat(toolProviderResult.tools()).hasSize(5);
+-        Set<String> toolNames = toolProviderResult.tools().keySet().stream()
+-                .map(ToolSpecification::name)
+-                .collect(Collectors.toSet());
+-        assertThatIterable(toolNames)
+-                .containsExactlyInAnyOrder("add", "echo", "longRunningOperation", "sampleLLM", "getTinyImage");
+-
+-        // verify the 'add' tool
+-        ToolSpecification addTool = findToolByName(toolProviderResult, "add");
+-        assertThat(addTool.description()).isEqualTo("Adds two numbers");
+-        JsonNumberSchema a =
+-                (JsonNumberSchema) addTool.parameters().properties().get("a");
+-        assertThat(a.description().equals("First number"));
+-        JsonNumberSchema b =
+-                (JsonNumberSchema) addTool.parameters().properties().get("b");
+-        assertThat(b.description().equals("Second number"));
+-
+-        // verify the 'echo' tool
+-        ToolSpecification echoTool = findToolByName(toolProviderResult, "echo");
+-        assertThat(echoTool.description()).isEqualTo("Echoes back the input");
+-        JsonStringSchema input =
+-                (JsonStringSchema) echoTool.parameters().properties().get("message");
+-        assertThat(input.description().equals("Message to echo"));
+-
+-        // verify the 'longRunningOperation' tool
+-        ToolSpecification longRunningOperationTool = findToolByName(toolProviderResult, "longRunningOperation");
+-        assertThat(longRunningOperationTool.description())
+-                .isEqualTo("Demonstrates a long running operation with progress updates");
+-        JsonNumberSchema duration = (JsonNumberSchema)
+-                longRunningOperationTool.parameters().properties().get("duration");
+-        assertThat(duration.description().equals("Duration of the operation in seconds"));
+-        JsonNumberSchema steps = (JsonNumberSchema)
+-                longRunningOperationTool.parameters().properties().get("steps");
+-        assertThat(steps.description().equals("Number of steps in the operation"));
+-
+-        // verify the 'sampleLLM' tool
+-        ToolSpecification sampleLLMTool = findToolByName(toolProviderResult, "sampleLLM");
+-        assertThat(sampleLLMTool.description()).isEqualTo("Samples from an LLM using MCP's sampling feature");
+-        JsonStringSchema prompt =
+-                (JsonStringSchema) sampleLLMTool.parameters().properties().get("prompt");
+-        assertThat(prompt.description().equals("The prompt to send to the LLM"));
+-        JsonNumberSchema maxTokens =
+-                (JsonNumberSchema) sampleLLMTool.parameters().properties().get("maxTokens");
+-        assertThat(maxTokens.description().equals("Maximum number of tokens to generate"));
+-
+-        // verify the 'getTinyImage' tool
+-        ToolSpecification getTinyImageTool = findToolByName(toolProviderResult, "getTinyImage");
+-        assertThat(getTinyImageTool.description()).isEqualTo("Returns the MCP_TINY_IMAGE");
+-        assertThat(getTinyImageTool.parameters().properties().isEmpty());
+-    }
+-
+-    private ToolSpecification findToolByName(ToolProviderResult toolProviderResult, String name) {
+-        return toolProviderResult.tools().keySet().stream()
+-                .filter(toolSpecification -> toolSpecification.name().equals(name))
+-                .findFirst()
+-                .get();
+-    }
+-
+-    @Test
+-    public void executingATool() {
+-        // obtain tools from the server
+-        ToolProvider toolProvider =
+-                McpToolProvider.builder().mcpClients(List.of(mcpClient)).build();
+-        ToolProviderResult toolProviderResult = toolProvider.provideTools(null);
+-
+-        // find the 'add' tool and execute it on the MCP server
+-        ToolExecutor executor = toolProviderResult.tools().entrySet().stream()
+-                .filter(entry -> entry.getKey().name().equals("add"))
+-                .findFirst()
+-                .get()
+-                .getValue();
+-        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
+-                .name("add")
+-                .arguments("{\"a\": 5, \"b\": 12}")
+-                .build();
+-        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
+-
+-        // validate the tool execution result
+-        assertThat(toolExecutionResultString).isEqualTo("The sum of 5 and 12 is 17.");
+-    }
+-
+-    @Test
+-    public void timeout() {
+-        // obtain tools from the server
+-        ToolProvider toolProvider =
+-                McpToolProvider.builder().mcpClients(List.of(mcpClient)).build();
+-        ToolProviderResult toolProviderResult = toolProvider.provideTools(null);
+-
+-        // find the 'longRunningOperation' tool and execute it on the MCP server
+-        ToolExecutor executor = toolProviderResult.tools().entrySet().stream()
+-                .filter(entry -> entry.getKey().name().equals("longRunningOperation"))
+-                .findFirst()
+-                .get()
+-                .getValue();
+-        ToolExecutionRequest toolExecutionRequest = ToolExecutionRequest.builder()
+-                .name("longRunningOperation")
+-                .arguments("{\"duration\": 5, \"steps\": 1}")
+-                .build();
+-        String toolExecutionResultString = executor.execute(toolExecutionRequest, null);
+-
+-        // validate the tool execution result
+-        assertThat(toolExecutionResultString).isEqualTo("There was a timeout executing the tool");
+-    }
+-}
+diff --git a/langchain4j-mcp/src/test/resources/everything/README.md b/langchain4j-mcp/src/test/resources/everything/README.md
+deleted file mode 100644
+index b00a6635018..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/README.md
++++ /dev/null
+@@ -1,91 +0,0 @@
+-# Everything MCP Server 
+-
+-This MCP server attempts to exercise all the features of the MCP protocol. It is not intended to be a useful server, but rather a test server for builders of MCP clients. It implements prompts, tools, resources, sampling, and more to showcase MCP capabilities.
+-
+-## Components
+-
+-### Tools
+-
+-1. `echo`
+-   - Simple tool to echo back input messages
+-   - Input:
+-     - `message` (string): Message to echo back
+-   - Returns: Text content with echoed message
+-
+-2. `add`
+-   - Adds two numbers together
+-   - Inputs:
+-     - `a` (number): First number 
+-     - `b` (number): Second number
+-   - Returns: Text result of the addition
+-
+-3. `longRunningOperation`
+-   - Demonstrates progress notifications for long operations
+-   - Inputs:
+-     - `duration` (number, default: 10): Duration in seconds
+-     - `steps` (number, default: 5): Number of progress steps
+-   - Returns: Completion message with duration and steps
+-   - Sends progress notifications during execution
+-
+-4. `sampleLLM` 
+-   - Demonstrates LLM sampling capability using MCP sampling feature
+-   - Inputs:
+-     - `prompt` (string): The prompt to send to the LLM
+-     - `maxTokens` (number, default: 100): Maximum tokens to generate
+-   - Returns: Generated LLM response
+-
+-5. `getTinyImage`
+-   - Returns a small test image
+-   - No inputs required
+-   - Returns: Base64 encoded PNG image data
+-
+-### Resources
+-
+-The server provides 100 test resources in two formats:
+-- Even numbered resources: 
+-  - Plaintext format
+-  - URI pattern: `test://static/resource/{even_number}`
+-  - Content: Simple text description
+-
+-- Odd numbered resources:
+-  - Binary blob format
+-  - URI pattern: `test://static/resource/{odd_number}`  
+-  - Content: Base64 encoded binary data
+-
+-Resource features:
+-- Supports pagination (10 items per page)
+-- Allows subscribing to resource updates
+-- Demonstrates resource templates
+-- Auto-updates subscribed resources every 5 seconds
+-
+-### Prompts
+-
+-1. `simple_prompt`
+-   - Basic prompt without arguments
+-   - Returns: Single message exchange
+-
+-2. `complex_prompt`
+-   - Advanced prompt demonstrating argument handling
+-   - Required arguments:
+-     - `temperature` (number): Temperature setting
+-   - Optional arguments:
+-     - `style` (string): Output style preference
+-   - Returns: Multi-turn conversation with images
+-
+-## Usage with Claude Desktop
+-
+-Add to your `claude_desktop_config.json`:
+-
+-```json
+-{
+-  "mcpServers": {
+-    "everything": {
+-      "command": "npx",
+-      "args": [
+-        "-y",
+-        "@modelcontextprotocol/server-everything"
+-      ]
+-    }
+-  }
+-}
+-```
+diff --git a/langchain4j-mcp/src/test/resources/everything/dist/everything.js b/langchain4j-mcp/src/test/resources/everything/dist/everything.js
+deleted file mode 100755
+index 89ee1bbe89d..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/dist/everything.js
++++ /dev/null
+@@ -1,361 +0,0 @@
+-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+-import { CallToolRequestSchema, CreateMessageResultSchema, GetPromptRequestSchema, ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ListToolsRequestSchema, ReadResourceRequestSchema, SetLevelRequestSchema, SubscribeRequestSchema, ToolSchema, UnsubscribeRequestSchema, } from "@modelcontextprotocol/sdk/types.js";
+-import { z } from "zod";
+-import { zodToJsonSchema } from "zod-to-json-schema";
+-const ToolInputSchema = ToolSchema.shape.inputSchema;
+-/* Input schemas for tools implemented in this server */
+-const EchoSchema = z.object({
+-    message: z.string().describe("Message to echo"),
+-});
+-const AddSchema = z.object({
+-    a: z.number().describe("First number"),
+-    b: z.number().describe("Second number"),
+-});
+-const LongRunningOperationSchema = z.object({
+-    duration: z
+-        .number()
+-        .default(10)
+-        .describe("Duration of the operation in seconds"),
+-    steps: z.number().default(5).describe("Number of steps in the operation"),
+-});
+-const SampleLLMSchema = z.object({
+-    prompt: z.string().describe("The prompt to send to the LLM"),
+-    maxTokens: z
+-        .number()
+-        .default(100)
+-        .describe("Maximum number of tokens to generate"),
+-});
+-const GetTinyImageSchema = z.object({});
+-var ToolName;
+-(function (ToolName) {
+-    ToolName["ECHO"] = "echo";
+-    ToolName["ADD"] = "add";
+-    ToolName["LONG_RUNNING_OPERATION"] = "longRunningOperation";
+-    ToolName["SAMPLE_LLM"] = "sampleLLM";
+-    ToolName["GET_TINY_IMAGE"] = "getTinyImage";
+-})(ToolName || (ToolName = {}));
+-var PromptName;
+-(function (PromptName) {
+-    PromptName["SIMPLE"] = "simple_prompt";
+-    PromptName["COMPLEX"] = "complex_prompt";
+-})(PromptName || (PromptName = {}));
+-export const createServer = () => {
+-    const server = new Server({
+-        name: "example-servers/everything",
+-        version: "1.0.0",
+-    }, {
+-        capabilities: {
+-            prompts: {},
+-            resources: { subscribe: true },
+-            tools: {},
+-            logging: {},
+-        },
+-    });
+-    let subscriptions = new Set();
+-    let updateInterval;
+-    // Set up update interval for subscribed resources
+-    updateInterval = setInterval(() => {
+-        for (const uri of subscriptions) {
+-            server.notification({
+-                method: "notifications/resources/updated",
+-                params: { uri },
+-            });
+-        }
+-    }, 5000);
+-    // Helper method to request sampling from client
+-    const requestSampling = async (context, uri, maxTokens = 100) => {
+-        const request = {
+-            method: "sampling/createMessage",
+-            params: {
+-                messages: [
+-                    {
+-                        role: "user",
+-                        content: {
+-                            type: "text",
+-                            text: `Resource ${uri} context: ${context}`,
+-                        },
+-                    },
+-                ],
+-                systemPrompt: "You are a helpful test server.",
+-                maxTokens,
+-                temperature: 0.7,
+-                includeContext: "thisServer",
+-            },
+-        };
+-        return await server.request(request, CreateMessageResultSchema);
+-    };
+-    const ALL_RESOURCES = Array.from({ length: 100 }, (_, i) => {
+-        const uri = `test://static/resource/${i + 1}`;
+-        if (i % 2 === 0) {
+-            return {
+-                uri,
+-                name: `Resource ${i + 1}`,
+-                mimeType: "text/plain",
+-                text: `Resource ${i + 1}: This is a plaintext resource`,
+-            };
+-        }
+-        else {
+-            const buffer = Buffer.from(`Resource ${i + 1}: This is a base64 blob`);
+-            return {
+-                uri,
+-                name: `Resource ${i + 1}`,
+-                mimeType: "application/octet-stream",
+-                blob: buffer.toString("base64"),
+-            };
+-        }
+-    });
+-    const PAGE_SIZE = 10;
+-    server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+-        const cursor = request.params?.cursor;
+-        let startIndex = 0;
+-        if (cursor) {
+-            const decodedCursor = parseInt(atob(cursor), 10);
+-            if (!isNaN(decodedCursor)) {
+-                startIndex = decodedCursor;
+-            }
+-        }
+-        const endIndex = Math.min(startIndex + PAGE_SIZE, ALL_RESOURCES.length);
+-        const resources = ALL_RESOURCES.slice(startIndex, endIndex);
+-        let nextCursor;
+-        if (endIndex < ALL_RESOURCES.length) {
+-            nextCursor = btoa(endIndex.toString());
+-        }
+-        return {
+-            resources,
+-            nextCursor,
+-        };
+-    });
+-    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+-        return {
+-            resourceTemplates: [
+-                {
+-                    uriTemplate: "test://static/resource/{id}",
+-                    name: "Static Resource",
+-                    description: "A static resource with a numeric ID",
+-                },
+-            ],
+-        };
+-    });
+-    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+-        const uri = request.params.uri;
+-        if (uri.startsWith("test://static/resource/")) {
+-            const index = parseInt(uri.split("/").pop() ?? "", 10) - 1;
+-            if (index >= 0 && index < ALL_RESOURCES.length) {
+-                const resource = ALL_RESOURCES[index];
+-                return {
+-                    contents: [resource],
+-                };
+-            }
+-        }
+-        throw new Error(`Unknown resource: ${uri}`);
+-    });
+-    server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+-        const { uri } = request.params;
+-        subscriptions.add(uri);
+-        // Request sampling from client when someone subscribes
+-        await requestSampling("A new subscription was started", uri);
+-        return {};
+-    });
+-    server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+-        subscriptions.delete(request.params.uri);
+-        return {};
+-    });
+-    server.setRequestHandler(ListPromptsRequestSchema, async () => {
+-        return {
+-            prompts: [
+-                {
+-                    name: PromptName.SIMPLE,
+-                    description: "A prompt without arguments",
+-                },
+-                {
+-                    name: PromptName.COMPLEX,
+-                    description: "A prompt with arguments",
+-                    arguments: [
+-                        {
+-                            name: "temperature",
+-                            description: "Temperature setting",
+-                            required: true,
+-                        },
+-                        {
+-                            name: "style",
+-                            description: "Output style",
+-                            required: false,
+-                        },
+-                    ],
+-                },
+-            ],
+-        };
+-    });
+-    server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+-        const { name, arguments: args } = request.params;
+-        if (name === PromptName.SIMPLE) {
+-            return {
+-                messages: [
+-                    {
+-                        role: "user",
+-                        content: {
+-                            type: "text",
+-                            text: "This is a simple prompt without arguments.",
+-                        },
+-                    },
+-                ],
+-            };
+-        }
+-        if (name === PromptName.COMPLEX) {
+-            return {
+-                messages: [
+-                    {
+-                        role: "user",
+-                        content: {
+-                            type: "text",
+-                            text: `This is a complex prompt with arguments: temperature=${args?.temperature}, style=${args?.style}`,
+-                        },
+-                    },
+-                    {
+-                        role: "assistant",
+-                        content: {
+-                            type: "text",
+-                            text: "I understand. You've provided a complex prompt with temperature and style arguments. How would you like me to proceed?",
+-                        },
+-                    },
+-                    {
+-                        role: "user",
+-                        content: {
+-                            type: "image",
+-                            data: MCP_TINY_IMAGE,
+-                            mimeType: "image/png",
+-                        },
+-                    },
+-                ],
+-            };
+-        }
+-        throw new Error(`Unknown prompt: ${name}`);
+-    });
+-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+-        const tools = [
+-            {
+-                name: ToolName.ECHO,
+-                description: "Echoes back the input",
+-                inputSchema: zodToJsonSchema(EchoSchema),
+-            },
+-            {
+-                name: ToolName.ADD,
+-                description: "Adds two numbers",
+-                inputSchema: zodToJsonSchema(AddSchema),
+-            },
+-            {
+-                name: ToolName.LONG_RUNNING_OPERATION,
+-                description: "Demonstrates a long running operation with progress updates",
+-                inputSchema: zodToJsonSchema(LongRunningOperationSchema),
+-            },
+-            {
+-                name: ToolName.SAMPLE_LLM,
+-                description: "Samples from an LLM using MCP's sampling feature",
+-                inputSchema: zodToJsonSchema(SampleLLMSchema),
+-            },
+-            {
+-                name: ToolName.GET_TINY_IMAGE,
+-                description: "Returns the MCP_TINY_IMAGE",
+-                inputSchema: zodToJsonSchema(GetTinyImageSchema),
+-            },
+-        ];
+-        return { tools };
+-    });
+-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+-        const { name, arguments: args } = request.params;
+-        if (name === ToolName.ECHO) {
+-            const validatedArgs = EchoSchema.parse(args);
+-            return {
+-                content: [{ type: "text", text: `Echo: ${validatedArgs.message}` }],
+-            };
+-        }
+-        if (name === ToolName.ADD) {
+-            const validatedArgs = AddSchema.parse(args);
+-            const sum = validatedArgs.a + validatedArgs.b;
+-            return {
+-                content: [
+-                    {
+-                        type: "text",
+-                        text: `The sum of ${validatedArgs.a} and ${validatedArgs.b} is ${sum}.`,
+-                    },
+-                ],
+-            };
+-        }
+-        if (name === ToolName.LONG_RUNNING_OPERATION) {
+-            const validatedArgs = LongRunningOperationSchema.parse(args);
+-            const { duration, steps } = validatedArgs;
+-            const stepDuration = duration / steps;
+-            const progressToken = request.params._meta?.progressToken;
+-            for (let i = 1; i < steps + 1; i++) {
+-                await new Promise((resolve) => setTimeout(resolve, stepDuration * 1000));
+-                if (progressToken !== undefined) {
+-                    await server.notification({
+-                        method: "notifications/progress",
+-                        params: {
+-                            progress: i,
+-                            total: steps,
+-                            progressToken,
+-                        },
+-                    });
+-                }
+-            }
+-            return {
+-                content: [
+-                    {
+-                        type: "text",
+-                        text: `Long running operation completed. Duration: ${duration} seconds, Steps: ${steps}.`,
+-                    },
+-                ],
+-            };
+-        }
+-        if (name === ToolName.SAMPLE_LLM) {
+-            const validatedArgs = SampleLLMSchema.parse(args);
+-            const { prompt, maxTokens } = validatedArgs;
+-            const result = await requestSampling(prompt, ToolName.SAMPLE_LLM, maxTokens);
+-            return {
+-                content: [{ type: "text", text: `LLM sampling result: ${result}` }],
+-            };
+-        }
+-        if (name === ToolName.GET_TINY_IMAGE) {
+-            GetTinyImageSchema.parse(args);
+-            return {
+-                content: [
+-                    {
+-                        type: "text",
+-                        text: "This is a tiny image:",
+-                    },
+-                    {
+-                        type: "image",
+-                        data: MCP_TINY_IMAGE,
+-                        mimeType: "image/png",
+-                    },
+-                    {
+-                        type: "text",
+-                        text: "The image above is the MCP tiny image.",
+-                    },
+-                ],
+-            };
+-        }
+-        throw new Error(`Unknown tool: ${name}`);
+-    });
+-    server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+-        const { level } = request.params;
+-        // Demonstrate different log levels
+-        await server.notification({
+-            method: "notifications/message",
+-            params: {
+-                level: "debug",
+-                logger: "test-server",
+-                data: `Logging level set to: ${level}`,
+-            },
+-        });
+-        return {};
+-    });
+-    const cleanup = async () => {
+-        if (updateInterval) {
+-            clearInterval(updateInterval);
+-        }
+-    };
+-    return { server, cleanup };
+-};
+-const MCP_TINY_IMAGE = "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";
+diff --git a/langchain4j-mcp/src/test/resources/everything/dist/index.js b/langchain4j-mcp/src/test/resources/everything/dist/index.js
+deleted file mode 100755
+index ffbcd8c7387..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/dist/index.js
++++ /dev/null
+@@ -1,18 +0,0 @@
+-#!/usr/bin/env node
+-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+-import { createServer } from "./everything.js";
+-async function main() {
+-    const transport = new StdioServerTransport();
+-    const { server, cleanup } = createServer();
+-    await server.connect(transport);
+-    // Cleanup on exit
+-    process.on("SIGINT", async () => {
+-        await cleanup();
+-        await server.close();
+-        process.exit(0);
+-    });
+-}
+-main().catch((error) => {
+-    console.error("Server error:", error);
+-    process.exit(1);
+-});
+diff --git a/langchain4j-mcp/src/test/resources/everything/dist/sse.js b/langchain4j-mcp/src/test/resources/everything/dist/sse.js
+deleted file mode 100755
+index 6d77d1f1d57..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/dist/sse.js
++++ /dev/null
+@@ -1,24 +0,0 @@
+-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+-import express from "express";
+-import { createServer } from "./everything.js";
+-const app = express();
+-const { server, cleanup } = createServer();
+-let transport;
+-app.get("/sse", async (req, res) => {
+-    console.log("Received connection");
+-    transport = new SSEServerTransport("/message", res);
+-    await server.connect(transport);
+-    server.onclose = async () => {
+-        await cleanup();
+-        await server.close();
+-        process.exit(0);
+-    };
+-});
+-app.post("/message", async (req, res) => {
+-    console.log("Received message");
+-    await transport.handlePostMessage(req, res);
+-});
+-const PORT = process.env.PORT || 3001;
+-app.listen(PORT, () => {
+-    console.log(`Server is running on port ${PORT}`);
+-});
+diff --git a/langchain4j-mcp/src/test/resources/everything/everything.ts b/langchain4j-mcp/src/test/resources/everything/everything.ts
+deleted file mode 100644
+index a31cd7f080a..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/everything.ts
++++ /dev/null
+@@ -1,441 +0,0 @@
+-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+-import {
+-  CallToolRequestSchema,
+-  CreateMessageRequest,
+-  CreateMessageResultSchema,
+-  GetPromptRequestSchema,
+-  ListPromptsRequestSchema,
+-  ListResourcesRequestSchema,
+-  ListResourceTemplatesRequestSchema,
+-  ListToolsRequestSchema,
+-  ReadResourceRequestSchema,
+-  Resource,
+-  SetLevelRequestSchema,
+-  SubscribeRequestSchema,
+-  Tool,
+-  ToolSchema,
+-  UnsubscribeRequestSchema,
+-} from "@modelcontextprotocol/sdk/types.js";
+-import { z } from "zod";
+-import { zodToJsonSchema } from "zod-to-json-schema";
+-
+-const ToolInputSchema = ToolSchema.shape.inputSchema;
+-type ToolInput = z.infer<typeof ToolInputSchema>;
+-
+-/* Input schemas for tools implemented in this server */
+-const EchoSchema = z.object({
+-  message: z.string().describe("Message to echo"),
+-});
+-
+-const AddSchema = z.object({
+-  a: z.number().describe("First number"),
+-  b: z.number().describe("Second number"),
+-});
+-
+-const LongRunningOperationSchema = z.object({
+-  duration: z
+-    .number()
+-    .default(10)
+-    .describe("Duration of the operation in seconds"),
+-  steps: z.number().default(5).describe("Number of steps in the operation"),
+-});
+-
+-const SampleLLMSchema = z.object({
+-  prompt: z.string().describe("The prompt to send to the LLM"),
+-  maxTokens: z
+-    .number()
+-    .default(100)
+-    .describe("Maximum number of tokens to generate"),
+-});
+-
+-const GetTinyImageSchema = z.object({});
+-
+-enum ToolName {
+-  ECHO = "echo",
+-  ADD = "add",
+-  LONG_RUNNING_OPERATION = "longRunningOperation",
+-  SAMPLE_LLM = "sampleLLM",
+-  GET_TINY_IMAGE = "getTinyImage",
+-}
+-
+-enum PromptName {
+-  SIMPLE = "simple_prompt",
+-  COMPLEX = "complex_prompt",
+-}
+-
+-export const createServer = () => {
+-  const server = new Server(
+-    {
+-      name: "example-servers/everything",
+-      version: "1.0.0",
+-    },
+-    {
+-      capabilities: {
+-        prompts: {},
+-        resources: { subscribe: true },
+-        tools: {},
+-        logging: {},
+-      },
+-    },
+-  );
+-
+-  let subscriptions: Set<string> = new Set();
+-  let updateInterval: NodeJS.Timeout | undefined;
+-
+-  // Set up update interval for subscribed resources
+-  updateInterval = setInterval(() => {
+-    for (const uri of subscriptions) {
+-      server.notification({
+-        method: "notifications/resources/updated",
+-        params: { uri },
+-      });
+-    }
+-  }, 5000);
+-
+-  // Helper method to request sampling from client
+-  const requestSampling = async (
+-    context: string,
+-    uri: string,
+-    maxTokens: number = 100,
+-  ) => {
+-    const request: CreateMessageRequest = {
+-      method: "sampling/createMessage",
+-      params: {
+-        messages: [
+-          {
+-            role: "user",
+-            content: {
+-              type: "text",
+-              text: `Resource ${uri} context: ${context}`,
+-            },
+-          },
+-        ],
+-        systemPrompt: "You are a helpful test server.",
+-        maxTokens,
+-        temperature: 0.7,
+-        includeContext: "thisServer",
+-      },
+-    };
+-
+-    return await server.request(request, CreateMessageResultSchema);
+-  };
+-
+-  const ALL_RESOURCES: Resource[] = Array.from({ length: 100 }, (_, i) => {
+-    const uri = `test://static/resource/${i + 1}`;
+-    if (i % 2 === 0) {
+-      return {
+-        uri,
+-        name: `Resource ${i + 1}`,
+-        mimeType: "text/plain",
+-        text: `Resource ${i + 1}: This is a plaintext resource`,
+-      };
+-    } else {
+-      const buffer = Buffer.from(`Resource ${i + 1}: This is a base64 blob`);
+-      return {
+-        uri,
+-        name: `Resource ${i + 1}`,
+-        mimeType: "application/octet-stream",
+-        blob: buffer.toString("base64"),
+-      };
+-    }
+-  });
+-
+-  const PAGE_SIZE = 10;
+-
+-  server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+-    const cursor = request.params?.cursor;
+-    let startIndex = 0;
+-
+-    if (cursor) {
+-      const decodedCursor = parseInt(atob(cursor), 10);
+-      if (!isNaN(decodedCursor)) {
+-        startIndex = decodedCursor;
+-      }
+-    }
+-
+-    const endIndex = Math.min(startIndex + PAGE_SIZE, ALL_RESOURCES.length);
+-    const resources = ALL_RESOURCES.slice(startIndex, endIndex);
+-
+-    let nextCursor: string | undefined;
+-    if (endIndex < ALL_RESOURCES.length) {
+-      nextCursor = btoa(endIndex.toString());
+-    }
+-
+-    return {
+-      resources,
+-      nextCursor,
+-    };
+-  });
+-
+-  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+-    return {
+-      resourceTemplates: [
+-        {
+-          uriTemplate: "test://static/resource/{id}",
+-          name: "Static Resource",
+-          description: "A static resource with a numeric ID",
+-        },
+-      ],
+-    };
+-  });
+-
+-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+-    const uri = request.params.uri;
+-
+-    if (uri.startsWith("test://static/resource/")) {
+-      const index = parseInt(uri.split("/").pop() ?? "", 10) - 1;
+-      if (index >= 0 && index < ALL_RESOURCES.length) {
+-        const resource = ALL_RESOURCES[index];
+-        return {
+-          contents: [resource],
+-        };
+-      }
+-    }
+-
+-    throw new Error(`Unknown resource: ${uri}`);
+-  });
+-
+-  server.setRequestHandler(SubscribeRequestSchema, async (request) => {
+-    const { uri } = request.params;
+-    subscriptions.add(uri);
+-
+-    // Request sampling from client when someone subscribes
+-    await requestSampling("A new subscription was started", uri);
+-    return {};
+-  });
+-
+-  server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
+-    subscriptions.delete(request.params.uri);
+-    return {};
+-  });
+-
+-  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+-    return {
+-      prompts: [
+-        {
+-          name: PromptName.SIMPLE,
+-          description: "A prompt without arguments",
+-        },
+-        {
+-          name: PromptName.COMPLEX,
+-          description: "A prompt with arguments",
+-          arguments: [
+-            {
+-              name: "temperature",
+-              description: "Temperature setting",
+-              required: true,
+-            },
+-            {
+-              name: "style",
+-              description: "Output style",
+-              required: false,
+-            },
+-          ],
+-        },
+-      ],
+-    };
+-  });
+-
+-  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+-    const { name, arguments: args } = request.params;
+-
+-    if (name === PromptName.SIMPLE) {
+-      return {
+-        messages: [
+-          {
+-            role: "user",
+-            content: {
+-              type: "text",
+-              text: "This is a simple prompt without arguments.",
+-            },
+-          },
+-        ],
+-      };
+-    }
+-
+-    if (name === PromptName.COMPLEX) {
+-      return {
+-        messages: [
+-          {
+-            role: "user",
+-            content: {
+-              type: "text",
+-              text: `This is a complex prompt with arguments: temperature=${args?.temperature}, style=${args?.style}`,
+-            },
+-          },
+-          {
+-            role: "assistant",
+-            content: {
+-              type: "text",
+-              text: "I understand. You've provided a complex prompt with temperature and style arguments. How would you like me to proceed?",
+-            },
+-          },
+-          {
+-            role: "user",
+-            content: {
+-              type: "image",
+-              data: MCP_TINY_IMAGE,
+-              mimeType: "image/png",
+-            },
+-          },
+-        ],
+-      };
+-    }
+-
+-    throw new Error(`Unknown prompt: ${name}`);
+-  });
+-
+-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+-    const tools: Tool[] = [
+-      {
+-        name: ToolName.ECHO,
+-        description: "Echoes back the input",
+-        inputSchema: zodToJsonSchema(EchoSchema) as ToolInput,
+-      },
+-      {
+-        name: ToolName.ADD,
+-        description: "Adds two numbers",
+-        inputSchema: zodToJsonSchema(AddSchema) as ToolInput,
+-      },
+-      {
+-        name: ToolName.LONG_RUNNING_OPERATION,
+-        description:
+-          "Demonstrates a long running operation with progress updates",
+-        inputSchema: zodToJsonSchema(LongRunningOperationSchema) as ToolInput,
+-      },
+-      {
+-        name: ToolName.SAMPLE_LLM,
+-        description: "Samples from an LLM using MCP's sampling feature",
+-        inputSchema: zodToJsonSchema(SampleLLMSchema) as ToolInput,
+-      },
+-      {
+-        name: ToolName.GET_TINY_IMAGE,
+-        description: "Returns the MCP_TINY_IMAGE",
+-        inputSchema: zodToJsonSchema(GetTinyImageSchema) as ToolInput,
+-      },
+-    ];
+-
+-    return { tools };
+-  });
+-
+-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+-    const { name, arguments: args } = request.params;
+-
+-    if (name === ToolName.ECHO) {
+-      const validatedArgs = EchoSchema.parse(args);
+-      return {
+-        content: [{ type: "text", text: `Echo: ${validatedArgs.message}` }],
+-      };
+-    }
+-
+-    if (name === ToolName.ADD) {
+-      const validatedArgs = AddSchema.parse(args);
+-      const sum = validatedArgs.a + validatedArgs.b;
+-      return {
+-        content: [
+-          {
+-            type: "text",
+-            text: `The sum of ${validatedArgs.a} and ${validatedArgs.b} is ${sum}.`,
+-          },
+-        ],
+-      };
+-    }
+-
+-    if (name === ToolName.LONG_RUNNING_OPERATION) {
+-      const validatedArgs = LongRunningOperationSchema.parse(args);
+-      const { duration, steps } = validatedArgs;
+-      const stepDuration = duration / steps;
+-      const progressToken = request.params._meta?.progressToken;
+-
+-      for (let i = 1; i < steps + 1; i++) {
+-        await new Promise((resolve) =>
+-          setTimeout(resolve, stepDuration * 1000),
+-        );
+-
+-        if (progressToken !== undefined) {
+-          await server.notification({
+-            method: "notifications/progress",
+-            params: {
+-              progress: i,
+-              total: steps,
+-              progressToken,
+-            },
+-          });
+-        }
+-      }
+-
+-      return {
+-        content: [
+-          {
+-            type: "text",
+-            text: `Long running operation completed. Duration: ${duration} seconds, Steps: ${steps}.`,
+-          },
+-        ],
+-      };
+-    }
+-
+-    if (name === ToolName.SAMPLE_LLM) {
+-      const validatedArgs = SampleLLMSchema.parse(args);
+-      const { prompt, maxTokens } = validatedArgs;
+-
+-      const result = await requestSampling(
+-        prompt,
+-        ToolName.SAMPLE_LLM,
+-        maxTokens,
+-      );
+-      return {
+-        content: [{ type: "text", text: `LLM sampling result: ${result}` }],
+-      };
+-    }
+-
+-    if (name === ToolName.GET_TINY_IMAGE) {
+-      GetTinyImageSchema.parse(args);
+-      return {
+-        content: [
+-          {
+-            type: "text",
+-            text: "This is a tiny image:",
+-          },
+-          {
+-            type: "image",
+-            data: MCP_TINY_IMAGE,
+-            mimeType: "image/png",
+-          },
+-          {
+-            type: "text",
+-            text: "The image above is the MCP tiny image.",
+-          },
+-        ],
+-      };
+-    }
+-
+-    throw new Error(`Unknown tool: ${name}`);
+-  });
+-
+-  server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+-    const { level } = request.params;
+-
+-    // Demonstrate different log levels
+-    await server.notification({
+-      method: "notifications/message",
+-      params: {
+-        level: "debug",
+-        logger: "test-server",
+-        data: `Logging level set to: ${level}`,
+-      },
+-    });
+-
+-    return {};
+-  });
+-
+-  const cleanup = async () => {
+-    if (updateInterval) {
+-      clearInterval(updateInterval);
+-    }
+-  };
+-
+-  return { server, cleanup };
+-};
+-
+-const MCP_TINY_IMAGE =
+-  "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";
+diff --git a/langchain4j-mcp/src/test/resources/everything/index.ts b/langchain4j-mcp/src/test/resources/everything/index.ts
+deleted file mode 100644
+index c0ab77a2da3..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/index.ts
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#!/usr/bin/env node
+-
+-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+-import { createServer } from "./everything.js";
+-
+-async function main() {
+-  const transport = new StdioServerTransport();
+-  const { server, cleanup } = createServer();
+-
+-  await server.connect(transport);
+-
+-  // Cleanup on exit
+-  process.on("SIGINT", async () => {
+-    await cleanup();
+-    await server.close();
+-    process.exit(0);
+-  });
+-}
+-
+-main().catch((error) => {
+-  console.error("Server error:", error);
+-  process.exit(1);
+-});
+diff --git a/langchain4j-mcp/src/test/resources/everything/package.json b/langchain4j-mcp/src/test/resources/everything/package.json
+deleted file mode 100644
+index 29df070b785..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/package.json
++++ /dev/null
+@@ -1,32 +0,0 @@
+-{
+-  "name": "@modelcontextprotocol/server-everything",
+-  "version": "0.5.1",
+-  "description": "MCP server that exercises all the features of the MCP protocol",
+-  "license": "MIT",
+-  "author": "Anthropic, PBC (https://anthropic.com)",
+-  "homepage": "https://modelcontextprotocol.io",
+-  "bugs": "https://github.com/modelcontextprotocol/servers/issues",
+-  "type": "module",
+-  "bin": {
+-    "mcp-server-everything": "dist/index.js"
+-  },
+-  "files": [
+-    "dist"
+-  ],
+-  "scripts": {
+-    "build": "tsc && shx chmod +x dist/*.js",
+-    "prepare": "npm run build",
+-    "watch": "tsc --watch"
+-  },
+-  "dependencies": {
+-    "@modelcontextprotocol/sdk": "0.5.0",
+-    "express": "^4.21.1",
+-    "zod": "^3.23.8",
+-    "zod-to-json-schema": "^3.23.5"
+-  },
+-  "devDependencies": {
+-    "@types/express": "^5.0.0",
+-    "shx": "^0.3.4",
+-    "typescript": "^5.6.2"
+-  }
+-}
+diff --git a/langchain4j-mcp/src/test/resources/everything/sse.ts b/langchain4j-mcp/src/test/resources/everything/sse.ts
+deleted file mode 100644
+index 7a02eb53e5d..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/sse.ts
++++ /dev/null
+@@ -1,32 +0,0 @@
+-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+-import express from "express";
+-import { createServer } from "./everything.js";
+-
+-const app = express();
+-
+-const { server, cleanup } = createServer();
+-
+-let transport: SSEServerTransport;
+-
+-app.get("/sse", async (req, res) => {
+-  console.log("Received connection");
+-  transport = new SSEServerTransport("/message", res);
+-  await server.connect(transport);
+-
+-  server.onclose = async () => {
+-    await cleanup();
+-    await server.close();
+-    process.exit(0);
+-  };
+-});
+-
+-app.post("/message", async (req, res) => {
+-  console.log("Received message");
+-
+-  await transport.handlePostMessage(req, res);
+-});
+-
+-const PORT = process.env.PORT || 3001;
+-app.listen(PORT, () => {
+-  console.log(`Server is running on port ${PORT}`);
+-});
+diff --git a/langchain4j-mcp/src/test/resources/everything/tsconfig.json b/langchain4j-mcp/src/test/resources/everything/tsconfig.json
+deleted file mode 100644
+index b66a6f60e2f..00000000000
+--- a/langchain4j-mcp/src/test/resources/everything/tsconfig.json
++++ /dev/null
+@@ -1,18 +0,0 @@
+-{
+-  "compilerOptions": {
+-    "target": "ES2022",
+-    "module": "Node16",
+-    "moduleResolution": "Node16",
+-    "strict": true,
+-    "esModuleInterop": true,
+-    "skipLibCheck": true,
+-    "forceConsistentCasingInFileNames": true,
+-    "resolveJsonModule": true,
+-    "outDir": "./dist",
+-    "rootDir": "."
+-  },
+-  "include": [
+-    "./**/*.ts"
+-  ],
+-  "exclude": ["node_modules"]
+-}
+diff --git a/langchain4j-mcp/src/test/resources/logback-test.xml b/langchain4j-mcp/src/test/resources/logback-test.xml
+new file mode 100644
+index 00000000000..601645f371c
+--- /dev/null
++++ b/langchain4j-mcp/src/test/resources/logback-test.xml
+@@ -0,0 +1,15 @@
++<configuration>
++
++    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
++        <encoder>
++            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger - %msg%n</pattern>
++        </encoder>
++    </appender>
++
++    <root level="DEBUG">
++        <appender-ref ref="STDOUT"/>
++    </root>
++
++    <logger name="dev.langchain4j" level="DEBUG"/>
++
++</configuration>
+diff --git a/langchain4j-mcp/src/test/resources/tools_mcp_server.java b/langchain4j-mcp/src/test/resources/tools_mcp_server.java
+new file mode 100644
+index 00000000000..92247ee1cee
+--- /dev/null
++++ b/langchain4j-mcp/src/test/resources/tools_mcp_server.java
+@@ -0,0 +1,41 @@
++///usr/bin/env jbang "$0" "$@" ; exit $?
++//DEPS io.quarkus:quarkus-bom:${quarkus.version:3.17.5}@pom
++//DEPS io.quarkiverse.mcp:quarkus-mcp-server-stdio:1.0.0.Alpha3
++//DEPS io.quarkiverse.mcp:quarkus-mcp-server-sse:1.0.0.Alpha3
++
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++import io.quarkiverse.mcp.server.TextContent;
++import io.quarkiverse.mcp.server.Tool;
++import io.quarkiverse.mcp.server.ToolArg;
++
++public class tools_mcp_server {
++
++    @Tool(description = "Echoes a string")
++    public String echoString(@ToolArg(description = "The string to be echoed") String input) {
++        return input;
++    }
++
++    @Tool(description = "Echoes an integer")
++    public String echoInteger(@ToolArg(description = "The integer to be echoed") Integer input) {
++        return String.valueOf(input);
++    }
++
++    @Tool(description = "Echoes a boolean")
++    public String echoBoolean(@ToolArg(description = "The boolean to be echoed") Boolean input) {
++        return Boolean.valueOf(input).toString();
++    }
++
++    @Tool(description = "Takes 10 seconds to complete")
++    public String longOperation() throws Exception {
++        TimeUnit.SECONDS.sleep(10);
++        return "ok";
++    }
++
++    @Tool(description = "Throws a business error")
++    public String error() throws Exception {
++        throw new RuntimeException("business error");
++    }
++
++}

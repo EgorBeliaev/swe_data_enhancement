@@ -1,0 +1,258 @@
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonAnyOfSchema.java b/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonAnyOfSchema.java
+new file mode 100644
+index 00000000000..02d559a93b8
+--- /dev/null
++++ b/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonAnyOfSchema.java
+@@ -0,0 +1,74 @@
++package dev.langchain4j.model.chat.request.json;
++
++import dev.langchain4j.Experimental;
++
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Objects;
++
++import static dev.langchain4j.internal.Utils.quoted;
++import static dev.langchain4j.internal.ValidationUtils.ensureNotEmpty;
++
++@Experimental
++public class JsonAnyOfSchema implements JsonSchemaElement {
++
++    private final String description;
++    private final List<JsonSchemaElement> anyOf;
++
++    public JsonAnyOfSchema(Builder builder) {
++        this.description = builder.description;
++        this.anyOf = new ArrayList<>(ensureNotEmpty(builder.anyOf, "anyOf"));
++    }
++
++    public String description() {
++        return description;
++    }
++
++    public List<JsonSchemaElement> anyOf() {
++        return anyOf;
++    }
++
++    public static Builder builder() {
++        return new Builder();
++    }
++
++    public static class Builder {
++        private String description;
++        private List<JsonSchemaElement> anyOf;
++
++        public Builder description(String description) {
++            this.description = description;
++            return this;
++        }
++
++        public Builder anyOf(List<JsonSchemaElement> anyOf) {
++            this.anyOf = anyOf;
++            return this;
++        }
++
++        public JsonAnyOfSchema build() {
++            return new JsonAnyOfSchema(this);
++        }
++    }
++
++    @Override
++    public boolean equals(final Object o) {
++        if (this == o) return true;
++        if (!(o instanceof final JsonAnyOfSchema that)) return false;
++        return Objects.equals(description, that.description)
++                && Objects.equals(anyOf, that.anyOf);
++    }
++
++    @Override
++    public int hashCode() {
++        return Objects.hash(description, anyOf);
++    }
++
++    @Override
++    public String toString() {
++        return "JsonAnyOfSchema {" +
++                "description = " + quoted(description) +
++                ", anyOf = " + anyOf +
++                " }";
++    }
++}
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonSchemaElement.java b/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonSchemaElement.java
+index 51aaf45e73b..c2e18e989b3 100644
+--- a/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonSchemaElement.java
++++ b/langchain4j-core/src/main/java/dev/langchain4j/model/chat/request/json/JsonSchemaElement.java
+@@ -5,6 +5,7 @@
+ /**
+  * A base interface for a JSON schema element.
+  *
++ * @see JsonAnyOfSchema
+  * @see JsonArraySchema
+  * @see JsonBooleanSchema
+  * @see JsonEnumSchema
+diff --git a/langchain4j-open-ai/src/main/java/dev/langchain4j/model/openai/InternalOpenAiHelper.java b/langchain4j-open-ai/src/main/java/dev/langchain4j/model/openai/InternalOpenAiHelper.java
+index e9580815718..54d0a21bf67 100644
+--- a/langchain4j-open-ai/src/main/java/dev/langchain4j/model/openai/InternalOpenAiHelper.java
++++ b/langchain4j-open-ai/src/main/java/dev/langchain4j/model/openai/InternalOpenAiHelper.java
+@@ -29,6 +29,7 @@
+ import dev.langchain4j.model.chat.listener.ChatModelRequest;
+ import dev.langchain4j.model.chat.listener.ChatModelResponse;
+ import dev.langchain4j.model.chat.request.ResponseFormat;
++import dev.langchain4j.model.chat.request.json.JsonAnyOfSchema;
+ import dev.langchain4j.model.chat.request.json.JsonArraySchema;
+ import dev.langchain4j.model.chat.request.json.JsonBooleanSchema;
+ import dev.langchain4j.model.chat.request.json.JsonEnumSchema;
+@@ -345,6 +346,15 @@ private static dev.ai4j.openai4j.chat.JsonSchemaElement toOpenAiJsonSchemaElemen
+             return dev.ai4j.openai4j.chat.JsonReferenceSchema.builder()
+                     .reference("#/$defs/" + jsonReferenceSchema.reference())
+                     .build();
++        } else if (jsonSchemaElement instanceof JsonAnyOfSchema) {
++            JsonAnyOfSchema jsonAnyOfSchema = (JsonAnyOfSchema) jsonSchemaElement;
++            return dev.ai4j.openai4j.chat.JsonAnyOfSchema.builder()
++                    .description(jsonAnyOfSchema.description())
++                    .anyOf(jsonAnyOfSchema.anyOf()
++                            .stream()
++                            .map(it -> toOpenAiJsonSchemaElement(it, strict))
++                            .collect(toList()))
++                    .build();
+         } else {
+             throw new IllegalArgumentException("Unknown type: " + jsonSchemaElement.getClass());
+         }
+diff --git a/langchain4j-open-ai/src/test/java/dev/langchain4j/model/openai/OpenAiChatModelWithJsonSchemaIT.java b/langchain4j-open-ai/src/test/java/dev/langchain4j/model/openai/OpenAiChatModelWithJsonSchemaIT.java
+new file mode 100644
+index 00000000000..5185b416fb3
+--- /dev/null
++++ b/langchain4j-open-ai/src/test/java/dev/langchain4j/model/openai/OpenAiChatModelWithJsonSchemaIT.java
+@@ -0,0 +1,119 @@
++package dev.langchain4j.model.openai;
++
++import com.fasterxml.jackson.annotation.JsonSubTypes;
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import dev.langchain4j.model.chat.request.ChatRequest;
++import dev.langchain4j.model.chat.request.ResponseFormat;
++import dev.langchain4j.model.chat.request.ResponseFormatType;
++import dev.langchain4j.model.chat.request.json.JsonAnyOfSchema;
++import dev.langchain4j.model.chat.request.json.JsonArraySchema;
++import dev.langchain4j.model.chat.request.json.JsonNumberSchema;
++import dev.langchain4j.model.chat.request.json.JsonObjectSchema;
++import dev.langchain4j.model.chat.request.json.JsonSchema;
++import dev.langchain4j.model.chat.response.ChatResponse;
++import org.assertj.core.api.Assertions;
++import org.junit.jupiter.api.Test;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++
++import static dev.langchain4j.data.message.UserMessage.userMessage;
++import static dev.langchain4j.model.openai.OpenAiChatModelName.GPT_4_O_MINI;
++import static java.util.Arrays.asList;
++import static java.util.Collections.singletonList;
++
++class OpenAiChatModelWithJsonSchemaIT {
++
++    OpenAiChatModel model = OpenAiChatModel.builder()
++            .baseUrl(System.getenv("OPENAI_BASE_URL"))
++            .apiKey(System.getenv("OPENAI_API_KEY"))
++            .modelName(GPT_4_O_MINI)
++            .strictJsonSchema(true)
++            .logRequests(true)
++            .logResponses(true)
++            .build();
++
++    @JsonTypeInfo(use = JsonTypeInfo.Id.DEDUCTION)
++    @JsonSubTypes({
++            @JsonSubTypes.Type(Circle.class),
++            @JsonSubTypes.Type(Rectangle.class)
++    })
++    interface Shape {
++
++    }
++
++    record Circle(double radius) implements Shape {
++
++    }
++
++    record Rectangle(double width,
++                     double height) implements Shape {
++
++    }
++
++    record Shapes(List<Shape> shapes) {
++    }
++
++
++    @Test
++    void should_generate_valid_json_with_anyof() throws JsonProcessingException {
++        final JsonObjectSchema circle = JsonObjectSchema.builder()
++                .description("Circle")
++                .properties(new LinkedHashMap<>() {{
++                    put("radius", JsonNumberSchema.builder().build());
++                }})
++                .required(singletonList("radius"))
++                .additionalProperties(false)
++                .build();
++        final JsonObjectSchema rectangle = JsonObjectSchema.builder()
++                .description("Rectangle")
++                .properties(new LinkedHashMap<>() {{
++                    put("width", JsonNumberSchema.builder().build());
++                    put("height", JsonNumberSchema.builder().build());
++                }})
++                .required(asList("width", "height"))
++                .additionalProperties(false)
++                .build();
++        final JsonSchema jsonSchema = JsonSchema.builder()
++                .name("shape")
++                .rootElement(JsonObjectSchema.builder()
++                        .description("Shape")
++                        .properties(new LinkedHashMap<>() {{
++                            put("shapes", JsonArraySchema.builder()
++                                    .items(JsonAnyOfSchema.builder()
++                                            .description("Shape")
++                                            .anyOf(asList(circle, rectangle))
++                                            .build())
++                                    .build());
++                        }})
++                        .required(singletonList("shape"))
++                        .additionalProperties(false)
++                        .build())
++                .build();
++
++
++        final ChatResponse response = model.chat(ChatRequest.builder()
++                .messages(userMessage("""
++                        Extract information from the following text:
++                        1. A circle with a radius of 5
++                        2. A rectangle with a width of 10 and a height of 20
++                        """))
++                .responseFormat(ResponseFormat.builder()
++                        .jsonSchema(jsonSchema)
++                        .type(ResponseFormatType.JSON)
++                        .build())
++                .build());
++
++        final Shapes shapes = new ObjectMapper().readValue(response.aiMessage().text(), Shapes.class);
++        Assertions.assertThat(shapes).isNotNull();
++        Assertions.assertThat(shapes.shapes())
++                .isNotNull()
++                .containsExactlyInAnyOrder(
++                        new Circle(5),
++                        new Rectangle(10, 20)
++                );
++    }
++
++}
+diff --git a/langchain4j-parent/pom.xml b/langchain4j-parent/pom.xml
+index 44809518b0d..300ef7508ac 100644
+--- a/langchain4j-parent/pom.xml
++++ b/langchain4j-parent/pom.xml
+@@ -20,7 +20,7 @@
+         <project.build.outputTimestamp>1714382357</project.build.outputTimestamp>
+         <argLine></argLine>
+         <!-- Dependency Versions -->
+-        <openai4j.version>0.23.0</openai4j.version>
++        <openai4j.version>0.24.0</openai4j.version>
+         <azure-ai-openai.version>1.0.0-beta.11</azure-ai-openai.version>
+         <azure-ai-search.version>11.7.3</azure-ai-search.version>
+         <azure.storage-blob.version>12.29.0</azure.storage-blob.version>

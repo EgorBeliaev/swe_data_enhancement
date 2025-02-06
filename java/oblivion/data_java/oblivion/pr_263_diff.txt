@@ -1,0 +1,691 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 20ee4144..ae7b89bd 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -98,7 +98,7 @@
+         <activity
+             android:name="org.bepass.oblivion.SettingsActivity"
+             android:exported="false"
+-            android:windowSoftInputMode="stateAlwaysHidden" />
++            android:windowSoftInputMode="adjustResize" />
+ 
+         <activity
+             android:name=".SplitTunnelActivity"
+diff --git a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+index 44e4ad66..ea79071f 100644
+--- a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
++++ b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+@@ -37,6 +37,7 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -285,6 +286,11 @@ private void clearLogFile() {
+     }
+ 
+     private void start() {
++        // If there's an existing running service, revoke it first
++        if (lastKnownState != ConnectionState.DISCONNECTED) {
++            onRevoke();
++        }
++
+         fileManager = FileManager.getInstance(this);
+ 
+         setLastKnownState(ConnectionState.CONNECTING);
+@@ -367,6 +373,7 @@ public void onDestroy() {
+     public void onRevoke() {
+         setLastKnownState(ConnectionState.DISCONNECTED);
+         Log.i(TAG, "Stopping VPN");
++        // Stop foreground service and notification
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             NotificationManager notificationManager = getSystemService(NotificationManager.class);
+             if (notificationManager != null) {
+@@ -379,11 +386,13 @@ public void onRevoke() {
+             e.printStackTrace();
+         }
+ 
++        // Release the wake lock if held
+         if (wLock != null && wLock.isHeld()) {
+             wLock.release();
+             wLock = null;
+         }
+ 
++        // Close the VPN interface
+         if (mInterface != null) {
+             try {
+                 mInterface.close();
+@@ -392,9 +401,25 @@ public void onRevoke() {
+             }
+         }
+ 
++        // Stop Tun2socks
+         Tun2socks.stop();
++
++        // Shutdown executor service
++        if (executorService instanceof ExecutorService) {
++            ((ExecutorService) executorService).shutdownNow();
++        }
++
++        // Ensure all tasks are completed or terminated
++        try {
++            if (!((ExecutorService) executorService).awaitTermination(1, TimeUnit.SECONDS)) {
++                Log.e(TAG, "Executor service did not terminate in the specified time.");
++            }
++        } catch (InterruptedException e) {
++            Log.e(TAG, "Executor service termination interrupted.", e);
++        }
+     }
+ 
++
+     private void publishConnectionState(ConnectionState state) {
+         if (!connectionStateObservers.isEmpty()) {
+             for (String observerKey : connectionStateObservers.keySet())
+diff --git a/app/src/main/java/org/bepass/oblivion/PublicIPUtils.java b/app/src/main/java/org/bepass/oblivion/PublicIPUtils.java
+index f2698bce..16036a35 100644
+--- a/app/src/main/java/org/bepass/oblivion/PublicIPUtils.java
++++ b/app/src/main/java/org/bepass/oblivion/PublicIPUtils.java
+@@ -9,6 +9,7 @@
+ 
+ import java.net.InetSocketAddress;
+ import java.net.Proxy;
++import java.util.Locale;
+ import java.util.Objects;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+@@ -61,7 +62,7 @@ public void getIPDetails(IPDetailsCallback callback) {
+                     }
+                     details.ip = jsonData.getString("ip");
+                     details.country = jsonData.getString("country");
+-                    details.flag = EmojiManager.getForAlias(jsonData.getString("country").toLowerCase()).getUnicode();
++                    details.flag = EmojiManager.getForAlias(jsonData.getString("country").toLowerCase(Locale.ROOT)).getUnicode();
+                     handler.post(() -> callback.onDetailsReceived(details));
+                     return;
+                 } catch (Exception e) {
+diff --git a/app/src/main/res/drawable-hdpi/ic_ircf.png b/app/src/main/res/drawable-hdpi/ic_ircf.png
+deleted file mode 100644
+index 6fe6dadc..00000000
+Binary files a/app/src/main/res/drawable-hdpi/ic_ircf.png and /dev/null differ
+diff --git a/app/src/main/res/drawable-hdpi/ic_power.png b/app/src/main/res/drawable-hdpi/ic_power.png
+deleted file mode 100644
+index 60170162..00000000
+Binary files a/app/src/main/res/drawable-hdpi/ic_power.png and /dev/null differ
+diff --git a/app/src/main/res/drawable-hdpi/ic_twitter.png b/app/src/main/res/drawable-hdpi/ic_twitter.png
+deleted file mode 100644
+index 568e1732..00000000
+Binary files a/app/src/main/res/drawable-hdpi/ic_twitter.png and /dev/null differ
+diff --git a/app/src/main/res/drawable-v24/ic_launcher_foreground.xml b/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
+deleted file mode 100644
+index 01fee93e..00000000
+--- a/app/src/main/res/drawable-v24/ic_launcher_foreground.xml
++++ /dev/null
+@@ -1,31 +0,0 @@
+-<vector xmlns:android="http://schemas.android.com/apk/res/android"
+-  xmlns:aapt="http://schemas.android.com/aapt"
+-  android:width="108dp"
+-  android:height="108dp"
+-  android:viewportWidth="108"
+-  android:viewportHeight="108">
+-  <path
+-    android:pathData="M31,63.928c0,0 6.4,-11 12.1,-13.1c7.2,-2.6 26,-1.4 26,-1.4l38.1,38.1L107,108.928l-32,-1L31,63.928z">
+-    <aapt:attr name="android:fillColor">
+-      <gradient
+-        android:endX="85.84757"
+-        android:endY="92.4963"
+-        android:startX="42.9492"
+-        android:startY="49.59793"
+-        android:type="linear">
+-        <item
+-          android:color="#44000000"
+-          android:offset="0.0" />
+-        <item
+-          android:color="#5E5E5E"
+-          android:offset="1.0" />
+-      </gradient>
+-    </aapt:attr>
+-  </path>
+-  <path
+-    android:fillColor="#FFFFFF"
+-    android:fillType="nonZero"
+-    android:pathData="M65.3,45.828l3.8,-6.6c0.2,-0.4 0.1,-0.9 -0.3,-1.1c-0.4,-0.2 -0.9,-0.1 -1.1,0.3l-3.9,6.7c-6.3,-2.8 -13.4,-2.8 -19.7,0l-3.9,-6.7c-0.2,-0.4 -0.7,-0.5 -1.1,-0.3C38.8,38.328 38.7,38.828 38.9,39.228l3.8,6.6C36.2,49.428 31.7,56.028 31,63.928h46C76.3,56.028 71.8,49.428 65.3,45.828zM43.4,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2c-0.3,-0.7 -0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C45.3,56.528 44.5,57.328 43.4,57.328L43.4,57.328zM64.6,57.328c-0.8,0 -1.5,-0.5 -1.8,-1.2s-0.1,-1.5 0.4,-2.1c0.5,-0.5 1.4,-0.7 2.1,-0.4c0.7,0.3 1.2,1 1.2,1.8C66.5,56.528 65.6,57.328 64.6,57.328L64.6,57.328z"
+-    android:strokeWidth="1"
+-    android:strokeColor="#5E5E5E" />
+-</vector>
+diff --git a/app/src/main/res/drawable/ic_launcher_background.xml b/app/src/main/res/drawable/ic_launcher_background.xml
+deleted file mode 100644
+index fc9655e7..00000000
+--- a/app/src/main/res/drawable/ic_launcher_background.xml
++++ /dev/null
+@@ -1,170 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<vector xmlns:android="http://schemas.android.com/apk/res/android"
+-  android:width="108dp"
+-  android:height="108dp"
+-  android:viewportWidth="108"
+-  android:viewportHeight="108">
+-  <path
+-    android:fillColor="#3DDC84"
+-    android:pathData="M0,0h108v108h-108z" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M9,0L9,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,0L19,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M29,0L29,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M39,0L39,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M49,0L49,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M59,0L59,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M69,0L69,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M79,0L79,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M89,0L89,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M99,0L99,108"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,9L108,9"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,19L108,19"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,29L108,29"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,39L108,39"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,49L108,49"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,59L108,59"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,69L108,69"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,79L108,79"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,89L108,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M0,99L108,99"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,29L89,29"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,39L89,39"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,49L89,49"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,59L89,59"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,69L89,69"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M19,79L89,79"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M29,19L29,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M39,19L39,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M49,19L49,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M59,19L59,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M69,19L69,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-  <path
+-    android:fillColor="#5E5E5E"
+-    android:pathData="M79,19L79,89"
+-    android:strokeWidth="0.8"
+-    android:strokeColor="#33FFFFFF" />
+-</vector>
+diff --git a/app/src/main/res/drawable/layout_border_bottom.xml b/app/src/main/res/drawable/layout_border_bottom.xml
+deleted file mode 100644
+index 82feed3f..00000000
+--- a/app/src/main/res/drawable/layout_border_bottom.xml
++++ /dev/null
+@@ -1,19 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+-  <!-- Main background -->
+-  <item>
+-    <shape android:shape="rectangle">
+-      <solid android:color="@android:color/transparent" />
+-    </shape>
+-  </item>
+-  <!-- Bottom border -->
+-  <item
+-    android:left="-2dp"
+-    android:right="-2dp"
+-    android:top="-2dp"
+-    android:bottom="0dp">
+-    <shape android:shape="rectangle">
+-      <solid android:color="#CCC" />
+-    </shape>
+-  </item>
+-</layer-list>
+diff --git a/app/src/main/res/drawable/quote.png b/app/src/main/res/drawable/quote.png
+deleted file mode 100644
+index 3b2ab26c..00000000
+Binary files a/app/src/main/res/drawable/quote.png and /dev/null differ
+diff --git a/app/src/main/res/layout/activity_info.xml b/app/src/main/res/layout/activity_info.xml
+index 075a4108..3368e06b 100644
+--- a/app/src/main/res/layout/activity_info.xml
++++ b/app/src/main/res/layout/activity_info.xml
+@@ -34,7 +34,8 @@
+       android:fontFamily="@font/shabnamlight"
+       android:text="@string/aboutApp"
+       android:textColor="@color/black"
+-      android:textSize="32sp" />
++      android:textSize="32sp"
++        tools:ignore="RelativeOverlap" />
+ 
+   </RelativeLayout>
+ 
+@@ -49,7 +50,8 @@
+       android:text='@string/aboutAppDesc'
+       android:textAlignment="center"
+       android:textColor="@color/black"
+-      android:textSize="16sp" />
++      android:textSize="16sp"
++      tools:ignore="RtlCompat" />
+ 
+   <RelativeLayout
+     android:id="@+id/github_layout"
+diff --git a/app/src/main/res/layout/activity_log.xml b/app/src/main/res/layout/activity_log.xml
+index f0bd68d6..8156e88d 100644
+--- a/app/src/main/res/layout/activity_log.xml
++++ b/app/src/main/res/layout/activity_log.xml
+@@ -37,7 +37,8 @@
+       android:fontFamily="@font/shabnamlight"
+       android:text="@string/logApp"
+       android:textColor="@color/black"
+-      android:textSize="32sp" />
++      android:textSize="32sp"
++        tools:ignore="RelativeOverlap" />
+ 
+   </RelativeLayout>
+ 
+diff --git a/app/src/main/res/layout/activity_settings.xml b/app/src/main/res/layout/activity_settings.xml
+index 00a86cf7..578ecfff 100644
+--- a/app/src/main/res/layout/activity_settings.xml
++++ b/app/src/main/res/layout/activity_settings.xml
+@@ -37,7 +37,8 @@
+       android:fontFamily="@font/shabnamlight"
+       android:text="@string/settingsText"
+       android:textColor="@color/black"
+-      android:textSize="24sp" />
++      android:textSize="24sp"
++      tools:ignore="RelativeOverlap" />
+ 
+   </RelativeLayout>
+ 
+@@ -240,7 +241,7 @@
+ 
+ 
+           <LinearLayout
+-              android:layout_width="115dp"
++              android:layout_width="0dp"
+               android:layout_height="wrap_content"
+               android:layout_weight="2">
+ 
+@@ -305,7 +306,7 @@
+           android:gravity="end">
+ 
+           <LinearLayout
+-            android:layout_width="wrap_content"
++            android:layout_width="0dp"
+             android:layout_height="wrap_content"
+             android:layout_weight="2"
+           >
+@@ -371,7 +372,7 @@
+ 
+           <Spinner
+             android:id="@+id/country"
+-            android:layout_width="wrap_content"
++            android:layout_width="0dp"
+             android:layout_height="wrap_content"
+             android:layout_weight="1" />
+ 
+@@ -486,7 +487,7 @@
+           android:layout_height="wrap_content">
+ 
+           <LinearLayout
+-            android:layout_width="wrap_content"
++            android:layout_width="0dp"
+             android:layout_height="wrap_content"
+             android:layout_weight="2"
+           >
+diff --git a/app/src/main/res/layout/activity_splash_screen.xml b/app/src/main/res/layout/activity_splash_screen.xml
+index 1ec1fad6..fe0ba5b6 100644
+--- a/app/src/main/res/layout/activity_splash_screen.xml
++++ b/app/src/main/res/layout/activity_splash_screen.xml
+@@ -44,7 +44,8 @@
+             app:layout_constraintEnd_toEndOf="parent"
+             app:layout_constraintStart_toStartOf="parent"
+             app:layout_constraintTop_toBottomOf="@+id/textView"
+-            app:layout_constraintVertical_bias="0.069" />
++            app:layout_constraintVertical_bias="0.069"
++            tools:ignore="RtlCompat" />
+ 
+         <TextView
+             android:id="@+id/textView4"
+@@ -62,7 +63,8 @@
+             app:layout_constraintHorizontal_bias="0.498"
+             app:layout_constraintStart_toStartOf="parent"
+             app:layout_constraintTop_toBottomOf="@+id/textView2"
+-            app:layout_constraintVertical_bias="0.034" />
++            app:layout_constraintVertical_bias="0.034"
++            tools:ignore="RtlCompat"/>
+     </androidx.constraintlayout.widget.ConstraintLayout>
+ 
+ 
+@@ -91,7 +93,8 @@
+             android:cropToPadding="true"
+             android:foreground="@drawable/light_shadow_bottom"
+             app:srcCompat="@drawable/segaro"
+-            tools:targetApi="m" />
++            tools:targetApi="m"
++            tools:ignore="UnusedAttribute" />
+ 
+         <com.google.android.material.imageview.ShapeableImageView
+             android:id="@+id/imageViewYousef"
+@@ -104,7 +107,8 @@
+             android:cropToPadding="true"
+             android:foreground="@drawable/light_shadow_bottom"
+             app:srcCompat="@drawable/yousef"
+-            tools:targetApi="m" />
++            tools:targetApi="m"
++            tools:ignore="UnusedAttribute" />
+ 
+     </LinearLayout>
+ 
+diff --git a/app/src/main/res/layout/activity_split_tunnel.xml b/app/src/main/res/layout/activity_split_tunnel.xml
+index 1f24b218..0f333b75 100644
+--- a/app/src/main/res/layout/activity_split_tunnel.xml
++++ b/app/src/main/res/layout/activity_split_tunnel.xml
+@@ -38,7 +38,8 @@
+             android:fontFamily="@font/shabnamlight"
+             android:text="@string/blackList"
+             android:textColor="@color/black"
+-            android:textSize="24sp" />
++            android:textSize="24sp"
++            tools:ignore="RelativeOverlap" />
+ 
+     </RelativeLayout>
+ 
+diff --git a/app/src/main/res/layout/edit_sheet.xml b/app/src/main/res/layout/edit_sheet.xml
+index 71d675c9..89b2e7d5 100644
+--- a/app/src/main/res/layout/edit_sheet.xml
++++ b/app/src/main/res/layout/edit_sheet.xml
+@@ -1,76 +1,83 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+-  xmlns:app="http://schemas.android.com/apk/res-auto"
+-  android:layout_width="match_parent"
+-  android:layout_height="wrap_content"
+-  android:background="@drawable/rounded_bottom_sheet"
+-  android:gravity="center"
+-  android:orientation="vertical">
+-
+-  <View
+-    android:id="@+id/dividingCloser"
+-    android:layout_width="64sp"
+-    android:layout_height="5sp"
+-    android:layout_marginTop="8sp"
+-    android:background="@drawable/bottom_sheet_closer" />
+-
+-  <TextView
+-    android:id="@+id/title"
+-    android:layout_width="wrap_content"
++<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="match_parent"
+     android:layout_height="wrap_content"
+-    android:layout_marginTop="16sp"
+-    android:fontFamily="@font/shabnam"
+-    android:text="@string/editSheetEndpoint"
+-    android:textColor="@color/black"
+-    android:textSize="18sp" />
++    android:fillViewport="true"
++    android:background="@drawable/rounded_bottom_sheet">
+ 
+-  <EditText
+-      android:id="@+id/edittext"
++  <LinearLayout
+       android:layout_width="match_parent"
+-      android:layout_height="48sp"
+-      android:layout_marginHorizontal="16sp"
+-      android:layout_marginTop="12sp"
+-      android:background="@drawable/edittext_back"
+-      android:fontFamily="@font/shabnam"
+-      android:lineSpacingExtra="4sp"
+-      android:padding="12sp"
+-      android:singleLine="true"
+-      android:textAlignment="center"
+-      android:textColor="@color/black"
+-      android:textSize="15sp" />
++      android:layout_height="wrap_content"
++      android:gravity="center"
++      android:orientation="vertical">
+ 
+-  <LinearLayout
+-    android:layout_width="match_parent"
+-    android:layout_height="wrap_content"
+-    android:layout_marginHorizontal="16sp"
+-    android:layout_marginVertical="12sp"
+-    android:orientation="horizontal">
++    <View
++        android:id="@+id/dividingCloser"
++        android:layout_width="64sp"
++        android:layout_height="5sp"
++        android:layout_marginTop="8sp"
++        android:background="@drawable/bottom_sheet_closer" />
+ 
+-    <Button
+-      android:id="@+id/cancelButton"
+-      android:layout_width="0sp"
+-      android:layout_height="wrap_content"
+-      android:layout_marginEnd="8sp"
+-      android:layout_weight="1"
+-      android:background="@drawable/bottom_sheet_cancel"
+-      android:fontFamily="@font/shabnam"
+-      android:text="@string/cancel"
+-      android:textColor="@color/black"
+-      android:textSize="17sp" />
++    <TextView
++        android:id="@+id/title"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="16sp"
++        android:fontFamily="@font/shabnam"
++        android:text="@string/editSheetEndpoint"
++        android:textColor="@color/black"
++        android:textSize="18sp" />
+ 
+-    <Button
+-      android:id="@+id/applyButton"
+-      android:layout_width="0sp"
+-      android:layout_height="wrap_content"
+-      android:layout_marginEnd="8sp"
+-      android:layout_weight="1"
+-      android:background="@drawable/bottom_sheet_closer"
+-      android:fontFamily="@font/shabnam"
+-      android:text="@string/update"
+-      android:textColor="@color/white"
+-      android:textSize="17sp" />
++    <EditText
++        android:id="@+id/edittext"
++        android:layout_width="match_parent"
++        android:layout_height="48sp"
++        android:layout_marginHorizontal="16sp"
++        android:layout_marginTop="12sp"
++        android:inputType="text"
++        android:background="@drawable/edittext_back"
++        android:fontFamily="@font/shabnam"
++        android:lineSpacingExtra="4sp"
++        android:padding="12sp"
++        android:singleLine="true"
++        android:textAlignment="center"
++        android:textColor="@color/black"
++        android:textSize="15sp" />
+ 
+-  </LinearLayout>
++    <LinearLayout
++        style="?android:attr/buttonBarStyle"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginHorizontal="16sp"
++        android:layout_marginVertical="12sp"
++        android:orientation="horizontal">
++
++      <Button
++          android:id="@+id/cancelButton"
++          style="?android:attr/buttonBarButtonStyle"
++          android:layout_width="0sp"
++          android:layout_height="wrap_content"
++          android:layout_marginEnd="8sp"
++          android:layout_weight="1"
++          android:background="@drawable/bottom_sheet_cancel"
++          android:fontFamily="@font/shabnam"
++          android:text="@string/cancel"
++          android:textColor="@color/black"
++          android:textSize="17sp" />
+ 
++      <Button
++          android:id="@+id/applyButton"
++          style="?android:attr/buttonBarButtonStyle"
++          android:layout_width="0sp"
++          android:layout_height="wrap_content"
++          android:layout_marginEnd="8sp"
++          android:layout_weight="1"
++          android:background="@drawable/bottom_sheet_closer"
++          android:fontFamily="@font/shabnam"
++          android:text="@string/update"
++          android:textColor="@color/white"
++          android:textSize="17sp" />
+ 
+-</LinearLayout>
++    </LinearLayout>
++  </LinearLayout>
++</ScrollView>
+diff --git a/app/src/main/res/raw/loading.json b/app/src/main/res/raw/loading.json
+deleted file mode 100644
+index bfd6f112..00000000
+--- a/app/src/main/res/raw/loading.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{"nm":"01 - Wifi","ddd":0,"h":500,"w":500,"meta":{"g":"@lottiefiles/toolkit-js 0.33.2"},"layers":[{"ty":4,"nm":"Line3 Outlines 5","sr":1,"st":195,"op":384,"ip":220,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[186.596,88.467,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,205.612,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":220},{"s":[100],"t":230}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-48.732,0],[-31.716,-31.448]],"o":[[31.8,-32.072],[48.193,0],[0,0]],"v":[[-124.096,25.967],[0.53,-25.967],[124.096,24.906]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[186.596,88.467],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":220},{"s":[100],"t":260}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":0,"k":0,"ix":1},"m":1}],"ind":1},{"ty":4,"nm":"Line2 Outlines 5","sr":1,"st":195,"op":384,"ip":210,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[151.595,81.219,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,249.783,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":210},{"s":[100],"t":220}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-35.064,0],[-22.759,-22.491]],"o":[[22.842,-23.115],[34.525,0],[0,0]],"v":[[-89.095,18.719],[0.531,-18.719],[89.095,17.657]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[151.595,81.219],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":210},{"s":[100],"t":250}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":0,"k":0,"ix":1},"m":1}],"ind":2},{"ty":4,"nm":"Line1 Outlines 5","sr":1,"st":195,"op":384,"ip":200,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[113.409,73.312,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250.99900000000002,293.955,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":200},{"s":[100],"t":210}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-20.152,0],[-12.984,-12.719]],"o":[[13.069,-13.343],[19.612,0],[0,0]],"v":[[-50.908,10.811],[0.531,-10.811],[50.908,9.75]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[113.408,73.312],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":200},{"s":[100],"t":240}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":0,"k":0,"ix":1},"m":1}],"ind":3},{"ty":4,"nm":"Line3 Outlines 3","sr":1,"st":145,"op":241,"ip":170,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[186.596,88.467,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,205.612,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":170},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":180},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":230},{"s":[0],"t":240}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-48.732,0],[-31.716,-31.448]],"o":[[31.8,-32.072],[48.193,0],[0,0]],"v":[[-124.096,25.967],[0.53,-25.967],[124.096,24.906]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[186.596,88.467],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":170},{"s":[100],"t":210}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":200},{"s":[100],"t":240}],"ix":1},"m":1}],"ind":4},{"ty":4,"nm":"Line2 Outlines 3","sr":1,"st":145,"op":231,"ip":160,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[151.595,81.219,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,249.783,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":160},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":170},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":220},{"s":[0],"t":230}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-35.064,0],[-22.759,-22.491]],"o":[[22.842,-23.115],[34.525,0],[0,0]],"v":[[-89.095,18.719],[0.531,-18.719],[89.095,17.657]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[151.595,81.219],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":160},{"s":[100],"t":200}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":190},{"s":[100],"t":230}],"ix":1},"m":1}],"ind":5},{"ty":4,"nm":"Line1 Outlines 3","sr":1,"st":145,"op":222,"ip":150,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[113.409,73.312,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250.99900000000002,293.955,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":150},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":160},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":211},{"s":[0],"t":221}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-20.152,0],[-12.984,-12.719]],"o":[[13.069,-13.343],[19.612,0],[0,0]],"v":[[-50.908,10.811],[0.531,-10.811],[50.908,9.75]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[113.408,73.312],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":150},{"s":[100],"t":190}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":180},{"s":[100],"t":220}],"ix":1},"m":1}],"ind":6},{"ty":4,"nm":"Line3 Outlines 2","sr":1,"st":95,"op":191,"ip":120,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[186.596,88.467,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,205.612,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":120},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":130},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":180},{"s":[0],"t":190}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-48.732,0],[-31.716,-31.448]],"o":[[31.8,-32.072],[48.193,0],[0,0]],"v":[[-124.096,25.967],[0.53,-25.967],[124.096,24.906]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[186.596,88.467],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":120},{"s":[100],"t":160}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":150},{"s":[100],"t":190}],"ix":1},"m":1}],"ind":7},{"ty":4,"nm":"Line2 Outlines 2","sr":1,"st":95,"op":181,"ip":110,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[151.595,81.219,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,249.783,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":110},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":120},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":170},{"s":[0],"t":180}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-35.064,0],[-22.759,-22.491]],"o":[[22.842,-23.115],[34.525,0],[0,0]],"v":[[-89.095,18.719],[0.531,-18.719],[89.095,17.657]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[151.595,81.219],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":110},{"s":[100],"t":150}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":140},{"s":[100],"t":180}],"ix":1},"m":1}],"ind":8},{"ty":4,"nm":"Line1 Outlines 2","sr":1,"st":95,"op":172,"ip":100,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[113.409,73.312,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250.99900000000002,293.955,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":100},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":110},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":161},{"s":[0],"t":171}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-20.152,0],[-12.984,-12.719]],"o":[[13.069,-13.343],[19.612,0],[0,0]],"v":[[-50.908,10.811],[0.531,-10.811],[50.908,9.75]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[113.408,73.312],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":100},{"s":[100],"t":140}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":130},{"s":[100],"t":170}],"ix":1},"m":1}],"ind":9},{"ty":4,"nm":"Line3 Outlines","sr":1,"st":45,"op":141,"ip":70,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[186.596,88.467,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,205.612,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":70},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":80},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":130},{"s":[0],"t":140}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-48.732,0],[-31.716,-31.448]],"o":[[31.8,-32.072],[48.193,0],[0,0]],"v":[[-124.096,25.967],[0.53,-25.967],[124.096,24.906]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[186.596,88.467],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":70},{"s":[100],"t":110}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":100},{"s":[100],"t":140}],"ix":1},"m":1}],"ind":10},{"ty":4,"nm":"Line2 Outlines","sr":1,"st":45,"op":131,"ip":60,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[151.595,81.219,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,249.783,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":60},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":70},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":120},{"s":[0],"t":130}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-35.064,0],[-22.759,-22.491]],"o":[[22.842,-23.115],[34.525,0],[0,0]],"v":[[-89.095,18.719],[0.531,-18.719],[89.095,17.657]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[151.595,81.219],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":60},{"s":[100],"t":100}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":90},{"s":[100],"t":130}],"ix":1},"m":1}],"ind":11},{"ty":4,"nm":"Line1 Outlines","sr":1,"st":45,"op":122,"ip":50,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[113.409,73.312,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250.99900000000002,293.955,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[0],"t":50},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":60},{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":111},{"s":[0],"t":121}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-20.152,0],[-12.984,-12.719]],"o":[[13.069,-13.343],[19.612,0],[0,0]],"v":[[-50.908,10.811],[0.531,-10.811],[50.908,9.75]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0,0,0],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[113.408,73.312],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":50},{"s":[100],"t":90}],"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":80},{"s":[100],"t":120}],"ix":1},"m":1}],"ind":12},{"ty":4,"nm":"Dot Outlines","sr":1,"st":2,"op":384,"ip":50,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[18.75,18.75,0],"ix":1},"s":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0,"y":1},"s":[0,0,100],"t":50},{"s":[100,100,100],"t":70}],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,337,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":0,"k":100,"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,-10.217],[10.217,0],[0,10.217],[-10.217,0]],"o":[[0,10.217],[-10.217,0],[0,-10.217],[10.217,0]],"v":[[18.5,0],[0,18.5],[-18.5,0],[0,-18.5]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0,0,0],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[18.75,18.75],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":13},{"ty":4,"nm":"Line3 Outlines 6","sr":1,"st":-5,"op":91,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[186.596,88.467,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,205.612,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":80},{"s":[0],"t":90}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-48.732,0],[-31.716,-31.448]],"o":[[31.8,-32.072],[48.193,0],[0,0]],"v":[[-124.096,25.967],[0.53,-25.967],[124.096,24.906]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0.902,0.902,0.9294],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[186.596,88.467],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":0,"k":100,"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":50},{"s":[100],"t":90}],"ix":1},"m":1}],"ind":14},{"ty":4,"nm":"Line2 Outlines 6","sr":1,"st":-5,"op":81,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[151.595,81.219,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,249.783,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":70},{"s":[0],"t":80}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-35.064,0],[-22.759,-22.491]],"o":[[22.842,-23.115],[34.525,0],[0,0]],"v":[[-89.095,18.719],[0.531,-18.719],[89.095,17.657]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0.902,0.902,0.9294],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[151.595,81.219],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":0,"k":100,"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":40},{"s":[100],"t":80}],"ix":1},"m":1}],"ind":15},{"ty":4,"nm":"Line1 Outlines 6","sr":1,"st":-5,"op":72,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[113.409,73.312,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250.99900000000002,293.955,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":0.167,"y":0.167},"i":{"x":0.833,"y":0.833},"s":[100],"t":61},{"s":[0],"t":71}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":false,"i":[[0,0],[-20.152,0],[-12.984,-12.719]],"o":[[13.069,-13.343],[19.612,0],[0,0]],"v":[[-50.908,10.811],[0.531,-10.811],[50.908,9.75]]},"ix":2}},{"ty":"st","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Stroke","nm":"Stroke 1","lc":2,"lj":1,"ml":10,"o":{"a":0,"k":100,"ix":4},"w":{"a":0,"k":25,"ix":5},"c":{"a":0,"k":[0.902,0.902,0.9294],"ix":3}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[113.408,73.312],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"tm","bm":0,"hd":false,"mn":"ADBE Vector Filter - Trim","nm":"Trim Paths 1","ix":2,"e":{"a":0,"k":100,"ix":2},"o":{"a":0,"k":0,"ix":3},"s":{"a":1,"k":[{"o":{"x":0.75,"y":0},"i":{"x":0.25,"y":1},"s":[0],"t":30},{"s":[100],"t":70}],"ix":1},"m":1}],"ind":16},{"ty":4,"nm":"Dot 2 Outlines","sr":1,"st":-48,"op":384,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[18.75,18.75,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[250,337,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":0,"k":100,"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,-10.217],[10.217,0],[0,10.217],[-10.217,0]],"o":[[0,10.217],[-10.217,0],[0,-10.217],[10.217,0]],"v":[[18.5,0],[0,18.5],[-18.5,0],[0,-18.5]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0.902,0.902,0.9294],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[18.75,18.75],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":17}],"v":"5.4.2","fr":48,"op":192,"ip":0,"assets":[]}
+\ No newline at end of file
+diff --git a/app/src/main/res/raw/loading2.json b/app/src/main/res/raw/loading2.json
+deleted file mode 100644
+index 69b8d86e..00000000
+--- a/app/src/main/res/raw/loading2.json
++++ /dev/null
+@@ -1 +0,0 @@
+-{"nm":"Network","ddd":0,"h":84,"w":101,"meta":{"g":"LottieFiles AE "},"layers":[{"ty":4,"nm":"4 Outlines","sr":1,"st":0,"op":900.000036657751,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[50.873,15.563,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[50.154,15.313,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":1,"y":0},"i":{"x":0.667,"y":1},"s":[0],"t":6},{"s":[98],"t":30.0000012219251}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":4,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,0],[-13.246,-13.093],[1.754,-2.246],[3.211,2.008],[0,0],[0.785,0.761],[21.992,-19.288],[2.918,0.196],[0.918,1.899],[-1.227,1.609],[0,0],[-0.672,0.579],[-17.132,0.297]],"o":[[19.117,0.258],[2.742,2.711],[-1.789,2.293],[0,0],[-0.914,-0.59],[-21.102,-20.117],[-2.129,1.867],[-2.039,-0.14],[-0.941,-1.953],[0,0],[0.555,-0.696],[13.203,-11.848],[0,0]],"v":[[-1.189,-15.312],[47.151,4.547],[48.768,12.766],[40.206,13.305],[40.202,13.309],[37.647,11.274],[-37.814,9.789],[-45.185,12.734],[-49.783,9.82],[-48.935,4.477],[-48.931,4.477],[-47.087,2.566],[-1.189,-15.313]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0,0,0],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[50.974,15.563],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":1},{"ty":4,"nm":"3 Outlines","sr":1,"st":0,"op":900.000036657751,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[37.175,12.451,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[51.154,34.98,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":1,"y":0},"i":{"x":0.667,"y":1},"s":[0],"t":6},{"s":[98],"t":22.0000008960784}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,0],[-9.683,-7.977],[-0.574,-1.477],[1.414,-1.629],[2.047,0.457],[1.649,1.469],[13.879,-10.613],[1.179,-1.032],[2.473,0.195],[-0.882,3.094],[0,0],[-1.23,1.097],[-12.629,0.186]],"o":[[13.168,0.266],[1.215,1],[0.735,1.879],[-1.449,1.664],[-2.199,-0.492],[-13.133,-11.754],[-1.242,0.953],[-1.813,1.585],[-3.222,-0.258],[0,0],[0.465,-1.586],[9.481,-8.711],[0,0]],"v":[[-0.32,-12.202],[33.422,1.025],[36.074,4.861],[35.512,10.26],[30.074,11.745],[24.535,8.424],[-21.949,6.471],[-25.512,9.542],[-31.833,11.917],[-36.044,5.846],[-36.036,5.854],[-33.445,1.753],[-0.32,-12.201]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0,0,0],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[37.175,12.452],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":2},{"ty":4,"nm":"2 Outlines","sr":1,"st":0,"op":900.000036657751,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[23.344,9.743,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[50.973,55.401,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":1,"k":[{"o":{"x":1,"y":0},"i":{"x":0.667,"y":1},"s":[0],"t":6},{"s":[100],"t":14.0000005702317}],"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[-9.258,-0.012],[-4.695,-4.946],[0.657,-2.563],[2.735,2.532],[9.032,-7.496],[2.011,1.617],[-1.336,2.492],[-1.172,0.958]],"o":[[6.82,0.125],[1.656,1.73],[-0.828,3.265],[-8.515,-7.89],[-2.519,2.094],[-2.016,-1.614],[0.722,-1.344],[5.168,-4.207]],"v":[[2.289,-9.48],[20.289,-1.555],[22.437,4.695],[14.945,6.96],[-14.446,6.508],[-20.594,7.156],[-21.758,0.32],[-18.805,-3.04]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0,0,0],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[23.344,9.742],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":3},{"ty":4,"nm":"1 Outlines","sr":1,"st":0,"op":900.000036657751,"ip":0,"hd":false,"ddd":0,"bm":0,"hasMask":false,"ao":0,"ks":{"a":{"a":0,"k":[50.873,41.659,0],"ix":1},"s":{"a":0,"k":[100,100,100],"ix":6},"sk":{"a":0,"k":0},"p":{"a":0,"k":[50.659,41.718,0],"ix":2},"r":{"a":0,"k":0,"ix":10},"sa":{"a":0,"k":0},"o":{"a":0,"k":100,"ix":11}},"ef":[],"shapes":[{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 1","ix":1,"cix":2,"np":4,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0.039,-4.797],[1.566,-1.546],[2.199,0.02],[-0.078,4.715],[-4.758,-0.098]],"o":[[-0.004,2.203],[-1.563,1.547],[-4.746,-0.023],[0.078,-4.898],[4.586,0.082]],"v":[[8.352,0.281],[5.902,6.136],[0.023,8.523],[-8.312,0.07],[0.238,-8.426]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[0,0,0],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[51.481,74.524],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 2","ix":2,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[-9.258,-0.012],[-4.695,-4.946],[0.657,-2.563],[2.735,2.532],[9.032,-7.496],[2.012,1.617],[-1.336,2.492],[-1.172,0.958]],"o":[[6.82,0.125],[1.656,1.73],[-0.828,3.265],[-8.515,-7.89],[-2.519,2.094],[-2.016,-1.614],[0.722,-1.344],[5.168,-4.207]],"v":[[2.289,-9.48],[20.289,-1.555],[22.437,4.696],[14.945,6.961],[-14.446,6.508],[-20.594,7.157],[-21.758,0.321],[-18.805,-3.04]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[1,1,1],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[51.309,55.118],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 3","ix":3,"cix":2,"np":2,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,0],[-9.683,-7.977],[-0.574,-1.477],[1.414,-1.629],[2.047,0.457],[1.649,1.469],[13.879,-10.613],[1.179,-1.032],[2.473,0.195],[-0.883,3.094],[0,0],[-1.23,1.097],[-12.629,0.187]],"o":[[13.168,0.266],[1.215,1],[0.735,1.879],[-1.449,1.664],[-2.199,-0.492],[-13.133,-11.754],[-1.242,0.953],[-1.813,1.586],[-3.222,-0.258],[0,0],[0.465,-1.586],[9.481,-8.711],[0,0]],"v":[[-0.32,-12.202],[33.422,1.025],[36.074,4.861],[35.512,10.26],[30.074,11.745],[24.535,8.424],[-21.949,6.471],[-25.511,9.542],[-31.832,11.917],[-36.042,5.846],[-36.035,5.854],[-33.445,1.753],[-0.32,-12.201]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[1,1,1],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[51.462,34.679],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]},{"ty":"gr","bm":0,"hd":false,"mn":"ADBE Vector Group","nm":"Group 4","ix":4,"cix":2,"np":4,"it":[{"ty":"sh","bm":0,"hd":false,"mn":"ADBE Vector Shape - Group","nm":"Path 1","ix":1,"d":1,"ks":{"a":0,"k":{"c":true,"i":[[0,0],[-13.246,-13.093],[1.754,-2.246],[3.211,2.008],[0,0],[0.785,0.761],[21.992,-19.288],[2.918,0.196],[0.918,1.899],[-1.227,1.609],[0,0],[-0.672,0.579],[-17.132,0.297]],"o":[[19.117,0.258],[2.742,2.711],[-1.789,2.293],[0,0],[-0.914,-0.59],[-21.102,-20.117],[-2.129,1.867],[-2.039,-0.14],[-0.941,-1.953],[0,0],[0.555,-0.696],[13.203,-11.848],[0,0]],"v":[[-0.702,-15.312],[47.638,4.547],[49.255,12.766],[40.693,13.305],[40.689,13.309],[38.134,11.274],[-37.327,9.789],[-44.698,12.734],[-49.296,9.82],[-48.448,4.477],[-48.444,4.477],[-46.6,2.566],[-0.702,-15.313]]},"ix":2}},{"ty":"fl","bm":0,"hd":false,"mn":"ADBE Vector Graphic - Fill","nm":"Fill 1","c":{"a":0,"k":[1,1,1],"ix":4},"r":1,"o":{"a":0,"k":100,"ix":5}},{"ty":"tr","a":{"a":0,"k":[0,0],"ix":1},"s":{"a":0,"k":[100,100],"ix":3},"sk":{"a":0,"k":0,"ix":4},"p":{"a":0,"k":[50.487,15.563],"ix":2},"r":{"a":0,"k":0,"ix":6},"sa":{"a":0,"k":0,"ix":5},"o":{"a":0,"k":100,"ix":7}}]}],"ind":4}],"v":"4.8.0","fr":29.9700012207031,"op":36.0000014663101,"ip":0,"assets":[]}
+\ No newline at end of file
+diff --git a/app/src/main/res/values/colors.xml b/app/src/main/res/values/colors.xml
+index 834b448a..b53ed83a 100644
+--- a/app/src/main/res/values/colors.xml
++++ b/app/src/main/res/values/colors.xml
+@@ -1,10 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-  <color name="purple_200">#FFBB86FC</color>
+-  <color name="purple_500">#FF6200EE</color>
+-  <color name="purple_700">#FF3700B3</color>
+-  <color name="teal_200">#FF03DAC5</color>
+-  <color name="teal_700">#FF018786</color>
+   <color name="black">#5E5E5E</color>
+   <color name="white">#FFFFFFFF</color>
+ </resources>

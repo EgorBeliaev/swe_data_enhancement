@@ -1,0 +1,431 @@
+diff --git a/langchain4j-parent/pom.xml b/langchain4j-parent/pom.xml
+index 14606a96818..9d350913aa2 100644
+--- a/langchain4j-parent/pom.xml
++++ b/langchain4j-parent/pom.xml
+@@ -33,7 +33,7 @@
+         <slf4j-api.version>2.0.7</slf4j-api.version>
+         <gson.version>2.10.1</gson.version>
+         <junit.version>5.11.2</junit.version>
+-        <testcontainers.version>1.20.2</testcontainers.version>
++        <testcontainers.version>1.20.3</testcontainers.version>
+         <bytebuddy.version>1.15.7</bytebuddy.version>
+         <mockito.version>5.14.1</mockito.version>
+         <assertj.version>3.24.2</assertj.version>
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
+index 24fd3576df3..66c444786ab 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
+@@ -1,39 +1,40 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
+-import org.junit.jupiter.api.BeforeEach;
+ import org.testcontainers.containers.PostgreSQLContainer;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
++
+ @Testcontainers
+-public class PgVectorEmbeddingIndexedStoreIT extends EmbeddingStoreWithFilteringIT {
++class PgVectorEmbeddingIndexedStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+     @Container
+     static PostgreSQLContainer<?> pgVector = new PostgreSQLContainer<>("pgvector/pgvector:pg15");
+ 
+-    EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
++    private final EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
+ 
+-    EmbeddingStore<TextSegment> embeddingStore;
++    private EmbeddingStore<TextSegment> embeddingStore;
+ 
+-    @BeforeEach
+-    void beforeEach() {
++    @Override
++    protected void ensureStoreIsReady() {
+         embeddingStore = PgVectorEmbeddingStore.builder()
+-                .host(pgVector.getHost())
+-                .port(pgVector.getFirstMappedPort())
+-                .user("test")
+-                .password("test")
+-                .database("test")
+-                .table("test")
+-                .dimension(embeddingModel.dimension())
+-                .useIndex(true)
+-                .indexListSize(1)
+-                .dropTableFirst(true)
+-                .build();
++            .host(pgVector.getHost())
++            .port(pgVector.getFirstMappedPort())
++            .user("test")
++            .password("test")
++            .database("test")
++            .table("test"+ nextInt(1, 1000))
++            .dimension(embeddingModel.dimension())
++            .useIndex(true)
++            .indexListSize(1)
++            .dropTableFirst(true)
++            .build();
+     }
+ 
+     @Override
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStore029.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStore029.java
+index baa5e4ddd52..d52326bc75d 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStore029.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStore029.java
+@@ -1,4 +1,5 @@
+ package dev.langchain4j.store.embedding.pgvector;
++
+ import com.google.gson.Gson;
+ import com.google.gson.reflect.TypeToken;
+ import com.pgvector.PGvector;
+@@ -12,11 +13,27 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import java.lang.reflect.Type;
+-import java.sql.*;
+-import java.util.*;
+-
+-import static dev.langchain4j.internal.Utils.*;
+-import static dev.langchain4j.internal.ValidationUtils.*;
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Types;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.UUID;
++
++import static dev.langchain4j.internal.Utils.getOrDefault;
++import static dev.langchain4j.internal.Utils.isNotNullOrBlank;
++import static dev.langchain4j.internal.Utils.isNullOrEmpty;
++import static dev.langchain4j.internal.Utils.randomUUID;
++import static dev.langchain4j.internal.ValidationUtils.ensureGreaterThanZero;
++import static dev.langchain4j.internal.ValidationUtils.ensureNotBlank;
++import static dev.langchain4j.internal.ValidationUtils.ensureTrue;
+ import static java.util.Collections.singletonList;
+ import static java.util.stream.Collectors.toList;
+ 
+@@ -81,26 +98,26 @@ class PgVectorEmbeddingStore029 implements EmbeddingStore<TextSegment> {
+         try (Connection connection = setupConnection()) {
+ 
+             if (dropTableFirst) {
+-                connection.createStatement().executeUpdate(String.format("DROP TABLE IF EXISTS %s", table));
++                connection.createStatement().executeUpdate("DROP TABLE IF EXISTS %s".formatted(table));
+             }
+ 
+             if (createTable) {
+-                connection.createStatement().executeUpdate(String.format(
++                connection.createStatement().executeUpdate((
+                         "CREATE TABLE IF NOT EXISTS %s (" +
+                                 "embedding_id UUID PRIMARY KEY, " +
+                                 "embedding vector(%s), " +
+                                 "text TEXT NULL, " +
+                                 "metadata JSON NULL" +
+-                                ")",
++                                ")").formatted(
+                         table, ensureGreaterThanZero(dimension, "dimension")));
+             }
+ 
+             if (useIndex) {
+                 final String indexName = table + "_ivfflat_index";
+-                connection.createStatement().executeUpdate(String.format(
++                connection.createStatement().executeUpdate((
+                         "CREATE INDEX IF NOT EXISTS %s ON %s " +
+                                 "USING ivfflat (embedding vector_cosine_ops) " +
+-                                "WITH (lists = %s)",
++                                "WITH (lists = %s)").formatted(
+                         indexName, table, ensureGreaterThanZero(indexListSize, "indexListSize")));
+             }
+         } catch (SQLException e) {
+@@ -110,7 +127,7 @@ class PgVectorEmbeddingStore029 implements EmbeddingStore<TextSegment> {
+ 
+     private Connection setupConnection() throws SQLException {
+         Connection connection = DriverManager.getConnection(
+-                String.format("jdbc:postgresql://%s:%s/%s", host, port, database),
++                "jdbc:postgresql://%s:%s/%s".formatted(host, port, database),
+                 user,
+                 password
+         );
+@@ -200,8 +217,7 @@ public List<EmbeddingMatch<TextSegment>> findRelevant(Embedding referenceEmbeddi
+         List<EmbeddingMatch<TextSegment>> result = new ArrayList<>();
+         try (Connection connection = setupConnection()) {
+             String referenceVector = Arrays.toString(referenceEmbedding.vector());
+-            String query = String.format(
+-                    "WITH temp AS (SELECT (2 - (embedding <=> '%s')) / 2 AS score, embedding_id, embedding, text, metadata FROM %s) SELECT * FROM temp WHERE score >= %s ORDER BY score desc LIMIT %s;",
++            String query = "WITH temp AS (SELECT (2 - (embedding <=> '%s')) / 2 AS score, embedding_id, embedding, text, metadata FROM %s) SELECT * FROM temp WHERE score >= %s ORDER BY score desc LIMIT %s;".formatted(
+                     referenceVector, table, minScore, maxResults);
+             PreparedStatement selectStmt = connection.prepareStatement(query);
+ 
+@@ -250,12 +266,12 @@ private void addAllInternal(
+                 "embeddings size is not equal to embedded size");
+ 
+         try (Connection connection = setupConnection()) {
+-            String query = String.format(
++            String query = (
+                     "INSERT INTO %s (embedding_id, embedding, text, metadata) VALUES (?, ?, ?, ?)" +
+                             "ON CONFLICT (embedding_id) DO UPDATE SET " +
+                             "embedding = EXCLUDED.embedding," +
+                             "text = EXCLUDED.text," +
+-                            "metadata = EXCLUDED.metadata;",
++                            "metadata = EXCLUDED.metadata;").formatted(
+                     table);
+ 
+             PreparedStatement upsertStmt = connection.prepareStatement(query);
+@@ -281,4 +297,4 @@ private void addAllInternal(
+             throw new RuntimeException(e);
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
+index 402bf34f828..79d9976c37c 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
+@@ -1,8 +1,8 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
+ import org.junit.jupiter.api.BeforeEach;
+@@ -12,11 +12,10 @@
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+ import javax.sql.DataSource;
+-import java.sql.Connection;
+ import java.sql.SQLException;
+ 
+ @Testcontainers
+-public abstract class PgVectorEmbeddingStoreConfigIT extends EmbeddingStoreWithFilteringIT {
++abstract class PgVectorEmbeddingStoreConfigIT extends EmbeddingStoreWithFilteringIT {
+ 
+     @Container
+     static PostgreSQLContainer<?> pgVector = new PostgreSQLContainer<>("pgvector/pgvector:pg16");
+@@ -31,7 +30,7 @@ public abstract class PgVectorEmbeddingStoreConfigIT extends EmbeddingStoreWithF
+     static final int TABLE_DIMENSION = 384;
+ 
+     static void configureStore(MetadataStorageConfig config) {
+-        PGSimpleDataSource source = new PGSimpleDataSource();
++        var source = new PGSimpleDataSource();
+         source.setServerNames(new String[] {pgVector.getHost()});
+         source.setPortNumbers(new int[] {pgVector.getFirstMappedPort()});
+         source.setDatabaseName("test");
+@@ -49,13 +48,18 @@ static void configureStore(MetadataStorageConfig config) {
+ 
+     @BeforeEach
+     void beforeEach() {
+-        try (Connection connection = dataSource.getConnection()) {
+-            connection.createStatement().executeUpdate(String.format("TRUNCATE TABLE %s", TABLE_NAME));
++        try (var connection = dataSource.getConnection()) {
++            connection.createStatement().executeUpdate("TRUNCATE TABLE %s".formatted(TABLE_NAME));
+         } catch (SQLException e) {
+             throw new RuntimeException(e);
+         }
+     }
+ 
++    @Override
++    protected void ensureStoreIsEmpty() {
++        // it's not necessary to clear the store before every test
++    }
++
+     @Override
+     protected EmbeddingStore<TextSegment> embeddingStore() {
+         return embeddingStore;
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
+index b1281a12ed5..a97e069dda1 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
+@@ -1,17 +1,18 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
+-import org.junit.jupiter.api.BeforeEach;
+ import org.testcontainers.containers.PostgreSQLContainer;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
++
+ @Testcontainers
+-public class PgVectorEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
++class PgVectorEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+     @Container
+     static PostgreSQLContainer<?> pgVector = new PostgreSQLContainer<>("pgvector/pgvector:pg15");
+@@ -20,15 +21,16 @@ public class PgVectorEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+     EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
+ 
+-    @BeforeEach
+-    void beforeEach() {
++
++    @Override
++    protected void ensureStoreIsReady() {
+         embeddingStore = PgVectorEmbeddingStore.builder()
+                 .host(pgVector.getHost())
+                 .port(pgVector.getFirstMappedPort())
+                 .user("test")
+                 .password("test")
+                 .database("test")
+-                .table("test")
++                .table("test"+nextInt(1000, 2000))
+                 .dimension(384)
+                 .dropTableFirst(true)
+                 .build();
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreRemovalIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreRemovalIT.java
+index 247f0ba49ca..38ec704b4e6 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreRemovalIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreRemovalIT.java
+@@ -1,30 +1,32 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithRemovalIT;
+ import org.testcontainers.containers.PostgreSQLContainer;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
++
+ @Testcontainers
+-public class PgVectorEmbeddingStoreRemovalIT extends EmbeddingStoreWithRemovalIT {
++class PgVectorEmbeddingStoreRemovalIT extends EmbeddingStoreWithRemovalIT {
+ 
+     @Container
+     static PostgreSQLContainer<?> pgVector = new PostgreSQLContainer<>("pgvector/pgvector:pg15");
+ 
+-    EmbeddingStore<TextSegment> embeddingStore = PgVectorEmbeddingStore.builder()
+-            .host(pgVector.getHost())
+-            .port(pgVector.getFirstMappedPort())
+-            .user("test")
+-            .password("test")
+-            .database("test")
+-            .table("test")
+-            .dimension(384)
+-            .dropTableFirst(true)
+-            .build();
++    final EmbeddingStore<TextSegment> embeddingStore = PgVectorEmbeddingStore.builder()
++        .host(pgVector.getHost())
++        .port(pgVector.getFirstMappedPort())
++        .user("test")
++        .password("test")
++        .database("test")
++        .table("test" + nextInt(2000, 3000))
++        .dimension(384)
++        .dropTableFirst(true)
++        .build();
+ 
+     EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
+ 
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreUpgradeIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreUpgradeIT.java
+index 97d43cb84f8..bad5446788d 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreUpgradeIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreUpgradeIT.java
+@@ -1,26 +1,25 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
+-import dev.langchain4j.data.embedding.Embedding;
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
+-import dev.langchain4j.store.embedding.*;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
++import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
++import dev.langchain4j.store.embedding.EmbeddingStore;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.testcontainers.containers.PostgreSQLContainer;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+-import java.util.List;
+-
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.data.Percentage.withPercentage;
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
+ 
+ /**
+  * Test upgrade from 029 to latest version
+  */
+ @Testcontainers
+-public class PgVectorEmbeddingStoreUpgradeIT {
++class PgVectorEmbeddingStoreUpgradeIT {
+ 
+     @Container
+     static PostgreSQLContainer<?> pgVector = new PostgreSQLContainer<>("pgvector/pgvector:pg15");
+@@ -29,17 +28,18 @@ public class PgVectorEmbeddingStoreUpgradeIT {
+ 
+     EmbeddingStore<TextSegment> embeddingStore;
+ 
+-    EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
++    private final EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
+ 
+     @BeforeEach
+     void beforeEach() {
++        final var tableName = "test" + nextInt(3000, 4000);
+         embeddingStore029 = PgVectorEmbeddingStore029.builder()
+                 .host(pgVector.getHost())
+                 .port(pgVector.getFirstMappedPort())
+                 .user("test")
+                 .password("test")
+                 .database("test")
+-                .table("test")
++                .table(tableName)
+                 .dimension(384)
+                 .dropTableFirst(true)
+                 .build();
+@@ -50,24 +50,23 @@ void beforeEach() {
+                 .user("test")
+                 .password("test")
+                 .database("test")
+-                .table("test")
++                .table(tableName)
+                 .dimension(384)
+                 .build();
+     }
+ 
+     @Test
+     void upgrade() {
++        var embedding = embeddingModel.embed("hello").content();
+ 
+-        Embedding embedding = embeddingModel.embed("hello").content();
+-
+-        String id = embeddingStore029.add(embedding);
++        var id = embeddingStore029.add(embedding);
+         assertThat(id).isNotBlank();
+ 
+         // Check 029 results
+-        List<EmbeddingMatch<TextSegment>> relevant = embeddingStore029.findRelevant(embedding, 10);
++        var relevant = embeddingStore029.findRelevant(embedding, 10);
+         assertThat(relevant).hasSize(1);
+ 
+-        EmbeddingMatch<TextSegment> match = relevant.get(0);
++        var match = relevant.get(0);
+         assertThat(match.score()).isCloseTo(1, withPercentage(1));
+         assertThat(match.embeddingId()).isEqualTo(id);
+         assertThat(match.embedding()).isEqualTo(embedding);

@@ -1,0 +1,81 @@
+diff --git a/src/main/java/meteordevelopment/meteorclient/events/packets/PacketEvent.java b/src/main/java/meteordevelopment/meteorclient/events/packets/PacketEvent.java
+index 2603e5dc5a..44274b9648 100644
+--- a/src/main/java/meteordevelopment/meteorclient/events/packets/PacketEvent.java
++++ b/src/main/java/meteordevelopment/meteorclient/events/packets/PacketEvent.java
+@@ -28,10 +28,12 @@ public static class Send extends Cancellable {
+         private static final Send INSTANCE = new Send();
+ 
+         public Packet<?> packet;
++        public ClientConnection connection;
+ 
+-        public static Send get(Packet<?> packet) {
++        public static Send get(Packet<?> packet, ClientConnection connection) {
+             INSTANCE.setCancelled(false);
+             INSTANCE.packet = packet;
++            INSTANCE.connection = connection;
+             return INSTANCE;
+         }
+     }
+@@ -40,9 +42,11 @@ public static class Sent {
+         private static final Sent INSTANCE = new Sent();
+ 
+         public Packet<?> packet;
++        public ClientConnection connection;
+ 
+-        public static Sent get(Packet<?> packet) {
++        public static Sent get(Packet<?> packet, ClientConnection connection) {
+             INSTANCE.packet = packet;
++            INSTANCE.connection = connection;
+             return INSTANCE;
+         }
+     }
+diff --git a/src/main/java/meteordevelopment/meteorclient/mixin/ClientConnectionMixin.java b/src/main/java/meteordevelopment/meteorclient/mixin/ClientConnectionMixin.java
+index 7275fbb4af..444a120550 100644
+--- a/src/main/java/meteordevelopment/meteorclient/mixin/ClientConnectionMixin.java
++++ b/src/main/java/meteordevelopment/meteorclient/mixin/ClientConnectionMixin.java
+@@ -68,14 +68,14 @@ private static void onConnect(InetSocketAddress address, boolean useEpoll, Clien
+ 
+     @Inject(at = @At("HEAD"), method = "send(Lnet/minecraft/network/packet/Packet;Lnet/minecraft/network/PacketCallbacks;)V", cancellable = true)
+     private void onSendPacketHead(Packet<?> packet, PacketCallbacks callbacks, CallbackInfo ci) {
+-        if (MeteorClient.EVENT_BUS.post(PacketEvent.Send.get(packet)).isCancelled()) {
++        if (MeteorClient.EVENT_BUS.post(PacketEvent.Send.get(packet, (ClientConnection) (Object) this)).isCancelled()) {
+             ci.cancel();
+         }
+     }
+ 
+     @Inject(method = "send(Lnet/minecraft/network/packet/Packet;Lnet/minecraft/network/PacketCallbacks;)V", at = @At("TAIL"))
+     private void onSendPacketTail(Packet<?> packet, @Nullable PacketCallbacks callbacks, CallbackInfo ci) {
+-        MeteorClient.EVENT_BUS.post(PacketEvent.Sent.get(packet));
++        MeteorClient.EVENT_BUS.post(PacketEvent.Sent.get(packet, (ClientConnection) (Object) this));
+     }
+ 
+     @Inject(method = "exceptionCaught", at = @At("HEAD"), cancellable = true)
+diff --git a/src/main/java/meteordevelopment/meteorclient/systems/modules/misc/ServerSpoof.java b/src/main/java/meteordevelopment/meteorclient/systems/modules/misc/ServerSpoof.java
+index d279b2ae1f..a81d9bd882 100644
+--- a/src/main/java/meteordevelopment/meteorclient/systems/modules/misc/ServerSpoof.java
++++ b/src/main/java/meteordevelopment/meteorclient/systems/modules/misc/ServerSpoof.java
+@@ -76,9 +76,6 @@ private void onPacketSend(PacketEvent.Send event) {
+         if (!isActive() || !(event.packet instanceof CustomPayloadC2SPacket)) return;
+         Identifier id = ((CustomPayloadC2SPacket) event.packet).payload().getId().id();
+ 
+-        if (spoofBrand.get() && id.equals(BrandCustomPayload.ID.id()))
+-            event.packet = new CustomPayloadC2SPacket(new BrandCustomPayload(brand.get()));
+-
+         if (blockChannels.get()) {
+             for (String channel : channels.get()) {
+                 if (StringUtils.containsIgnoreCase(id.toString(), channel)) {
+@@ -87,6 +84,14 @@ private void onPacketSend(PacketEvent.Send event) {
+                 }
+             }
+         }
++
++        if (spoofBrand.get() && id.equals(BrandCustomPayload.ID.id())) {
++            CustomPayloadC2SPacket spoofedPacket = new CustomPayloadC2SPacket(new BrandCustomPayload(brand.get()));
++
++            // PacketEvent.Send doesn't trigger if we send the packet like this
++            event.connection.send(spoofedPacket, null, true);
++            event.cancel();
++        }
+     }
+ 
+     @EventHandler

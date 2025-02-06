@@ -1,0 +1,155 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f43e80e844..8ddd5f5e86 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,7 @@
+ * Support for storage class overrides has been removed
+ * Added support to configure `dnsPolicy` and `dnsConfig` using the `template` sections.
+ * Store Kafka node certificates in separate Secrets, one Secret per pod.
++* Allow configuring `ssl.principal.mapping.rules` and custom trusted CAs in Kafka brokers with `type: custom` authentication
+ 
+ ### Major changes, deprecations and removals
+ 
+diff --git a/api/src/main/java/io/strimzi/api/kafka/model/kafka/listener/KafkaListenerAuthenticationCustom.java b/api/src/main/java/io/strimzi/api/kafka/model/kafka/listener/KafkaListenerAuthenticationCustom.java
+index dc4cd1e73f..2d9f728399 100644
+--- a/api/src/main/java/io/strimzi/api/kafka/model/kafka/listener/KafkaListenerAuthenticationCustom.java
++++ b/api/src/main/java/io/strimzi/api/kafka/model/kafka/listener/KafkaListenerAuthenticationCustom.java
+@@ -30,7 +30,7 @@
+ @EqualsAndHashCode(callSuper = true)
+ @ToString(callSuper = true)
+ public class KafkaListenerAuthenticationCustom extends KafkaListenerAuthentication {
+-    public static final String FORBIDDEN_PREFIXES = "ssl.";
++    public static final String FORBIDDEN_PREFIXES = "ssl.keystore.";
+ 
+     public static final String TYPE_CUSTOM = "custom";
+ 
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaBrokerConfigurationBuilderTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaBrokerConfigurationBuilderTest.java
+index d65b5ab30d..36bf2e2979 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaBrokerConfigurationBuilderTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/model/KafkaBrokerConfigurationBuilderTest.java
+@@ -2477,7 +2477,7 @@ public void testCustomAuthConfigRemovesForbiddenPrefixes() {
+                 .withTls(false)
+                 .withNewKafkaListenerAuthenticationCustomAuth()
+                 .withSasl(false)
+-                .withListenerConfig(Map.of("ssl.truststore.path", "foo"))
++                .withListenerConfig(Map.of("ssl.keystore.path", "foo"))
+                 .endKafkaListenerAuthenticationCustomAuth()
+                 .build();
+ 
+@@ -2485,7 +2485,7 @@ public void testCustomAuthConfigRemovesForbiddenPrefixes() {
+                 .withListeners("my-cluster", KAFKA_3_8_0, "my-namespace", singletonList(listener), listenerId -> "dummy-advertised-address", listenerId -> "1919")
+                 .build();
+ 
+-        assertThat(configuration, not(containsString("ssl.truststore.path")));
++        assertThat(configuration, not(containsString("ssl.keystore.path")));
+     }
+ 
+     @ParallelTest
+@@ -2542,6 +2542,56 @@ public void testCustomAuthConfigPrefixesUserProvidedConfig() {
+                 "listener.name.custom-listener-9092.oauthbearer.sasl.jaas.config=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required ;"));
+     }
+ 
++    @ParallelTest
++    public void testCustomTlsAuth() {
++        GenericKafkaListener listener = new GenericKafkaListenerBuilder()
++                .withName("CUSTOM-LISTENER")
++                .withPort(9092)
++                .withType(KafkaListenerType.INTERNAL)
++                .withTls(true)
++                .withNewKafkaListenerAuthenticationCustomAuth()
++                    .withSasl(false)
++                    .withListenerConfig(Map.of("ssl.client.auth", "required",
++                            "ssl.principal.mapping.rules", "RULE:^CN=(.*?),(.*)$/CN=$1/",
++                            "ssl.truststore.location", "/opt/kafka/custom-authn-secrets/custom-listener-external-9094/custom-truststore/ca.crt",
++                            "ssl.truststore.type", "PEM"))
++                .endKafkaListenerAuthenticationCustomAuth()
++                .build();
++
++        String configuration = new KafkaBrokerConfigurationBuilder(Reconciliation.DUMMY_RECONCILIATION, NODE_REF)
++                .withListeners("my-cluster", KAFKA_3_8_0, "my-namespace", singletonList(listener), listenerId -> "dummy-advertised-address", listenerId -> "1919")
++                .build();
++
++        assertThat(configuration, isEquivalent("node.id=2",
++                "listener.name.controlplane-9090.ssl.client.auth=required",
++                "listener.name.controlplane-9090.ssl.keystore.location=/tmp/kafka/cluster.keystore.p12",
++                "listener.name.controlplane-9090.ssl.keystore.password=${strimzienv:CERTS_STORE_PASSWORD}",
++                "listener.name.controlplane-9090.ssl.keystore.type=PKCS12",
++                "listener.name.controlplane-9090.ssl.truststore.location=/tmp/kafka/cluster.truststore.p12",
++                "listener.name.controlplane-9090.ssl.truststore.password=${strimzienv:CERTS_STORE_PASSWORD}",
++                "listener.name.controlplane-9090.ssl.truststore.type=PKCS12",
++                "listener.name.replication-9091.ssl.keystore.location=/tmp/kafka/cluster.keystore.p12",
++                "listener.name.replication-9091.ssl.keystore.password=${strimzienv:CERTS_STORE_PASSWORD}",
++                "listener.name.replication-9091.ssl.keystore.type=PKCS12",
++                "listener.name.replication-9091.ssl.truststore.location=/tmp/kafka/cluster.truststore.p12",
++                "listener.name.replication-9091.ssl.truststore.password=${strimzienv:CERTS_STORE_PASSWORD}",
++                "listener.name.replication-9091.ssl.truststore.type=PKCS12",
++                "listener.name.replication-9091.ssl.client.auth=required",
++                "listener.name.custom-listener-9092.ssl.keystore.location=/tmp/kafka/cluster.keystore.p12",
++                "listener.name.custom-listener-9092.ssl.keystore.password=${strimzienv:CERTS_STORE_PASSWORD}",
++                "listener.name.custom-listener-9092.ssl.keystore.type=PKCS12",
++                "listener.name.custom-listener-9092.ssl.truststore.location=/opt/kafka/custom-authn-secrets/custom-listener-external-9094/custom-truststore/ca.crt",
++                "listener.name.custom-listener-9092.ssl.truststore.type=PEM",
++                "listener.name.custom-listener-9092.ssl.client.auth=required",
++                "listener.name.custom-listener-9092.ssl.principal.mapping.rules=RULE:^CN=(.*?),(.*)$/CN=$1/",
++                "listeners=REPLICATION-9091://0.0.0.0:9091,CUSTOM-LISTENER-9092://0.0.0.0:9092",
++                "advertised.listeners=REPLICATION-9091://my-cluster-kafka-2.my-cluster-kafka-brokers.my-namespace.svc:9091,CUSTOM-LISTENER-9092://dummy-advertised-address:1919",
++                "listener.security.protocol.map=CONTROLPLANE-9090:SSL,REPLICATION-9091:SSL,CUSTOM-LISTENER-9092:SSL",
++                "inter.broker.listener.name=REPLICATION-9091",
++                "sasl.enabled.mechanisms=",
++                "ssl.endpoint.identification.algorithm=HTTPS"));
++    }
++
+     @ParallelTest
+     public void testOAuthDefaultOptions()  {
+         KafkaListenerAuthenticationOAuth auth = new KafkaListenerAuthenticationOAuthBuilder()
+diff --git a/documentation/api/io.strimzi.api.kafka.model.kafka.listener.KafkaListenerAuthenticationCustom.adoc b/documentation/api/io.strimzi.api.kafka.model.kafka.listener.KafkaListenerAuthenticationCustom.adoc
+index f1986602ba..6f66c6969d 100644
+--- a/documentation/api/io.strimzi.api.kafka.model.kafka.listener.KafkaListenerAuthenticationCustom.adoc
++++ b/documentation/api/io.strimzi.api.kafka.model.kafka.listener.KafkaListenerAuthenticationCustom.adoc
+@@ -27,7 +27,7 @@ spec:
+             oauthbearer.sasl.jaas.config: |
+               org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required ;
+           secrets:
+-            - name: example
++            - secretName: example
+ ----
+ 
+ A protocol map is generated that uses the `sasl` and `tls` values to determine which protocol to map to the listener.
+@@ -40,7 +40,37 @@ A protocol map is generated that uses the `sasl` and `tls` values to determine w
+ Secrets are mounted to `/opt/kafka/custom-authn-secrets/custom-listener-<listener_name>-<port>/<secret_name>` in the Kafka broker nodes' containers.
+ For example, the mounted secret (`example`) in the example configuration would be located at `/opt/kafka/custom-authn-secrets/custom-listener-oauth-bespoke-9093/example`.
+ 
++= Configuring customized TLS Client Authentication
++
++You can also use the `custom` authentication to configure customized TLS client authentication.
++This allows configuration options that are not permissible with `type: tls` authentication.
++For example, it's possible to configure a custom truststore with multiple trusted CAs or options such as `ssl.principal.mapping.rules`.
++
++.Example custom TLS Client Authentication configuration
++[source,yaml,subs="attributes+"]
++----
++spec:
++  kafka:
++    listeners:
++      - name: tls
++        port: 9093
++        tls: true
++        type: internal
++        authentication:
++          type: custom
++          sasl: false
++          listenerConfig:
++            ssl.client.auth: required
++            ssl.principal.mapping.rules: RULE:^CN=(.*?),(.*)$/$1@my-cluster.com/
++            ssl.truststore.location: /opt/kafka/custom-authn-secrets/custom-listener-tls-9093/custom-truststore/ca.crt
++            ssl.truststore.type: PEM
++          secrets:
++            - key: ca.crt
++              secretName: custom-truststore
++----
++
+ = Setting a custom principal builder
++
+ You can set a custom principal builder in the Kafka cluster configuration.
+ However, the principal builder is subject to the following requirements:
+ 

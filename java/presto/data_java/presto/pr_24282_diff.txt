@@ -1,0 +1,110 @@
+diff --git a/presto-docs/src/main/sphinx/presto_cpp/properties-session.rst b/presto-docs/src/main/sphinx/presto_cpp/properties-session.rst
+index b699b922003a6..47977a0627d25 100644
+--- a/presto-docs/src/main/sphinx/presto_cpp/properties-session.rst
++++ b/presto-docs/src/main/sphinx/presto_cpp/properties-session.rst
+@@ -179,7 +179,7 @@ Native Execution only. Enable row number spilling on native engine.
+ Native Execution only. Enable simplified path in expression evaluation.
+ 
+ ``native_expression_max_array_size_in_reduce``
+-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+ * **Type:** ``integer``
+ * **Default value:** ``100000``
+@@ -187,6 +187,15 @@ Native Execution only. Enable simplified path in expression evaluation.
+ Native Execution only. The `reduce <https://prestodb.io/docs/current/functions/array.html#reduce-array-T-initialState-S-inputFunction-S-T-S-outputFunction-S-R-R>`_ 
+ function will throw an error if it encounters an array of size greater than this value.
+ 
++``native_expression_max_compiled_regexes``
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++* **Type:** ``integer``
++* **Default value:** ``100``
++
++Native Execution only. Controls maximum number of compiled regular expression patterns per
++regular expression function instance per thread of execution.
++
+ ``native_spill_compression_codec``
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff --git a/presto-main/src/main/java/com/facebook/presto/sessionpropertyproviders/NativeWorkerSessionPropertyProvider.java b/presto-main/src/main/java/com/facebook/presto/sessionpropertyproviders/NativeWorkerSessionPropertyProvider.java
+index 08d6c939b6d84..caf3de920c3f0 100644
+--- a/presto-main/src/main/java/com/facebook/presto/sessionpropertyproviders/NativeWorkerSessionPropertyProvider.java
++++ b/presto-main/src/main/java/com/facebook/presto/sessionpropertyproviders/NativeWorkerSessionPropertyProvider.java
+@@ -34,6 +34,7 @@ public class NativeWorkerSessionPropertyProvider
+ {
+     public static final String NATIVE_SIMPLIFIED_EXPRESSION_EVALUATION_ENABLED = "native_simplified_expression_evaluation_enabled";
+     public static final String NATIVE_EXPRESSION_MAX_ARRAY_SIZE_IN_REDUCE = "native_expression_max_array_size_in_reduce";
++    public static final String NATIVE_EXPRESSION_MAX_COMPILED_REGEXES = "native_expression_max_compiled_regexes";
+     public static final String NATIVE_MAX_SPILL_LEVEL = "native_max_spill_level";
+     public static final String NATIVE_MAX_SPILL_FILE_SIZE = "native_max_spill_file_size";
+     public static final String NATIVE_SPILL_COMPRESSION_CODEC = "native_spill_compression_codec";
+@@ -90,6 +91,12 @@ public NativeWorkerSessionPropertyProvider(FeaturesConfig featuresConfig)
+                         "Native Execution only. Reduce() function will throw an error if it encounters an array of size greater than this value.",
+                         100000,
+                         !nativeExecution),
++                integerProperty(
++                        NATIVE_EXPRESSION_MAX_COMPILED_REGEXES,
++                        "Native Execution only. Controls maximum number of compiled regular expression patterns " +
++                                "per regular expression function instance per thread of execution.",
++                        100,
++                        !nativeExecution),
+                 integerProperty(
+                         NATIVE_MAX_SPILL_LEVEL,
+                         "Native Execution only. The maximum allowed spilling level for hash join build.\n" +
+diff --git a/presto-native-execution/presto_cpp/main/SessionProperties.cpp b/presto-native-execution/presto_cpp/main/SessionProperties.cpp
+index 30ef49e3420b8..314e81c3110f7 100644
+--- a/presto-native-execution/presto_cpp/main/SessionProperties.cpp
++++ b/presto-native-execution/presto_cpp/main/SessionProperties.cpp
+@@ -72,6 +72,15 @@ SessionProperties::SessionProperties() {
+       QueryConfig::kExprMaxArraySizeInReduce,
+       std::to_string(c.exprMaxArraySizeInReduce()));
+ 
++  addSessionProperty(
++      kExprMaxCompiledRegexes,
++      "Controls maximum number of compiled regular expression patterns per regular expression function instance "
++      "per thread of execution.",
++      BIGINT(),
++      false,
++      QueryConfig::kExprMaxCompiledRegexes,
++      std::to_string(c.exprMaxCompiledRegexes()));
++
+   addSessionProperty(
+       kMaxPartialAggregationMemory,
+       "The max partial aggregation memory when data reduction is not optimal.",
+diff --git a/presto-native-execution/presto_cpp/main/SessionProperties.h b/presto-native-execution/presto_cpp/main/SessionProperties.h
+index 3156c66de7563..a952c052845bc 100644
+--- a/presto-native-execution/presto_cpp/main/SessionProperties.h
++++ b/presto-native-execution/presto_cpp/main/SessionProperties.h
+@@ -82,6 +82,11 @@ class SessionProperties {
+   static constexpr const char* kExprMaxArraySizeInReduce =
+       "native_expression_max_array_size_in_reduce";
+ 
++  /// Controls maximum number of compiled regular expression patterns per
++  /// regular expression function instance per thread of execution.
++  static constexpr const char* kExprMaxCompiledRegexes =
++      "native_expression_max_compiled_regexes";
++
+   /// The maximum memory used by partial aggregation when data reduction is not
+   /// optimal.
+   static constexpr const char* kMaxPartialAggregationMemory =
+diff --git a/presto-native-execution/presto_cpp/main/tests/QueryContextManagerTest.cpp b/presto-native-execution/presto_cpp/main/tests/QueryContextManagerTest.cpp
+index 7a686d33d1790..0f258c5896393 100644
+--- a/presto-native-execution/presto_cpp/main/tests/QueryContextManagerTest.cpp
++++ b/presto-native-execution/presto_cpp/main/tests/QueryContextManagerTest.cpp
+@@ -59,6 +59,7 @@ TEST_F(QueryContextManagerTest, nativeSessionProperties) {
+           {"native_selective_nimble_reader_enabled", "true"},
+           {"aggregation_spill_all", "true"},
+           {"native_expression_max_array_size_in_reduce", "99999"},
++          {"native_expression_max_compiled_regexes", "54321"},
+       }};
+   auto queryCtx = taskManager_->getQueryContextManager()->findOrCreateQueryCtx(
+       taskId, session);
+@@ -73,6 +74,7 @@ TEST_F(QueryContextManagerTest, nativeSessionProperties) {
+   EXPECT_TRUE(queryCtx->queryConfig().selectiveNimbleReaderEnabled());
+   EXPECT_EQ(queryCtx->queryConfig().spillWriteBufferSize(), 1024);
+   EXPECT_EQ(queryCtx->queryConfig().exprMaxArraySizeInReduce(), 99999);
++  EXPECT_EQ(queryCtx->queryConfig().exprMaxCompiledRegexes(), 54321);
+ }
+ 
+ TEST_F(QueryContextManagerTest, defaultSessionProperties) {

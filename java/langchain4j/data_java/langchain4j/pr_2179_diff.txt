@@ -1,0 +1,224 @@
+diff --git a/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStore.java b/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStore.java
+index 34d1f54cd65..63a6210e0f1 100644
+--- a/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStore.java
++++ b/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStore.java
+@@ -19,6 +19,7 @@
+ import io.qdrant.client.QdrantGrpcClient;
+ import io.qdrant.client.WithVectorsSelectorFactory;
+ import io.qdrant.client.grpc.JsonWithInt.Value;
++import io.qdrant.client.grpc.Points;
+ import io.qdrant.client.grpc.Points.DeletePoints;
+ import io.qdrant.client.grpc.Points.Filter;
+ import io.qdrant.client.grpc.Points.PointStruct;
+@@ -26,6 +27,7 @@
+ import io.qdrant.client.grpc.Points.ScoredPoint;
+ import io.qdrant.client.grpc.Points.SearchPoints;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+@@ -107,21 +109,21 @@ public String add(Embedding embedding, TextSegment textSegment) {
+   @Override
+   public List<String> addAll(List<Embedding> embeddings) {
+ 
+-    List<String> ids = embeddings.stream().map(ignored -> randomUUID()).collect(toList());
++    List<String> ids = embeddings.stream().map(ignored -> randomUUID()).toList();
+ 
+     addAllInternal(ids, embeddings, null);
+ 
+-    return ids;
++    return Collections.unmodifiableList(ids);
+   }
+ 
+   @Override
+   public List<String> addAll(List<Embedding> embeddings, List<TextSegment> textSegments) {
+ 
+-    List<String> ids = embeddings.stream().map(ignored -> randomUUID()).collect(toList());
++    List<String> ids = embeddings.stream().map(ignored -> randomUUID()).toList();
+ 
+     addAllInternal(ids, embeddings, textSegments);
+ 
+-    return ids;
++    return Collections.unmodifiableList(ids);
+   }
+ 
+   private void addInternal(String id, Embedding embedding, TextSegment textSegment) {
+@@ -166,6 +168,66 @@ private void addAllInternal(
+     }
+   }
+ 
++  @Override
++  public void remove(String id) {
++      if (id == null || id.isBlank()) {
++          throw new IllegalArgumentException("id cannot be null or blank");
++      }
++      removeAll(Collections.singleton(id));
++  }
++
++  @Override
++  public void removeAll(Collection<String> ids) {
++      if (ids == null || ids.isEmpty()) {
++          throw new IllegalArgumentException("ids cannot be null or empty");
++      }
++      try {
++
++          Points.PointsIdsList pointsIdsList = Points.PointsIdsList.newBuilder()
++                  .addAllIds(ids.stream().map(id -> id(UUID.fromString(id))).toList())
++                  .build();
++          PointsSelector pointsSelector = PointsSelector.newBuilder().setPoints(pointsIdsList).build();
++
++          client
++                  .deleteAsync(
++                          DeletePoints.newBuilder()
++                                  .setCollectionName(collectionName)
++                                  .setPoints(pointsSelector)
++                                  .build())
++                  .get();
++      } catch (InterruptedException | ExecutionException e) {
++          throw new RuntimeException(e);
++      }
++  }
++
++  @Override
++  public void removeAll(dev.langchain4j.store.embedding.filter.Filter filter) {
++      if (filter == null) {
++          throw new IllegalArgumentException("filter cannot be null");
++      }
++      try {
++
++          Filter qdrantFilter = QdrantFilterConverter.convertExpression(filter);
++          PointsSelector pointsSelector = PointsSelector.newBuilder().setFilter(qdrantFilter).build();
++
++          client
++                  .deleteAsync(
++                          DeletePoints.newBuilder()
++                                  .setCollectionName(collectionName)
++                                  .setPoints(pointsSelector)
++                                  .build())
++                  .get();
++      } catch (InterruptedException | ExecutionException e) {
++          throw new RuntimeException(e);
++      }
++  }
++
++  @Override
++  public void removeAll() {
++      clearStore();
++  }
++
++  @Override
+   public EmbeddingSearchResult<TextSegment> search(EmbeddingSearchRequest request) {
+ 
+     SearchPoints.Builder searchBuilder = SearchPoints.newBuilder()
+@@ -189,7 +251,7 @@ public EmbeddingSearchResult<TextSegment> search(EmbeddingSearchRequest request)
+     }
+ 
+     if (results.isEmpty()) {
+-      return new EmbeddingSearchResult<TextSegment>(emptyList());
++      return new EmbeddingSearchResult<>(emptyList());
+     }
+ 
+     List<EmbeddingMatch<TextSegment>> matches = results.stream()
+@@ -200,7 +262,7 @@ public EmbeddingSearchResult<TextSegment> search(EmbeddingSearchRequest request)
+ 
+     Collections.reverse(matches);
+ 
+-    return new EmbeddingSearchResult<TextSegment>(matches);
++    return new EmbeddingSearchResult<>(matches);
+   }
+ 
+   @Override
+diff --git a/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreWithRemovalIT.java b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreWithRemovalIT.java
+new file mode 100644
+index 00000000000..b80b63e2d4d
+--- /dev/null
++++ b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreWithRemovalIT.java
+@@ -0,0 +1,87 @@
++package dev.langchain4j.store.embedding.qdrant;
++
++import dev.langchain4j.data.segment.TextSegment;
++import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
++import dev.langchain4j.store.embedding.EmbeddingStore;
++import dev.langchain4j.store.embedding.EmbeddingStoreWithRemovalIT;
++import io.qdrant.client.QdrantClient;
++import io.qdrant.client.QdrantGrpcClient;
++import io.qdrant.client.grpc.Collections;
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.BeforeEach;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++import org.testcontainers.qdrant.QdrantContainer;
++
++import java.util.concurrent.ExecutionException;
++
++import static dev.langchain4j.internal.Utils.randomUUID;
++import static io.qdrant.client.grpc.Collections.Distance.Cosine;
++import static org.assertj.core.api.Assertions.assertThat;
++
++@Testcontainers
++public class QdrantEmbeddingStoreWithRemovalIT extends EmbeddingStoreWithRemovalIT {
++
++    private static final String COLLECTION_NAME = "langchain4j-" + randomUUID();
++
++    @Container
++    private static final QdrantContainer QDRANT_CONTAINER = new QdrantContainer("qdrant/qdrant:latest");
++
++    private static QdrantEmbeddingStore EMBEDDING_STORE;
++    private static final EmbeddingModel EMBEDDING_MODEL = new AllMiniLmL6V2QuantizedEmbeddingModel();
++
++    @BeforeAll
++    static void setup() throws InterruptedException, ExecutionException {
++        EMBEDDING_STORE = QdrantEmbeddingStore.builder()
++                .host(QDRANT_CONTAINER.getHost())
++                .port(QDRANT_CONTAINER.getGrpcPort())
++                .collectionName(COLLECTION_NAME)
++                .build();
++
++        QdrantClient client = new QdrantClient(
++                QdrantGrpcClient.newBuilder(QDRANT_CONTAINER.getHost(), QDRANT_CONTAINER.getGrpcPort(), false)
++                        .build());
++
++        client
++                .createCollectionAsync(
++                        COLLECTION_NAME,
++                        Collections.VectorParams.newBuilder()
++                                .setDistance(Cosine)
++                                .setSize(EMBEDDING_MODEL.dimension())
++                                .build())
++                .get();
++
++        client.close();
++    }
++
++    @AfterAll
++    static void teardown() {
++        EMBEDDING_STORE.close();
++    }
++
++    @BeforeEach
++    void beforeEach() {
++        clearStore();
++        ensureStoreIsEmpty();
++    }
++
++    protected void clearStore() {
++        EMBEDDING_STORE.clearStore();
++    }
++
++    protected void ensureStoreIsEmpty() {
++        assertThat(getAllEmbeddings()).isEmpty();
++    }
++
++    @Override
++    protected EmbeddingStore<TextSegment> embeddingStore() {
++        return EMBEDDING_STORE;
++    }
++
++    @Override
++    protected EmbeddingModel embeddingModel() {
++        return EMBEDDING_MODEL;
++    }
++}

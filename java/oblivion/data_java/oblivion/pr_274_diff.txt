@@ -1,0 +1,411 @@
+diff --git a/app/src/main/java/org/bepass/oblivion/LogActivity.java b/app/src/main/java/org/bepass/oblivion/LogActivity.java
+index b1c6aae3..de9e4cbd 100644
+--- a/app/src/main/java/org/bepass/oblivion/LogActivity.java
++++ b/app/src/main/java/org/bepass/oblivion/LogActivity.java
+@@ -1,17 +1,26 @@
+ package org.bepass.oblivion;
+ 
++import android.content.ClipData;
++import android.content.ClipboardManager;
++import android.content.Context;
+ import android.os.Bundle;
+ import android.os.Handler;
+ import android.os.Looper;
++import android.widget.Button;
+ import android.widget.ImageView;
+ import android.widget.ScrollView;
+ import android.widget.TextView;
+ 
+ import androidx.appcompat.app.AppCompatActivity;
+ 
++import com.google.android.material.button.MaterialButton;
++
+ import java.io.BufferedReader;
+ import java.io.IOException;
+ import java.io.InputStreamReader;
++import java.util.ArrayDeque;
++import java.util.Arrays;
++import java.util.Deque;
+ 
+ public class LogActivity extends AppCompatActivity {
+ 
+@@ -27,11 +36,15 @@ protected void onCreate(Bundle savedInstanceState) {
+         setContentView(R.layout.activity_log);
+ 
+         ImageView back = findViewById(R.id.back);
++        Button copyToClip = findViewById(R.id.copytoclip);
+         logs = findViewById(R.id.logs);
+         logScrollView = findViewById(R.id.logScrollView);
+ 
+         setupScrollListener();
+         back.setOnClickListener(v -> getOnBackPressedDispatcher().onBackPressed());
++
++        copyToClip.setOnClickListener(v -> copyLast100LinesToClipboard());
++
+         logUpdater = new Runnable() {
+             @Override
+             public void run() {
+@@ -81,4 +94,24 @@ private void readLogsFromFile() {
+             e.printStackTrace();
+         }
+     }
++
++    private void copyLast100LinesToClipboard() {
++        String logText = logs.getText().toString();
++        String[] logLines = logText.split("\n");
++        int totalLines = logLines.length;
++
++        // Use Deque to efficiently get the last 100 lines
++        Deque<String> last100Lines = new ArrayDeque<>(100);
++        last100Lines.addAll(Arrays.asList(logLines).subList(Math.max(0, totalLines - 100), totalLines));
++
++        StringBuilder sb = new StringBuilder();
++        for (String line : last100Lines) {
++            sb.append(line).append("\n");
++        }
++
++        String last100Log = sb.toString();
++        ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
++        ClipData clip = ClipData.newPlainText("Log", last100Log);
++        clipboard.setPrimaryClip(clip);
++    }
+ }
+diff --git a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+index 14809caa..0a768ad3 100644
+--- a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
++++ b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+@@ -39,6 +39,7 @@
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.TimeUnit;
+ 
+ import okhttp3.OkHttpClient;
+@@ -74,8 +75,10 @@ public void run() {
+             handler.postDelayed(this, 2000); // Poll every 2 seconds
+         }
+     };
+-
++    // For JNI Calling in a new threa
+     private final Executor executorService = Executors.newSingleThreadExecutor();
++    // For PingHTTPTestConnection to don't busy-waiting
++    private ScheduledExecutorService scheduler;
+     private Notification notification;
+     private ParcelFileDescriptor mInterface;
+     private String bindAddress;
+@@ -226,28 +229,46 @@ private Set<String> getSplitTunnelApps() {
+         return fileManager.getStringSet("splitTunnelApps", new HashSet<>());
+     }
+ 
++
+     private void performConnectionTest(String bindAddress, ConnectionStateChangeListener changeListener) {
+         if (changeListener == null) {
+             return;
+         }
+ 
+-        long startTime = System.currentTimeMillis();
++        scheduler = Executors.newScheduledThreadPool(1);
++
++        final long startTime = System.currentTimeMillis();
++        final long timeout = 60 * 1000; // 1 minute
++
++        Runnable pingTask = () -> {
++            if (System.currentTimeMillis() - startTime >= timeout) {
++                changeListener.onChange(ConnectionState.DISCONNECTED);
++                stopForegroundService();
++                scheduler.shutdown();
++                return;
++            }
+ 
+-        while (System.currentTimeMillis() - startTime < 60 * 1000) { // 1 minute
+             boolean result = pingOverHTTP(bindAddress);
+             if (result) {
+                 changeListener.onChange(ConnectionState.CONNECTED);
+-                return;
++                scheduler.shutdown();
+             }
++        };
+ 
+-            try {
+-                Thread.sleep(1000); // Sleep before retrying
+-            } catch (InterruptedException e) {
+-                Thread.currentThread().interrupt();
+-                break;
++
++        // Schedule the ping task to run with a fixed delay of 1 second
++        scheduler.scheduleWithFixedDelay(pingTask, 0, 1, TimeUnit.SECONDS);
++    }
++
++    private void stopForegroundService() {
++        stopForeground(true);
++        NotificationManager notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
++        if (notificationManager != null) {
++            notificationManager.cancel(1);
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                notificationManager.deleteNotificationChannel("oblivion");
+             }
+         }
+-        changeListener.onChange(ConnectionState.DISCONNECTED);
+     }
+ 
+     private String getBindAddress() {
+@@ -307,7 +328,7 @@ private void start() {
+         if (wLock == null) {
+             wLock = ((PowerManager) getSystemService(Context.POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "oblivion:vpn");
+             wLock.setReferenceCounted(false);
+-            wLock.acquire();
++            wLock.acquire(3*60*1000L /*3 minutes*/);
+         }
+ 
+         executorService.execute(() -> {
+@@ -326,6 +347,9 @@ private void start() {
+                     onRevoke();
+                 }
+                 setLastKnownState(state);
++                // Re-create the notification when the connection state changes
++                createNotification();
++                startForeground(1, notification); // Start foreground again after connection
+             });
+         });
+     }
+@@ -374,18 +398,7 @@ public void onRevoke() {
+         setLastKnownState(ConnectionState.DISCONNECTED);
+         Log.i(TAG, "Stopping VPN");
+ 
+-        // Stop foreground service and notification
+-        try {
+-            stopForeground(true);
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-                NotificationManager notificationManager = getSystemService(NotificationManager.class);
+-                if (notificationManager != null) {
+-                    notificationManager.deleteNotificationChannel("oblivion");
+-                }
+-            }
+-        } catch (Exception e) {
+-            Log.e(TAG, "Error stopping foreground service and notification", e);
+-        }
++        stopForegroundService();
+ 
+         // Release the wake lock if held
+         try {
+@@ -429,10 +442,24 @@ public void onRevoke() {
+             }
+         }
+ 
++        // Shutdown scheduler if it is running
++        shutdownScheduler();
+         Log.i(TAG, "VPN stopped successfully");
+     }
+-
+-
++    private void shutdownScheduler() {
++        if (scheduler != null && !scheduler.isShutdown()) {
++            scheduler.shutdown();
++            try {
++                if (!scheduler.awaitTermination(500, TimeUnit.MILLISECONDS)) {
++                    scheduler.shutdownNow();
++                }
++            } catch (InterruptedException e) {
++                scheduler.shutdownNow();
++                Thread.currentThread().interrupt();
++                Log.e(TAG, "Scheduler termination interrupted", e);
++            }
++        }
++    }
+ 
+     private void publishConnectionState(ConnectionState state) {
+         if (!connectionStateObservers.isEmpty()) {
+diff --git a/app/src/main/res/drawable/button.xml b/app/src/main/res/drawable/button.xml
+new file mode 100644
+index 00000000..ec3a2e1d
+--- /dev/null
++++ b/app/src/main/res/drawable/button.xml
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="utf-8"?>
++<shape xmlns:android="http://schemas.android.com/apk/res/android">
++    <solid android:color="#ffa200" />
++    <stroke
++        android:width="0dp"
++    android:color="#00FFFFFF" />
++    <corners android:topLeftRadius="6dp" android:topRightRadius="6dp" />
++</shape>
+diff --git a/app/src/main/res/layout/activity_log.xml b/app/src/main/res/layout/activity_log.xml
+index 8156e88d..bef38151 100644
+--- a/app/src/main/res/layout/activity_log.xml
++++ b/app/src/main/res/layout/activity_log.xml
+@@ -1,66 +1,76 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <androidx.constraintlayout.widget.ConstraintLayout
+-  xmlns:android="http://schemas.android.com/apk/res/android"
+-  xmlns:app="http://schemas.android.com/apk/res-auto"
+-  xmlns:tools="http://schemas.android.com/tools"
+-  android:layout_width="match_parent"
+-  android:layout_height="match_parent"
+-  android:background="@drawable/background_gradient"
+-  tools:context="org.bepass.oblivion.LogActivity">
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:app="http://schemas.android.com/apk/res-auto"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    android:background="@drawable/background_gradient"
++    tools:context="org.bepass.oblivion.LogActivity">
+ 
+   <RelativeLayout
+-    android:id="@+id/top_bar"
+-    android:layout_width="match_parent"
+-    android:layout_height="48dp"
+-    android:layout_marginTop="8dp"
+-    app:layout_constraintEnd_toEndOf="parent"
+-    app:layout_constraintStart_toStartOf="parent"
+-    app:layout_constraintTop_toTopOf="parent">
++      android:id="@+id/top_bar"
++      android:layout_width="match_parent"
++      android:layout_height="48dp"
++      android:layout_marginTop="8dp"
++      app:layout_constraintEnd_toEndOf="parent"
++      app:layout_constraintStart_toStartOf="parent"
++      app:layout_constraintTop_toTopOf="parent">
+ 
+     <ImageView
+-      android:id="@+id/back"
+-      android:layout_width="36dp"
+-      android:layout_height="36dp"
+-      android:background="?selectableItemBackgroundBorderless"
+-      android:layout_alignParentStart="true"
+-      android:layout_centerVertical="true"
+-      android:layout_marginStart="16dp"
+-      android:src="@drawable/ic_back"
+-      app:tint="#000000" />
++        android:id="@+id/back"
++        android:layout_width="36dp"
++        android:layout_height="36dp"
++        android:background="?selectableItemBackgroundBorderless"
++        android:layout_alignParentStart="true"
++        android:layout_centerVertical="true"
++        android:layout_marginStart="16dp"
++        android:src="@drawable/ic_back"
++        app:tint="#000000" />
+ 
+     <TextView
+-      android:layout_width="wrap_content"
+-      android:layout_height="wrap_content"
+-      android:layout_alignParentEnd="true"
+-      android:layout_centerVertical="true"
+-      android:layout_marginEnd="16dp"
+-      android:fontFamily="@font/shabnamlight"
+-      android:text="@string/logApp"
+-      android:textColor="@color/black"
+-      android:textSize="32sp"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_alignParentEnd="true"
++        android:layout_centerVertical="true"
++        android:layout_marginEnd="16dp"
++        android:fontFamily="@font/shabnamlight"
++        android:text="@string/logApp"
++        android:textColor="@color/black"
++        android:textSize="32sp"
+         tools:ignore="RelativeOverlap" />
+-
+   </RelativeLayout>
+ 
+   <ScrollView
+-    android:id="@+id/logScrollView"
+-    android:layout_width="match_parent"
+-    android:fillViewport="true"
+-    android:layout_height="0dp"
+-    android:layout_marginHorizontal="16dp"
+-    android:layout_marginTop="16dp"
+-    app:layout_constraintBottom_toBottomOf="parent"
+-    app:layout_constraintEnd_toEndOf="parent"
+-    app:layout_constraintStart_toStartOf="parent"
+-    app:layout_constraintTop_toBottomOf="@id/top_bar">
++      android:id="@+id/logScrollView"
++      android:layout_width="match_parent"
++      android:layout_height="0dp"
++      android:layout_marginHorizontal="16dp"
++      android:layout_marginTop="16dp"
++      app:layout_constraintTop_toBottomOf="@id/top_bar"
++      app:layout_constraintBottom_toTopOf="@id/copytoclip"
++      app:layout_constraintEnd_toEndOf="parent"
++      app:layout_constraintStart_toStartOf="parent">
+ 
+     <TextView
+-      android:id="@+id/logs"
+-      android:layout_width="match_parent"
+-      android:layout_height="wrap_content"
+-      android:text="Start Logging Here.."
+-      android:textSize="11sp" />
++        android:id="@+id/logs"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:text="Start Logging Here.."
++        android:textSize="11sp" />
+   </ScrollView>
+ 
++  <Button
++      android:id="@+id/copytoclip"
++      android:layout_width="match_parent"
++      android:layout_height="wrap_content"
++      android:background="@drawable/button"
++      android:fontFamily="@font/shabnam"
++      android:text="@string/copytoclip"
++      android:textColor="@color/white"
++      android:textSize="18sp"
++      app:layout_constraintBottom_toBottomOf="parent"
++      app:layout_constraintEnd_toEndOf="parent"
++      app:layout_constraintStart_toStartOf="parent" />
+ 
+ </androidx.constraintlayout.widget.ConstraintLayout>
+diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
+index dd091aff..821f3502 100644
+--- a/app/src/main/res/values-fa/strings.xml
++++ b/app/src/main/res/values-fa/strings.xml
+@@ -43,6 +43,7 @@
+     <string name="batteryOpLText">غیرفعال‌سازی بهینه‌سازی باتری برای تجربه بهتر</string>
+     <string name="dialBtText">برای اطمینان از عملکرد صحیح برنامه، لطفاً بهینه‌سازی باتری برای این برنامه را غیرفعال کنید.</string>
+     <string name="goToSettings">به تنظیمات بروید</string>
++    <string name="copytoclip">کپی کردن لاگ به کلیپ‌بورد</string>
+     <string-array name="countries">
+         <item>اتریش</item>
+         <item>بلژیک</item>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 3a5e6a41..04596c14 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -43,6 +43,7 @@
+     <string name="batteryOpLText">Отключение оптимизации батареи для лучшего опыта</string>
+     <string name="dialBtText">Чтобы приложение работало правильно, отключите оптимизацию батареи для этого приложения.</string>
+     <string name="goToSettings">Перейти к настройкам</string>
++    <string name="copytoclip">Скопировать лог в буфер обмена</string>
+     <string-array name="countries">
+         <item>Австрия</item>
+         <item>Бельгия</item>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 202af853..0e6221a2 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -43,6 +43,7 @@
+     <string name="batteryOpLText">为了更好的体验，关闭电池优化</string>
+     <string name="dialBtText">为了确保应用程序正常运行，请为此应用程序关闭电池优化。</string>
+     <string name="goToSettings">前往设置</string>
++    <string name="copytoclip">复制日志到剪贴板</string>
+     <string-array name="countries">
+         <item>奥地利</item>
+         <item>比利时</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index f7a97a68..8be3d317 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -43,7 +43,8 @@
+   <string name="batteryOpLText">Disabling battery optimization for better experience</string>
+   <string name="dialBtText"> To ensure the app works properly, please disable battery optimization for this app. </string>
+   <string name="goToSettings"> Go to Settings </string>
+-  <string-array name="countries">
++    <string name="copytoclip">Copy log to clipboard</string>
++    <string-array name="countries">
+     <item>Austria</item>
+     <item>Belgium</item>
+     <item>Brazil</item>

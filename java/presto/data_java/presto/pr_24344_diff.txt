@@ -1,0 +1,265 @@
+diff --git a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHouseClient.java b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHouseClient.java
+index 87eb7606cd841..8359b748f5ef1 100755
+--- a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHouseClient.java
++++ b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHouseClient.java
+@@ -17,6 +17,7 @@
+ import com.facebook.presto.common.predicate.TupleDomain;
+ import com.facebook.presto.common.type.CharType;
+ import com.facebook.presto.common.type.DecimalType;
++import com.facebook.presto.common.type.TimestampType;
+ import com.facebook.presto.common.type.Type;
+ import com.facebook.presto.common.type.VarbinaryType;
+ import com.facebook.presto.common.type.VarcharType;
+@@ -875,6 +876,9 @@ private String toWriteMapping(Type type)
+         if (type == DATE) {
+             return "Date";
+         }
++        if (type instanceof TimestampType) {
++            return "DateTime64(3)";
++        }
+         throw new PrestoException(NOT_SUPPORTED, "Unsupported column type: " + type);
+     }
+ 
+diff --git a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHousePageSink.java b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHousePageSink.java
+index 6c2964eab8ec6..1125832780530 100755
+--- a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHousePageSink.java
++++ b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/ClickHousePageSink.java
+@@ -17,6 +17,7 @@
+ import com.facebook.presto.common.Page;
+ import com.facebook.presto.common.block.Block;
+ import com.facebook.presto.common.type.DecimalType;
++import com.facebook.presto.common.type.TimestampType;
+ import com.facebook.presto.common.type.Type;
+ import com.facebook.presto.spi.ConnectorPageSink;
+ import com.facebook.presto.spi.ConnectorSession;
+@@ -163,6 +164,10 @@ else if (DATE.equals(type)) {
+             // convert to midnight in default time zone
+             statement.setDate(parameter, convertZonedDaysToDate(type.getLong(block, position)));
+         }
++        else if (type instanceof TimestampType) {
++            // setTimestamp doesn't work, so we use setLong as described at https://github.com/ClickHouse/clickhouse-java/issues/608
++            statement.setLong(parameter, type.getLong(block, position));
++        }
+         else {
+             throw new PrestoException(NOT_SUPPORTED, "Unsupported column type: " + type.getDisplayName());
+         }
+diff --git a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/StandardReadMappings.java b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/StandardReadMappings.java
+index 73f3f094be171..e7a57abeb483e 100755
+--- a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/StandardReadMappings.java
++++ b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/StandardReadMappings.java
+@@ -48,6 +48,7 @@
+ import static com.facebook.presto.plugin.clickhouse.DateTimeUtil.getMillisOfDay;
+ import static com.facebook.presto.plugin.clickhouse.ReadMapping.longReadMapping;
+ import static com.facebook.presto.plugin.clickhouse.ReadMapping.sliceReadMapping;
++import static com.facebook.presto.plugin.clickhouse.TimestampUtil.getMillisecondsFromTimestampString;
+ import static io.airlift.slice.Slices.utf8Slice;
+ import static io.airlift.slice.Slices.wrappedBuffer;
+ import static java.lang.Float.floatToRawIntBits;
+@@ -140,7 +141,8 @@ public static ReadMapping timestampReadMapping()
+     {
+         return longReadMapping(TIMESTAMP, (resultSet, columnIndex) -> {
+             Timestamp timestamp = resultSet.getTimestamp(columnIndex);
+-            return timestamp.getTime();
++            // getTimestamp loses the milliseconds, but we can get them from the getString
++            return timestamp.getTime() + getMillisecondsFromTimestampString(resultSet.getString(columnIndex));
+         });
+     }
+ 
+@@ -163,6 +165,8 @@ public static Optional<ReadMapping> jdbcTypeToPrestoType(ClickHouseTypeHandle ty
+                     return Optional.of(varcharReadMapping(createUnboundedVarcharType()));
+                 }
+                 return Optional.of(varbinaryReadMapping());
++            case "DateTime64": // DateTime64(n)
++                return Optional.of(timestampReadMapping());
+             case "block":
+                 return Optional.of(doubleReadMapping());
+         }
+diff --git a/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/TimestampUtil.java b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/TimestampUtil.java
+new file mode 100644
+index 0000000000000..9ad771335c274
+--- /dev/null
++++ b/presto-clickhouse/src/main/java/com/facebook/presto/plugin/clickhouse/TimestampUtil.java
+@@ -0,0 +1,35 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.facebook.presto.plugin.clickhouse;
++
++public class TimestampUtil
++{
++    private TimestampUtil() {}
++
++    public static int getMillisecondsFromTimestampString(String timestampString)
++    {
++        int dotIndex = timestampString.indexOf('.');
++        if (dotIndex == -1) {
++            return 0;
++        }
++
++        String fraction = timestampString.substring(dotIndex + 1);
++        int nonNormalized = Integer.parseInt(fraction);
++        if (nonNormalized == 0 || fraction.length() == 3) {
++            return nonNormalized;
++        }
++        // this will make sure it's always 3 digits. e.g., 7 -> 700; 71 -> 710; 7591 -> 759
++        return (int) Math.round(nonNormalized * Math.pow(10, -(Math.floor(Math.log10(nonNormalized)) - 2)));
++    }
++}
+diff --git a/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestClickHouseDistributedQueries.java b/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestClickHouseDistributedQueries.java
+index e9c6e1d915435..56e6d924e5fb6 100755
+--- a/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestClickHouseDistributedQueries.java
++++ b/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestClickHouseDistributedQueries.java
+@@ -25,18 +25,23 @@
+ import org.testng.annotations.Test;
+ 
+ import java.security.SecureRandom;
++import java.time.ZoneId;
++import java.time.ZonedDateTime;
++import java.time.format.DateTimeFormatter;
+ 
+ import static com.facebook.presto.common.type.BigintType.BIGINT;
+ import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
+ import static com.facebook.presto.common.type.VarcharType.VARCHAR;
+ import static com.facebook.presto.plugin.clickhouse.ClickHouseQueryRunner.createClickHouseQueryRunner;
+ import static com.facebook.presto.testing.MaterializedResult.resultBuilder;
++import static com.facebook.presto.testing.TestingSession.DEFAULT_TIME_ZONE_KEY;
+ import static com.facebook.presto.testing.assertions.Assert.assertEquals;
+ import static com.facebook.presto.tests.QueryAssertions.assertEqualsIgnoreOrder;
+ import static java.lang.Character.MAX_RADIX;
+ import static java.lang.Math.abs;
+ import static java.lang.Math.min;
+ import static java.lang.String.format;
++import static java.time.format.DateTimeFormatter.ISO_ZONED_DATE_TIME;
+ import static java.util.Objects.requireNonNull;
+ import static java.util.stream.Collectors.joining;
+ import static java.util.stream.IntStream.range;
+@@ -224,6 +229,75 @@ public void testInsertIntoNotNullColumn()
+         assertUpdate("DROP TABLE test_not_null_with_insert");
+     }
+ 
++    @Test
++    public void testInsertAndSelectFromDateTimeTables()
++    {
++        // ----- Table T - No milliseconds -----
++        ZonedDateTime originalTimestamp = ZonedDateTime.parse("2025-01-08T12:34:56Z", ISO_ZONED_DATE_TIME);
++        // the test session is Pacific/Apia
++        ZonedDateTime adjustedTimestamp = originalTimestamp.withZoneSameInstant(
++                ZoneId.of(DEFAULT_TIME_ZONE_KEY.getId()));
++
++        // Pacific/Apia becomes 2025-01-09 01:34:56
++        String adjustedTimestampString = adjustedTimestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
++
++        assertUpdate("CREATE TABLE t (ts timestamp not null)");
++        assertUpdate("INSERT INTO t (ts) VALUES (timestamp '" + adjustedTimestampString + "')", 1);
++        assertQuery(
++                "SELECT * FROM t LIMIT 100",
++                "VALUES (timestamp  '" + adjustedTimestampString + "')");
++        assertUpdate("DROP TABLE IF EXISTS t");
++        // ----- End of Table T - No milliseconds -----
++
++        // ----- Table T1 - 1 digit of milliseconds -----
++        originalTimestamp = ZonedDateTime.parse("2025-01-08T12:34:56.7Z", ISO_ZONED_DATE_TIME);
++        // the test session is Pacific/Apia
++        adjustedTimestamp = originalTimestamp.withZoneSameInstant(ZoneId.of(DEFAULT_TIME_ZONE_KEY.getId()));
++
++        // Pacific/Apia becomes 2025-01-09 01:34:56.7
++        adjustedTimestampString = adjustedTimestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.S"));
++
++        assertUpdate("CREATE TABLE t1 (ts timestamp not null)");
++        assertUpdate("INSERT INTO t1 (ts) VALUES (timestamp '" + adjustedTimestampString + "')", 1);
++        assertQuery(
++                "SELECT * FROM t1 LIMIT 100",
++                "VALUES (timestamp  '" + adjustedTimestampString + "')");
++        assertUpdate("DROP TABLE IF EXISTS t1");
++        // ----- End of Table T1 - 1 digit of milliseconds -----
++
++        // ----- Table T2 - 2 digits of milliseconds -----
++        originalTimestamp = ZonedDateTime.parse("2025-01-08T12:34:56.75Z", ISO_ZONED_DATE_TIME);
++        // the test session is Pacific/Apia
++        adjustedTimestamp = originalTimestamp.withZoneSameInstant(ZoneId.of(DEFAULT_TIME_ZONE_KEY.getId()));
++
++        // Pacific/Apia becomes 2025-01-09 01:34:56.75
++        adjustedTimestampString = adjustedTimestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SS"));
++
++        assertUpdate("CREATE TABLE t2 (ts timestamp not null)");
++        assertUpdate("INSERT INTO t2 (ts) VALUES (timestamp '" + adjustedTimestampString + "')", 1);
++        assertQuery(
++                "SELECT * FROM t2 LIMIT 100",
++                "VALUES (timestamp  '" + adjustedTimestampString + "')");
++        assertUpdate("DROP TABLE IF EXISTS t2");
++        // ----- End of Table T2 - 2 digits of milliseconds -----
++
++        // ----- Table T3 - 3 digits of milliseconds -----
++        originalTimestamp = ZonedDateTime.parse("2025-01-08T12:34:56.759Z", ISO_ZONED_DATE_TIME);
++        // the test session is Pacific/Apia
++        adjustedTimestamp = originalTimestamp.withZoneSameInstant(ZoneId.of(DEFAULT_TIME_ZONE_KEY.getId()));
++
++        // Pacific/Apia becomes 2025-01-09 01:34:56.759
++        adjustedTimestampString = adjustedTimestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
++
++        assertUpdate("CREATE TABLE t3 (ts timestamp not null)");
++        assertUpdate("INSERT INTO t3 (ts) VALUES (timestamp '" + adjustedTimestampString + "')", 1);
++        assertQuery(
++                "SELECT * FROM t3 LIMIT 100",
++                "VALUES (timestamp  '" + adjustedTimestampString + "')");
++        assertUpdate("DROP TABLE IF EXISTS t3");
++        // ----- End of Table T3 - 3 digits of milliseconds -----
++    }
++
+     @Override
+     public void testDropColumn()
+     {
+diff --git a/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestingClickHouseServer.java b/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestingClickHouseServer.java
+index 659c42cc40204..87dbb916f1179 100755
+--- a/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestingClickHouseServer.java
++++ b/presto-clickhouse/src/test/java/com/facebook/presto/plugin/clickhouse/TestingClickHouseServer.java
+@@ -26,7 +26,7 @@
+ public class TestingClickHouseServer
+         implements Closeable
+ {
+-    private static final String CLICKHOUSE_IMAGE = "yandex/clickhouse-server:20.8";
++    private static final String CLICKHOUSE_IMAGE = "clickhouse/clickhouse-server:23.12.2.59";
+     private final ClickHouseContainer dockerContainer;
+ 
+     public TestingClickHouseServer()
+diff --git a/presto-docs/src/main/sphinx/connector/clickhouse.rst b/presto-docs/src/main/sphinx/connector/clickhouse.rst
+index 338d98836727b..f8510cc8424a4 100644
+--- a/presto-docs/src/main/sphinx/connector/clickhouse.rst
++++ b/presto-docs/src/main/sphinx/connector/clickhouse.rst
+@@ -89,6 +89,26 @@ Run ``SELECT`` to access the ``cks`` table in the ``tpch`` database::
+     If you used a different name for your catalog properties file, use
+     that catalog name instead of ``clickhouse`` in the above examples.
+ 
++PrestoDB to ClickHouse Type Mapping
++-----------------------------------
++
++========================================== ========================= =================================================================================
++**PrestoDB Type**                          **ClickHouse Type**       **Notes**
++========================================== ========================= =================================================================================
++BOOLEAN                                    UInt8                     ClickHouse uses UInt8 as boolean, restricted values to 0 and 1.
++TINYINT                                    Int8
++SMALLINT                                   Int16
++INTEGER                                    Int32
++BIGINT                                     Int64
++REAL                                       Float32
++DOUBLE                                     Float64
++DECIMAL                                    Decimal(precision, scale) The precision and scale are dynamic based on the PrestoDB type.
++CHAR / VARCHAR                             String                    The String type replaces VARCHAR, BLOB, CLOB, and related types from other DBMSs.
++VARBINARY                                  String
++DATE                                       Date
++TIMESTAMP                                  DateTime64(3)             Timestamp with 3 digits of millisecond precision.
++========================================== ========================= =================================================================================
++
+ Table properties
+ ----------------
+ 

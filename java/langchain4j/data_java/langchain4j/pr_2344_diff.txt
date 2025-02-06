@@ -1,0 +1,2090 @@
+diff --git a/docs/docs/tutorials/rag.md b/docs/docs/tutorials/rag.md
+index 2327318af55..a0e6d38b617 100644
+--- a/docs/docs/tutorials/rag.md
++++ b/docs/docs/tutorials/rag.md
+@@ -487,6 +487,29 @@ It has the following attributes:
+ 
+ #### Filter
+ The `Filter` allows filtering by `Metadata` entries when performing a vector search.
++
++Currently, the following `Filter` types/operations are supported:
++-  `IsEqualTo`
++-  `IsNotEqualTo`
++-  `IsGreaterThan`
++-  `IsGreaterThanOrEqualTo`
++-  `IsLessThan`
++-  `IsLessThanOrEqualTo`
++-  `IsIn`
++-  `IsNotIn`
++-  `ContainsString`
++-  `And`
++-  `Not`
++-  `Or`
++
++:::note
++Not all embedding stores support filtering by `Metadata`,
++please see the "Filtering by Metadata" column [here](https://docs.langchain4j.dev/integrations/embedding-stores/).
++
++Some stores that support filtering by `Metadata` do not support all possible `Filter` types/operations.
++For example, `ContainsString` is currently supported only by Milvus, PgVector and Qdrant.
++:::
++
+ More details about `Filter` can be found [here](https://github.com/langchain4j/langchain4j/pull/610).
+ 
+ 
+diff --git a/langchain4j-azure-ai-search/src/main/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapper.java b/langchain4j-azure-ai-search/src/main/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapper.java
+index 718d4b6e8ac..1ad84716d76 100644
+--- a/langchain4j-azure-ai-search/src/main/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapper.java
++++ b/langchain4j-azure-ai-search/src/main/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapper.java
+@@ -35,7 +35,7 @@ private String mapLogicalOperator(Filter operator) {
+         if (operator instanceof And) return  format(getLogicalFormat(operator), map(((And) operator).left()), map(((And) operator).right()));
+         if (operator instanceof Or) return format(getLogicalFormat(operator), map(((Or) operator).left()), map(((Or) operator).right()));
+         if (operator instanceof Not) return format(getLogicalFormat(operator), map(((Not) operator).expression()));
+-        throw new IllegalArgumentException("Unsupported operator: " + operator);
++        throw new UnsupportedOperationException("Unsupported filter type: " + operator.getClass().getName());
+     }
+ 
+     private boolean isLogicalOperator(Filter filter) {
+@@ -51,14 +51,14 @@ private String mapComparisonFilter(Filter filter) {
+         if (filter instanceof IsLessThanOrEqualTo) return mapIsLessThanOrEqualTo((IsLessThanOrEqualTo) filter);
+         if (filter instanceof IsIn) return mapIsIn((IsIn) filter);
+         if (filter instanceof IsNotIn) return mapIsNotIn((IsNotIn) filter);
+-        throw new IllegalArgumentException("Unsupported filter: " + filter);
++        throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
+     }
+ 
+     private String getLogicalFormat(Filter filter) {
+         if (filter instanceof And) return "(%s and %s)";
+         if (filter instanceof Or) return "(%s or %s)";
+         if (filter instanceof Not) return "(not %s)";
+-        throw new IllegalArgumentException("Unsupported filter: " + filter);
++        throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
+     }
+ 
+     private String getComparisonFormat(Filter filter) {
+@@ -72,7 +72,7 @@ private String getComparisonFormat(Filter filter) {
+         if (filter instanceof IsIn) return "search.in(k/value, ('%s'))";
+ // not use, it raplace by Not ( IsIn )
+ //        if (filter instanceof IsNotIn) return "not search.in(k/value, ('%s'))";
+-        throw new IllegalArgumentException("Unsupported filter: " + filter);
++        throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
+     }
+ 
+     private String mapIsNotIn(IsNotIn filter) {
+@@ -114,4 +114,4 @@ private String mapSearchInValues(Collection<?> comparisonValues) {
+     private String formatComparisonFilter(String key, String value, String format) {
+         return format("metadata/attributes/any(k: k/key eq '%s' and " + format + ")", key, value);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/langchain4j-azure-ai-search/src/test/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapperTest.java b/langchain4j-azure-ai-search/src/test/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapperTest.java
+index 7272de71e4b..32f71846536 100644
+--- a/langchain4j-azure-ai-search/src/test/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapperTest.java
++++ b/langchain4j-azure-ai-search/src/test/java/dev/langchain4j/rag/content/retriever/azure/search/DefaultAzureAiSearchFilterMapperTest.java
+@@ -83,6 +83,6 @@ public boolean test(Object object) {
+                 return false;
+             }
+         };
+-        assertThatExceptionOfType(IllegalArgumentException.class).isThrownBy(() -> mapper.map(unsupportedFilter));
++        assertThatExceptionOfType(UnsupportedOperationException.class).isThrownBy(() -> mapper.map(unsupportedFilter));
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/Filter.java b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/Filter.java
+index ae1b1fbe573..56c27fab605 100644
+--- a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/Filter.java
++++ b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/Filter.java
+@@ -1,6 +1,7 @@
+ package dev.langchain4j.store.embedding.filter;
+ 
+ import dev.langchain4j.store.embedding.EmbeddingStore;
++import dev.langchain4j.store.embedding.filter.comparison.ContainsString;
+ import dev.langchain4j.store.embedding.filter.comparison.IsEqualTo;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThan;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThanOrEqualTo;
+@@ -33,6 +34,7 @@
+  * @see IsLessThanOrEqualTo
+  * @see IsIn
+  * @see IsNotIn
++ * @see ContainsString
+  * @see And
+  * @see Not
+  * @see Or
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/MetadataFilterBuilder.java b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/MetadataFilterBuilder.java
+index ab104f053a4..50c66b9bfe5 100644
+--- a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/MetadataFilterBuilder.java
++++ b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/MetadataFilterBuilder.java
+@@ -1,6 +1,12 @@
+ package dev.langchain4j.store.embedding.filter;
+ 
++import static dev.langchain4j.internal.ValidationUtils.ensureNotBlank;
++import static java.util.Arrays.asList;
++import static java.util.Arrays.stream;
++import static java.util.stream.Collectors.toList;
++
+ import dev.langchain4j.data.document.Metadata;
++import dev.langchain4j.store.embedding.filter.comparison.ContainsString;
+ import dev.langchain4j.store.embedding.filter.comparison.IsEqualTo;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThan;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThanOrEqualTo;
+@@ -9,17 +15,11 @@
+ import dev.langchain4j.store.embedding.filter.comparison.IsLessThanOrEqualTo;
+ import dev.langchain4j.store.embedding.filter.comparison.IsNotEqualTo;
+ import dev.langchain4j.store.embedding.filter.comparison.IsNotIn;
+-
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.UUID;
+ 
+-import static dev.langchain4j.internal.ValidationUtils.ensureNotBlank;
+-import static java.util.Arrays.asList;
+-import static java.util.Arrays.stream;
+-import static java.util.stream.Collectors.toList;
+-
+ /**
+  * A helper class for building a {@link Filter} for {@link Metadata} key.
+  */
+@@ -35,6 +35,11 @@ public static MetadataFilterBuilder metadataKey(String key) {
+         return new MetadataFilterBuilder(key);
+     }
+ 
++    // containsString
++
++    public Filter containsString(String value) {
++        return new ContainsString(key, value);
++    }
+ 
+     // isEqualTo
+ 
+@@ -62,7 +67,6 @@ public Filter isEqualTo(double value) {
+         return new IsEqualTo(key, value);
+     }
+ 
+-
+     // isNotEqualTo
+ 
+     public Filter isNotEqualTo(String value) {
+@@ -89,7 +93,6 @@ public Filter isNotEqualTo(double value) {
+         return new IsNotEqualTo(key, value);
+     }
+ 
+-
+     // isGreaterThan
+ 
+     public Filter isGreaterThan(String value) {
+@@ -112,7 +115,6 @@ public Filter isGreaterThan(double value) {
+         return new IsGreaterThan(key, value);
+     }
+ 
+-
+     // isGreaterThanOrEqualTo
+ 
+     public Filter isGreaterThanOrEqualTo(String value) {
+@@ -135,7 +137,6 @@ public Filter isGreaterThanOrEqualTo(double value) {
+         return new IsGreaterThanOrEqualTo(key, value);
+     }
+ 
+-
+     // isLessThan
+ 
+     public Filter isLessThan(String value) {
+@@ -158,7 +159,6 @@ public Filter isLessThan(double value) {
+         return new IsLessThan(key, value);
+     }
+ 
+-
+     // isLessThanOrEqualTo
+ 
+     public Filter isLessThanOrEqualTo(String value) {
+@@ -181,7 +181,6 @@ public Filter isLessThanOrEqualTo(double value) {
+         return new IsLessThanOrEqualTo(key, value);
+     }
+ 
+-
+     // isBetween
+ 
+     public Filter isBetween(String fromValue, String toValue) {
+@@ -204,7 +203,6 @@ public Filter isBetween(double fromValue, double toValue) {
+         return isGreaterThanOrEqualTo(fromValue).and(isLessThanOrEqualTo(toValue));
+     }
+ 
+-
+     // isIn
+ 
+     public Filter isIn(String... values) {
+@@ -239,7 +237,6 @@ public Filter isIn(Collection<?> values) {
+         return new IsIn(key, values);
+     }
+ 
+-
+     // isNotIn
+ 
+     public Filter isNotIn(String... values) {
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/comparison/ContainsString.java b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/comparison/ContainsString.java
+new file mode 100644
+index 00000000000..a0c6f80d22e
+--- /dev/null
++++ b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/comparison/ContainsString.java
+@@ -0,0 +1,72 @@
++package dev.langchain4j.store.embedding.filter.comparison;
++
++import static dev.langchain4j.internal.Exceptions.illegalArgument;
++import static dev.langchain4j.internal.ValidationUtils.ensureNotBlank;
++import static dev.langchain4j.internal.ValidationUtils.ensureNotNull;
++
++import dev.langchain4j.data.document.Metadata;
++import dev.langchain4j.store.embedding.filter.Filter;
++import java.util.Objects;
++
++/**
++ * A filter that checks if the value of a metadata key contains a specific string.
++ * The value of the metadata key must be a string.
++ */
++public class ContainsString implements Filter {
++
++    private final String key;
++    private final String comparisonValue;
++
++    public ContainsString(String key, String comparisonValue) {
++        this.key = ensureNotBlank(key, "key");
++        this.comparisonValue = ensureNotNull(comparisonValue, "comparisonValue with key '" + key + "'");
++    }
++
++    public String key() {
++        return key;
++    }
++
++    public String comparisonValue() {
++        return comparisonValue;
++    }
++
++    @Override
++    public boolean test(Object object) {
++        if (!(object instanceof Metadata metadata)) {
++            return false;
++        }
++
++        if (!metadata.containsKey(key)) {
++            return false;
++        }
++
++        Object actualValue = metadata.toMap().get(key);
++
++        if (actualValue instanceof String str) {
++            return str.contains(comparisonValue);
++        }
++
++        throw illegalArgument(
++                "Type mismatch: actual value of metadata key \"%s\" (%s) has type %s, "
++                        + "while it is expected to be a string",
++                key, actualValue, actualValue.getClass().getName());
++    }
++
++    @Override
++    public boolean equals(final Object o) {
++        if (o == this) return true;
++        if (!(o instanceof ContainsString other)) return false;
++
++        return Objects.equals(this.key, other.key) && Objects.equals(this.comparisonValue, other.comparisonValue);
++    }
++
++    @Override
++    public int hashCode() {
++        return Objects.hash(key, comparisonValue);
++    }
++
++    @Override
++    public String toString() {
++        return "ContainsString(key=" + this.key + ", comparisonValue=" + this.comparisonValue + ")";
++    }
++}
+diff --git a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/logical/Not.java b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/logical/Not.java
+index ce222a880d0..01784cdfa6c 100644
+--- a/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/logical/Not.java
++++ b/langchain4j-core/src/main/java/dev/langchain4j/store/embedding/filter/logical/Not.java
+@@ -1,11 +1,11 @@
+ package dev.langchain4j.store.embedding.filter.logical;
+ 
+-import dev.langchain4j.store.embedding.filter.Filter;
++import static dev.langchain4j.internal.ValidationUtils.ensureNotNull;
+ 
++import dev.langchain4j.data.document.Metadata;
++import dev.langchain4j.store.embedding.filter.Filter;
+ import java.util.Objects;
+ 
+-import static dev.langchain4j.internal.ValidationUtils.ensureNotNull;
+-
+ public class Not implements Filter {
+ 
+     private final Filter expression;
+@@ -20,6 +20,9 @@ public Filter expression() {
+ 
+     @Override
+     public boolean test(Object object) {
++        if (!(object instanceof Metadata)) {
++            return false;
++        }
+         return !expression.test(object);
+     }
+ 
+diff --git a/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/EmbeddingStoreWithFilteringIT.java b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/EmbeddingStoreWithFilteringIT.java
+index 870cf0899e5..3464a311ea4 100644
+--- a/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/EmbeddingStoreWithFilteringIT.java
++++ b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/EmbeddingStoreWithFilteringIT.java
+@@ -4,6 +4,9 @@
+ import dev.langchain4j.data.embedding.Embedding;
+ import dev.langchain4j.data.segment.TextSegment;
+ import dev.langchain4j.store.embedding.filter.Filter;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.condition.DisabledIf;
++import org.junit.jupiter.api.condition.EnabledIf;
+ import org.junit.jupiter.params.ParameterizedTest;
+ import org.junit.jupiter.params.provider.Arguments;
+ import org.junit.jupiter.params.provider.MethodSource;
+@@ -21,6 +24,7 @@
+ import static java.util.Arrays.asList;
+ import static java.util.Collections.singletonList;
+ import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.catchThrowable;
+ import static org.assertj.core.data.Percentage.withPercentage;
+ 
+ /**
+@@ -1748,4 +1752,52 @@ protected static Stream<Arguments> should_filter_by_metadata_not() {
+ 
+                 .build();
+     }
++
++    @DisabledIf("supportsContains")
++    @Test
++    protected void should_throw_exception_when_contains_is_not_supported() {
++        // given
++        Filter metadataFilter = metadataKey("key").containsString("value");
++        EmbeddingSearchRequest embeddingSearchRequest = EmbeddingSearchRequest.builder()
++                .queryEmbedding(embeddingModel().embed("matching").content())
++                .filter(metadataFilter)
++                .maxResults(100)
++                .build();
++
++        // when
++        Throwable throwable = catchThrowable(() -> embeddingStore().search(embeddingSearchRequest));
++
++        // then
++        assertThat(throwable)
++                .isInstanceOf(UnsupportedOperationException.class);
++    }
++
++    @EnabledIf("supportsContains")
++    @Test
++    protected void should_filter_by_metadata_contains() {
++        should_filter_by_metadata(
++                metadataKey("key").containsString("contains"),
++                List.of(
++                        new Metadata().put("key", "|contains|"),
++                        new Metadata().put("key", "contains").put("key2", "not")),
++                List.of(new Metadata().put("key", "ContainsString"), new Metadata().put("key2", "contains"), new Metadata()));
++    }
++
++    @EnabledIf("supportsContains")
++    @Test
++    protected void should_filter_by_not_metadata_contains() {
++        should_filter_by_metadata_not(
++                not(metadataKey("key").containsString("contains")),
++                List.of(
++                        new Metadata().put("key", "not"),
++                        new Metadata().put("key", "not").put("key2", "contains"),
++                        new Metadata()),
++                List.of(
++                        new Metadata().put("key", "|contains|"),
++                        new Metadata().put("key", "contains").put("key2", "not")));
++    }
++
++    protected boolean supportsContains() {
++        return false;
++    }
+ }
+diff --git a/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/comparison/ContainsStringTest.java b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/comparison/ContainsStringTest.java
+new file mode 100644
+index 00000000000..ea21bc0cb2c
+--- /dev/null
++++ b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/comparison/ContainsStringTest.java
+@@ -0,0 +1,48 @@
++package dev.langchain4j.store.embedding.filter.comparison;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import dev.langchain4j.data.document.Metadata;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++
++class ContainsStringTest {
++
++    @Test
++    void testShouldReturnFalseWhenNotMetadata() {
++        ContainsString containsString = new ContainsString("key", "value");
++        assertThat(containsString.test("notMetadata")).isFalse();
++    }
++
++    @Test
++    void testShouldReturnFalseWhenKeyNotFound() {
++        ContainsString containsString = new ContainsString("key", "value");
++        Metadata metadata = new Metadata(Map.of());
++        assertThat(containsString.test(metadata)).isFalse();
++    }
++
++    @Test
++    void testShouldReturnTrueWhenContains() {
++        ContainsString containsString = new ContainsString("key", "value");
++        Metadata metadata = new Metadata(Map.of("key", "foovaluebar"));
++        assertThat(containsString.test(metadata)).isTrue();
++    }
++
++    @Test
++    void testShouldReturnFalseWhenNotContains() {
++        ContainsString containsString = new ContainsString("key", "value");
++        Metadata metadata = new Metadata(Map.of("key", "foobar"));
++        assertThat(containsString.test(metadata)).isFalse();
++    }
++
++    @Test
++    void testShouldThrowIllegalArgumentExceptionWhenTypeMismatch() {
++        ContainsString containsString = new ContainsString("key", "value");
++        Metadata metadata = new Metadata(Map.of("key", 42));
++        assertThatThrownBy(() -> containsString.test(metadata))
++                .isInstanceOf(IllegalArgumentException.class)
++                .hasMessage(
++                        "Type mismatch: actual value of metadata key \"key\" (42) has type java.lang.Integer, while it is expected to be a string");
++    }
++}
+diff --git a/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/logical/NotTest.java b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/logical/NotTest.java
+index 16a9f23bd10..c8189722f08 100644
+--- a/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/logical/NotTest.java
++++ b/langchain4j-core/src/test/java/dev/langchain4j/store/embedding/filter/logical/NotTest.java
+@@ -1,15 +1,16 @@
+ package dev.langchain4j.store.embedding.filter.logical;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.mockito.ArgumentMatchers.any;
++
++import dev.langchain4j.data.document.Metadata;
+ import dev.langchain4j.store.embedding.filter.Filter;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.extension.ExtendWith;
+ import org.mockito.Mock;
+ import org.mockito.Mockito;
+ import org.mockito.junit.jupiter.MockitoExtension;
+-import org.junit.jupiter.api.extension.ExtendWith;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+-import static org.mockito.ArgumentMatchers.any;
+ 
+ @ExtendWith(MockitoExtension.class)
+ class NotTest {
+@@ -24,11 +25,18 @@ void beforeEach() {
+         subject = new Not(filter);
+     }
+ 
++    @Test
++    void shouldReturnFalseWhenNotMetadata() {
++        boolean result = subject.test(new Object());
++
++        assertThat(result).isFalse();
++    }
++
+     @Test
+     void shouldReturnFalseWhenFilterReturnsTrue() {
+         Mockito.when(filter.test(any())).thenReturn(true);
+ 
+-        boolean result = subject.test(new Object());
++        boolean result = subject.test(new Metadata());
+ 
+         assertThat(result).isFalse();
+     }
+@@ -37,7 +45,7 @@ void shouldReturnFalseWhenFilterReturnsTrue() {
+     void shouldReturnTrueWhenFilterReturnsFalse() {
+         Mockito.when(filter.test(any())).thenReturn(false);
+ 
+-        boolean result = subject.test(new Object());
++        boolean result = subject.test(new Metadata());
+ 
+         assertThat(result).isTrue();
+     }
+@@ -58,9 +66,7 @@ void shouldHaveCorrectToStringImplementation() {
+     void shouldReturnTrueForEqualsWithSameExpression() {
+         Not anotherWithSameExp = new Not(filter);
+ 
+-        assertThat(subject)
+-            .isEqualTo(anotherWithSameExp)
+-            .hasSameHashCodeAs(anotherWithSameExp);
++        assertThat(subject).isEqualTo(anotherWithSameExp).hasSameHashCodeAs(anotherWithSameExp);
+     }
+ 
+     @Test
+diff --git a/langchain4j-milvus/src/main/java/dev/langchain4j/store/embedding/milvus/MilvusMetadataFilterMapper.java b/langchain4j-milvus/src/main/java/dev/langchain4j/store/embedding/milvus/MilvusMetadataFilterMapper.java
+index bc1b2b52e0e..db82084546f 100644
+--- a/langchain4j-milvus/src/main/java/dev/langchain4j/store/embedding/milvus/MilvusMetadataFilterMapper.java
++++ b/langchain4j-milvus/src/main/java/dev/langchain4j/store/embedding/milvus/MilvusMetadataFilterMapper.java
+@@ -1,70 +1,91 @@
+ package dev.langchain4j.store.embedding.milvus;
+ 
++import static java.lang.String.format;
++import static java.util.stream.Collectors.toList;
++
+ import dev.langchain4j.store.embedding.filter.Filter;
+ import dev.langchain4j.store.embedding.filter.comparison.*;
+ import dev.langchain4j.store.embedding.filter.logical.And;
+ import dev.langchain4j.store.embedding.filter.logical.Not;
+ import dev.langchain4j.store.embedding.filter.logical.Or;
+-
+ import java.util.Collection;
+ import java.util.List;
+ import java.util.UUID;
+ 
+-import static java.lang.String.format;
+-import static java.util.stream.Collectors.toList;
+-
+ class MilvusMetadataFilterMapper {
+ 
+     static String map(Filter filter, String metadataFieldName) {
+-        if (filter instanceof IsEqualTo) {
+-            return mapEqual((IsEqualTo) filter, metadataFieldName);
+-        } else if (filter instanceof IsNotEqualTo) {
+-            return mapNotEqual((IsNotEqualTo) filter, metadataFieldName);
+-        } else if (filter instanceof IsGreaterThan) {
+-            return mapGreaterThan((IsGreaterThan) filter, metadataFieldName);
+-        } else if (filter instanceof IsGreaterThanOrEqualTo) {
+-            return mapGreaterThanOrEqual((IsGreaterThanOrEqualTo) filter, metadataFieldName);
+-        } else if (filter instanceof IsLessThan) {
+-            return mapLessThan((IsLessThan) filter, metadataFieldName);
+-        } else if (filter instanceof IsLessThanOrEqualTo) {
+-            return mapLessThanOrEqual((IsLessThanOrEqualTo) filter, metadataFieldName);
+-        } else if (filter instanceof IsIn) {
+-            return mapIn((IsIn) filter, metadataFieldName);
+-        } else if (filter instanceof IsNotIn) {
+-            return mapNotIn((IsNotIn) filter, metadataFieldName);
+-        } else if (filter instanceof And) {
+-            return mapAnd((And) filter, metadataFieldName);
+-        } else if (filter instanceof Not) {
+-            return mapNot((Not) filter, metadataFieldName);
+-        } else if (filter instanceof Or) {
+-            return mapOr((Or) filter, metadataFieldName);
++        if (filter instanceof ContainsString containsString) {
++            return mapContains(containsString, metadataFieldName);
++        } else if (filter instanceof IsEqualTo isEqualTo) {
++            return mapEqual(isEqualTo, metadataFieldName);
++        } else if (filter instanceof IsNotEqualTo isNotEqualTo) {
++            return mapNotEqual(isNotEqualTo, metadataFieldName);
++        } else if (filter instanceof IsGreaterThan isGreaterThan) {
++            return mapGreaterThan(isGreaterThan, metadataFieldName);
++        } else if (filter instanceof IsGreaterThanOrEqualTo isGreaterThanOrEqualTo) {
++            return mapGreaterThanOrEqual(isGreaterThanOrEqualTo, metadataFieldName);
++        } else if (filter instanceof IsLessThan isLessThan) {
++            return mapLessThan(isLessThan, metadataFieldName);
++        } else if (filter instanceof IsLessThanOrEqualTo isLessThanOrEqualTo) {
++            return mapLessThanOrEqual(isLessThanOrEqualTo, metadataFieldName);
++        } else if (filter instanceof IsIn isIn) {
++            return mapIn(isIn, metadataFieldName);
++        } else if (filter instanceof IsNotIn isNotIn) {
++            return mapNotIn(isNotIn, metadataFieldName);
++        } else if (filter instanceof And and) {
++            return mapAnd(and, metadataFieldName);
++        } else if (filter instanceof Not not) {
++            return mapNot(not, metadataFieldName);
++        } else if (filter instanceof Or or) {
++            return mapOr(or, metadataFieldName);
+         } else {
+-            throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
++            throw new UnsupportedOperationException(
++                    "Unsupported filter type: " + filter.getClass().getName());
+         }
+     }
+ 
++    private static String mapContains(ContainsString containsString, String metadataFieldName) {
++        return format(
++                "%s LIKE %s",
++                formatKey(containsString.key(), metadataFieldName), formatValue("%" + containsString.comparisonValue() + "%"));
++    }
++
+     private static String mapEqual(IsEqualTo isEqualTo, String metadataFieldName) {
+-        return format("%s == %s", formatKey(isEqualTo.key(), metadataFieldName), formatValue(isEqualTo.comparisonValue()));
++        return format(
++                "%s == %s", formatKey(isEqualTo.key(), metadataFieldName), formatValue(isEqualTo.comparisonValue()));
+     }
+ 
+     private static String mapNotEqual(IsNotEqualTo isNotEqualTo, String metadataFieldName) {
+-        return format("%s != %s", formatKey(isNotEqualTo.key(), metadataFieldName), formatValue(isNotEqualTo.comparisonValue()));
++        return format(
++                "%s != %s",
++                formatKey(isNotEqualTo.key(), metadataFieldName), formatValue(isNotEqualTo.comparisonValue()));
+     }
+ 
+     private static String mapGreaterThan(IsGreaterThan isGreaterThan, String metadataFieldName) {
+-        return format("%s > %s", formatKey(isGreaterThan.key(), metadataFieldName), formatValue(isGreaterThan.comparisonValue()));
++        return format(
++                "%s > %s",
++                formatKey(isGreaterThan.key(), metadataFieldName), formatValue(isGreaterThan.comparisonValue()));
+     }
+ 
+-    private static String mapGreaterThanOrEqual(IsGreaterThanOrEqualTo isGreaterThanOrEqualTo, String metadataFieldName) {
+-        return format("%s >= %s", formatKey(isGreaterThanOrEqualTo.key(), metadataFieldName), formatValue(isGreaterThanOrEqualTo.comparisonValue()));
++    private static String mapGreaterThanOrEqual(
++            IsGreaterThanOrEqualTo isGreaterThanOrEqualTo, String metadataFieldName) {
++        return format(
++                "%s >= %s",
++                formatKey(isGreaterThanOrEqualTo.key(), metadataFieldName),
++                formatValue(isGreaterThanOrEqualTo.comparisonValue()));
+     }
+ 
+     private static String mapLessThan(IsLessThan isLessThan, String metadataFieldName) {
+-        return format("%s < %s", formatKey(isLessThan.key(), metadataFieldName), formatValue(isLessThan.comparisonValue()));
++        return format(
++                "%s < %s", formatKey(isLessThan.key(), metadataFieldName), formatValue(isLessThan.comparisonValue()));
+     }
+ 
+     private static String mapLessThanOrEqual(IsLessThanOrEqualTo isLessThanOrEqualTo, String metadataFieldName) {
+-        return format("%s <= %s", formatKey(isLessThanOrEqualTo.key(), metadataFieldName), formatValue(isLessThanOrEqualTo.comparisonValue()));
++        return format(
++                "%s <= %s",
++                formatKey(isLessThanOrEqualTo.key(), metadataFieldName),
++                formatValue(isLessThanOrEqualTo.comparisonValue()));
+     }
+ 
+     private static String mapIn(IsIn isIn, String metadataFieldName) {
+@@ -72,7 +93,8 @@ private static String mapIn(IsIn isIn, String metadataFieldName) {
+     }
+ 
+     private static String mapNotIn(IsNotIn isNotIn, String metadataFieldName) {
+-        return format("%s not in %s", formatKey(isNotIn.key(), metadataFieldName), formatValues(isNotIn.comparisonValues()));
++        return format(
++                "%s not in %s", formatKey(isNotIn.key(), metadataFieldName), formatValues(isNotIn.comparisonValues()));
+     }
+ 
+     private static String mapAnd(And and, String metadataFieldName) {
+@@ -88,7 +110,7 @@ private static String mapOr(Or or, String metadataFieldName) {
+     }
+ 
+     private static String formatKey(String key, String metadataFieldName) {
+-        return metadataFieldName+"[\"" + key + "\"]";
++        return metadataFieldName + "[\"" + key + "\"]";
+     }
+ 
+     private static String formatValue(Object value) {
+@@ -103,4 +125,3 @@ protected static List<String> formatValues(Collection<?> values) {
+         return values.stream().map(MilvusMetadataFilterMapper::formatValue).collect(toList());
+     }
+ }
+-
+diff --git a/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreCloudIT.java b/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreCloudIT.java
+index b19bc3c7e67..b1943fe0da5 100644
+--- a/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreCloudIT.java
++++ b/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreCloudIT.java
+@@ -1,23 +1,22 @@
+ package dev.langchain4j.store.embedding.milvus;
+ 
++import static io.milvus.common.clientenum.ConsistencyLevelEnum.STRONG;
++import static java.util.Arrays.asList;
++import static org.assertj.core.api.Assertions.assertThat;
++
+ import dev.langchain4j.data.embedding.Embedding;
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingMatch;
+ import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
++import java.util.List;
+ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+ 
+-import java.util.List;
+-
+-import static io.milvus.common.clientenum.ConsistencyLevelEnum.STRONG;
+-import static java.util.Arrays.asList;
+-import static org.assertj.core.api.Assertions.assertThat;
+-
+ @EnabledIfEnvironmentVariable(named = "MILVUS_API_KEY", matches = ".+")
+ class MilvusEmbeddingStoreCloudIT extends EmbeddingStoreWithFilteringIT {
+ 
+@@ -69,12 +68,19 @@ void should_not_retrieve_embeddings_when_searching() {
+         Embedding secondEmbedding = embeddingModel.embed("hi").content();
+         embeddingStore.addAll(asList(firstEmbedding, secondEmbedding));
+ 
+-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(EmbeddingSearchRequest.builder()
+-                .queryEmbedding(firstEmbedding)
+-                .maxResults(10)
+-                .build()).matches();
++        List<EmbeddingMatch<TextSegment>> matches = embeddingStore
++                .search(EmbeddingSearchRequest.builder()
++                        .queryEmbedding(firstEmbedding)
++                        .maxResults(10)
++                        .build())
++                .matches();
+         assertThat(matches).hasSize(2);
+         assertThat(matches.get(0).embedding()).isNull();
+         assertThat(matches.get(1).embedding()).isNull();
+     }
+-}
+\ No newline at end of file
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
++}
+diff --git a/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreIT.java b/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreIT.java
+index 491305365ec..f96c175dc74 100644
+--- a/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreIT.java
++++ b/langchain4j-milvus/src/test/java/dev/langchain4j/store/embedding/milvus/MilvusEmbeddingStoreIT.java
+@@ -1,28 +1,26 @@
+ package dev.langchain4j.store.embedding.milvus;
+ 
++import static io.milvus.common.clientenum.ConsistencyLevelEnum.STRONG;
++import static java.util.Arrays.asList;
++import static org.assertj.core.api.Assertions.assertThat;
++
+ import dev.langchain4j.data.embedding.Embedding;
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingMatch;
+ import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
+ import io.milvus.client.MilvusServiceClient;
+ import io.milvus.param.ConnectParam;
++import java.util.List;
+ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ import org.testcontainers.milvus.MilvusContainer;
+ 
+-import java.util.List;
+-
+-import static dev.langchain4j.internal.Utils.getOrDefault;
+-import static io.milvus.common.clientenum.ConsistencyLevelEnum.STRONG;
+-import static java.util.Arrays.asList;
+-import static org.assertj.core.api.Assertions.assertThat;
+-
+ @Testcontainers
+ class MilvusEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+@@ -82,52 +80,57 @@ void should_not_retrieve_embeddings_when_searching() {
+         Embedding secondEmbedding = embeddingModel.embed("hi").content();
+         embeddingStore.addAll(asList(firstEmbedding, secondEmbedding));
+ 
+-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(EmbeddingSearchRequest.builder()
+-                .queryEmbedding(firstEmbedding)
+-                .maxResults(10)
+-                .build()).matches();
++        List<EmbeddingMatch<TextSegment>> matches = embeddingStore
++                .search(EmbeddingSearchRequest.builder()
++                        .queryEmbedding(firstEmbedding)
++                        .maxResults(10)
++                        .build())
++                .matches();
+         assertThat(matches).hasSize(2);
+         assertThat(matches.get(0).embedding()).isNull();
+         assertThat(matches.get(1).embedding()).isNull();
+     }
+ 
+-
+     @Test
+-    void test_milvus_with_existing_client(){
++    void test_milvus_with_existing_client() {
+ 
+-        ConnectParam.Builder connectBuilder = ConnectParam
+-            .newBuilder()
+-            .withHost(milvus.getHost())
+-            .withUri(milvus.getEndpoint())
+-            .withPort(milvus.getMappedPort(19530))
+-            .withAuthorization("", "");
++        ConnectParam.Builder connectBuilder = ConnectParam.newBuilder()
++                .withHost(milvus.getHost())
++                .withUri(milvus.getEndpoint())
++                .withPort(milvus.getMappedPort(19530))
++                .withAuthorization("", "");
+ 
+         MilvusServiceClient milvusServiceClient = new MilvusServiceClient(connectBuilder.build());
+ 
+         EmbeddingStore<TextSegment> embeddingStore = MilvusEmbeddingStore.builder()
+-            .milvusClient(milvusServiceClient)
+-            .collectionName(COLLECTION_NAME)
+-            .consistencyLevel(STRONG)
+-            .dimension(384)
+-            .retrieveEmbeddingsOnSearch(false)
+-            .idFieldName("id_field")
+-            .textFieldName("text_field")
+-            .metadataFieldName("metadata_field")
+-            .vectorFieldName("vector_field")
+-            .build();
++                .milvusClient(milvusServiceClient)
++                .collectionName(COLLECTION_NAME)
++                .consistencyLevel(STRONG)
++                .dimension(384)
++                .retrieveEmbeddingsOnSearch(false)
++                .idFieldName("id_field")
++                .textFieldName("text_field")
++                .metadataFieldName("metadata_field")
++                .vectorFieldName("vector_field")
++                .build();
+ 
+         Embedding firstEmbedding = embeddingModel.embed("hello").content();
+         Embedding secondEmbedding = embeddingModel.embed("hi").content();
+         embeddingStore.addAll(asList(firstEmbedding, secondEmbedding));
+ 
+-        List<EmbeddingMatch<TextSegment>> matches = embeddingStore.search(EmbeddingSearchRequest.builder()
+-            .queryEmbedding(firstEmbedding)
+-            .maxResults(10)
+-            .build()).matches();
++        List<EmbeddingMatch<TextSegment>> matches = embeddingStore
++                .search(EmbeddingSearchRequest.builder()
++                        .queryEmbedding(firstEmbedding)
++                        .maxResults(10)
++                        .build())
++                .matches();
+         assertThat(matches).hasSize(2);
+         assertThat(matches.get(0).embedding()).isNull();
+         assertThat(matches.get(1).embedding()).isNull();
+-
+     }
+ 
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }
+diff --git a/langchain4j-oracle/src/main/java/dev/langchain4j/store/embedding/oracle/SQLFilters.java b/langchain4j-oracle/src/main/java/dev/langchain4j/store/embedding/oracle/SQLFilters.java
+index e2d8e2b0f38..a4d3c04f78b 100644
+--- a/langchain4j-oracle/src/main/java/dev/langchain4j/store/embedding/oracle/SQLFilters.java
++++ b/langchain4j-oracle/src/main/java/dev/langchain4j/store/embedding/oracle/SQLFilters.java
+@@ -6,7 +6,6 @@
+ import dev.langchain4j.store.embedding.filter.logical.And;
+ import dev.langchain4j.store.embedding.filter.logical.Not;
+ import dev.langchain4j.store.embedding.filter.logical.Or;
+-
+ import java.sql.*;
+ import java.sql.SQLType;
+ import java.util.*;
+@@ -32,46 +31,39 @@ private SQLFilters() {}
+      * Map of {@link Filter} classes to functions which construct the equivalent {@link SQLFilter}.
+      */
+     private static final Map<Class<? extends Filter>, FilterConstructor> CONSTRUCTORS;
++
+     static {
+         Map<Class<? extends Filter>, FilterConstructor> map = new HashMap<>();
+ 
+-        map.put(IsEqualTo.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsEqualTo) filter, keyMapper));
++        map.put(IsEqualTo.class, (filter, keyMapper) -> new SQLComparisonFilter((IsEqualTo) filter, keyMapper));
+ 
+-        map.put(IsNotEqualTo.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsNotEqualTo) filter, keyMapper));
++        map.put(IsNotEqualTo.class, (filter, keyMapper) -> new SQLComparisonFilter((IsNotEqualTo) filter, keyMapper));
+ 
+-        map.put(IsGreaterThan.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsGreaterThan) filter, keyMapper));
++        map.put(IsGreaterThan.class, (filter, keyMapper) -> new SQLComparisonFilter((IsGreaterThan) filter, keyMapper));
+ 
+-        map.put(IsGreaterThanOrEqualTo.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsGreaterThanOrEqualTo) filter, keyMapper));
++        map.put(
++                IsGreaterThanOrEqualTo.class,
++                (filter, keyMapper) -> new SQLComparisonFilter((IsGreaterThanOrEqualTo) filter, keyMapper));
+ 
+-        map.put(IsLessThan.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsLessThan) filter, keyMapper));
++        map.put(IsLessThan.class, (filter, keyMapper) -> new SQLComparisonFilter((IsLessThan) filter, keyMapper));
+ 
+-        map.put(IsLessThanOrEqualTo.class, (filter, keyMapper) ->
+-            new SQLComparisonFilter((IsLessThanOrEqualTo) filter, keyMapper));
++        map.put(
++                IsLessThanOrEqualTo.class,
++                (filter, keyMapper) -> new SQLComparisonFilter((IsLessThanOrEqualTo) filter, keyMapper));
+ 
+-        map.put(IsIn.class, (filter, keyMapper) ->
+-            new SQLInFilter((IsIn) filter, keyMapper));
++        map.put(IsIn.class, (filter, keyMapper) -> new SQLInFilter((IsIn) filter, keyMapper));
+ 
+-        map.put(IsNotIn.class, (filter, keyMapper) ->
+-            new SQLInFilter((IsNotIn) filter, keyMapper));
++        map.put(IsNotIn.class, (filter, keyMapper) -> new SQLInFilter((IsNotIn) filter, keyMapper));
+ 
+-        map.put(And.class, (filter, keyMapper) ->
+-            new SQLLogicalFilter((And) filter, keyMapper));
++        map.put(And.class, (filter, keyMapper) -> new SQLLogicalFilter((And) filter, keyMapper));
+ 
+-        map.put(Or.class, (filter, keyMapper) ->
+-            new SQLLogicalFilter((Or) filter, keyMapper));
++        map.put(Or.class, (filter, keyMapper) -> new SQLLogicalFilter((Or) filter, keyMapper));
+ 
+-        map.put(Not.class, (filter, keyMapper) ->
+-            new SQLNot((Not)filter, keyMapper));
++        map.put(Not.class, (filter, keyMapper) -> new SQLNot((Not) filter, keyMapper));
+ 
+         CONSTRUCTORS = Collections.unmodifiableMap(map);
+     }
+ 
+-
+     /**
+      * <p>
+      * Returns a SQL filter that evaluates to the same result as a <code>Filter</code>.
+@@ -93,14 +85,14 @@ private SQLFilters() {}
+      * @throws IllegalArgumentException If the class of the Filter is not recognized.
+      */
+     static SQLFilter create(Filter filter, BiFunction<String, SQLType, String> keyMapper) {
+-        if (filter == null)
+-            return EMPTY;
++        if (filter == null) return EMPTY;
+ 
+         Class<? extends Filter> filterClass = filter.getClass();
+         FilterConstructor constructor = CONSTRUCTORS.get(filterClass);
+ 
+-        if (constructor == null)
+-            throw new IllegalArgumentException("Unrecognized Filter class: " + filterClass);
++        if (constructor == null) {
++            throw new UnsupportedOperationException("Unsupported filter type: " + filterClass.getName());
++        }
+ 
+         return constructor.construct(filter, keyMapper);
+     }
+@@ -168,7 +160,8 @@ private static class SQLComparisonFilter implements SQLFilter {
+             this(isGreaterThan.key(), keyMapper, ">", isGreaterThan.comparisonValue(), false);
+         }
+ 
+-        SQLComparisonFilter(IsGreaterThanOrEqualTo isGreaterThanOrEqualTo, BiFunction<String, SQLType, String> keyMapper) {
++        SQLComparisonFilter(
++                IsGreaterThanOrEqualTo isGreaterThanOrEqualTo, BiFunction<String, SQLType, String> keyMapper) {
+             this(isGreaterThanOrEqualTo.key(), keyMapper, ">=", isGreaterThanOrEqualTo.comparisonValue(), false);
+         }
+ 
+@@ -213,7 +206,10 @@ private static class SQLComparisonFilter implements SQLFilter {
+          * @param isNullTrue Result of the filter when the metadata does not contain the key.
+          */
+         private <T> SQLComparisonFilter(
+-                String key, BiFunction<String, SQLType, String> keyMapper, String operator, T comparisonValue,
++                String key,
++                BiFunction<String, SQLType, String> keyMapper,
++                String operator,
++                T comparisonValue,
+                 boolean isNullTrue) {
+             this.sqlType = toSQLType(comparisonValue);
+             this.sql = "NVL(" + keyMapper.apply(key, sqlType) + " " + operator + " ?, " + isNullTrue + ")";
+@@ -270,7 +266,8 @@ private static class SQLLogicalFilter implements SQLFilter {
+             this(or.left(), "OR", or.right(), keyMapper);
+         }
+ 
+-        private SQLLogicalFilter(Filter left, String operator, Filter right, BiFunction<String, SQLType, String> keyMapper) {
++        private SQLLogicalFilter(
++                Filter left, String operator, Filter right, BiFunction<String, SQLType, String> keyMapper) {
+             this(create(left, keyMapper), operator, create(right, keyMapper));
+         }
+ 
+@@ -403,13 +400,13 @@ private static class SQLInFilter implements SQLFilter {
+          * @param comparisonValues Set of values to search within. Not null. Not empty.
+          */
+         private SQLInFilter(
+-                String key, BiFunction<String, SQLType, String> keyMapper, boolean isIn,
++                String key,
++                BiFunction<String, SQLType, String> keyMapper,
++                boolean isIn,
+                 Collection<?> comparisonValues) {
+             this.sqlType = toSQLType(comparisonValues);
+             this.sql = "NVL(" + keyMapper.apply(key, sqlType) + (isIn ? " IN " : " NOT IN ") + "("
+-                    + Stream.generate(() -> "?")
+-                        .limit(comparisonValues.size())
+-                        .collect(Collectors.joining(", "))
++                    + Stream.generate(() -> "?").limit(comparisonValues.size()).collect(Collectors.joining(", "))
+                     + "), "
+                     + !isIn + ")"; // <-- 2nd argument to NVL
+             this.comparisonValues = comparisonValues;
+@@ -465,8 +462,7 @@ public String asWhereClause() {
+      * @return The converted object, or the same object if no conversion is required. May be null.
+      */
+     static Object toJdbcObject(Object object) {
+-        if (object instanceof UUID)
+-            return object.toString();
++        if (object instanceof UUID) return object.toString();
+ 
+         return object;
+     }
+@@ -489,20 +485,17 @@ static Object toJdbcObject(Object object) {
+      * @return The SQL data type to convert objects into. Not null.
+      */
+     static SQLType toSQLType(Collection<?> objects) {
+-        Set<SQLType> jdbcTypes =
+-            objects.stream()
+-                    .map(SQLFilters::toSQLType)
+-                    .collect(Collectors.toSet());
++        Set<SQLType> jdbcTypes = objects.stream().map(SQLFilters::toSQLType).collect(Collectors.toSet());
+ 
+         // Not supporting the case where a collection contains different classes of objects.
+         if (jdbcTypes.size() != 1) {
+             throw new IllegalArgumentException(
+-                    "Filters comparing a Collection of non-uniform object classes are not supported. The Collection " +
+-                            "contains objects of the following classes: " +
+-                    objects.stream()
+-                            .map(Object::getClass)
+-                            .map(Class::getSimpleName)
+-                            .collect(Collectors.joining(", ")));
++                    "Filters comparing a Collection of non-uniform object classes are not supported. The Collection "
++                            + "contains objects of the following classes: "
++                            + objects.stream()
++                                    .map(Object::getClass)
++                                    .map(Class::getSimpleName)
++                                    .collect(Collectors.joining(", ")));
+         }
+ 
+         return jdbcTypes.iterator().next();
+@@ -523,14 +516,10 @@ static SQLType toSQLType(Object object) {
+                 return JDBCType.REAL; // REAL with default precision is a 32-bit floating point number
+             else if (object instanceof Double)
+                 return JDBCType.FLOAT; // FLOAT with default precision is a 64-bit floating point number
+-            else if (object instanceof Integer)
+-                return JDBCType.INTEGER;
+-            else if (object instanceof Long)
+-                return JDBCType.NUMERIC; // NUMERIC is an integer with 38 decimal digits
+-            else
+-                throw new RuntimeException("Unsupported type: " + object.getClass());
+-        }
+-        else {
++            else if (object instanceof Integer) return JDBCType.INTEGER;
++            else if (object instanceof Long) return JDBCType.NUMERIC; // NUMERIC is an integer with 38 decimal digits
++            else throw new RuntimeException("Unsupported type: " + object.getClass());
++        } else {
+             // Compare null, String, UUID, and any other object that Metadata supports in the future as VARCHAR objects.
+             // It is assumed that the getOsonFromMetadata object method in OracleEmbeddingStore will convert these
+             // objects to String. A VARCHAR can store the information of a Java String without losing any information.
+diff --git a/langchain4j-pgvector/src/main/java/dev/langchain4j/store/embedding/pgvector/PgVectorFilterMapper.java b/langchain4j-pgvector/src/main/java/dev/langchain4j/store/embedding/pgvector/PgVectorFilterMapper.java
+index b7534ceb267..1626a3f9e4b 100644
+--- a/langchain4j-pgvector/src/main/java/dev/langchain4j/store/embedding/pgvector/PgVectorFilterMapper.java
++++ b/langchain4j-pgvector/src/main/java/dev/langchain4j/store/embedding/pgvector/PgVectorFilterMapper.java
+@@ -1,20 +1,19 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
++import static java.lang.String.format;
++import static java.util.AbstractMap.SimpleEntry;
++
+ import dev.langchain4j.store.embedding.filter.Filter;
+ import dev.langchain4j.store.embedding.filter.comparison.*;
+ import dev.langchain4j.store.embedding.filter.logical.And;
+ import dev.langchain4j.store.embedding.filter.logical.Not;
+ import dev.langchain4j.store.embedding.filter.logical.Or;
+-
+ import java.util.Collection;
+ import java.util.Map;
+ import java.util.UUID;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
+ 
+-import static java.lang.String.format;
+-import static java.util.AbstractMap.SimpleEntry;
+-
+ abstract class PgVectorFilterMapper {
+ 
+     static final Map<Class<?>, String> SQL_TYPE_MAP = Stream.of(
+@@ -30,62 +29,81 @@ abstract class PgVectorFilterMapper {
+             .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+ 
+     public String map(Filter filter) {
+-        if (filter instanceof IsEqualTo) {
+-            return mapEqual((IsEqualTo) filter);
+-        } else if (filter instanceof IsNotEqualTo) {
+-            return mapNotEqual((IsNotEqualTo) filter);
+-        } else if (filter instanceof IsGreaterThan) {
+-            return mapGreaterThan((IsGreaterThan) filter);
+-        } else if (filter instanceof IsGreaterThanOrEqualTo) {
+-            return mapGreaterThanOrEqual((IsGreaterThanOrEqualTo) filter);
+-        } else if (filter instanceof IsLessThan) {
+-            return mapLessThan((IsLessThan) filter);
+-        } else if (filter instanceof IsLessThanOrEqualTo) {
+-            return mapLessThanOrEqual((IsLessThanOrEqualTo) filter);
+-        } else if (filter instanceof IsIn) {
+-            return mapIn((IsIn) filter);
+-        } else if (filter instanceof IsNotIn) {
+-            return mapNotIn((IsNotIn) filter);
+-        } else if (filter instanceof And) {
+-            return mapAnd((And) filter);
+-        } else if (filter instanceof Not) {
+-            return mapNot((Not) filter);
+-        } else if (filter instanceof Or) {
+-            return mapOr((Or) filter);
++        if (filter instanceof ContainsString containsString) {
++            return mapContains(containsString);
++        } else if (filter instanceof IsEqualTo isEqualTo) {
++            return mapEqual(isEqualTo);
++        } else if (filter instanceof IsNotEqualTo isNotEqualTo) {
++            return mapNotEqual(isNotEqualTo);
++        } else if (filter instanceof IsGreaterThan isGreaterThan) {
++            return mapGreaterThan(isGreaterThan);
++        } else if (filter instanceof IsGreaterThanOrEqualTo isGreaterThanOrEqualTo) {
++            return mapGreaterThanOrEqual(isGreaterThanOrEqualTo);
++        } else if (filter instanceof IsLessThan isLessThan) {
++            return mapLessThan(isLessThan);
++        } else if (filter instanceof IsLessThanOrEqualTo isLessThanOrEqualTo) {
++            return mapLessThanOrEqual(isLessThanOrEqualTo);
++        } else if (filter instanceof IsIn isIn) {
++            return mapIn(isIn);
++        } else if (filter instanceof IsNotIn isNotIn) {
++            return mapNotIn(isNotIn);
++        } else if (filter instanceof And and) {
++            return mapAnd(and);
++        } else if (filter instanceof Not not) {
++            return mapNot(not);
++        } else if (filter instanceof Or or) {
++            return mapOr(or);
+         } else {
+-            throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
++            throw new UnsupportedOperationException(
++                    "Unsupported filter type: " + filter.getClass().getName());
+         }
+     }
+ 
++    private String mapContains(ContainsString containsString) {
++        String key = formatKey(containsString.key(), containsString.comparisonValue().getClass());
++        return format("%s is not null and %s ~ %s", key, key, formatValue(containsString.comparisonValue()));
++    }
++
+     private String mapEqual(IsEqualTo isEqualTo) {
+         String key = formatKey(isEqualTo.key(), isEqualTo.comparisonValue().getClass());
+-        return format("%s is not null and %s = %s", key, key,
+-                formatValue(isEqualTo.comparisonValue()));
++        return format("%s is not null and %s = %s", key, key, formatValue(isEqualTo.comparisonValue()));
+     }
+ 
+     private String mapNotEqual(IsNotEqualTo isNotEqualTo) {
+-        String key = formatKey(isNotEqualTo.key(), isNotEqualTo.comparisonValue().getClass());
+-        return format("%s is null or %s != %s", key, key,
+-                formatValue(isNotEqualTo.comparisonValue()));
++        String key =
++                formatKey(isNotEqualTo.key(), isNotEqualTo.comparisonValue().getClass());
++        return format("%s is null or %s != %s", key, key, formatValue(isNotEqualTo.comparisonValue()));
+     }
+ 
+     private String mapGreaterThan(IsGreaterThan isGreaterThan) {
+-        return format("%s > %s", formatKey(isGreaterThan.key(), isGreaterThan.comparisonValue().getClass()),
++        return format(
++                "%s > %s",
++                formatKey(isGreaterThan.key(), isGreaterThan.comparisonValue().getClass()),
+                 formatValue(isGreaterThan.comparisonValue()));
+     }
+ 
+     private String mapGreaterThanOrEqual(IsGreaterThanOrEqualTo isGreaterThanOrEqualTo) {
+-        return format("%s >= %s", formatKey(isGreaterThanOrEqualTo.key(), isGreaterThanOrEqualTo.comparisonValue().getClass()),
++        return format(
++                "%s >= %s",
++                formatKey(
++                        isGreaterThanOrEqualTo.key(),
++                        isGreaterThanOrEqualTo.comparisonValue().getClass()),
+                 formatValue(isGreaterThanOrEqualTo.comparisonValue()));
+     }
+ 
+     private String mapLessThan(IsLessThan isLessThan) {
+-        return format("%s < %s", formatKey(isLessThan.key(), isLessThan.comparisonValue().getClass()),
++        return format(
++                "%s < %s",
++                formatKey(isLessThan.key(), isLessThan.comparisonValue().getClass()),
+                 formatValue(isLessThan.comparisonValue()));
+     }
+ 
+     private String mapLessThanOrEqual(IsLessThanOrEqualTo isLessThanOrEqualTo) {
+-        return format("%s <= %s", formatKey(isLessThanOrEqualTo.key(), isLessThanOrEqualTo.comparisonValue().getClass()),
++        return format(
++                "%s <= %s",
++                formatKey(
++                        isLessThanOrEqualTo.key(),
++                        isLessThanOrEqualTo.comparisonValue().getClass()),
+                 formatValue(isLessThanOrEqualTo.comparisonValue()));
+     }
+ 
+@@ -123,7 +141,6 @@ String formatValue(Object value) {
+     }
+ 
+     String formatValuesAsString(Collection<?> values) {
+-        return "(" + values.stream().map(v -> String.format("'%s'", v))
+-                .collect(Collectors.joining(",")) + ")";
++        return "(" + values.stream().map(v -> format("'%s'", v)).collect(Collectors.joining(",")) + ")";
+     }
+ }
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
+index 66c444786ab..7b86fb193e7 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingIndexedStoreIT.java
+@@ -1,5 +1,7 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
++
+ import dev.langchain4j.data.segment.TextSegment;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
+ import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+@@ -9,8 +11,6 @@
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+-import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
+-
+ @Testcontainers
+ class PgVectorEmbeddingIndexedStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+@@ -24,17 +24,17 @@ class PgVectorEmbeddingIndexedStoreIT extends EmbeddingStoreWithFilteringIT {
+     @Override
+     protected void ensureStoreIsReady() {
+         embeddingStore = PgVectorEmbeddingStore.builder()
+-            .host(pgVector.getHost())
+-            .port(pgVector.getFirstMappedPort())
+-            .user("test")
+-            .password("test")
+-            .database("test")
+-            .table("test"+ nextInt(1, 1000))
+-            .dimension(embeddingModel.dimension())
+-            .useIndex(true)
+-            .indexListSize(1)
+-            .dropTableFirst(true)
+-            .build();
++                .host(pgVector.getHost())
++                .port(pgVector.getFirstMappedPort())
++                .user("test")
++                .password("test")
++                .database("test")
++                .table("test" + nextInt(1, 1000))
++                .dimension(embeddingModel.dimension())
++                .useIndex(true)
++                .indexListSize(1)
++                .dropTableFirst(true)
++                .build();
+     }
+ 
+     @Override
+@@ -46,4 +46,9 @@ protected EmbeddingStore<TextSegment> embeddingStore() {
+     protected EmbeddingModel embeddingModel() {
+         return embeddingModel;
+     }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
+index 79d9976c37c..a5281a89f2e 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreConfigIT.java
+@@ -5,15 +5,14 @@
+ import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
++import java.sql.SQLException;
++import javax.sql.DataSource;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.postgresql.ds.PGSimpleDataSource;
+ import org.testcontainers.containers.PostgreSQLContainer;
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+-import javax.sql.DataSource;
+-import java.sql.SQLException;
+-
+ @Testcontainers
+ abstract class PgVectorEmbeddingStoreConfigIT extends EmbeddingStoreWithFilteringIT {
+ 
+@@ -69,4 +68,9 @@ protected EmbeddingStore<TextSegment> embeddingStore() {
+     protected EmbeddingModel embeddingModel() {
+         return embeddingModel;
+     }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }
+diff --git a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
+index a97e069dda1..211ca1cf8a6 100644
+--- a/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
++++ b/langchain4j-pgvector/src/test/java/dev/langchain4j/store/embedding/pgvector/PgVectorEmbeddingStoreIT.java
+@@ -1,5 +1,7 @@
+ package dev.langchain4j.store.embedding.pgvector;
+ 
++import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
++
+ import dev.langchain4j.data.segment.TextSegment;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
+ import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+@@ -9,8 +11,6 @@
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ 
+-import static org.testcontainers.shaded.org.apache.commons.lang3.RandomUtils.nextInt;
+-
+ @Testcontainers
+ class PgVectorEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+@@ -21,7 +21,6 @@ class PgVectorEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+     EmbeddingModel embeddingModel = new AllMiniLmL6V2QuantizedEmbeddingModel();
+ 
+-
+     @Override
+     protected void ensureStoreIsReady() {
+         embeddingStore = PgVectorEmbeddingStore.builder()
+@@ -30,7 +29,7 @@ protected void ensureStoreIsReady() {
+                 .user("test")
+                 .password("test")
+                 .database("test")
+-                .table("test"+nextInt(1000, 2000))
++                .table("test" + nextInt(1000, 2000))
+                 .dimension(384)
+                 .dropTableFirst(true)
+                 .build();
+@@ -45,4 +44,9 @@ protected EmbeddingStore<TextSegment> embeddingStore() {
+     protected EmbeddingModel embeddingModel() {
+         return embeddingModel;
+     }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }
+diff --git a/langchain4j-pinecone/src/test/java/dev/langchain4j/store/embedding/pinecone/PineconeEmbeddingStoreIT.java b/langchain4j-pinecone/src/test/java/dev/langchain4j/store/embedding/pinecone/PineconeEmbeddingStoreIT.java
+index 68485767a3a..c815bb8fa93 100644
+--- a/langchain4j-pinecone/src/test/java/dev/langchain4j/store/embedding/pinecone/PineconeEmbeddingStoreIT.java
++++ b/langchain4j-pinecone/src/test/java/dev/langchain4j/store/embedding/pinecone/PineconeEmbeddingStoreIT.java
+@@ -40,7 +40,11 @@ class PineconeEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+ 
+     @AfterEach
+     protected void clear() {
+-        embeddingStore.removeAll();
++        try {
++            embeddingStore.removeAll();
++        } catch (Exception e) {
++            // ignore
++        }
+     }
+ 
+     @Override
+@@ -85,4 +89,4 @@ protected static Stream<Arguments> should_filter_by_metadata() {
+     protected boolean testLong1746714878034235396() {
+         return false; // TODO remove after https://github.com/langchain4j/langchain4j/issues/1948 is fixed
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/langchain4j-qdrant/pom.xml b/langchain4j-qdrant/pom.xml
+index d82022d7ab6..b626ebda597 100644
+--- a/langchain4j-qdrant/pom.xml
++++ b/langchain4j-qdrant/pom.xml
+@@ -1,7 +1,5 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+-<project xmlns="http://maven.apache.org/POM/4.0.0"
+-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+-    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
++<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+     <modelVersion>4.0.0</modelVersion>
+ 
+     <parent>
+@@ -102,7 +100,7 @@
+             <groupId>io.qdrant</groupId>
+             <artifactId>client</artifactId>
+             <version>1.11.0</version>
+-        </dependency>       
++        </dependency>
+ 
+         <dependency>
+             <groupId>org.awaitility</groupId>
+diff --git a/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverter.java b/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverter.java
+index c80c64e8a08..2b8343b3904 100644
+--- a/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverter.java
++++ b/langchain4j-qdrant/src/main/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverter.java
+@@ -1,20 +1,17 @@
+ package dev.langchain4j.store.embedding.qdrant;
+ 
+-import io.qdrant.client.ConditionFactory;
+ import dev.langchain4j.store.embedding.filter.Filter;
+-
+ import dev.langchain4j.store.embedding.filter.comparison.*;
+ import dev.langchain4j.store.embedding.filter.logical.And;
+ import dev.langchain4j.store.embedding.filter.logical.Not;
+ import dev.langchain4j.store.embedding.filter.logical.Or;
+-
++import io.qdrant.client.ConditionFactory;
++import io.qdrant.client.grpc.Points;
++import io.qdrant.client.grpc.Points.Condition;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.UUID;
+ 
+-import io.qdrant.client.grpc.Points;
+-import io.qdrant.client.grpc.Points.Condition;
+-
+ class QdrantFilterConverter {
+ 
+     public static Points.Filter convertExpression(Filter expression) {
+@@ -39,34 +36,43 @@ private static Points.Filter convertOperand(Filter operand) {
+             shouldClauses.add(ConditionFactory.filter(convertOperand(or.left())));
+             shouldClauses.add(ConditionFactory.filter(convertOperand(or.right())));
+         } else {
+-            mustClauses.add(parseComparison(operand));
++            mustClauses.add(convert(operand));
+         }
+ 
+-        return context.addAllMust(mustClauses).addAllShould(shouldClauses).addAllMustNot(mustNotClauses).build();
++        return context.addAllMust(mustClauses)
++                .addAllShould(shouldClauses)
++                .addAllMustNot(mustNotClauses)
++                .build();
+     }
+ 
+-    private static Condition parseComparison(Filter comparision) {
+-        if (comparision instanceof IsEqualTo) {
+-            return buildEqCondition((IsEqualTo) comparision);
+-        } else if (comparision instanceof IsNotEqualTo) {
+-            return buildNeCondition((IsNotEqualTo) comparision);
+-        } else if (comparision instanceof IsGreaterThan) {
+-            return buildGtCondition((IsGreaterThan) comparision);
+-        } else if (comparision instanceof IsGreaterThanOrEqualTo) {
+-            return buildGteCondition((IsGreaterThanOrEqualTo) comparision);
+-        } else if (comparision instanceof IsLessThan) {
+-            return buildLtCondition((IsLessThan) comparision);
+-        } else if (comparision instanceof IsLessThanOrEqualTo) {
+-            return buildLteCondition((IsLessThanOrEqualTo) comparision);
+-        } else if (comparision instanceof IsIn) {
+-            return buildInCondition((IsIn) comparision);
+-        } else if (comparision instanceof IsNotIn) {
+-            return buildNInCondition((IsNotIn) comparision);
++    private static Condition convert(Filter filter) {
++        if (filter instanceof ContainsString containsString) {
++            return buildContainsCondition(containsString);
++        } else if (filter instanceof IsEqualTo isEqualTo) {
++            return buildEqCondition(isEqualTo);
++        } else if (filter instanceof IsNotEqualTo isNotEqualTo) {
++            return buildNeCondition(isNotEqualTo);
++        } else if (filter instanceof IsGreaterThan isGreaterThan) {
++            return buildGtCondition(isGreaterThan);
++        } else if (filter instanceof IsGreaterThanOrEqualTo isGreaterThanOrEqualTo) {
++            return buildGteCondition(isGreaterThanOrEqualTo);
++        } else if (filter instanceof IsLessThan isLessThan) {
++            return buildLtCondition(isLessThan);
++        } else if (filter instanceof IsLessThanOrEqualTo isLessThanOrEqualTo) {
++            return buildLteCondition(isLessThanOrEqualTo);
++        } else if (filter instanceof IsIn isIn) {
++            return buildInCondition(isIn);
++        } else if (filter instanceof IsNotIn isNotIn) {
++            return buildNInCondition(isNotIn);
+         } else {
+-            throw new UnsupportedOperationException("Unsupported comparision type: " + comparision);
++            throw new UnsupportedOperationException("Unsupported filter type: " + filter.getClass().getName());
+         }
+     }
+ 
++    private static Condition buildContainsCondition(ContainsString containsString) {
++        return ConditionFactory.matchText(containsString.key(), containsString.comparisonValue());
++    }
++
+     private static Condition buildEqCondition(IsEqualTo equalTo) {
+         String key = equalTo.key();
+         Object value = equalTo.comparisonValue();
+@@ -81,28 +87,28 @@ private static Condition buildEqCondition(IsEqualTo equalTo) {
+ 
+         throw new IllegalArgumentException(
+                 "Invalid value type for IsEqualTo. Can either be a String or Boolean or Integer or Long");
+-
+     }
+ 
+     private static Condition buildNeCondition(IsNotEqualTo notEqual) {
+         String key = notEqual.key();
+         Object value = notEqual.comparisonValue();
+         if (value instanceof String || value instanceof UUID) {
+-            return ConditionFactory.filter(
+-                    Points.Filter.newBuilder().addMustNot(ConditionFactory.matchKeyword(key, value.toString()))
+-                            .build());
++            return ConditionFactory.filter(Points.Filter.newBuilder()
++                    .addMustNot(ConditionFactory.matchKeyword(key, value.toString()))
++                    .build());
+         } else if (value instanceof Boolean) {
+             Condition condition = ConditionFactory.match(key, (Boolean) value);
+-            return ConditionFactory.filter(Points.Filter.newBuilder().addMustNot(condition).build());
++            return ConditionFactory.filter(
++                    Points.Filter.newBuilder().addMustNot(condition).build());
+         } else if (value instanceof Integer || value instanceof Long) {
+             long lValue = Long.parseLong(value.toString());
+             Condition condition = ConditionFactory.match(key, lValue);
+-            return ConditionFactory.filter(Points.Filter.newBuilder().addMustNot(condition).build());
++            return ConditionFactory.filter(
++                    Points.Filter.newBuilder().addMustNot(condition).build());
+         }
+ 
+         throw new IllegalArgumentException(
+                 "Invalid value type for IsNotEqualto. Can either be a String or Boolean or Integer or Long");
+-
+     }
+ 
+     private static Condition buildGtCondition(IsGreaterThan greaterThan) {
+@@ -110,10 +116,10 @@ private static Condition buildGtCondition(IsGreaterThan greaterThan) {
+         Object value = greaterThan.comparisonValue();
+         if (value instanceof Number) {
+             Double dvalue = Double.parseDouble(value.toString());
+-            return ConditionFactory.range(key, Points.Range.newBuilder().setGt(dvalue).build());
++            return ConditionFactory.range(
++                    key, Points.Range.newBuilder().setGt(dvalue).build());
+         }
+         throw new RuntimeException("Unsupported value type for IsGreaterThan condition. Only supports Number");
+-
+     }
+ 
+     private static Condition buildLtCondition(IsLessThan lessThan) {
+@@ -121,10 +127,10 @@ private static Condition buildLtCondition(IsLessThan lessThan) {
+         Object value = lessThan.comparisonValue();
+         if (value instanceof Number) {
+             Double dvalue = Double.parseDouble(value.toString());
+-            return ConditionFactory.range(key, Points.Range.newBuilder().setLt(dvalue).build());
++            return ConditionFactory.range(
++                    key, Points.Range.newBuilder().setLt(dvalue).build());
+         }
+         throw new RuntimeException("Unsupported value type for IsLessThan condition. Only supports Number");
+-
+     }
+ 
+     private static Condition buildGteCondition(IsGreaterThanOrEqualTo greaterThanOrEqualTo) {
+@@ -132,10 +138,10 @@ private static Condition buildGteCondition(IsGreaterThanOrEqualTo greaterThanOrE
+         Object value = greaterThanOrEqualTo.comparisonValue();
+         if (value instanceof Number) {
+             Double dvalue = Double.parseDouble(value.toString());
+-            return ConditionFactory.range(key, Points.Range.newBuilder().setGte(dvalue).build());
++            return ConditionFactory.range(
++                    key, Points.Range.newBuilder().setGte(dvalue).build());
+         }
+         throw new RuntimeException("Unsupported value type for IsGreaterThanOrEqualTo condition. Only supports Number");
+-
+     }
+ 
+     private static Condition buildLteCondition(IsLessThanOrEqualTo lessThanOrEqualTo) {
+@@ -143,10 +149,10 @@ private static Condition buildLteCondition(IsLessThanOrEqualTo lessThanOrEqualTo
+         Object value = lessThanOrEqualTo.comparisonValue();
+         if (value instanceof Number) {
+             Double dvalue = Double.parseDouble(value.toString());
+-            return ConditionFactory.range(key, Points.Range.newBuilder().setLte(dvalue).build());
++            return ConditionFactory.range(
++                    key, Points.Range.newBuilder().setLte(dvalue).build());
+         }
+         throw new RuntimeException("Unsupported value type for IsLessThanOrEqualTo condition. Only supports Number");
+-
+     }
+ 
+     private static Condition buildInCondition(IsIn in) {
+@@ -170,10 +176,8 @@ private static Condition buildInCondition(IsIn in) {
+             }
+             return ConditionFactory.matchValues(key, longValues);
+         } else {
+-            throw new RuntimeException(
+-                    "Unsupported value in IsIn value list. Only supports String or Integer or Long");
++            throw new RuntimeException("Unsupported value in IsIn value list. Only supports String or Integer or Long");
+         }
+-
+     }
+ 
+     private static Condition buildNInCondition(IsNotIn notIn) {
+@@ -201,5 +205,4 @@ private static Condition buildNInCondition(IsNotIn notIn) {
+                     "Unsupported value in IsNotIn value list. Only supports String or Integer or Long");
+         }
+     }
+-
+-}
+\ No newline at end of file
++}
+diff --git a/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreIT.java b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreIT.java
+index 691eeb99ffd..88db2c343d9 100644
+--- a/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreIT.java
++++ b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantEmbeddingStoreIT.java
+@@ -1,24 +1,31 @@
+ package dev.langchain4j.store.embedding.qdrant;
+ 
++import static dev.langchain4j.internal.Utils.randomUUID;
++import static io.qdrant.client.grpc.Collections.Distance.Cosine;
++
+ import dev.langchain4j.data.document.Metadata;
+ import dev.langchain4j.data.segment.TextSegment;
+-import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.model.embedding.EmbeddingModel;
++import dev.langchain4j.model.embedding.onnx.allminilml6v2q.AllMiniLmL6V2QuantizedEmbeddingModel;
+ import dev.langchain4j.store.embedding.EmbeddingStore;
+ import dev.langchain4j.store.embedding.EmbeddingStoreWithFilteringIT;
+ import dev.langchain4j.store.embedding.filter.Filter;
+ import dev.langchain4j.store.embedding.filter.comparison.IsEqualTo;
+-import dev.langchain4j.store.embedding.filter.comparison.IsNotEqualTo;
+-import dev.langchain4j.store.embedding.filter.comparison.IsNotIn;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThan;
+ import dev.langchain4j.store.embedding.filter.comparison.IsGreaterThanOrEqualTo;
+ import dev.langchain4j.store.embedding.filter.comparison.IsIn;
+ import dev.langchain4j.store.embedding.filter.comparison.IsLessThan;
+ import dev.langchain4j.store.embedding.filter.comparison.IsLessThanOrEqualTo;
++import dev.langchain4j.store.embedding.filter.comparison.IsNotEqualTo;
++import dev.langchain4j.store.embedding.filter.comparison.IsNotIn;
+ import io.qdrant.client.QdrantClient;
+ import io.qdrant.client.QdrantGrpcClient;
+ import io.qdrant.client.grpc.Collections.VectorParams;
+-
++import java.lang.reflect.Method;
++import java.util.List;
++import java.util.UUID;
++import java.util.concurrent.ExecutionException;
++import java.util.stream.Stream;
+ import org.junit.jupiter.api.AfterAll;
+ import org.junit.jupiter.api.BeforeAll;
+ import org.junit.jupiter.params.ParameterizedTest;
+@@ -27,14 +34,6 @@
+ import org.testcontainers.junit.jupiter.Container;
+ import org.testcontainers.junit.jupiter.Testcontainers;
+ import org.testcontainers.qdrant.QdrantContainer;
+-import java.util.stream.Stream;
+-import java.util.List;
+-import java.util.UUID;
+-import java.util.concurrent.ExecutionException;
+-import java.lang.reflect.Method;
+-
+-import static dev.langchain4j.internal.Utils.randomUUID;
+-import static io.qdrant.client.grpc.Collections.Distance.Cosine;
+ 
+ @Testcontainers
+ class QdrantEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+@@ -50,23 +49,22 @@ class QdrantEmbeddingStoreIT extends EmbeddingStoreWithFilteringIT {
+     @BeforeAll
+     static void setup() throws InterruptedException, ExecutionException {
+         EMBEDDING_STORE = QdrantEmbeddingStore.builder()
+-            .host(QDRANT_CONTAINER.getHost())
+-            .port(QDRANT_CONTAINER.getGrpcPort())
+-            .collectionName(COLLECTION_NAME)
+-            .build();
++                .host(QDRANT_CONTAINER.getHost())
++                .port(QDRANT_CONTAINER.getGrpcPort())
++                .collectionName(COLLECTION_NAME)
++                .build();
+ 
+         QdrantClient client = new QdrantClient(
+-            QdrantGrpcClient.newBuilder(QDRANT_CONTAINER.getHost(), QDRANT_CONTAINER.getGrpcPort(), false)
+-            .build());
+-
+-        client
+-            .createCollectionAsync(
+-                COLLECTION_NAME,
+-                VectorParams.newBuilder()
+-                    .setDistance(Cosine)
+-                    .setSize(EMBEDDING_MODEL.dimension())
+-                .build())
+-            .get();
++                QdrantGrpcClient.newBuilder(QDRANT_CONTAINER.getHost(), QDRANT_CONTAINER.getGrpcPort(), false)
++                        .build());
++
++        client.createCollectionAsync(
++                        COLLECTION_NAME,
++                        VectorParams.newBuilder()
++                                .setDistance(Cosine)
++                                .setSize(EMBEDDING_MODEL.dimension())
++                                .build())
++                .get();
+ 
+         client.close();
+     }
+@@ -77,7 +75,7 @@ static void teardown() {
+     }
+ 
+     @Override
+-    protected EmbeddingStore < TextSegment > embeddingStore() {
++    protected EmbeddingStore<TextSegment> embeddingStore() {
+         return EMBEDDING_STORE;
+     }
+ 
+@@ -94,9 +92,8 @@ protected void clearStore() {
+     @Override
+     @ParameterizedTest
+     @MethodSource("should_filter_by_metadata_not_qdrant")
+-    protected void should_filter_by_metadata_not(Filter metadataFilter,
+-                                                 List<Metadata> matchingMetadatas,
+-                                                 List<Metadata> notMatchingMetadatas) {
++    protected void should_filter_by_metadata_not(
++            Filter metadataFilter, List<Metadata> matchingMetadatas, List<Metadata> notMatchingMetadatas) {
+         super.should_filter_by_metadata_not(metadataFilter, matchingMetadatas, notMatchingMetadatas);
+     }
+ 
+@@ -106,90 +103,85 @@ protected void should_filter_by_metadata_not(Filter metadataFilter,
+     // - For In and NIn conditions, if the key doesn't exist in the metadata, it is
+     // not matched.
+ 
+-    protected static Stream < Arguments > should_filter_by_metadata_not_qdrant() {
+-        return EmbeddingStoreWithFilteringIT.should_filter_by_metadata_not()
+-            .filter(arguments -> {
+-                Filter filter = (Filter) arguments.get()[0];
+-                if (filter instanceof IsNotIn) {
+-                    try {
+-                        IsNotIn notIn = (IsNotIn) filter;
+-                        Method method = notIn.getClass().getMethod("key");
+-                        String key = (String) method.invoke(filter);
+-
+-                        List < Metadata > matchingMetadatas = (List < Metadata > ) arguments.get()[1];
+-                        // For NIn conditions, if the key doesn't exist in the metadata it is not
+-                        // matched.
+-                        Boolean matching = matchingMetadatas.stream()
+-                            .allMatch(metadata -> metadata.containsKey(key));
+-                        if (!matching) {
+-                            return false;
+-                        }
+-
+-                        Object firstValue = notIn.comparisonValues().stream().findFirst().get();
+-                        return firstValue instanceof String ||
+-                            firstValue instanceof UUID ||
+-                            firstValue instanceof Integer ||
+-                            firstValue instanceof Long;
+-                    } catch (Exception e) {
+-                        throw new RuntimeException(e);
++    protected static Stream<Arguments> should_filter_by_metadata_not_qdrant() {
++        return EmbeddingStoreWithFilteringIT.should_filter_by_metadata_not().filter(arguments -> {
++            Filter filter = (Filter) arguments.get()[0];
++            if (filter instanceof IsNotIn) {
++                try {
++                    IsNotIn notIn = (IsNotIn) filter;
++                    Method method = notIn.getClass().getMethod("key");
++                    String key = (String) method.invoke(filter);
++
++                    List<Metadata> matchingMetadatas =
++                            (List<Metadata>) arguments.get()[1];
++                    // For NIn conditions, if the key doesn't exist in the metadata it is not
++                    // matched.
++                    Boolean matching = matchingMetadatas.stream().allMatch(metadata -> metadata.containsKey(key));
++                    if (!matching) {
++                        return false;
+                     }
+-                } else if (filter instanceof IsNotEqualTo) {
+-                    IsNotEqualTo notEqualTo = (IsNotEqualTo) filter;
+-                    return notEqualTo.comparisonValue() instanceof String ||
+-                        notEqualTo.comparisonValue() instanceof UUID ||
+-                        notEqualTo.comparisonValue() instanceof Integer ||
+-                        notEqualTo.comparisonValue() instanceof Long;
+-                } else {
+-                    return true;
++
++                    Object firstValue =
++                            notIn.comparisonValues().stream().findFirst().get();
++                    return firstValue instanceof String
++                            || firstValue instanceof UUID
++                            || firstValue instanceof Integer
++                            || firstValue instanceof Long;
++                } catch (Exception e) {
++                    throw new RuntimeException(e);
+                 }
+-            });
++            } else if (filter instanceof final IsNotEqualTo notEqualTo) {
++                return notEqualTo.comparisonValue() instanceof String
++                        || notEqualTo.comparisonValue() instanceof UUID
++                        || notEqualTo.comparisonValue() instanceof Integer
++                        || notEqualTo.comparisonValue() instanceof Long;
++            } else {
++                return true;
++            }
++        });
+     }
+ 
+     @Override
+     @ParameterizedTest
+     @MethodSource("should_filter_by_metadata_qdrant")
+-    protected void should_filter_by_metadata(Filter metadataFilter,
+-                                             List<Metadata> matchingMetadatas,
+-                                             List<Metadata> notMatchingMetadatas) {
++    protected void should_filter_by_metadata(
++            Filter metadataFilter, List<Metadata> matchingMetadatas, List<Metadata> notMatchingMetadatas) {
+         super.should_filter_by_metadata(metadataFilter, matchingMetadatas, notMatchingMetadatas);
+     }
+ 
+-    protected static Stream < Arguments > should_filter_by_metadata_qdrant() {
+-        return EmbeddingStoreWithFilteringIT.should_filter_by_metadata()
+-            .filter(arguments -> {
+-                Filter filter = (Filter) arguments.get()[0];
+-                if (filter instanceof IsLessThan) {
+-                    IsLessThan lessThan = (IsLessThan) filter;
+-                    return lessThan.comparisonValue() instanceof Integer ||
+-                        lessThan.comparisonValue() instanceof Long;
+-                } else if (filter instanceof IsLessThanOrEqualTo) {
+-                    IsLessThanOrEqualTo lessThanOrEqualTo = (IsLessThanOrEqualTo) filter;
+-                    return lessThanOrEqualTo.comparisonValue() instanceof Integer ||
+-                        lessThanOrEqualTo.comparisonValue() instanceof Long;
+-                } else if (filter instanceof IsGreaterThan) {
+-                    IsGreaterThan greaterThan = (IsGreaterThan) filter;
+-                    return greaterThan.comparisonValue() instanceof Integer ||
+-                        greaterThan.comparisonValue() instanceof Long;
+-                } else if (filter instanceof IsGreaterThanOrEqualTo) {
+-                    IsGreaterThanOrEqualTo greaterThanOrEqualTo = (IsGreaterThanOrEqualTo) filter;
+-                    return greaterThanOrEqualTo.comparisonValue() instanceof Integer ||
+-                        greaterThanOrEqualTo.comparisonValue() instanceof Long;
+-                } else if (filter instanceof IsEqualTo) {
+-                    IsEqualTo equalTo = (IsEqualTo) filter;
+-                    return equalTo.comparisonValue() instanceof String ||
+-                        equalTo.comparisonValue() instanceof UUID ||
+-                        equalTo.comparisonValue() instanceof Integer ||
+-                        equalTo.comparisonValue() instanceof Long;
+-                } else if (filter instanceof IsIn) {
+-                    IsIn in = (IsIn) filter;
+-                    Object firstValue = in .comparisonValues().stream().findFirst().get();
+-                    return firstValue instanceof String ||
+-                        firstValue instanceof UUID ||
+-                        firstValue instanceof Integer ||
+-                        firstValue instanceof Long;
+-                } else {
+-                    return true;
+-                }
+-            });
++    protected static Stream<Arguments> should_filter_by_metadata_qdrant() {
++        return EmbeddingStoreWithFilteringIT.should_filter_by_metadata().filter(arguments -> {
++            Filter filter = (Filter) arguments.get()[0];
++            if (filter instanceof final IsLessThan lessThan) {
++                return lessThan.comparisonValue() instanceof Integer || lessThan.comparisonValue() instanceof Long;
++            } else if (filter instanceof final IsLessThanOrEqualTo lessThanOrEqualTo) {
++                return lessThanOrEqualTo.comparisonValue() instanceof Integer
++                        || lessThanOrEqualTo.comparisonValue() instanceof Long;
++            } else if (filter instanceof final IsGreaterThan greaterThan) {
++                return greaterThan.comparisonValue() instanceof Integer
++                        || greaterThan.comparisonValue() instanceof Long;
++            } else if (filter instanceof final IsGreaterThanOrEqualTo greaterThanOrEqualTo) {
++                return greaterThanOrEqualTo.comparisonValue() instanceof Integer
++                        || greaterThanOrEqualTo.comparisonValue() instanceof Long;
++            } else if (filter instanceof final IsEqualTo equalTo) {
++                return equalTo.comparisonValue() instanceof String
++                        || equalTo.comparisonValue() instanceof UUID
++                        || equalTo.comparisonValue() instanceof Integer
++                        || equalTo.comparisonValue() instanceof Long;
++            } else if (filter instanceof final IsIn in) {
++                Object firstValue = in.comparisonValues().stream().findFirst().get();
++                return firstValue instanceof String
++                        || firstValue instanceof UUID
++                        || firstValue instanceof Integer
++                        || firstValue instanceof Long;
++            } else {
++                return true;
++            }
++        });
++    }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
+     }
+ }
+diff --git a/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverterTest.java b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverterTest.java
+index 84d08ce5cbf..694fbbba7e1 100644
+--- a/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverterTest.java
++++ b/langchain4j-qdrant/src/test/java/dev/langchain4j/store/embedding/qdrant/QdrantFilterConverterTest.java
+@@ -1,15 +1,25 @@
+ package dev.langchain4j.store.embedding.qdrant;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
++
++import dev.langchain4j.store.embedding.filter.Filter;
+ import dev.langchain4j.store.embedding.filter.comparison.*;
+ import io.qdrant.client.grpc.Points;
+-import dev.langchain4j.store.embedding.filter.Filter;
+-import org.junit.jupiter.api.Test;
+-
+-import static org.assertj.core.api.Assertions.assertThat;
+ import java.util.Arrays;
++import org.junit.jupiter.api.Test;
+ 
+ class QdrantFilterConverterTest {
+ 
++    @Test
++    void testContainsFilter() {
++        Filter filter = new ContainsString("string-value", "contains");
++        Points.Filter convertedFilter = QdrantFilterConverter.convertExpression(filter);
++        assertThat(convertedFilter).isNotNull();
++        assertThat(convertedFilter.getMustCount()).isEqualTo(1);
++        assertThat(convertedFilter.getMust(0).getField().getKey()).isEqualTo("string-value");
++        assertThat(convertedFilter.getMust(0).getField().getMatch().getText()).isEqualTo("contains");
++    }
++
+     @Test
+     void testIsEqualToFilter() {
+         Filter filter = new IsEqualTo("num-value", 5);
+@@ -17,21 +27,24 @@ void testIsEqualToFilter() {
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+         assertThat(convertedFilter.getMust(0).getField().getKey()).isEqualTo("num-value");
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getInteger()).isEqualTo(5);
++        assertThat(convertedFilter.getMust(0).getField().getMatch().getInteger())
++                .isEqualTo(5);
+ 
+         filter = new IsEqualTo("str-value", "value");
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+         assertThat(convertedFilter.getMust(0).getField().getKey()).isEqualTo("str-value");
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getKeyword()).isEqualTo("value");
++        assertThat(convertedFilter.getMust(0).getField().getMatch().getKeyword())
++                .isEqualTo("value");
+ 
+         filter = new IsEqualTo("bool-value", true);
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+         assertThat(convertedFilter.getMust(0).getField().getKey()).isEqualTo("bool-value");
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getBoolean()).isEqualTo(true);
++        assertThat(convertedFilter.getMust(0).getField().getMatch().getBoolean())
++                .isEqualTo(true);
+     }
+ 
+     @Test
+@@ -40,22 +53,61 @@ void testIsNotEqualToFilter() {
+         Points.Filter convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getKey()).isEqualTo("num-value");
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getMatch().getInteger()).isEqualTo(5);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getKey())
++                .isEqualTo("num-value");
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getMatch()
++                        .getInteger())
++                .isEqualTo(5);
+ 
+         filter = new IsNotEqualTo("str-value", "value");
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getKey()).isEqualTo("str-value");
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getMatch().getKeyword()).isEqualTo("value");
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getKey())
++                .isEqualTo("str-value");
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getMatch()
++                        .getKeyword())
++                .isEqualTo("value");
+ 
+         filter = new IsNotEqualTo("bool-value", true);
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getKey()).isEqualTo("bool-value");
+-        assertThat(convertedFilter.getMust(0).getFilter().getMustNot(0).getField().getMatch().getBoolean()).isEqualTo(true);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getKey())
++                .isEqualTo("bool-value");
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getFilter()
++                        .getMustNot(0)
++                        .getField()
++                        .getMatch()
++                        .getBoolean())
++                .isEqualTo(true);
+     }
+ 
+     @Test
+@@ -104,13 +156,25 @@ void testInFilter() {
+         Points.Filter convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getIntegers().getIntegersCount()).isEqualTo(3);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getField()
++                        .getMatch()
++                        .getIntegers()
++                        .getIntegersCount())
++                .isEqualTo(3);
+ 
+         filter = new IsIn("key", Arrays.asList("a", "b", "c"));
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getKeywords().getStringsCount()).isEqualTo(3);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getField()
++                        .getMatch()
++                        .getKeywords()
++                        .getStringsCount())
++                .isEqualTo(3);
+     }
+ 
+     @Test
+@@ -119,12 +183,24 @@ void testNInFilter() {
+         Points.Filter convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getExceptIntegers().getIntegersCount()).isEqualTo(4);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getField()
++                        .getMatch()
++                        .getExceptIntegers()
++                        .getIntegersCount())
++                .isEqualTo(4);
+ 
+         filter = new IsNotIn("key", Arrays.asList("a", "b", "c", "k"));
+         convertedFilter = QdrantFilterConverter.convertExpression(filter);
+         assertThat(convertedFilter).isNotNull();
+         assertThat(convertedFilter.getMustCount()).isEqualTo(1);
+-        assertThat(convertedFilter.getMust(0).getField().getMatch().getExceptKeywords().getStringsCount()).isEqualTo(4);
++        assertThat(convertedFilter
++                        .getMust(0)
++                        .getField()
++                        .getMatch()
++                        .getExceptKeywords()
++                        .getStringsCount())
++                .isEqualTo(4);
+     }
+ }
+diff --git a/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreSerializedTest.java b/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreSerializedTest.java
+index bff256b43b7..7c3d2bc23a1 100644
+--- a/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreSerializedTest.java
++++ b/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreSerializedTest.java
+@@ -30,4 +30,9 @@ private void serializeAndDeserialize() {
+     protected EmbeddingModel embeddingModel() {
+         return embeddingModel;
+     }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }
+diff --git a/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreTest.java b/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreTest.java
+index 635adbd854e..6cad551e762 100644
+--- a/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreTest.java
++++ b/langchain4j/src/test/java/dev/langchain4j/store/embedding/inmemory/InMemoryEmbeddingStoreTest.java
+@@ -133,4 +133,9 @@ protected EmbeddingStore<TextSegment> embeddingStore() {
+     protected EmbeddingModel embeddingModel() {
+         return embeddingModel;
+     }
++
++    @Override
++    protected boolean supportsContains() {
++        return true;
++    }
+ }

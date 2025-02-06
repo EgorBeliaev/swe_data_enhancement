@@ -1,0 +1,102 @@
+diff --git a/src/main/java/meteordevelopment/meteorclient/mixin/WorldRendererMixin.java b/src/main/java/meteordevelopment/meteorclient/mixin/WorldRendererMixin.java
+index 5baabf8289..7c31fd1567 100644
+--- a/src/main/java/meteordevelopment/meteorclient/mixin/WorldRendererMixin.java
++++ b/src/main/java/meteordevelopment/meteorclient/mixin/WorldRendererMixin.java
+@@ -29,11 +29,19 @@
+ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+ 
++import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
++import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
++import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
++import com.llamalad7.mixinextras.sugar.Local;
++import com.llamalad7.mixinextras.sugar.ref.LocalRef;
++
+ @Mixin(WorldRenderer.class)
+ public abstract class WorldRendererMixin {
+     @Shadow
+     private Framebuffer entityOutlinesFramebuffer;
+ 
++    @Unique private ESP esp;
++
+     @Shadow
+     protected abstract void renderEntity(Entity entity, double cameraX, double cameraY, double cameraZ, float tickDelta, MatrixStack matrices, VertexConsumerProvider vertexConsumers);
+ 
+@@ -97,6 +105,24 @@ private void onRender(MatrixStack matrices, float tickDelta, long limitTime, boo
+         PostProcessShaders.endRender();
+     }
+ 
++    @ModifyExpressionValue(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/MinecraftClient;hasOutline(Lnet/minecraft/entity/Entity;)Z"))
++    private boolean shouldMobGlow(boolean original, @Local Entity entity) {
++        if (!getESP().isGlow() || getESP().shouldSkip(entity)) return original;
++
++        return getESP().getColor(entity) != null || original;
++    }
++
++    @WrapOperation(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/render/OutlineVertexConsumerProvider;setColor(IIII)V"))
++    private void setGlowColor(OutlineVertexConsumerProvider instance, int red, int green, int blue, int alpha, Operation<Void> original, @Local LocalRef<Entity> entity) {
++        if (!getESP().isGlow() || getESP().shouldSkip(entity.get())) original.call(instance, red, green, blue, alpha);
++        else {
++            Color color = getESP().getColor(entity.get());
++
++            if (color == null) original.call(instance, red, green, blue, alpha);
++            else instance.setColor(color.r, color.g, color.b, color.a);
++        }
++    }
++
+     @Inject(method = "onResized", at = @At("HEAD"))
+     private void onResized(int width, int height, CallbackInfo info) {
+         PostProcessShaders.onResized(width, height);
+@@ -135,4 +161,13 @@ private static int getLightmapCoordinatesModifySkyLight(int sky) {
+     private static int getLightmapCoordinatesModifyBlockLight(int sky) {
+         return Math.max(Modules.get().get(Fullbright.class).getLuminance(LightType.BLOCK), sky);
+     }
++
++    @Unique
++    private ESP getESP() {
++        if (esp == null) {
++            esp = Modules.get().get(ESP.class);
++        }
++
++        return esp;
++    }
+ }
+diff --git a/src/main/java/meteordevelopment/meteorclient/systems/modules/render/ESP.java b/src/main/java/meteordevelopment/meteorclient/systems/modules/render/ESP.java
+index 080d164d8e..40e8f3eb35 100644
+--- a/src/main/java/meteordevelopment/meteorclient/systems/modules/render/ESP.java
++++ b/src/main/java/meteordevelopment/meteorclient/systems/modules/render/ESP.java
+@@ -74,6 +74,7 @@ public class ESP extends Module {
+     public final Setting<ShapeMode> shapeMode = sgGeneral.add(new EnumSetting.Builder<ShapeMode>()
+         .name("shape-mode")
+         .description("How the shapes are rendered.")
++        .visible(() -> mode.get() != Mode.Glow)
+         .defaultValue(ShapeMode.Both)
+         .build()
+     );
+@@ -81,7 +82,7 @@ public class ESP extends Module {
+     public final Setting<Double> fillOpacity = sgGeneral.add(new DoubleSetting.Builder()
+         .name("fill-opacity")
+         .description("The opacity of the shape fill.")
+-        .visible(() -> shapeMode.get() != ShapeMode.Lines)
++        .visible(() -> shapeMode.get() != ShapeMode.Lines && mode.get() != Mode.Glow)
+         .defaultValue(0.3)
+         .range(0, 1)
+         .sliderMax(1)
+@@ -349,11 +350,16 @@ public boolean isShader() {
+         return isActive() && mode.get() == Mode.Shader;
+     }
+ 
++    public boolean isGlow() {
++        return isActive() && mode.get() == Mode.Glow;
++    }
++
+     public enum Mode {
+         Box,
+         Wireframe,
+         _2D,
+-        Shader;
++        Shader,
++        Glow;
+ 
+         @Override
+         public String toString() {

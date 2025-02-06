@@ -1,0 +1,430 @@
+diff --git a/presto-common/src/main/java/com/facebook/presto/common/RuntimeMetricName.java b/presto-common/src/main/java/com/facebook/presto/common/RuntimeMetricName.java
+index 3f981dc41718e..f0295bbf284d0 100644
+--- a/presto-common/src/main/java/com/facebook/presto/common/RuntimeMetricName.java
++++ b/presto-common/src/main/java/com/facebook/presto/common/RuntimeMetricName.java
+@@ -50,6 +50,9 @@ private RuntimeMetricName()
+     public static final String SCAN_STAGE_SCHEDULER_CPU_TIME_NANOS = "scanStageSchedulerCpuTimeNanos";
+     public static final String SCAN_STAGE_SCHEDULER_WALL_TIME_NANOS = "scanStageSchedulerWallTimeNanos";
+     public static final String SCAN_STAGE_SCHEDULER_BLOCKED_TIME_NANOS = "scanStageSchedulerBlockedTimeNanos";
++    public static final String ANALYZE_TIME_NANOS = "analyzeTimeNanos";
++    public static final String PLAN_AND_OPTIMIZE_TIME_NANOS = "planAndOptimizeTimeNanos";
++    public static final String CREATE_SCHEDULER_TIME_NANOS = "createSchedulerTimeNanos";
+     public static final String LOGICAL_PLANNER_TIME_NANOS = "logicalPlannerTimeNanos";
+     public static final String OPTIMIZER_TIME_NANOS = "optimizerTimeNanos";
+     public static final String GET_CANONICAL_INFO_TIME_NANOS = "getCanonicalInfoTimeNanos";
+diff --git a/presto-common/src/main/java/com/facebook/presto/common/RuntimeStats.java b/presto-common/src/main/java/com/facebook/presto/common/RuntimeStats.java
+index f31a0b2d3189f..2caa105c3d22b 100644
+--- a/presto-common/src/main/java/com/facebook/presto/common/RuntimeStats.java
++++ b/presto-common/src/main/java/com/facebook/presto/common/RuntimeStats.java
+@@ -19,6 +19,8 @@
+ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonValue;
+ 
++import java.lang.management.ManagementFactory;
++import java.lang.management.ThreadMXBean;
+ import java.util.Collections;
+ import java.util.Map;
+ import java.util.concurrent.ConcurrentHashMap;
+@@ -34,6 +36,8 @@
+ @ThriftStruct
+ public class RuntimeStats
+ {
++    private static final ThreadMXBean THREAD_MX_BEAN = ManagementFactory.getThreadMXBean();
++
+     private final ConcurrentMap<String, RuntimeMetric> metrics = new ConcurrentHashMap<>();
+ 
+     public RuntimeStats()
+@@ -130,7 +134,7 @@ public void update(RuntimeStats stats)
+         stats.getMetrics().forEach((name, newMetric) -> metrics.computeIfAbsent(name, k -> new RuntimeMetric(name, newMetric.getUnit())).set(newMetric));
+     }
+ 
+-    public <V> V profileNanos(String tag, Supplier<V> supplier)
++    public <V> V recordWallTime(String tag, Supplier<V> supplier)
+     {
+         long startTime = System.nanoTime();
+         V result = supplier.get();
+@@ -138,10 +142,34 @@ public <V> V profileNanos(String tag, Supplier<V> supplier)
+         return result;
+     }
+ 
+-    public void profileNanosVoid(String tag, Runnable runnable)
++    public void recordWallTime(String tag, Runnable runnable)
+     {
+-        long startTime = System.nanoTime();
+-        runnable.run();
+-        addMetricValueIgnoreZero(tag, NANO, System.nanoTime() - startTime);
++        recordWallTime(tag, () -> {
++            runnable.run();
++            return null;
++        });
++    }
++
++    public <V> V recordWallAndCpuTime(String tag, Supplier<V> supplier)
++    {
++        long startWall = System.nanoTime();
++        long startCpu = THREAD_MX_BEAN.getCurrentThreadCpuTime();
++
++        V result = supplier.get();
++
++        long endWall = System.nanoTime();
++        long endCpu = THREAD_MX_BEAN.getCurrentThreadCpuTime();
++
++        addMetricValueIgnoreZero(tag, NANO, endWall - startWall);
++        addMetricValueIgnoreZero(tag + "OnCpu", NANO, endCpu - startCpu);
++        return result;
++    }
++
++    public void recordWallAndCpuTime(String tag, Runnable runnable)
++    {
++        recordWallAndCpuTime(tag, () -> {
++            runnable.run();
++            return null;
++        });
+     }
+ }
+diff --git a/presto-common/src/test/java/com/facebook/presto/common/TestRuntimeStats.java b/presto-common/src/test/java/com/facebook/presto/common/TestRuntimeStats.java
+index cf46f22583715..99cba97b6593b 100644
+--- a/presto-common/src/test/java/com/facebook/presto/common/TestRuntimeStats.java
++++ b/presto-common/src/test/java/com/facebook/presto/common/TestRuntimeStats.java
+@@ -19,6 +19,9 @@
+ import static com.facebook.presto.common.RuntimeUnit.BYTE;
+ import static com.facebook.presto.common.RuntimeUnit.NANO;
+ import static com.facebook.presto.common.RuntimeUnit.NONE;
++import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
++import static java.util.concurrent.TimeUnit.MILLISECONDS;
++import static org.assertj.core.api.Assertions.assertThat;
+ import static org.testng.Assert.assertEquals;
+ import static org.testng.Assert.assertNull;
+ 
+@@ -238,21 +241,31 @@ public void testReturnUnmodifiedMetrics()
+     }
+ 
+     @Test
+-    public void testProfileNano()
++    public void testRecordWallTime()
+     {
+         RuntimeStats stats = new RuntimeStats();
+-        int status = stats.profileNanos(TEST_METRIC_NAME_NANO_3, () -> 1);
+ 
+-        assert stats.getMetric(TEST_METRIC_NAME_NANO_3).getSum() < ONE_SECOND_IN_NANOS;
+-        assertEquals(status, 1);
++        assertEquals(stats.recordWallTime(TEST_METRIC_NAME_NANO_3, () -> 1), 1);
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_3).getSum()).isLessThan(ONE_SECOND_IN_NANOS);
++
++        stats.recordWallTime(TEST_METRIC_NAME_NANO_2, () -> {});
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_2).getSum()).isLessThan(ONE_SECOND_IN_NANOS);
+     }
+ 
+     @Test
+-    public void testProfileNanoVoid()
++    public void testRecordWallAndCpuTime()
+     {
+         RuntimeStats stats = new RuntimeStats();
+-        stats.profileNanosVoid(TEST_METRIC_NAME_NANO_3, () -> {});
+ 
+-        assert stats.getMetric(TEST_METRIC_NAME_NANO_3).getSum() < ONE_SECOND_IN_NANOS;
++        assertEquals(stats.recordWallAndCpuTime(TEST_METRIC_NAME_NANO_1, () -> {
++            sleepUninterruptibly(100, MILLISECONDS);
++            return 1;
++        }), 1);
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_1).getSum()).isGreaterThanOrEqualTo(MILLISECONDS.toNanos(100));
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_1 + "OnCpu").getSum()).isLessThan(MILLISECONDS.toNanos(100));
++
++        stats.recordWallAndCpuTime(TEST_METRIC_NAME_NANO_2, () -> sleepUninterruptibly(100, MILLISECONDS));
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_2).getSum()).isGreaterThanOrEqualTo(MILLISECONDS.toNanos(100));
++        assertThat(stats.getMetric(TEST_METRIC_NAME_NANO_2 + "OnCpu").getSum()).isLessThan(MILLISECONDS.toNanos(100));
+     }
+ }
+diff --git a/presto-hive-metastore/src/main/java/com/facebook/presto/hive/metastore/SemiTransactionalHiveMetastore.java b/presto-hive-metastore/src/main/java/com/facebook/presto/hive/metastore/SemiTransactionalHiveMetastore.java
+index e6e17535d11b2..d04d92e2210e9 100644
+--- a/presto-hive-metastore/src/main/java/com/facebook/presto/hive/metastore/SemiTransactionalHiveMetastore.java
++++ b/presto-hive-metastore/src/main/java/com/facebook/presto/hive/metastore/SemiTransactionalHiveMetastore.java
+@@ -202,7 +202,7 @@ public synchronized Optional<Table> getTable(MetastoreContext metastoreContext,
+         checkReadable();
+         Action<TableAndMore> tableAction = tableActions.get(hiveTableHandle.getSchemaTableName());
+         if (tableAction == null) {
+-            return metastoreContext.getRuntimeStats().profileNanos(GET_TABLE_TIME_NANOS, () -> delegate.getTable(metastoreContext, hiveTableHandle));
++            return metastoreContext.getRuntimeStats().recordWallTime(GET_TABLE_TIME_NANOS, () -> delegate.getTable(metastoreContext, hiveTableHandle));
+         }
+         switch (tableAction.getType()) {
+             case ADD:
+@@ -761,7 +761,7 @@ public synchronized Map<String, Optional<Partition>> getPartitionsByNames(Metast
+                 resultBuilder.put(partitionNameWithVersion.getPartitionName(), getPartitionFromPartitionAction(partitionAction));
+             }
+         }
+-        Map<String, Optional<Partition>> delegateResult = metastoreContext.getRuntimeStats().profileNanos(GET_PARTITIONS_BY_NAMES_TIME_NANOS, () -> delegate.getPartitionsByNames(metastoreContext, databaseName, tableName, partitionNamesToQuery.build()));
++        Map<String, Optional<Partition>> delegateResult = metastoreContext.getRuntimeStats().recordWallTime(GET_PARTITIONS_BY_NAMES_TIME_NANOS, () -> delegate.getPartitionsByNames(metastoreContext, databaseName, tableName, partitionNamesToQuery.build()));
+         resultBuilder.putAll(delegateResult);
+ 
+         cacheLastDataCommitTimes(delegateResult, databaseName, tableName);
+diff --git a/presto-main/src/main/java/com/facebook/presto/execution/SqlQueryExecution.java b/presto-main/src/main/java/com/facebook/presto/execution/SqlQueryExecution.java
+index 55a52ed96617c..9efb9780e4e2e 100644
+--- a/presto-main/src/main/java/com/facebook/presto/execution/SqlQueryExecution.java
++++ b/presto-main/src/main/java/com/facebook/presto/execution/SqlQueryExecution.java
+@@ -87,10 +87,13 @@
+ import static com.facebook.presto.SystemSessionProperties.isEagerPlanValidationEnabled;
+ import static com.facebook.presto.SystemSessionProperties.isLogInvokedFunctionNamesEnabled;
+ import static com.facebook.presto.SystemSessionProperties.isSpoolingOutputBufferEnabled;
++import static com.facebook.presto.common.RuntimeMetricName.ANALYZE_TIME_NANOS;
++import static com.facebook.presto.common.RuntimeMetricName.CREATE_SCHEDULER_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.FRAGMENT_PLAN_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.GET_CANONICAL_INFO_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.LOGICAL_PLANNER_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.OPTIMIZER_TIME_NANOS;
++import static com.facebook.presto.common.RuntimeMetricName.PLAN_AND_OPTIMIZE_TIME_NANOS;
+ import static com.facebook.presto.execution.QueryStateMachine.pruneHistogramsFromStatsAndCosts;
+ import static com.facebook.presto.execution.buffer.OutputBuffers.BROADCAST_PARTITION_ID;
+ import static com.facebook.presto.execution.buffer.OutputBuffers.createInitialEmptyOutputBuffers;
+@@ -207,7 +210,9 @@ private SqlQueryExecution(
+                     Thread.currentThread(),
+                     timeoutThreadExecutor,
+                     getQueryAnalyzerTimeout(getSession()))) {
+-                this.queryAnalysis = queryAnalyzer.analyze(analyzerContext, preparedQuery);
++                this.queryAnalysis = getSession()
++                        .getRuntimeStats()
++                        .recordWallAndCpuTime(ANALYZE_TIME_NANOS, () -> queryAnalyzer.analyze(analyzerContext, preparedQuery));
+             }
+ 
+             stateMachine.setUpdateType(queryAnalysis.getUpdateType());
+@@ -482,7 +487,7 @@ public void start()
+                 metadata.beginQuery(getSession(), plan.getConnectors());
+ 
+                 // plan distribution of query
+-                planDistribution(plan);
++                getSession().getRuntimeStats().recordWallAndCpuTime(CREATE_SCHEDULER_TIME_NANOS, () -> createQueryScheduler(plan));
+ 
+                 // transition to starting
+                 if (!stateMachine.transitionToStarting()) {
+@@ -544,6 +549,15 @@ public void addFinalQueryInfoListener(StateChangeListener<QueryInfo> stateChange
+     }
+ 
+     private PlanRoot createLogicalPlanAndOptimize()
++    {
++        return stateMachine.getSession()
++                .getRuntimeStats()
++                .recordWallAndCpuTime(
++                        PLAN_AND_OPTIMIZE_TIME_NANOS,
++                        this::doCreateLogicalPlanAndOptimize);
++    }
++
++    private PlanRoot doCreateLogicalPlanAndOptimize()
+     {
+         try {
+             // time analysis phase
+@@ -551,7 +565,7 @@ private PlanRoot createLogicalPlanAndOptimize()
+ 
+             PlanNode planNode = stateMachine.getSession()
+                     .getRuntimeStats()
+-                    .profileNanos(
++                    .recordWallAndCpuTime(
+                             LOGICAL_PLANNER_TIME_NANOS,
+                             () -> queryAnalyzer.plan(this.analyzerContext, queryAnalysis));
+ 
+@@ -567,14 +581,14 @@ private PlanRoot createLogicalPlanAndOptimize()
+                     costCalculator,
+                     false);
+ 
+-            Plan plan = getSession().getRuntimeStats().profileNanos(
++            Plan plan = getSession().getRuntimeStats().recordWallAndCpuTime(
+                     OPTIMIZER_TIME_NANOS,
+                     () -> optimizer.validateAndOptimizePlan(planNode, OPTIMIZED_AND_VALIDATED));
+ 
+             queryPlan.set(plan);
+             stateMachine.setPlanStatsAndCosts(plan.getStatsAndCosts());
+             stateMachine.setPlanIdNodeMap(plan.getPlanIdNodeMap());
+-            List<CanonicalPlanWithInfo> canonicalPlanWithInfos = getSession().getRuntimeStats().profileNanos(
++            List<CanonicalPlanWithInfo> canonicalPlanWithInfos = getSession().getRuntimeStats().recordWallAndCpuTime(
+                     GET_CANONICAL_INFO_TIME_NANOS,
+                     () -> getCanonicalInfo(getSession(), plan.getRoot(), planCanonicalInfoProvider));
+             stateMachine.setPlanCanonicalInfo(canonicalPlanWithInfos);
+@@ -590,7 +604,7 @@ private PlanRoot createLogicalPlanAndOptimize()
+             // fragment the plan
+             // the variableAllocator is finally passed to SqlQueryScheduler for runtime cost-based optimizations
+             variableAllocator.set(new VariableAllocator(plan.getTypes().allVariables()));
+-            SubPlan fragmentedPlan = getSession().getRuntimeStats().profileNanos(
++            SubPlan fragmentedPlan = getSession().getRuntimeStats().recordWallAndCpuTime(
+                     FRAGMENT_PLAN_TIME_NANOS,
+                     () -> planFragmenter.createSubPlans(stateMachine.getSession(), plan, false, idAllocator, variableAllocator.get(), stateMachine.getWarningCollector()));
+ 
+@@ -620,7 +634,7 @@ private PlanRoot runCreateLogicalPlanAsync()
+         }
+     }
+ 
+-    private void planDistribution(PlanRoot plan)
++    private void createQueryScheduler(PlanRoot plan)
+     {
+         CloseableSplitSourceProvider splitSourceProvider = new CloseableSplitSourceProvider(splitManager::getSplits);
+ 
+diff --git a/presto-main/src/main/java/com/facebook/presto/metadata/MetadataManager.java b/presto-main/src/main/java/com/facebook/presto/metadata/MetadataManager.java
+index 3041d3990fdf8..ead35ca3cc4be 100644
+--- a/presto-main/src/main/java/com/facebook/presto/metadata/MetadataManager.java
++++ b/presto-main/src/main/java/com/facebook/presto/metadata/MetadataManager.java
+@@ -1051,7 +1051,7 @@ private MaterializedViewStatus getMaterializedViewStatus(Session session, Qualif
+         ConnectorId connectorId = materializedViewHandle.get().getConnectorId();
+         ConnectorMetadata metadata = getMetadata(session, connectorId);
+ 
+-        return session.getRuntimeStats().profileNanos(
++        return session.getRuntimeStats().recordWallTime(
+                 GET_MATERIALIZED_VIEW_STATUS_TIME_NANOS,
+                 () -> metadata.getMaterializedViewStatus(session.toConnectorSession(connectorId), toSchemaTableName(materializedViewName), baseQueryDomain));
+     }
+diff --git a/presto-main/src/main/java/com/facebook/presto/sql/analyzer/MetadataExtractor.java b/presto-main/src/main/java/com/facebook/presto/sql/analyzer/MetadataExtractor.java
+index 17f7a314eb89f..3eda7c8204334 100644
+--- a/presto-main/src/main/java/com/facebook/presto/sql/analyzer/MetadataExtractor.java
++++ b/presto-main/src/main/java/com/facebook/presto/sql/analyzer/MetadataExtractor.java
+@@ -84,7 +84,7 @@ private void populateMetadataHandle(Session session, Statement statement, Metada
+             }
+ 
+             metadataHandle.addViewDefinition(tableName, executor.get().submit(() -> {
+-                Optional<ViewDefinition> optionalView = session.getRuntimeStats().profileNanos(
++                Optional<ViewDefinition> optionalView = session.getRuntimeStats().recordWallTime(
+                         GET_VIEW_TIME_NANOS,
+                         () -> metadataResolver.getView(tableName));
+                 if (optionalView.isPresent()) {
+@@ -109,7 +109,7 @@ private void populateMetadataHandle(Session session, Statement statement, Metada
+             }));
+ 
+             metadataHandle.addMaterializedViewDefinition(tableName, executor.get().submit(() -> {
+-                Optional<MaterializedViewDefinition> optionalMaterializedView = session.getRuntimeStats().profileNanos(
++                Optional<MaterializedViewDefinition> optionalMaterializedView = session.getRuntimeStats().recordWallTime(
+                         GET_MATERIALIZED_VIEW_TIME_NANOS,
+                         () -> metadataResolver.getMaterializedView(tableName));
+                 if (optionalMaterializedView.isPresent()) {
+diff --git a/presto-main/src/main/java/com/facebook/presto/sql/analyzer/QueryExplainer.java b/presto-main/src/main/java/com/facebook/presto/sql/analyzer/QueryExplainer.java
+index 0e671e1436f18..8fd24024aaa25 100644
+--- a/presto-main/src/main/java/com/facebook/presto/sql/analyzer/QueryExplainer.java
++++ b/presto-main/src/main/java/com/facebook/presto/sql/analyzer/QueryExplainer.java
+@@ -47,6 +47,8 @@
+ import java.util.Optional;
+ 
+ import static com.facebook.presto.SystemSessionProperties.isVerboseOptimizerInfoEnabled;
++import static com.facebook.presto.common.RuntimeMetricName.ANALYZE_TIME_NANOS;
++import static com.facebook.presto.common.RuntimeMetricName.FRAGMENT_PLAN_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.LOGICAL_PLANNER_TIME_NANOS;
+ import static com.facebook.presto.common.RuntimeMetricName.OPTIMIZER_TIME_NANOS;
+ import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
+@@ -200,7 +202,8 @@ public Plan getLogicalPlan(Session session, Statement statement, List<Expression
+     public Plan getLogicalPlan(Session session, Statement statement, List<Expression> parameters, WarningCollector warningCollector, PlanNodeIdAllocator idAllocator)
+     {
+         // analyze statement
+-        Analysis analysis = analyze(session, statement, parameters, warningCollector);
++        Analysis analysis = session.getRuntimeStats()
++                .recordWallAndCpuTime(ANALYZE_TIME_NANOS, () -> analyze(session, statement, parameters, warningCollector));
+ 
+         final VariableAllocator planVariableAllocator = new VariableAllocator();
+         LogicalPlanner logicalPlanner = new LogicalPlanner(
+@@ -210,7 +213,7 @@ public Plan getLogicalPlan(Session session, Statement statement, List<Expression
+                 planVariableAllocator,
+                 sqlParser);
+ 
+-        PlanNode planNode = session.getRuntimeStats().profileNanos(
++        PlanNode planNode = session.getRuntimeStats().recordWallAndCpuTime(
+                 LOGICAL_PLANNER_TIME_NANOS,
+                 () -> logicalPlanner.plan(analysis));
+ 
+@@ -226,7 +229,7 @@ public Plan getLogicalPlan(Session session, Statement statement, List<Expression
+                 costCalculator,
+                 true);
+ 
+-        return session.getRuntimeStats().profileNanos(
++        return session.getRuntimeStats().recordWallAndCpuTime(
+                 OPTIMIZER_TIME_NANOS,
+                 () -> optimizer.validateAndOptimizePlan(planNode, OPTIMIZED_AND_VALIDATED));
+     }
+@@ -235,6 +238,7 @@ public SubPlan getDistributedPlan(Session session, Statement statement, List<Exp
+     {
+         PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
+         Plan plan = getLogicalPlan(session, statement, parameters, warningCollector, idAllocator);
+-        return planFragmenter.createSubPlans(session, plan, false, idAllocator, warningCollector);
++        return session.getRuntimeStats()
++                .recordWallAndCpuTime(FRAGMENT_PLAN_TIME_NANOS, () -> planFragmenter.createSubPlans(session, plan, false, idAllocator, warningCollector));
+     }
+ }
+diff --git a/presto-main/src/main/java/com/facebook/presto/testing/LocalQueryRunner.java b/presto-main/src/main/java/com/facebook/presto/testing/LocalQueryRunner.java
+index c8968c60adc83..995eb5bd1f373 100644
+--- a/presto-main/src/main/java/com/facebook/presto/testing/LocalQueryRunner.java
++++ b/presto-main/src/main/java/com/facebook/presto/testing/LocalQueryRunner.java
+@@ -1170,7 +1170,7 @@ public Plan createPlan(Session session, @Language("SQL") String sql, List<PlanOp
+         QueryAnalysis queryAnalysis = queryAnalyzer.analyze(analyzerContext, preparedQuery);
+         checkAccessPermissions(queryAnalysis.getAccessControlReferences());
+ 
+-        PlanNode planNode = session.getRuntimeStats().profileNanos(
++        PlanNode planNode = session.getRuntimeStats().recordWallAndCpuTime(
+                 LOGICAL_PLANNER_TIME_NANOS,
+                 () -> queryAnalyzer.plan(analyzerContext, queryAnalysis));
+ 
+@@ -1186,7 +1186,7 @@ public Plan createPlan(Session session, @Language("SQL") String sql, List<PlanOp
+                 costCalculator,
+                 preparedQuery.getWrappedStatement() instanceof Explain);
+ 
+-        return session.getRuntimeStats().profileNanos(
++        return session.getRuntimeStats().recordWallAndCpuTime(
+                 OPTIMIZER_TIME_NANOS,
+                 () -> optimizer.validateAndOptimizePlan(planNode, stage));
+     }
+diff --git a/presto-main/src/main/java/com/facebook/presto/util/MetadataUtils.java b/presto-main/src/main/java/com/facebook/presto/util/MetadataUtils.java
+index a00b79c003666..de8c6cf6b4989 100644
+--- a/presto-main/src/main/java/com/facebook/presto/util/MetadataUtils.java
++++ b/presto-main/src/main/java/com/facebook/presto/util/MetadataUtils.java
+@@ -60,7 +60,7 @@ public static Optional<ViewDefinition> getViewDefinition(Session session, Metada
+             return metadataHandle.getViewDefinition(viewName);
+         }
+ 
+-        return session.getRuntimeStats().profileNanos(
++        return session.getRuntimeStats().recordWallTime(
+                 GET_VIEW_TIME_NANOS,
+                 () -> metadataResolver.getView(viewName));
+     }
+@@ -71,14 +71,14 @@ public static Optional<MaterializedViewDefinition> getMaterializedViewDefinition
+             return metadataHandle.getMaterializedViewDefinition(viewName);
+         }
+ 
+-        return session.getRuntimeStats().profileNanos(
++        return session.getRuntimeStats().recordWallTime(
+                 GET_MATERIALIZED_VIEW_TIME_NANOS,
+                 () -> metadataResolver.getMaterializedView(viewName));
+     }
+ 
+     public static TableColumnMetadata getTableColumnMetadata(Session session, MetadataResolver metadataResolver, QualifiedObjectName tableName)
+     {
+-        Optional<TableHandle> tableHandle = session.getRuntimeStats().profileNanos(
++        Optional<TableHandle> tableHandle = session.getRuntimeStats().recordWallTime(
+                 GET_TABLE_HANDLE_TIME_NANOS,
+                 () -> metadataResolver.getTableHandle(tableName));
+ 
+@@ -92,11 +92,11 @@ public static TableColumnMetadata getTableColumnMetadata(Session session, Metada
+             throw new SemanticException(MISSING_TABLE, "Table %s does not exist", tableName);
+         }
+ 
+-        Map<String, ColumnHandle> columnHandles = session.getRuntimeStats().profileNanos(
++        Map<String, ColumnHandle> columnHandles = session.getRuntimeStats().recordWallTime(
+                 GET_COLUMN_HANDLE_TIME_NANOS,
+                 () -> metadataResolver.getColumnHandles(tableHandle.get()));
+ 
+-        List<ColumnMetadata> columnsMetadata = session.getRuntimeStats().profileNanos(
++        List<ColumnMetadata> columnsMetadata = session.getRuntimeStats().recordWallTime(
+                 GET_COLUMN_METADATA_TIME_NANOS,
+                 () -> metadataResolver.getColumns(tableHandle.get()));
+ 
+diff --git a/presto-spark-base/src/main/java/com/facebook/presto/spark/planner/PrestoSparkQueryPlanner.java b/presto-spark-base/src/main/java/com/facebook/presto/spark/planner/PrestoSparkQueryPlanner.java
+index 818cedae4cb01..fe6f0b43194d0 100644
+--- a/presto-spark-base/src/main/java/com/facebook/presto/spark/planner/PrestoSparkQueryPlanner.java
++++ b/presto-spark-base/src/main/java/com/facebook/presto/spark/planner/PrestoSparkQueryPlanner.java
+@@ -127,7 +127,7 @@ public PlanAndMore createQueryPlan(Session session, BuiltInPreparedQuery prepare
+                 variableAllocator,
+                 sqlParser);
+ 
+-        PlanNode planNode = session.getRuntimeStats().profileNanos(
++        PlanNode planNode = session.getRuntimeStats().recordWallAndCpuTime(
+                 LOGICAL_PLANNER_TIME_NANOS,
+                 () -> logicalPlanner.plan(analysis));
+ 
+@@ -143,7 +143,7 @@ public PlanAndMore createQueryPlan(Session session, BuiltInPreparedQuery prepare
+                 costCalculator,
+                 false);
+ 
+-        Plan plan = session.getRuntimeStats().profileNanos(
++        Plan plan = session.getRuntimeStats().recordWallAndCpuTime(
+                 OPTIMIZER_TIME_NANOS,
+                 () -> optimizer.validateAndOptimizePlan(planNode, OPTIMIZED_AND_VALIDATED));
+ 

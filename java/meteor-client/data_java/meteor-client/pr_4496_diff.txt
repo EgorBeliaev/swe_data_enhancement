@@ -1,0 +1,557 @@
+diff --git a/src/main/java/meteordevelopment/meteorclient/systems/config/Config.java b/src/main/java/meteordevelopment/meteorclient/systems/config/Config.java
+index 92239d2f5e..acd6ac65b6 100644
+--- a/src/main/java/meteordevelopment/meteorclient/systems/config/Config.java
++++ b/src/main/java/meteordevelopment/meteorclient/systems/config/Config.java
+@@ -142,6 +142,23 @@ public class Config extends System<Config> {
+         .build()
+     );
+ 
++    public final Setting<Boolean> heuristicCombatUtils = sgMisc.add(new BoolSetting.Builder()
++            .name("heuristic-damage-utils")
++            .description("Spends extra computation time in order to make combat-related calculations more accurate at the expense of framerate.")
++            .defaultValue(true)
++            .build()
++    );
++
++    public final Setting<Integer> heuristicDepth = sgMisc.add(new IntSetting.Builder()
++            .name("heuristic-depth")
++            .description("The amount of extra computation time to give, in an exponential scale.")
++            .defaultValue(4)
++            .min(2)
++            .sliderRange(2, 5)
++            .visible(heuristicCombatUtils::get)
++            .build()
++    );
++
+     public List<String> dontShowAgainPrompts = new ArrayList<>();
+ 
+     public Config() {
+diff --git a/src/main/java/meteordevelopment/meteorclient/utils/entity/DamageUtils.java b/src/main/java/meteordevelopment/meteorclient/utils/entity/DamageUtils.java
+index 55479ff535..4028523a6c 100644
+--- a/src/main/java/meteordevelopment/meteorclient/utils/entity/DamageUtils.java
++++ b/src/main/java/meteordevelopment/meteorclient/utils/entity/DamageUtils.java
+@@ -5,8 +5,8 @@
+ 
+ package meteordevelopment.meteorclient.utils.entity;
+ 
+-import meteordevelopment.meteorclient.mixininterface.IVec3d;
+ import meteordevelopment.meteorclient.utils.entity.fakeplayer.FakePlayerEntity;
++import meteordevelopment.meteorclient.utils.player.PlayerUtils;
+ import net.minecraft.block.BlockState;
+ import net.minecraft.block.Blocks;
+ import net.minecraft.enchantment.EnchantmentHelper;
+@@ -27,44 +27,103 @@
+ import net.minecraft.world.explosion.Explosion;
+ import org.jetbrains.annotations.Nullable;
+ 
++import java.util.function.BiFunction;
++
+ import static meteordevelopment.meteorclient.MeteorClient.mc;
+ 
++@SuppressWarnings("JavadocReference")
+ public class DamageUtils {
+     // Explosion damage
+ 
+-    public static float explosionDamage(LivingEntity target, Vec3d origin, float power, boolean predictMovement, BlockPos override, BlockState overrideState) {
+-        if (target == null) return 0f;
+-        if (target instanceof PlayerEntity player && EntityUtils.getGameMode(player) == GameMode.CREATIVE && !(player instanceof FakePlayerEntity)) return 0f;
++    /**
++     * It is recommended to use this {@link RaycastFactory} unless you implement custom behaviour, as soon:tm: it will be the
++     * target of optimizations to make it more performant.
++     * @see BlockView#raycast(RaycastContext)
++     */
++    public static final RaycastFactory HIT_FACTORY = (context, blockPos) -> {
++        BlockState blockState = mc.world.getBlockState(blockPos);
++        if (blockState.getBlock().getBlastResistance() < 600) return null;
+ 
+-        Vec3d position = predictMovement ? target.getPos().add(target.getVelocity()) : target.getPos();
++        return blockState.getCollisionShape(mc.world, blockPos).raycast(context.start(), context.end(), blockPos);
++    };
+ 
+-        double modDistance = position.distanceTo(origin);
+-        if (modDistance > power) return 0f;
++    public static float crystalDamage(LivingEntity target, Vec3d targetPos, Box targetBox, Vec3d explosionPos, RaycastFactory raycastFactory) {
++        return explosionDamage(target, targetPos, targetBox, explosionPos, 12f, raycastFactory);
++    }
+ 
+-        Box box = target.getBoundingBox();
+-        if (predictMovement) box = box.offset(target.getVelocity());
++    public static float bedDamage(LivingEntity target, Vec3d targetPos, Box targetBox, Vec3d explosionPos, RaycastFactory raycastFactory) {
++        return explosionDamage(target, targetPos, targetBox, explosionPos, 10f, raycastFactory);
++    }
+ 
+-        double exposure = getExposure(origin, box, override, overrideState);
++    public static float anchorDamage(LivingEntity target, Vec3d targetPos, Box targetBox, Vec3d explosionPos, RaycastFactory raycastFactory) {
++        return explosionDamage(target, targetPos, targetBox, explosionPos, 10f, raycastFactory);
++    }
++
++    /**
++     * Low level control of parameters without having to reimplement everything, for addon authors who wish to use their
++     * own predictions or other systems.
++     * @see net.minecraft.world.explosion.ExplosionBehavior#calculateDamage(Explosion, Entity)
++     */
++    public static float explosionDamage(LivingEntity target, Vec3d targetPos, Box targetBox, Vec3d explosionPos, float power, RaycastFactory raycastFactory) {
++        double modDistance = PlayerUtils.distance(targetPos.x, targetPos.y, targetPos.z, explosionPos.x, explosionPos.y, explosionPos.z);
++        if (modDistance > power) return 0f;
++
++        double exposure = getExposure(explosionPos, targetBox, raycastFactory);
+         double impact = (1 - (modDistance / power)) * exposure;
+         float damage = (int) ((impact * impact + impact) / 2 * 7 * 12 + 1);
+ 
+         return calculateReductions(damage, target, mc.world.getDamageSources().explosion(null));
+     }
+ 
++    /** Meteor Client implementations */
++
+     public static float crystalDamage(LivingEntity target, Vec3d crystal, boolean predictMovement, BlockPos obsidianPos) {
+-        return explosionDamage(target, crystal, 12f, predictMovement, obsidianPos, Blocks.OBSIDIAN.getDefaultState());
++        return overridingExplosionDamage(target, crystal, 12f, predictMovement, obsidianPos, Blocks.OBSIDIAN.getDefaultState());
+     }
+ 
+     public static float crystalDamage(LivingEntity target, Vec3d crystal) {
+-        return explosionDamage(target, crystal, 12f, false, null, null);
++        return explosionDamage(target, crystal, 12f, false);
+     }
+ 
+     public static float bedDamage(LivingEntity target, Vec3d bed) {
+-        return explosionDamage(target, bed, 10f, false, null, null);
++        return explosionDamage(target, bed, 10f, false);
+     }
+ 
+     public static float anchorDamage(LivingEntity target, Vec3d anchor) {
+-        return explosionDamage(target, anchor, 10f, false, BlockPos.ofFloored(anchor), Blocks.AIR.getDefaultState());
++        return overridingExplosionDamage(target, anchor, 10f, false, BlockPos.ofFloored(anchor), Blocks.AIR.getDefaultState());
++    }
++
++    private static float overridingExplosionDamage(LivingEntity target, Vec3d explosionPos, float power, boolean predictMovement, BlockPos overridePos, BlockState overrideState) {
++        return explosionDamage(target, explosionPos, power, predictMovement, getOverridingHitFactory(overridePos, overrideState));
++    }
++
++    private static float explosionDamage(LivingEntity target, Vec3d explosionPos, float power, boolean predictMovement) {
++        return explosionDamage(target, explosionPos, power, predictMovement, HIT_FACTORY);
++    }
++
++    private static float explosionDamage(LivingEntity target, Vec3d explosionPos, float power, boolean predictMovement, RaycastFactory raycastFactory) {
++        if (target == null) return 0f;
++        if (target instanceof PlayerEntity player && EntityUtils.getGameMode(player) == GameMode.CREATIVE && !(player instanceof FakePlayerEntity)) return 0f;
++
++        Vec3d position = predictMovement ? target.getPos().add(target.getVelocity()) : target.getPos();
++
++        Box box = target.getBoundingBox();
++        if (predictMovement) box = box.offset(target.getVelocity());
++
++        return explosionDamage(target, position, box, explosionPos, power, raycastFactory);
++    }
++
++    public static RaycastFactory getOverridingHitFactory(BlockPos overridePos, BlockState overrideState) {
++        return (context, blockPos) -> {
++            BlockState blockState;
++            if (blockPos.equals(overridePos)) blockState = overrideState;
++            else {
++                blockState = mc.world.getBlockState(blockPos);
++                if (blockState.getBlock().getBlastResistance() < 600) return null;
++            }
++
++            return blockState.getCollisionShape(mc.world, blockPos).raycast(context.start(), context.end(), blockPos);
++        };
+     }
+ 
+     // Sword damage
+@@ -108,7 +167,6 @@ public static float getAttackDamage(LivingEntity attacker, LivingEntity target)
+     /**
+      * @see LivingEntity#computeFallDamage(float, float) (float, float, DamageSource)
+      */
+-    @SuppressWarnings("JavadocReference")
+     public static float fallDamage(LivingEntity entity) {
+         if (entity instanceof PlayerEntity player && player.getAbilities().flying) return 0f;
+         if (StatusEffectHelper.hasStatusEffect(entity, StatusEffects.SLOW_FALLING) || StatusEffectHelper.hasStatusEffect(entity, StatusEffects.LEVITATION)) return 0f;
+@@ -134,12 +192,12 @@ private static float fallDamageReductions(LivingEntity entity, int surface) {
+ 
+     // Utils
+ 
+-    private static float calculateReductions(float damage, LivingEntity entity, DamageSource damageSource) {
++    /**
++     * @see LivingEntity#applyDamage(DamageSource, float)
++     */
++    public static float calculateReductions(float damage, LivingEntity entity, DamageSource damageSource) {
+         if (damageSource.isScaledWithDifficulty()) {
+             switch (mc.world.getDifficulty()) {
+-                case PEACEFUL -> {
+-                    return 0;
+-                }
+                 case EASY     -> damage = Math.min(damage / 2 + 1, damage);
+                 case HARD     -> damage *= 1.5f;
+             }
+@@ -164,7 +222,6 @@ private static float getArmor(LivingEntity entity) {
+     /**
+      * @see LivingEntity#modifyAppliedDamage(DamageSource, float)
+      */
+-    @SuppressWarnings("JavadocReference")
+     private static float protectionReduction(Entity player, float damage, DamageSource source) {
+         int protLevel = EnchantmentHelper.getProtectionAmount(player.getArmorItems(), source);
+         return DamageUtil.getInflictedDamage(damage, protLevel);
+@@ -173,7 +230,6 @@ private static float protectionReduction(Entity player, float damage, DamageSour
+     /**
+      * @see LivingEntity#modifyAppliedDamage(DamageSource, float)
+      */
+-    @SuppressWarnings("JavadocReference")
+     private static float resistanceReduction(LivingEntity player, float damage) {
+         StatusEffectInstance resistance = StatusEffectHelper.getStatusEffect(player, StatusEffects.RESISTANCE);
+         if (resistance != null) {
+@@ -187,19 +243,25 @@ private static float resistanceReduction(LivingEntity player, float damage) {
+     /**
+      * @see Explosion#getExposure(Vec3d, Entity)
+      */
+-    private static float getExposure(Vec3d source, Box box, @Nullable BlockPos override, @Nullable BlockState overrideState) {
+-        double xStep = 1 / ((box.maxX - box.minX) * 2 + 1);
+-        double yStep = 1 / ((box.maxY - box.minY) * 2 + 1);
++    private static float getExposure(Vec3d source, Box box, RaycastFactory raycastFactory) {
++        double xDiff = box.maxX - box.minX;
++        double yDiff = box.maxY - box.minY;
++        double zDiff = box.maxZ - box.minZ;
++
++        double xStep = 1 / (xDiff * 2 + 1);
++        double yStep = 1 / (yDiff * 2 + 1);
++        double zStep = 1 / (zDiff * 2 + 1);
+ 
+-        if (xStep > 0 && yStep > 0) {
++        if (xStep > 0 && yStep > 0 && zStep > 0) {
+             int misses = 0;
+             int hits = 0;
+ 
+-            xStep = xStep * (box.maxX - box.minX);
+-            yStep = yStep * (box.maxY - box.minY);
++            double xOffset = (1 - Math.floor(1 / xStep) * xStep) * 0.5;
++            double zOffset = (1 - Math.floor(1 / zStep) * zStep) * 0.5;
+ 
+-            double xOffset = (1 - Math.floor(1 / xStep) * xStep) / 2;
+-            double zOffset = (1 - Math.floor(1 / yStep) * yStep) / 2;
++            xStep = xStep * xDiff;
++            yStep = yStep * yDiff;
++            zStep = zStep * zDiff;
+ 
+             double startX = box.minX + xOffset;
+             double startY = box.minY;
+@@ -208,14 +270,12 @@ private static float getExposure(Vec3d source, Box box, @Nullable BlockPos overr
+             double endY = box.maxY;
+             double endZ = box.maxZ + zOffset;
+ 
+-            Vec3d position = new Vec3d(0, 0, 0);
+-
+             for (double x = startX; x <= endX; x += xStep) {
+                 for (double y = startY; y <= endY; y += yStep) {
+-                    for (double z = startZ; z <= endZ; z += xStep) {
+-                        ((IVec3d) position).set(x, y, z);
++                    for (double z = startZ; z <= endZ; z += zStep) {
++                        Vec3d position = new Vec3d(x, y, z);
+ 
+-                        if ((override != null ? raycast(position, source, override, overrideState) : raycast(position, source)) == HitResult.Type.MISS) misses++;
++                        if (raycast(new ExposureRaycastContext(position, source), raycastFactory) == null) misses++;
+ 
+                         hits++;
+                     }
+@@ -228,31 +288,14 @@ private static float getExposure(Vec3d source, Box box, @Nullable BlockPos overr
+         return 0f;
+     }
+ 
+-    /**
+-     * @see BlockView#raycast(RaycastContext)
+-     */
+-    private static HitResult.Type raycast(Vec3d start, Vec3d end) {
+-        return BlockView.raycast(start, end, null, (_null, blockPos) -> {
+-            BlockState blockState = mc.world.getBlockState(blockPos);
+-            if (blockState.getBlock().getBlastResistance() < 600) return null;
+-
+-            BlockHitResult hitResult = blockState.getCollisionShape(mc.world, blockPos).raycast(start, end, blockPos);
+-            return hitResult == null ? null : hitResult.getType();
+-        }, (_null) -> HitResult.Type.MISS);
+-    }
++    /* Raycasts */
+ 
++    private static BlockHitResult raycast(ExposureRaycastContext context, RaycastFactory raycastFactory) {
++        return BlockView.raycast(context.start, context.end, context, raycastFactory, ctx -> null);
++    }
+ 
+-    private static HitResult.Type raycast(Vec3d start, Vec3d end, BlockPos override, BlockState overrideState) {
+-        return BlockView.raycast(start, end, null, (_null, blockPos) -> {
+-            BlockState blockState;
+-            if (blockPos.equals(override)) blockState = overrideState;
+-            else {
+-                blockState = mc.world.getBlockState(blockPos);
+-                if (blockState.getBlock().getBlastResistance() < 600) return null;
+-            }
++    public record ExposureRaycastContext(Vec3d start, Vec3d end) {}
+ 
+-            BlockHitResult hitResult = blockState.getCollisionShape(mc.world, blockPos).raycast(start, end, blockPos);
+-            return hitResult == null ? null : hitResult.getType();
+-        }, (_null) -> HitResult.Type.MISS);
+-    }
++    @FunctionalInterface
++    public interface RaycastFactory extends BiFunction<ExposureRaycastContext, BlockPos, BlockHitResult> {}
+ }
+diff --git a/src/main/java/meteordevelopment/meteorclient/utils/entity/SortPriority.java b/src/main/java/meteordevelopment/meteorclient/utils/entity/SortPriority.java
+index b33d58d52b..835cc78652 100644
+--- a/src/main/java/meteordevelopment/meteorclient/utils/entity/SortPriority.java
++++ b/src/main/java/meteordevelopment/meteorclient/utils/entity/SortPriority.java
+@@ -5,10 +5,58 @@
+ 
+ package meteordevelopment.meteorclient.utils.entity;
+ 
+-public enum SortPriority {
+-    LowestDistance,
+-    HighestDistance,
+-    LowestHealth,
+-    HighestHealth,
+-    ClosestAngle
++import meteordevelopment.meteorclient.utils.player.PlayerUtils;
++import meteordevelopment.meteorclient.utils.player.Rotations;
++import net.minecraft.entity.Entity;
++import net.minecraft.entity.LivingEntity;
++
++import java.util.Comparator;
++
++import static meteordevelopment.meteorclient.MeteorClient.mc;
++
++public enum SortPriority implements Comparator<Entity> {
++    LowestDistance((e1, e2) -> Double.compare(PlayerUtils.squaredDistanceTo(e1), PlayerUtils.squaredDistanceTo(e2))),
++    HighestDistance((e1, e2) -> Double.compare(PlayerUtils.squaredDistanceTo(e2), PlayerUtils.squaredDistanceTo(e1))),
++    LowestHealth(SortPriority::sortHealth),
++    HighestHealth((e1, e2) -> sortHealth(e2, e1)),
++    ClosestAngle(SortPriority::sortAngle);
++
++    private final Comparator<Entity> comparator;
++
++    SortPriority(Comparator<Entity> comparator) {
++        this.comparator = comparator;
++    }
++
++    @Override
++    public int compare(Entity o1, Entity o2) {
++        return comparator.compare(o1, o2);
++    }
++
++    private static int sortHealth(Entity e1, Entity e2) {
++        boolean e1l = e1 instanceof LivingEntity;
++        boolean e2l = e2 instanceof LivingEntity;
++
++        if (!e1l && !e2l) return 0;
++        else if (e1l && !e2l) return 1;
++        else if (!e1l) return -1;
++
++        return Float.compare(((LivingEntity) e1).getHealth(), ((LivingEntity) e2).getHealth());
++    }
++
++    private static int sortAngle(Entity e1, Entity e2) {
++        boolean e1l = e1 instanceof LivingEntity;
++        boolean e2l = e2 instanceof LivingEntity;
++
++        if (!e1l && !e2l) return 0;
++        else if (e1l && !e2l) return 1;
++        else if (!e1l) return -1;
++
++        double e1yaw = Math.abs(Rotations.getYaw(e1) - mc.player.getYaw());
++        double e2yaw = Math.abs(Rotations.getYaw(e2) - mc.player.getYaw());
++
++        double e1pitch = Math.abs(Rotations.getPitch(e1) - mc.player.getPitch());
++        double e2pitch = Math.abs(Rotations.getPitch(e2) - mc.player.getPitch());
++
++        return Double.compare(e1yaw * e1yaw + e1pitch * e1pitch, e2yaw * e2yaw + e2pitch * e2pitch);
++    }
+ }
+diff --git a/src/main/java/meteordevelopment/meteorclient/utils/entity/TargetUtils.java b/src/main/java/meteordevelopment/meteorclient/utils/entity/TargetUtils.java
+index b1721767ce..8c479876da 100644
+--- a/src/main/java/meteordevelopment/meteorclient/utils/entity/TargetUtils.java
++++ b/src/main/java/meteordevelopment/meteorclient/utils/entity/TargetUtils.java
+@@ -10,12 +10,11 @@
+ import meteordevelopment.meteorclient.utils.entity.fakeplayer.FakePlayerEntity;
+ import meteordevelopment.meteorclient.utils.entity.fakeplayer.FakePlayerManager;
+ import meteordevelopment.meteorclient.utils.player.PlayerUtils;
+-import meteordevelopment.meteorclient.utils.player.Rotations;
+ import net.minecraft.entity.Entity;
+-import net.minecraft.entity.LivingEntity;
+ import net.minecraft.entity.player.PlayerEntity;
+ import net.minecraft.world.GameMode;
+ 
++import javax.annotation.Nullable;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.function.Predicate;
+@@ -25,6 +24,7 @@
+ public class TargetUtils {
+     private static final List<Entity> ENTITIES = new ArrayList<>();
+ 
++    @Nullable
+     public static Entity get(Predicate<Entity> isGood, SortPriority sortPriority) {
+         ENTITIES.clear();
+         getList(ENTITIES, isGood, sortPriority, 1);
+@@ -46,10 +46,12 @@ public static void getList(List<Entity> targetList, Predicate<Entity> isGood, So
+             if (fp != null && isGood.test(fp)) targetList.add(fp);
+         });
+ 
+-        targetList.sort((e1, e2) -> sort(e1, e2, sortPriority));
+-        targetList.removeIf(entity -> targetList.indexOf(entity) > maxCount -1);
++        targetList.sort(sortPriority);
++        // fast list trimming
++        for (int i = targetList.size() - 1; i >= maxCount; i--) targetList.remove(i);
+     }
+ 
++    @Nullable
+     public static PlayerEntity getPlayerTarget(double range, SortPriority priority) {
+         if (!Utils.canUpdate()) return null;
+         return (PlayerEntity) get(entity -> {
+@@ -65,42 +67,4 @@ public static boolean isBadTarget(PlayerEntity target, double range) {
+         if (target == null) return true;
+         return !PlayerUtils.isWithin(target, range) || !target.isAlive() || target.isDead() || target.getHealth() <= 0;
+     }
+-
+-    private static int sort(Entity e1, Entity e2, SortPriority priority) {
+-        return switch (priority) {
+-            case LowestDistance -> Double.compare(PlayerUtils.squaredDistanceTo(e1), PlayerUtils.squaredDistanceTo(e2));
+-            case HighestDistance -> Double.compare(PlayerUtils.squaredDistanceTo(e2), PlayerUtils.squaredDistanceTo(e1));
+-            case LowestHealth -> sortHealth(e1, e2);
+-            case HighestHealth -> sortHealth(e2, e1);
+-            case ClosestAngle -> sortAngle(e1, e2);
+-        };
+-    }
+-
+-    private static int sortHealth(Entity e1, Entity e2) {
+-        boolean e1l = e1 instanceof LivingEntity;
+-        boolean e2l = e2 instanceof LivingEntity;
+-
+-        if (!e1l && !e2l) return 0;
+-        else if (e1l && !e2l) return 1;
+-        else if (!e1l) return -1;
+-
+-        return Float.compare(((LivingEntity) e1).getHealth(), ((LivingEntity) e2).getHealth());
+-    }
+-
+-    private static int sortAngle(Entity e1, Entity e2) {
+-        boolean e1l = e1 instanceof LivingEntity;
+-        boolean e2l = e2 instanceof LivingEntity;
+-
+-        if (!e1l && !e2l) return 0;
+-        else if (e1l && !e2l) return 1;
+-        else if (!e1l) return -1;
+-
+-        double e1yaw = Math.abs(Rotations.getYaw(e1) - mc.player.getYaw());
+-        double e2yaw = Math.abs(Rotations.getYaw(e2) - mc.player.getYaw());
+-
+-        double e1pitch = Math.abs(Rotations.getPitch(e1) - mc.player.getPitch());
+-        double e2pitch = Math.abs(Rotations.getPitch(e2) - mc.player.getPitch());
+-
+-        return Double.compare(e1yaw * e1yaw + e1pitch * e1pitch, e2yaw * e2yaw + e2pitch * e2pitch);
+-    }
+ }
+diff --git a/src/main/java/meteordevelopment/meteorclient/utils/entity/effects/StatusEffectBruteForce.java b/src/main/java/meteordevelopment/meteorclient/utils/entity/effects/StatusEffectBruteForce.java
+index 5fc8ab19a6..52e5856ce5 100644
+--- a/src/main/java/meteordevelopment/meteorclient/utils/entity/effects/StatusEffectBruteForce.java
++++ b/src/main/java/meteordevelopment/meteorclient/utils/entity/effects/StatusEffectBruteForce.java
+@@ -12,6 +12,7 @@
+ import meteordevelopment.meteorclient.MeteorClient;
+ import meteordevelopment.meteorclient.events.game.GameLeftEvent;
+ import meteordevelopment.meteorclient.mixin.LivingEntityAccessor;
++import meteordevelopment.meteorclient.systems.config.Config;
+ import meteordevelopment.meteorclient.utils.PreInit;
+ import meteordevelopment.meteorclient.utils.entity.StatusEffectHelper;
+ import meteordevelopment.orbit.EventHandler;
+@@ -33,9 +34,8 @@
+  */
+ public class StatusEffectBruteForce {
+     private static final TrackedData<Integer> POTION_SWIRLS_COLOR = LivingEntityAccessor.meteor$getPotionSwirlsColor();
+-    private static final TrackedData<Boolean> POTION_SWRISL_AMBIENT = LivingEntityAccessor.meteor$getPotionSwirlsAmbient();
++    private static final TrackedData<Boolean> POTION_SWIRLS_AMBIENT = LivingEntityAccessor.meteor$getPotionSwirlsAmbient();
+     private static final int EMPTY_COLOR = 3694022;
+-    private static final int MAX_DEPTH = 4;
+     public static final Set<StatusEffectEntry> ALL_ENTRIES = new ReferenceOpenHashSet<>();
+     public static final Set<StatusEffectEntry> BEACON_ENTRIES = new ReferenceOpenHashSet<>();
+     private static final Map<LivingEntity, EntityEffectCache> PLAYER_EFFECT_MAP = new Object2ObjectOpenHashMap<>();
+@@ -130,7 +130,7 @@ private static void update(int particleColor, LivingEntity entity, EntityEffectC
+         Set<StatusEffectEntry> possibleEntries;
+         EffectAttributeModifier[] possibleModifiers;
+ 
+-        if (entity.getDataTracker().get(POTION_SWRISL_AMBIENT)) { // entity is only affected by effects from beacons
++        if (entity.getDataTracker().get(POTION_SWIRLS_AMBIENT)) { // entity is only affected by effects from beacons
+             possibleEntries = BEACON_ENTRIES;
+             possibleModifiers = EffectAttributeModifier.BEACON;
+         } else {
+@@ -174,28 +174,36 @@ private static void update(int particleColor, LivingEntity entity, EntityEffectC
+         // Map#computeIfAbsent(Object, Function) cannot cache null return values, so we use a separate cache for those
+         if (NULL_COLORS.contains(cacheKey)) return;
+ 
+-        @Nullable Map<StatusEffect, StatusEffectInstance> match = EFFECT_CACHE_MAP.computeIfAbsent(cacheKey, key -> {
+-            for (int depth = 2; depth <= MAX_DEPTH; depth++) {
+-                for (var combination : Sets.combinations(possibleEntries, depth)) {
+-                    int color = blend(initialColor, combination);
+-                    if (color == particleColor) {
+-                        // If the amplifiers of all applied effects match, then it cannot be inferred and should be assumed to be 1
+-                        boolean assumeLowestAmplifier = combination.stream().mapToInt(o -> o.amplifier).reduce((i1, i2) -> i1 == i2 ? i1 : -1).orElse(-1) != -1;
++        @Nullable Map<StatusEffect, StatusEffectInstance> match = EFFECT_CACHE_MAP.get(cacheKey);
++        if (match == null && Config.get().heuristicCombatUtils.get()) {
++            match = bruteForce(possibleEntries, initialColor, particleColor);
++            if (match == null) NULL_COLORS.add(cacheKey);
++        }
++
++        if (match != null) container.statusEffects.putAll(match);
++    }
+ 
+-                        Map<StatusEffect, StatusEffectInstance> map = new Reference2ObjectOpenHashMap<>();
++    @Nullable
++    private static Map<StatusEffect, StatusEffectInstance> bruteForce(Set<StatusEffectEntry> entries, MutableParticleColor initialColor, int particleColor) {
++        int maxDepth = Config.get().heuristicDepth.get();
++        for (int depth = 2; depth <= maxDepth; depth++) {
++            for (var combination : Sets.combinations(entries, depth)) {
++                int color = blend(initialColor, combination);
++                if (color == particleColor) {
++                    // If the amplifiers of all applied effects match, then it cannot be inferred and should be assumed to be 1
++                    boolean assumeLowestAmplifier = combination.stream().mapToInt(o -> o.amplifier).reduce((i1, i2) -> i1 == i2 ? i1 : -1).orElse(-1) != -1;
+ 
+-                        for (var entry : combination) {
+-                            map.put(entry.effect, new StatusEffectInstance(entry.effect, 0, assumeLowestAmplifier ? 0 : entry.amplifier - 1));
+-                        }
++                    Map<StatusEffect, StatusEffectInstance> map = new Reference2ObjectOpenHashMap<>();
+ 
+-                        return map;
++                    for (var entry : combination) {
++                        map.put(entry.effect, new StatusEffectInstance(entry.effect, 0, assumeLowestAmplifier ? 0 : entry.amplifier - 1));
+                     }
++
++                    return map;
+                 }
+             }
+-            return null;
+-        });
+-        if (match != null) container.statusEffects.putAll(match);
+-        else NULL_COLORS.add(cacheKey);
++        }
++        return null;
+     }
+ 
+     @EventHandler
+diff --git a/src/main/java/meteordevelopment/meteorclient/utils/player/PlayerUtils.java b/src/main/java/meteordevelopment/meteorclient/utils/player/PlayerUtils.java
+index 203cd5340f..57a6762229 100644
+--- a/src/main/java/meteordevelopment/meteorclient/utils/player/PlayerUtils.java
++++ b/src/main/java/meteordevelopment/meteorclient/utils/player/PlayerUtils.java
+@@ -227,6 +227,10 @@ else if (entity instanceof PlayerEntity player && !Friends.get().isFriend(player
+         return damageTaken;
+     }
+ 
++    public static double distance(double x1, double y1, double z1, double x2, double y2, double z2) {
++        return Math.sqrt(squaredDistance(x1, y1, z1, x2, y2, z2));
++    }
++
+     public static double distanceTo(Entity entity) {
+         return distanceTo(entity.getX(), entity.getY(), entity.getZ());
+     }
+@@ -256,9 +260,9 @@ public static double squaredDistanceTo(double x, double y, double z) {
+     }
+ 
+     public static double squaredDistance(double x1, double y1, double z1, double x2, double y2, double z2) {
+-        float f = (float) (x1 - x2);
+-        float g = (float) (y1 - y2);
+-        float h = (float) (z1 - z2);
++        double f = x1 - x2;
++        double g = y1 - y2;
++        double h = z1 - z2;
+         return org.joml.Math.fma(f, f, org.joml.Math.fma(g, g, h * h));
+     }
+ 

@@ -1,0 +1,272 @@
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/DefaultMcpClient.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/DefaultMcpClient.java
+index 5a8ba82c78a..b523ebcb4ce 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/DefaultMcpClient.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/DefaultMcpClient.java
+@@ -11,6 +11,7 @@
+ import com.fasterxml.jackson.databind.node.ObjectNode;
+ import dev.langchain4j.agent.tool.ToolExecutionRequest;
+ import dev.langchain4j.agent.tool.ToolSpecification;
++import dev.langchain4j.mcp.client.protocol.CancellationNotification;
+ import dev.langchain4j.mcp.client.protocol.InitializeParams;
+ import dev.langchain4j.mcp.client.protocol.McpCallToolRequest;
+ import dev.langchain4j.mcp.client.protocol.McpInitializeRequest;
+@@ -45,7 +46,7 @@ public class DefaultMcpClient implements McpClient {
+     private final JsonNode RESULT_TIMEOUT;
+     private final String toolExecutionTimeoutErrorMessage;
+     private final Map<Long, CompletableFuture<JsonNode>> pendingOperations = new ConcurrentHashMap<>();
+-    private final McpOperationHandler messageHandler = new McpOperationHandler(pendingOperations);
++    private final McpOperationHandler messageHandler;
+ 
+     public DefaultMcpClient(Builder builder) {
+         transport = ensureNotNull(builder.transport, "transport");
+@@ -56,6 +57,7 @@ public DefaultMcpClient(Builder builder) {
+         toolExecutionTimeoutErrorMessage =
+                 getOrDefault(builder.toolExecutionTimeoutErrorMessage, "There was a timeout executing the tool");
+         RESULT_TIMEOUT = JsonNodeFactory.instance.objectNode();
++        messageHandler = new McpOperationHandler(pendingOperations, transport);
+         ((ObjectNode) RESULT_TIMEOUT)
+                 .putObject("result")
+                 .putArray("content")
+@@ -102,7 +104,7 @@ private InitializeParams createInitializeParams() {
+     @Override
+     public List<ToolSpecification> listTools() {
+         McpListToolsRequest operation = new McpListToolsRequest(idGenerator.getAndIncrement());
+-        CompletableFuture<JsonNode> resultFuture = transport.listTools(operation);
++        CompletableFuture<JsonNode> resultFuture = transport.executeOperationWithResponse(operation);
+         JsonNode result = null;
+         try {
+             result = resultFuture.get();
+@@ -130,10 +132,10 @@ public String executeTool(ToolExecutionRequest executionRequest) {
+         CompletableFuture<JsonNode> resultFuture = null;
+         JsonNode result = null;
+         try {
+-            resultFuture = transport.executeTool(operation);
++            resultFuture = transport.executeOperationWithResponse(operation);
+             result = resultFuture.get(timeoutMillis, TimeUnit.MILLISECONDS);
+         } catch (TimeoutException timeout) {
+-            transport.cancelOperation(operationId);
++            transport.executeOperationWithoutResponse(new CancellationNotification(operationId, "Timeout"));
+             return ToolExecutionHelper.extractResult(
+                     (ArrayNode) RESULT_TIMEOUT.get("result").get("content"));
+         } catch (ExecutionException | InterruptedException e) {
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/ClientMethod.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/ClientMethod.java
+index b19c791609b..8c4197e500d 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/ClientMethod.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/ClientMethod.java
+@@ -12,5 +12,7 @@ public enum ClientMethod {
+     @JsonProperty("notifications/cancelled")
+     NOTIFICATION_CANCELLED,
+     @JsonProperty("notifications/initialized")
+-    NOTIFICATION_INITIALIZED
++    NOTIFICATION_INITIALIZED,
++    @JsonProperty("ping")
++    PING
+ }
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/PingResponse.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/PingResponse.java
+new file mode 100644
+index 00000000000..cc162e9ba0b
+--- /dev/null
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/protocol/PingResponse.java
+@@ -0,0 +1,16 @@
++package dev.langchain4j.mcp.client.protocol;
++
++import com.fasterxml.jackson.annotation.JsonInclude;
++import java.util.HashMap;
++import java.util.Map;
++
++public class PingResponse extends McpClientMessage {
++
++    // has to be an empty object
++    @JsonInclude(JsonInclude.Include.ALWAYS)
++    private final Map<String, Object> result = new HashMap<>();
++
++    public PingResponse(final Long id) {
++        super(id);
++    }
++}
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpOperationHandler.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpOperationHandler.java
+index eed86b876d7..132ca5bd1a1 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpOperationHandler.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpOperationHandler.java
+@@ -1,6 +1,7 @@
+ package dev.langchain4j.mcp.client.transport;
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
++import dev.langchain4j.mcp.client.protocol.PingResponse;
+ import java.util.Map;
+ import java.util.concurrent.CompletableFuture;
+ import org.slf4j.Logger;
+@@ -16,9 +17,11 @@ public class McpOperationHandler {
+ 
+     private final Map<Long, CompletableFuture<JsonNode>> pendingOperations;
+     private static final Logger log = LoggerFactory.getLogger(McpOperationHandler.class);
++    private final McpTransport transport;
+ 
+-    public McpOperationHandler(Map<Long, CompletableFuture<JsonNode>> pendingOperations) {
++    public McpOperationHandler(Map<Long, CompletableFuture<JsonNode>> pendingOperations, McpTransport transport) {
+         this.pendingOperations = pendingOperations;
++        this.transport = transport;
+     }
+ 
+     public void handle(JsonNode message) {
+@@ -28,6 +31,13 @@ public void handle(JsonNode message) {
+             if (op != null) {
+                 op.complete(message);
+             } else {
++                if (message.has("method")) {
++                    String method = message.get("method").asText();
++                    if (method.equals("ping")) {
++                        transport.executeOperationWithoutResponse(new PingResponse(messageId));
++                        return;
++                    }
++                }
+                 log.warn("Received response for unknown message id: {}", messageId);
+             }
+         } else {
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpTransport.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpTransport.java
+index 16b8f2aa4d2..b83daf2bb3e 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpTransport.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/McpTransport.java
+@@ -1,9 +1,8 @@
+ package dev.langchain4j.mcp.client.transport;
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
+-import dev.langchain4j.mcp.client.protocol.McpCallToolRequest;
++import dev.langchain4j.mcp.client.protocol.McpClientMessage;
+ import dev.langchain4j.mcp.client.protocol.McpInitializeRequest;
+-import dev.langchain4j.mcp.client.protocol.McpListToolsRequest;
+ import java.io.Closeable;
+ import java.util.concurrent.CompletableFuture;
+ 
+@@ -24,20 +23,13 @@ public interface McpTransport extends Closeable {
+     CompletableFuture<JsonNode> initialize(McpInitializeRequest request);
+ 
+     /**
+-     * Requests a list of available tools from the MCP server.
++     * Executes an operation that expects a response from the server.
+      */
+-    CompletableFuture<JsonNode> listTools(McpListToolsRequest request);
++    CompletableFuture<JsonNode> executeOperationWithResponse(McpClientMessage request);
+ 
+     /**
+-     * Executes a tool on the MCP server.
+-     * @param request the tool execution request
++     * Sends a message that does not expect a response from the server. The 'id' field
++     * of the message should be null.
+      */
+-    CompletableFuture<JsonNode> executeTool(McpCallToolRequest request);
+-
+-    /**
+-     * Cancels a running operation on the server (sends a 'notifications/cancelled' message to the server).
+-     * This does not expect any response from the server.
+-     * @param operationId The ID of the operation to be cancelled.
+-     */
+-    void cancelOperation(long operationId);
++    void executeOperationWithoutResponse(McpClientMessage request);
+ }
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/http/HttpMcpTransport.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/http/HttpMcpTransport.java
+index 993748f5741..106cc48bd0d 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/http/HttpMcpTransport.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/http/HttpMcpTransport.java
+@@ -6,12 +6,9 @@
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+-import dev.langchain4j.mcp.client.protocol.CancellationNotification;
+ import dev.langchain4j.mcp.client.protocol.InitializationNotification;
+-import dev.langchain4j.mcp.client.protocol.McpCallToolRequest;
+ import dev.langchain4j.mcp.client.protocol.McpClientMessage;
+ import dev.langchain4j.mcp.client.protocol.McpInitializeRequest;
+-import dev.langchain4j.mcp.client.protocol.McpListToolsRequest;
+ import dev.langchain4j.mcp.client.transport.McpOperationHandler;
+ import dev.langchain4j.mcp.client.transport.McpTransport;
+ import java.io.IOException;
+@@ -83,7 +80,7 @@ public CompletableFuture<JsonNode> initialize(McpInitializeRequest operation) {
+     }
+ 
+     @Override
+-    public CompletableFuture<JsonNode> listTools(McpListToolsRequest operation) {
++    public CompletableFuture<JsonNode> executeOperationWithResponse(McpClientMessage operation) {
+         try {
+             Request httpRequest = createRequest(operation);
+             return execute(httpRequest, operation.getId());
+@@ -93,22 +90,12 @@ public CompletableFuture<JsonNode> listTools(McpListToolsRequest operation) {
+     }
+ 
+     @Override
+-    public CompletableFuture<JsonNode> executeTool(McpCallToolRequest operation) {
++    public void executeOperationWithoutResponse(McpClientMessage operation) {
+         try {
+             Request httpRequest = createRequest(operation);
+-            return execute(httpRequest, operation.getId());
+-        } catch (JsonProcessingException e) {
+-            return CompletableFuture.failedFuture(e);
+-        }
+-    }
+-
+-    @Override
+-    public void cancelOperation(long operationId) {
+-        try {
+-            Request httpRequest = createRequest(new CancellationNotification(operationId, "Timeout"));
+             execute(httpRequest, null);
+         } catch (JsonProcessingException e) {
+-            log.warn("Failed to create a cancellation request", e);
++            throw new RuntimeException(e);
+         }
+     }
+ 
+diff --git a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/stdio/StdioMcpTransport.java b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/stdio/StdioMcpTransport.java
+index 96788f2d527..3af4a6106b2 100644
+--- a/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/stdio/StdioMcpTransport.java
++++ b/langchain4j-mcp/src/main/java/dev/langchain4j/mcp/client/transport/stdio/StdioMcpTransport.java
+@@ -3,11 +3,9 @@
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+-import dev.langchain4j.mcp.client.protocol.CancellationNotification;
+ import dev.langchain4j.mcp.client.protocol.InitializationNotification;
+-import dev.langchain4j.mcp.client.protocol.McpCallToolRequest;
++import dev.langchain4j.mcp.client.protocol.McpClientMessage;
+ import dev.langchain4j.mcp.client.protocol.McpInitializeRequest;
+-import dev.langchain4j.mcp.client.protocol.McpListToolsRequest;
+ import dev.langchain4j.mcp.client.transport.McpOperationHandler;
+ import dev.langchain4j.mcp.client.transport.McpTransport;
+ import java.io.IOException;
+@@ -69,34 +67,19 @@ public CompletableFuture<JsonNode> initialize(McpInitializeRequest operation) {
+     }
+ 
+     @Override
+-    public CompletableFuture<JsonNode> listTools(McpListToolsRequest operation) {
++    public CompletableFuture<JsonNode> executeOperationWithResponse(McpClientMessage operation) {
+         try {
+             String requestString = OBJECT_MAPPER.writeValueAsString(operation);
+             return execute(requestString, operation.getId());
+         } catch (JsonProcessingException e) {
+-            throw new RuntimeException(e);
++            return CompletableFuture.failedFuture(e);
+         }
+     }
+ 
+     @Override
+-    public CompletableFuture<JsonNode> executeTool(McpCallToolRequest operation) {
++    public void executeOperationWithoutResponse(McpClientMessage operation) {
+         try {
+             String requestString = OBJECT_MAPPER.writeValueAsString(operation);
+-            return execute(requestString, operation.getId());
+-        } catch (JsonProcessingException e) {
+-            throw new RuntimeException(e);
+-        }
+-    }
+-
+-    @Override
+-    public void cancelOperation(long operationId) {
+-        try {
+-            String requestString =
+-                    OBJECT_MAPPER.writeValueAsString(new CancellationNotification(operationId, "Timeout"));
+-            // Note: we're passing a null operationId here because this
+-            // argument refers to the 'cancellation' notification, not the
+-            // operation being cancelled. The cancellation is a notification
+-            // so it does not have any ID and does not expect any response.
+             execute(requestString, null);
+         } catch (JsonProcessingException e) {
+             throw new RuntimeException(e);

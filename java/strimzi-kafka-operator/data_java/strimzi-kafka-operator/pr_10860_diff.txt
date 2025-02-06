@@ -1,0 +1,929 @@
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceAssemblyOperator.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceAssemblyOperator.java
+index 140654c7e0..56ead08401 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceAssemblyOperator.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceAssemblyOperator.java
+@@ -4,6 +4,11 @@
+  */
+ package io.strimzi.operator.cluster.operator.assembly;
+ 
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.node.ArrayNode;
++import com.fasterxml.jackson.databind.node.ObjectNode;
+ import io.fabric8.kubernetes.api.model.ConfigMap;
+ import io.fabric8.kubernetes.api.model.ConfigMapBuilder;
+ import io.fabric8.kubernetes.api.model.LabelSelector;
+@@ -58,8 +63,6 @@
+ import io.vertx.core.Future;
+ import io.vertx.core.Promise;
+ import io.vertx.core.Vertx;
+-import io.vertx.core.json.JsonArray;
+-import io.vertx.core.json.JsonObject;
+ 
+ import java.util.ArrayList;
+ import java.util.Collections;
+@@ -148,6 +151,7 @@ public class KafkaRebalanceAssemblyOperator
+        extends AbstractOperator<KafkaRebalance, KafkaRebalanceSpec, KafkaRebalanceStatus, AbstractWatchableStatusedNamespacedResourceOperator<KubernetesClient, KafkaRebalance, KafkaRebalanceList, Resource<KafkaRebalance>>> {
+ 
+     private static final ReconciliationLogger LOGGER = ReconciliationLogger.create(KafkaRebalanceAssemblyOperator.class.getName());
++    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+ 
+     /* test */ static final String BROKER_LOAD_KEY = "brokerLoad.json";
+     private final CrdOperator<KubernetesClient, KafkaRebalance, KafkaRebalanceList> kafkaRebalanceOperator;
+@@ -463,28 +467,26 @@ private MapAndStatus<ConfigMap, KafkaRebalanceStatus> buildRebalanceStatus(Strin
+      * @param brokerLoadArray The JSONArray of broker load JSONObjects returned by the Cruise Control rebalance endpoint.
+      * @return A map linking from broker ID integer to a map of load parameter to value.
+      */
+-    protected static Map<Integer, Map<String, Object>> extractLoadParameters(JsonArray brokerLoadArray) {
++    protected static Map<Integer, Map<String, Object>> extractLoadParameters(ArrayNode brokerLoadArray) {
+ 
+         Map<Integer, Map<String, Object>> loadMap = new HashMap<>();
+ 
+-        for (Object rawBrokerLoad : brokerLoadArray) {
+-            JsonObject brokerLoad = (JsonObject) rawBrokerLoad;
+-
++        for (JsonNode brokerLoad : brokerLoadArray) {
+             Map<String, Object> brokerLoadMap = new HashMap<>();
+ 
+             for (CruiseControlLoadParameters intParam : CruiseControlLoadParameters.getIntegerParameters()) {
+-                if (brokerLoad.containsKey(intParam.getCruiseControlKey())) {
+-                    brokerLoadMap.put(intParam.getKafkaRebalanceStatusKey(), brokerLoad.getInteger(intParam.getCruiseControlKey()));
++                if (brokerLoad.has(intParam.getCruiseControlKey())) {
++                    brokerLoadMap.put(intParam.getKafkaRebalanceStatusKey(), brokerLoad.get(intParam.getCruiseControlKey()).asInt());
+                 }
+             }
+ 
+             for (CruiseControlLoadParameters doubleParam : CruiseControlLoadParameters.getDoubleParameters()) {
+-                if (brokerLoad.containsKey(doubleParam.getCruiseControlKey())) {
+-                    brokerLoadMap.put(doubleParam.getKafkaRebalanceStatusKey(), brokerLoad.getDouble(doubleParam.getCruiseControlKey()));
++                if (brokerLoad.has(doubleParam.getCruiseControlKey())) {
++                    brokerLoadMap.put(doubleParam.getKafkaRebalanceStatusKey(), brokerLoad.get(doubleParam.getCruiseControlKey()).asDouble());
+                 }
+             }
+ 
+-            int brokerID = brokerLoad.getInteger(CruiseControlRebalanceKeys.BROKER_ID.getKey());
++            int brokerID = brokerLoad.get(CruiseControlRebalanceKeys.BROKER_ID.getKey()).asInt();
+             loadMap.put(brokerID, brokerLoadMap);
+ 
+         }
+@@ -506,7 +508,7 @@ protected static Map<Integer, Map<String, Object>> extractLoadParameters(JsonArr
+      *                             returned by the Cruise Control rebalance endpoint.
+      * @return A JsonObject linking from broker ID integer to a map of load parameter to [before, after, difference] arrays.
+      */
+-    protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonArray brokerLoadAfterJson) {
++    protected static JsonNode parseLoadStats(ArrayNode brokerLoadBeforeJson, ArrayNode brokerLoadAfterJson) {
+ 
+         if (brokerLoadBeforeJson == null && brokerLoadAfterJson == null) {
+             throw new IllegalArgumentException("The rebalance optimization proposal returned by Cruise Control did not contain broker load information");
+@@ -527,7 +529,7 @@ protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonA
+             throw new IllegalArgumentException("Broker data was missing from the load before/after information");
+         }
+ 
+-        JsonObject brokersStats = new JsonObject();
++        ObjectNode brokersStats = OBJECT_MAPPER.createObjectNode();
+ 
+         for (Map.Entry<Integer, Map<String, Object>> loadAfterEntry : loadAfterMap.entrySet()) {
+ 
+@@ -539,7 +541,7 @@ protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonA
+ 
+             Map<String, Object> brokerAfter = loadAfterEntry.getValue();
+ 
+-            JsonObject brokerStats = new JsonObject();
++            ObjectNode brokerStats = OBJECT_MAPPER.createObjectNode();
+ 
+             for (CruiseControlLoadParameters intLoadParameter : CruiseControlLoadParameters.getIntegerParameters()) {
+ 
+@@ -551,19 +553,19 @@ protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonA
+                     int intDiff = intAfterStat - intBeforeStat;
+ 
+ 
+-                    JsonObject intStats = new JsonObject();
++                    ObjectNode intStats = OBJECT_MAPPER.createObjectNode();
+                     intStats.put("before", intBeforeStat);
+                     intStats.put("after", intAfterStat);
+                     intStats.put("diff", intDiff);
+ 
+-                    brokerStats.put(intLoadParameter.getKafkaRebalanceStatusKey(), intStats);
++                    brokerStats.set(intLoadParameter.getKafkaRebalanceStatusKey(), intStats);
+                 } else if (brokerBefore.isEmpty() &&
+                         brokerAfter.containsKey(intLoadParameter.getKafkaRebalanceStatusKey())) {
+                     int intAfterStat = (int) brokerAfter.get(intLoadParameter.getKafkaRebalanceStatusKey());
+-                    JsonObject intStats = new JsonObject();
++                    ObjectNode intStats = OBJECT_MAPPER.createObjectNode();
+                     intStats.put("after", intAfterStat);
+ 
+-                    brokerStats.put(intLoadParameter.getKafkaRebalanceStatusKey(), intStats);
++                    brokerStats.set(intLoadParameter.getKafkaRebalanceStatusKey(), intStats);
+                 } else {
+                     LOGGER.warnOp("{} information was missing from the broker before/after load information",
+                             intLoadParameter.getKafkaRebalanceStatusKey());
+@@ -579,19 +581,19 @@ protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonA
+                     double doubleAfterStat = (double) brokerAfter.get(doubleLoadParameter.getKafkaRebalanceStatusKey());
+                     double doubleDiff = doubleAfterStat - doubleBeforeStat;
+ 
+-                    JsonObject doubleStats = new JsonObject();
++                    ObjectNode doubleStats = OBJECT_MAPPER.createObjectNode();
+                     doubleStats.put("before", doubleBeforeStat);
+                     doubleStats.put("after", doubleAfterStat);
+                     doubleStats.put("diff", doubleDiff);
+ 
+-                    brokerStats.put(doubleLoadParameter.getKafkaRebalanceStatusKey(), doubleStats);
++                    brokerStats.set(doubleLoadParameter.getKafkaRebalanceStatusKey(), doubleStats);
+                 } else if (brokerBefore.isEmpty() &&
+                         brokerAfter.containsKey(doubleLoadParameter.getKafkaRebalanceStatusKey())) {
+                     double doubleAfterStat = (double) brokerAfter.get(doubleLoadParameter.getKafkaRebalanceStatusKey());
+-                    JsonObject doubleStats = new JsonObject();
++                    ObjectNode doubleStats = OBJECT_MAPPER.createObjectNode();
+                     doubleStats.put("after", doubleAfterStat);
+ 
+-                    brokerStats.put(doubleLoadParameter.getKafkaRebalanceStatusKey(), doubleStats);
++                    brokerStats.set(doubleLoadParameter.getKafkaRebalanceStatusKey(), doubleStats);
+                 } else {
+                     LOGGER.warnOp("{} information was missing from the broker before/after load information",
+                             doubleLoadParameter.getKafkaRebalanceStatusKey());
+@@ -599,7 +601,7 @@ protected static JsonObject parseLoadStats(JsonArray brokerLoadBeforeJson, JsonA
+ 
+             }
+ 
+-            brokersStats.put(String.valueOf(loadAfterEntry.getKey()), brokerStats);
++            brokersStats.set(String.valueOf(loadAfterEntry.getKey()), brokerStats);
+         }
+ 
+         return brokersStats;
+@@ -639,22 +641,22 @@ public MapAndStatus(T loadMap, K status) {
+      * @param  proposalJson The JSONObject representing the response from the Cruise Control rebalance endpoint.
+      * @return A wrapper class containing the proposal summary map and a config map containing broker load.
+      */
+-    protected static MapAndStatus<ConfigMap, Map<String, Object>> processOptimizationProposal(KafkaRebalance kafkaRebalance, JsonObject proposalJson) {
+-
+-        JsonArray brokerLoadBeforeOptimization = null;
+-        JsonArray brokerLoadAfterOptimization = null;
+-        if (proposalJson.containsKey(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())) {
+-            brokerLoadBeforeOptimization = proposalJson
+-                    .getJsonObject(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
+-                    .getJsonArray(CruiseControlRebalanceKeys.BROKERS.getKey());
++    protected static MapAndStatus<ConfigMap, Map<String, Object>> processOptimizationProposal(KafkaRebalance kafkaRebalance, JsonNode proposalJson) {
++
++        ArrayNode brokerLoadBeforeOptimization = null;
++        ArrayNode brokerLoadAfterOptimization = null;
++        if (proposalJson.has(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())) {
++            brokerLoadBeforeOptimization = (ArrayNode) proposalJson
++                    .get(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
++                    .get(CruiseControlRebalanceKeys.BROKERS.getKey());
+         }
+-        if (proposalJson.containsKey(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())) {
+-            brokerLoadAfterOptimization = proposalJson
+-                    .getJsonObject(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())
+-                    .getJsonArray(CruiseControlRebalanceKeys.BROKERS.getKey());
++        if (proposalJson.has(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())) {
++            brokerLoadAfterOptimization = (ArrayNode) proposalJson
++                    .get(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())
++                    .get(CruiseControlRebalanceKeys.BROKERS.getKey());
+         }
+ 
+-        JsonObject beforeAndAfterBrokerLoad = parseLoadStats(
++        JsonNode beforeAndAfterBrokerLoad = parseLoadStats(
+                 brokerLoadBeforeOptimization, brokerLoadAfterOptimization);
+ 
+         ConfigMap rebalanceMap = new ConfigMapBuilder()
+@@ -664,14 +666,15 @@ protected static MapAndStatus<ConfigMap, Map<String, Object>> processOptimizatio
+                     .withLabels(Collections.singletonMap("app", "strimzi"))
+                     .withOwnerReferences(ModelUtils.createOwnerReference(kafkaRebalance, false))
+                 .endMetadata()
+-                .withData(Collections.singletonMap(BROKER_LOAD_KEY, beforeAndAfterBrokerLoad.encode()))
++                .withData(Collections.singletonMap(BROKER_LOAD_KEY, beforeAndAfterBrokerLoad.toPrettyString()))
+                 .build();
+ 
+-        proposalJson.getJsonObject(CruiseControlRebalanceKeys.SUMMARY.getKey()).getMap().put("afterBeforeLoadConfigMap", rebalanceMap.getMetadata().getName());
+-        return new MapAndStatus<>(rebalanceMap, proposalJson.getJsonObject(CruiseControlRebalanceKeys.SUMMARY.getKey()).getMap());
++        Map<String, Object> summaryMap = OBJECT_MAPPER.convertValue(proposalJson.get(CruiseControlRebalanceKeys.SUMMARY.getKey()), new TypeReference<Map<String, Object>>() { });
++        summaryMap.put("afterBeforeLoadConfigMap", rebalanceMap.getMetadata().getName());
++        return new MapAndStatus<>(rebalanceMap, summaryMap);
+     }
+ 
+-    private MapAndStatus<ConfigMap, KafkaRebalanceStatus> buildRebalanceStatus(KafkaRebalance kafkaRebalance, String sessionID, KafkaRebalanceState cruiseControlState, JsonObject proposalJson, Set<Condition> validation) {
++    private MapAndStatus<ConfigMap, KafkaRebalanceStatus> buildRebalanceStatus(KafkaRebalance kafkaRebalance, String sessionID, KafkaRebalanceState cruiseControlState, JsonNode proposalJson, Set<Condition> validation) {
+         List<Condition> conditions = new ArrayList<>();
+         conditions.add(StatusUtils.buildRebalanceCondition(cruiseControlState.toString()));
+         conditions.addAll(validation);
+@@ -839,8 +842,8 @@ private void handleUserTaskStatusResponse(Reconciliation reconciliation, CruiseC
+             return;
+         }
+ 
+-        JsonObject taskStatusJson = cruiseControlResponse.getJson();
+-        CruiseControlUserTaskStatus taskStatus = CruiseControlUserTaskStatus.lookup(taskStatusJson.getString("Status"));
++        JsonNode taskStatusJson = cruiseControlResponse.getJson();
++        CruiseControlUserTaskStatus taskStatus = CruiseControlUserTaskStatus.lookup(taskStatusJson.get("Status").asText());
+         switch (taskStatus) {
+             case COMPLETED_WITH_ERROR:
+                 // TODO: There doesn't seem to be a way to retrieve the actual error message from the user tasks endpoint?
+@@ -859,8 +862,8 @@ private void handleUserTaskStatusResponse(Reconciliation reconciliation, CruiseC
+             case IN_EXECUTION:
+                 if (dryRun) {
+                     // If the returned status has an optimization result then the rebalance proposal is ready.
+-                    if (taskStatusJson.containsKey(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey()) &&
+-                            taskStatusJson.containsKey(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())) {
++                    if (taskStatusJson.has(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey()) &&
++                            taskStatusJson.has(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())) {
+                         LOGGER.infoCr(reconciliation, "Rebalance ({}) optimization proposal is now ready", sessionId);
+                         System.out.println("Status" + taskStatusJson);
+                         p.complete(buildRebalanceStatus(kafkaRebalance, sessionId, KafkaRebalanceState.ProposalReady, taskStatusJson, conditions));
+@@ -1241,7 +1244,7 @@ private MapAndStatus<ConfigMap, KafkaRebalanceStatus> handleRebalanceResponse(Re
+             }
+         }
+ 
+-        if (response.getJson() != null && response.getJson().containsKey(CruiseControlRebalanceKeys.SUMMARY.getKey())) {
++        if (response.getJson() != null && response.getJson().has(CruiseControlRebalanceKeys.SUMMARY.getKey())) {
+             // If there is enough data and the proposal is complete (the response has the "summary" key) then we move
+             // to ProposalReady for a dry run or to the Rebalancing state for a full run
+             KafkaRebalanceState ready = dryrun ? KafkaRebalanceState.ProposalReady : KafkaRebalanceState.Rebalancing;
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlApiImpl.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlApiImpl.java
+index 166a3f9704..496b97651c 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlApiImpl.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlApiImpl.java
+@@ -4,6 +4,11 @@
+  */
+ package io.strimzi.operator.cluster.operator.resource.cruisecontrol;
+ 
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.node.ArrayNode;
++import com.fasterxml.jackson.databind.node.ObjectNode;
+ import io.fabric8.kubernetes.api.model.HTTPHeader;
+ import io.fabric8.kubernetes.api.model.Secret;
+ import io.strimzi.operator.common.CruiseControlUtil;
+@@ -18,9 +23,6 @@
+ import io.strimzi.operator.common.model.cruisecontrol.CruiseControlParameters;
+ import io.strimzi.operator.common.model.cruisecontrol.CruiseControlRebalanceKeys;
+ import io.strimzi.operator.common.model.cruisecontrol.CruiseControlUserTaskStatus;
+-import io.vertx.core.json.Json;
+-import io.vertx.core.json.JsonArray;
+-import io.vertx.core.json.JsonObject;
+ 
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.TrustManagerFactory;
+@@ -42,6 +44,7 @@
+  */
+ public class CruiseControlApiImpl implements CruiseControlApi {
+     private static final ReconciliationLogger LOGGER = ReconciliationLogger.create(CruiseControlApiImpl.class);
++    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+     /**
+      * Default timeout for the HTTP client (-1 means use the clients default)
+      */
+@@ -52,6 +55,7 @@ public class CruiseControlApiImpl implements CruiseControlApi {
+     private final HTTPHeader authHttpHeader;
+     private final PemTrustSet pemTrustSet;
+     private final HttpClient httpClient;
++
+     /**
+      * Constructor
+      *
+@@ -99,12 +103,13 @@ public CompletableFuture<CruiseControlResponse> getCruiseControlState(Reconcilia
+                     int statusCode = response.statusCode();
+                     if (statusCode == 200 || statusCode == 201) {
+                         String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
++
+                         LOGGER.debugCr(reconciliation, "Got {} response to GET request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+-                        if (json.containsKey(CC_REST_API_ERROR_KEY)) {
++                        if (json.has(CC_REST_API_ERROR_KEY)) {
+                             return CompletableFuture.failedFuture(new CruiseControlRestException(
+                                     "Error for request: " + host + ":" + port + path + ". Server returned: " +
+-                                            json.getString(CC_REST_API_ERROR_KEY)));
++                                            json.get(CC_REST_API_ERROR_KEY)));
+                         } else {
+                             return CompletableFuture.completedFuture(new CruiseControlResponse(userTaskID, json));
+                         }
+@@ -153,6 +158,17 @@ private HttpClient buildHttpClient() {
+         }
+     }
+ 
++    private JsonNode parseToJsonNode(String responseBody) {
++        JsonNode json;
++        try {
++            json = OBJECT_MAPPER.readTree(responseBody);
++        } catch (JsonProcessingException e) {
++            throw new CruiseControlRestException(
++                    "Failed to deserialize the response: " + e);
++        }
++        return json;
++    }
++
+     private CompletableFuture<CruiseControlRebalanceResponse> internalRebalance(Reconciliation reconciliation, String host, int port, String path, String userTaskId) {
+         HttpRequest.Builder builder = HttpRequest.newBuilder()
+                 .uri(URI.create(String.format("%s://%s:%d%s", apiSslEnabled ? "https" : "http", host, port, path)))
+@@ -179,23 +195,23 @@ private CompletableFuture<CruiseControlRebalanceResponse> internalRebalance(Reco
+                     // send request and handle response
+                     LOGGER.traceCr(reconciliation, "Response: {}, body: {}", response, response.body());
+                     int statusCode = response.statusCode();
++                    String userTaskID = response.headers().firstValue(USER_TASK_ID_HEADER).orElse("");
++
+                     if (statusCode == 200 || statusCode == 201) {
+-                        String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
+                         LOGGER.debugCr(reconciliation, "Got {} response to POST request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+-                        if (json.containsKey(CC_REST_API_ERROR_KEY)) {
++                        if (json.has(CC_REST_API_ERROR_KEY)) {
+                             return CompletableFuture.failedFuture(new CruiseControlRestException(
+                                     "Error for request: " + host + ":" + port + path + ". Server returned: " +
+-                                            json.getString(CC_REST_API_ERROR_KEY)));
++                                            json.get(CC_REST_API_ERROR_KEY).asText()));
+                         } else {
+                             return CompletableFuture.completedFuture(new CruiseControlRebalanceResponse(userTaskID, json));
+                         }
+                     } else if (statusCode == 202) {
+-                        String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
+                         LOGGER.debugCr(reconciliation, "Got {} response to POST request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+                         CruiseControlRebalanceResponse ccResponse = new CruiseControlRebalanceResponse(userTaskID, json);
+-                        if (json.containsKey(CC_REST_API_PROGRESS_KEY)) {
++                        if (json.has(CC_REST_API_PROGRESS_KEY)) {
+                             // If the response contains a "progress" key then the rebalance proposal has not yet completed processing
+                             ccResponse.setProposalStillCalculating(true);
+                         } else {
+@@ -206,24 +222,24 @@ private CompletableFuture<CruiseControlRebalanceResponse> internalRebalance(Reco
+                         }
+                         return CompletableFuture.completedFuture(ccResponse);
+                     } else if (statusCode == 500) {
+-                        String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
+                         LOGGER.debugCr(reconciliation, "Got {} response to POST request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+-                        if (json.containsKey(CC_REST_API_ERROR_KEY)) {
++                        if ((json.has(CC_REST_API_ERROR_KEY))) {
++                            String errorString = json.get(CC_REST_API_ERROR_KEY).asText();
+                             // If there was a client side error, check whether it was due to not enough data being available ...
+-                            if (json.getString(CC_REST_API_ERROR_KEY).contains("NotEnoughValidWindowsException")) {
++                            if (errorString.contains("NotEnoughValidWindowsException")) {
+                                 CruiseControlRebalanceResponse ccResponse = new CruiseControlRebalanceResponse(userTaskID, json);
+                                 ccResponse.setNotEnoughDataForProposal(true);
+                                 return CompletableFuture.completedFuture(ccResponse);
+                                 // ... or one or more brokers doesn't exist on a add/remove brokers rebalance request
+-                            } else if (json.getString(CC_REST_API_ERROR_KEY).contains("IllegalArgumentException") &&
+-                                    json.getString(CC_REST_API_ERROR_KEY).contains("does not exist.")) {
++                            } else if (errorString.contains("IllegalArgumentException") &&
++                                    errorString.contains("does not exist.")) {
+                                 return CompletableFuture.failedFuture(new IllegalArgumentException("Some/all brokers specified don't exist"));
+                             } else {
+                                 // If there was any other kind of error propagate this to the operator
+                                 return CompletableFuture.failedFuture(new CruiseControlRestException(
+                                         "Error for request: " + host + ":" + port + path + ". Server returned: " +
+-                                                json.getString(CC_REST_API_ERROR_KEY)));
++                                                errorString));
+                             }
+                         } else {
+                             return CompletableFuture.failedFuture(new CruiseControlRestException(
+@@ -301,7 +317,6 @@ public CompletableFuture<CruiseControlRebalanceResponse> removeDisks(Reconciliat
+     }
+ 
+     @Override
+-    @SuppressWarnings("deprecation")
+     public CompletableFuture<CruiseControlUserTasksResponse> getUserTaskStatus(Reconciliation reconciliation, String host, int port, String userTaskId) {
+         PathBuilder pathBuilder = new PathBuilder(CruiseControlEndpoints.USER_TASKS)
+                         .withParameter(CruiseControlParameters.JSON, "true")
+@@ -334,26 +349,28 @@ public CompletableFuture<CruiseControlUserTasksResponse> getUserTaskStatus(Recon
+                     // send request and handle response
+                     LOGGER.traceCr(reconciliation, "Response: {}, body: {}", response, response.body());
+                     int statusCode = response.statusCode();
++                    String userTaskID = response.headers().firstValue(USER_TASK_ID_HEADER).orElse("");
++
+                     if (statusCode == 200 || statusCode == 201) {
+-                        String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
+-                        JsonArray userTasks = json.getJsonArray("userTasks");
+-                        JsonObject statusJson = new JsonObject();
++                        JsonNode json = parseToJsonNode(response.body());
++                        ArrayNode userTasks = (ArrayNode) json.get("userTasks");
++                        ObjectNode statusJson = OBJECT_MAPPER.createObjectNode();
+                         if (userTasks.isEmpty()) {
+                             // This may happen if:
+                             // 1. Cruise Control restarted so resetting the state because the tasks queue is not persisted
+                             // 2. Task's retention time expired, or the cache has become full
+                             return CompletableFuture.completedFuture(new CruiseControlUserTasksResponse(userTaskID, statusJson));
+                         } else {
+-                            JsonObject jsonUserTask = userTasks.getJsonObject(0);
+-                            String taskStatusStr = jsonUserTask.getString(STATUS_KEY);
++                            JsonNode jsonUserTask = userTasks.get(0);
++                            String taskStatusStr = jsonUserTask.get(STATUS_KEY).asText();
+                             LOGGER.debugCr(reconciliation, "Got {} response to GET request to {} : userTaskID = {}, status = {}", response.statusCode(), path, userTaskID, taskStatusStr);
+                             // This should not be an error with a 200 status but we play it safe
+-                            if (jsonUserTask.containsKey(CC_REST_API_ERROR_KEY)) {
++                            if (jsonUserTask.has(CC_REST_API_ERROR_KEY)) {
+                                 return CompletableFuture.failedFuture(new CruiseControlRestException(
+                                         "Error for request: " + host + ":" + port + path + ". Server returned: " +
+-                                                json.getString(CC_REST_API_ERROR_KEY)));
++                                                json.get(CC_REST_API_ERROR_KEY).asText()));
+                             }
++
+                             statusJson.put(STATUS_KEY, taskStatusStr);
+                             CruiseControlUserTaskStatus taskStatus = CruiseControlUserTaskStatus.lookup(taskStatusStr);
+                             switch (taskStatus) {
+@@ -365,24 +382,25 @@ public CompletableFuture<CruiseControlUserTasksResponse> getUserTaskStatus(Recon
+                                     // We handle these in the same way as COMPLETED tasks so we drop down to that case.
+                                 case COMPLETED:
+                                     // Completed tasks will have the original rebalance proposal summary in their original response
+-                                    JsonObject originalResponse = (JsonObject) Json.decodeValue(jsonUserTask.getString(
+-                                            CruiseControlRebalanceKeys.ORIGINAL_RESPONSE.getKey()));
+-                                    statusJson.put(CruiseControlRebalanceKeys.SUMMARY.getKey(),
+-                                            originalResponse.getJsonObject(CruiseControlRebalanceKeys.SUMMARY.getKey()));
++                                    // The original response is not Json, therefore it needs to be parsed
++                                    JsonNode originalResponse = parseToJsonNode(jsonUserTask.get(
++                                                CruiseControlRebalanceKeys.ORIGINAL_RESPONSE.getKey()).asText());
++                                    statusJson.set(CruiseControlRebalanceKeys.SUMMARY.getKey(),
++                                            originalResponse.get(CruiseControlRebalanceKeys.SUMMARY.getKey()));
+                                     // Extract the load before/after information for the brokers
+-                                    JsonObject loadBeforeOptJsonObject = originalResponse.getJsonObject(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey());
++                                    JsonNode loadBeforeOptJsonObject = originalResponse.get(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey());
+                                     if (loadBeforeOptJsonObject != null) {
+-                                        statusJson.put(
++                                        statusJson.set(
+                                                 CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey(),
+                                                 loadBeforeOptJsonObject);
+                                     }
+-                                    statusJson.put(
++                                    statusJson.set(
+                                             CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey(),
+-                                            originalResponse.getJsonObject(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey()));
++                                            originalResponse.get(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey()));
+                                     break;
+                                 case COMPLETED_WITH_ERROR:
+                                     // Completed with error tasks will have "CompletedWithError" as their original response, which is not Json.
+-                                    statusJson.put(CruiseControlRebalanceKeys.SUMMARY.getKey(), jsonUserTask.getString(CruiseControlRebalanceKeys.ORIGINAL_RESPONSE.getKey()));
++                                    statusJson.set(CruiseControlRebalanceKeys.SUMMARY.getKey(), jsonUserTask.get(CruiseControlRebalanceKeys.ORIGINAL_RESPONSE.getKey()));
+                                     break;
+                                 default:
+                                     throw new IllegalStateException("Unexpected user task status: " + taskStatus);
+@@ -390,16 +408,14 @@ public CompletableFuture<CruiseControlUserTasksResponse> getUserTaskStatus(Recon
+                             return CompletableFuture.completedFuture(new CruiseControlUserTasksResponse(userTaskID, statusJson));
+                         }
+                     } else if (statusCode == 500) {
+-                        String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
+                         LOGGER.debugCr(reconciliation, "Got {} response to GET request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+                         String errorString;
+-                        if (json.containsKey(CC_REST_API_ERROR_KEY)) {
+-                            errorString = json.getString(CC_REST_API_ERROR_KEY);
++                        if (json.has(CC_REST_API_ERROR_KEY)) {
++                            errorString = json.get(CC_REST_API_ERROR_KEY).asText();
+                         } else {
+-                            errorString = json.toString();
++                            errorString = json.asText();
+                         }
+-                        
+                         if (errorString.matches(".*" + "There are already \\d+ active user tasks, which has reached the servlet capacity." + ".*")) {
+                             LOGGER.debugCr(reconciliation, errorString);
+                             CruiseControlUserTasksResponse ccResponse = new CruiseControlUserTasksResponse(userTaskID, json);
+@@ -449,12 +465,13 @@ public CompletableFuture<CruiseControlResponse> stopExecution(Reconciliation rec
+                     int statusCode = response.statusCode();
+                     if (statusCode == 200 || statusCode == 201) {
+                         String userTaskID = response.headers().firstValue(CruiseControlHeaders.USER_TASK_ID_HEADER).orElse("");
+-                        JsonObject json = new JsonObject(response.body());
++                        JsonNode json = parseToJsonNode(response.body());
++
+                         LOGGER.debugCr(reconciliation, "Got {} response to POST request to {} : userTaskID = {}", response.statusCode(), path, userTaskID);
+-                        if (json.containsKey(CC_REST_API_ERROR_KEY)) {
++                        if (json.has(CC_REST_API_ERROR_KEY)) {
+                             return CompletableFuture.failedFuture(new CruiseControlRestException(
+                                     "Error for request: " + host + ":" + port + path + ". Server returned: " +
+-                                            json.getString(CC_REST_API_ERROR_KEY)));
++                                            json.get(CC_REST_API_ERROR_KEY)));
+                         } else {
+                             return CompletableFuture.completedFuture(new CruiseControlResponse(userTaskID, json));
+                         }
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlRebalanceResponse.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlRebalanceResponse.java
+index 7ac7473ee3..c2d6915f58 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlRebalanceResponse.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlRebalanceResponse.java
+@@ -4,7 +4,7 @@
+  */
+ package io.strimzi.operator.cluster.operator.resource.cruisecontrol;
+ 
+-import io.vertx.core.json.JsonObject;
++import com.fasterxml.jackson.databind.JsonNode;
+ 
+ /**
+  * Response to rebalance request
+@@ -19,7 +19,7 @@ public class CruiseControlRebalanceResponse extends CruiseControlResponse {
+      * @param userTaskId    User task ID
+      * @param json          JSON data
+      */
+-    CruiseControlRebalanceResponse(String userTaskId, JsonObject json) {
++    CruiseControlRebalanceResponse(String userTaskId, JsonNode json) {
+         super(userTaskId, json);
+         // There is sufficient data for proposal unless response from Cruise Control says otherwise
+         // Sourced from the NotEnoughValidWindows error from the Cruise Control response
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlResponse.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlResponse.java
+index 6deb2aeccd..42f4f3d942 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlResponse.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlResponse.java
+@@ -4,14 +4,14 @@
+  */
+ package io.strimzi.operator.cluster.operator.resource.cruisecontrol;
+ 
+-import io.vertx.core.json.JsonObject;
++import com.fasterxml.jackson.databind.JsonNode;
+ 
+ /**
+  * Cruise Control response
+  */
+ public class CruiseControlResponse {
+     private final String userTaskId;
+-    private final JsonObject json;
++    private final JsonNode json;
+ 
+     /**
+      * Constructor
+@@ -19,7 +19,7 @@ public class CruiseControlResponse {
+      * @param userTaskId    User task ID
+      * @param json          JSON data
+      */
+-    CruiseControlResponse(String userTaskId, JsonObject json) {
++    CruiseControlResponse(String userTaskId, JsonNode json) {
+         this.userTaskId = userTaskId;
+         this.json = json;
+     }
+@@ -34,12 +34,12 @@ public String getUserTaskId() {
+     /**
+      * @return  The JSON data of the response
+      */
+-    public JsonObject getJson() {
++    public JsonNode getJson() {
+         return json;
+     }
+ 
+     @Override
+     public String toString() {
+-        return "User Task ID: " + userTaskId + " JSON: " + json.toString();
++        return "User Task ID: " + userTaskId + " JSON: " + json;
+     }
+ }
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlUserTasksResponse.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlUserTasksResponse.java
+index a2c6d3e0fd..106bdfce95 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlUserTasksResponse.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlUserTasksResponse.java
+@@ -4,7 +4,7 @@
+  */
+ package io.strimzi.operator.cluster.operator.resource.cruisecontrol;
+ 
+-import io.vertx.core.json.JsonObject;
++import com.fasterxml.jackson.databind.JsonNode;
+ 
+ /**
+  * Response to user tasks request
+@@ -18,7 +18,7 @@ public class CruiseControlUserTasksResponse extends CruiseControlResponse {
+      * @param userTaskId    User task ID
+      * @param json          JSON data
+      */
+-    CruiseControlUserTasksResponse(String userTaskId, JsonObject json) {
++    CruiseControlUserTasksResponse(String userTaskId, JsonNode json) {
+         super(userTaskId, json);
+         // The maximum number of active user tasks that can run concurrently has reached
+         // Sourced from the error message that contains "reached the servlet capacity" from the Cruise Control response
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/JSONObjectMatchers.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/JSONObjectMatchers.java
+index e0f33d2297..cacd1cc892 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/JSONObjectMatchers.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/JSONObjectMatchers.java
+@@ -4,20 +4,22 @@
+  */
+ package io.strimzi.operator.cluster;
+ 
+-import io.vertx.core.json.JsonObject;
++import com.fasterxml.jackson.databind.JsonNode;
+ import org.hamcrest.Description;
+ import org.hamcrest.Matcher;
+ import org.hamcrest.TypeSafeDiagnosingMatcher;
+ 
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.List;
+ 
+ public class JSONObjectMatchers {
+ 
+-    public static Matcher<JsonObject> hasSize(int size) {
++    public static Matcher<JsonNode> hasSize(int size) {
+         return new TypeSafeDiagnosingMatcher<>() {
+ 
+             @Override
+-            protected boolean matchesSafely(JsonObject actual, Description mismatchDescription) {
++            protected boolean matchesSafely(JsonNode actual, Description mismatchDescription) {
+                 mismatchDescription.appendText("was ").appendValue(actual.size());
+                 if (size != actual.size()) {
+                     mismatchDescription.appendText("\n There are actually ")
+@@ -35,13 +37,15 @@ public void describeTo(final Description description) {
+             }
+         };
+     }
+-    public static Matcher<JsonObject> hasKey(String key) {
++    public static Matcher<JsonNode> hasKey(String key) {
+         return new TypeSafeDiagnosingMatcher<>() {
+ 
+             @Override
+-            protected boolean matchesSafely(JsonObject actual, Description mismatchDescription) {
+-                mismatchDescription.appendText("was ").appendValue(actual.fieldNames());
+-                if (!actual.fieldNames().contains(key)) {
++            protected boolean matchesSafely(JsonNode actual, Description mismatchDescription) {
++                List<String> fieldNames = new ArrayList<>();
++                actual.fieldNames().forEachRemaining(fieldNames::add);
++                mismatchDescription.appendText("was ").appendValue(fieldNames);
++                if (!fieldNames.contains(key)) {
+                     mismatchDescription.appendText("\nDoes not contain desired key");
+                     return false;
+                 }
+@@ -55,12 +59,14 @@ public void describeTo(final Description description) {
+         };
+     }
+ 
+-    public static Matcher<JsonObject> hasKeys(String... keys) {
++    public static Matcher<JsonNode> hasKeys(String... keys) {
+         return new TypeSafeDiagnosingMatcher<>() {
+ 
+             @Override
+-            protected boolean matchesSafely(JsonObject actual, Description mismatchDescription) {
+-                mismatchDescription.appendText("was ").appendValue(actual.fieldNames());
++            protected boolean matchesSafely(JsonNode actual, Description mismatchDescription) {
++                List<String> fieldNames = new ArrayList<>();
++                actual.fieldNames().forEachRemaining(fieldNames::add);
++                mismatchDescription.appendText("was ").appendValue(fieldNames);
+                 boolean matches = true;
+                 for (String key : keys) {
+                     if (!hasKey(key).matches(actual)) {
+@@ -80,18 +86,18 @@ public void describeTo(final Description description) {
+         };
+     }
+ 
+-    public static Matcher<JsonObject> hasEntry(String key, String value) {
++    public static Matcher<JsonNode> hasEntry(String key, String value) {
+         return new TypeSafeDiagnosingMatcher<>() {
+ 
+             @Override
+-            protected boolean matchesSafely(JsonObject actual, Description mismatchDescription) {
+-                mismatchDescription.appendText("was ").appendValue(actual.getString(key));
++            protected boolean matchesSafely(JsonNode actual, Description mismatchDescription) {
++                mismatchDescription.appendText("was ").appendValue(actual.get(key));
+                 if (!hasKey(key).matches(actual)) {
+                     mismatchDescription.appendText("\nDoes not contain key " + key);
+                     return false;
+                 }
+ 
+-                String actualValue = actual.getString(key);
++                String actualValue = actual.get(key).asText();
+                 if (!value.equals(actualValue)) {
+                     mismatchDescription.appendText("\nKey does not have expected value, found " + actualValue);
+                     return false;
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceStatusTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceStatusTest.java
+index 907c3862de..e058d8e391 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceStatusTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaRebalanceStatusTest.java
+@@ -6,7 +6,10 @@
+ package io.strimzi.operator.cluster.operator.assembly;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.node.ArrayNode;
++import com.fasterxml.jackson.databind.node.ObjectNode;
+ import io.fabric8.kubernetes.api.model.ConfigMap;
+ import io.strimzi.api.kafka.model.rebalance.KafkaRebalance;
+ import io.strimzi.api.kafka.model.rebalance.KafkaRebalanceBuilder;
+@@ -15,8 +18,6 @@
+ import io.strimzi.operator.common.model.Labels;
+ import io.strimzi.operator.common.model.cruisecontrol.CruiseControlLoadParameters;
+ import io.strimzi.operator.common.model.cruisecontrol.CruiseControlRebalanceKeys;
+-import io.vertx.core.json.JsonArray;
+-import io.vertx.core.json.JsonObject;
+ import org.junit.jupiter.api.Test;
+ 
+ import java.util.Collections;
+@@ -27,6 +28,7 @@
+ import static org.hamcrest.Matchers.hasEntry;
+ import static org.hamcrest.Matchers.hasKey;
+ import static org.hamcrest.Matchers.is;
++import static org.junit.jupiter.api.Assertions.assertTrue;
+ 
+ public class KafkaRebalanceStatusTest {
+ 
+@@ -34,6 +36,7 @@ public class KafkaRebalanceStatusTest {
+     private static final String RESOURCE_NAME = "my-rebalance";
+     private static final String CLUSTER_NAMESPACE = "cruise-control-namespace";
+     private static final String CLUSTER_NAME = "kafka-cruise-control-test-cluster";
++    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+ 
+ 
+     private KafkaRebalance createKafkaRebalance(String namespace, String clusterName, String resourceName,
+@@ -48,33 +51,36 @@ private KafkaRebalance createKafkaRebalance(String namespace, String clusterName
+                 .build();
+     }
+ 
+-    public static JsonObject buildOptimizationProposal() {
++    public static JsonNode buildOptimizationProposal() {
++        ObjectNode proposal = OBJECT_MAPPER.createObjectNode();
+ 
+-        JsonObject proposal = new JsonObject();
++        ObjectNode summary = OBJECT_MAPPER.createObjectNode();
+ 
+-        JsonObject summary = new JsonObject();
++        ObjectNode brokersBeforeObject = OBJECT_MAPPER.createObjectNode();
++        ArrayNode brokerLoadBeforeArray = OBJECT_MAPPER.createArrayNode();
+ 
+-        JsonObject brokersBeforeObject = new JsonObject();
+-        JsonArray brokerLoadBeforeArray = new JsonArray();
+-        JsonObject brokerOneBefore = new JsonObject();
++        ObjectNode brokerOneBefore = OBJECT_MAPPER.createObjectNode();
+         brokerOneBefore.put(CruiseControlRebalanceKeys.BROKER_ID.getKey(), BROKER_ONE_KEY);
+         brokerOneBefore.put(CruiseControlLoadParameters.CPU_PERCENTAGE.getCruiseControlKey(), 10.0);
+         brokerOneBefore.put(CruiseControlLoadParameters.REPLICAS.getCruiseControlKey(), 10);
++
+         brokerLoadBeforeArray.add(brokerOneBefore);
+-        brokersBeforeObject.put(CruiseControlRebalanceKeys.BROKERS.getKey(), brokerLoadBeforeArray);
++        brokersBeforeObject.set(CruiseControlRebalanceKeys.BROKERS.getKey(), brokerLoadBeforeArray);
++
++        ObjectNode brokersAfterObject = OBJECT_MAPPER.createObjectNode();
++        ArrayNode brokerLoadAfterArray = OBJECT_MAPPER.createArrayNode();
+ 
+-        JsonObject brokersAfterObject = new JsonObject();
+-        JsonArray brokerLoadAfterArray = new JsonArray();
+-        JsonObject brokerOneAfter = new JsonObject();
++        ObjectNode brokerOneAfter = OBJECT_MAPPER.createObjectNode();
+         brokerOneAfter.put(CruiseControlRebalanceKeys.BROKER_ID.getKey(), BROKER_ONE_KEY);
+         brokerOneAfter.put(CruiseControlLoadParameters.CPU_PERCENTAGE.getCruiseControlKey(), 20.0);
+         brokerOneAfter.put(CruiseControlLoadParameters.REPLICAS.getCruiseControlKey(), 5);
++
+         brokerLoadAfterArray.add(brokerOneAfter);
+-        brokersAfterObject.put(CruiseControlRebalanceKeys.BROKERS.getKey(), brokerLoadAfterArray);
++        brokersAfterObject.set(CruiseControlRebalanceKeys.BROKERS.getKey(), brokerLoadAfterArray);
+ 
+-        proposal.put(CruiseControlRebalanceKeys.SUMMARY.getKey(), summary);
+-        proposal.put(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey(), brokersBeforeObject);
+-        proposal.put(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey(), brokersAfterObject);
++        proposal.set(CruiseControlRebalanceKeys.SUMMARY.getKey(), summary);
++        proposal.set(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey(), brokersBeforeObject);
++        proposal.set(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey(), brokersAfterObject);
+ 
+         return proposal;
+ 
+@@ -83,10 +89,10 @@ public static JsonObject buildOptimizationProposal() {
+     @Test
+     public void testLoadParamExtract() {
+ 
+-        JsonObject proposal = buildOptimizationProposal();
++        JsonNode proposal = buildOptimizationProposal();
+ 
+-        JsonArray loadBeforeArray = proposal.getJsonObject(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
+-                .getJsonArray(CruiseControlRebalanceKeys.BROKERS.getKey());
++        ArrayNode loadBeforeArray = (ArrayNode) proposal.get(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
++                .get(CruiseControlRebalanceKeys.BROKERS.getKey());
+ 
+         Map<Integer, Map<String, Object>> output = KafkaRebalanceAssemblyOperator.extractLoadParameters(loadBeforeArray);
+ 
+@@ -99,40 +105,39 @@ public void testLoadParamExtract() {
+     @Test
+     public void testCreateLoadMap() {
+ 
+-        JsonObject proposal = buildOptimizationProposal();
++        JsonNode proposal = buildOptimizationProposal();
+ 
+-        JsonArray loadBeforeArray = proposal.getJsonObject(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
+-                .getJsonArray(CruiseControlRebalanceKeys.BROKERS.getKey());
+-        JsonArray loadAfterArray = proposal.getJsonObject(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())
+-                .getJsonArray(CruiseControlRebalanceKeys.BROKERS.getKey());
++        ArrayNode loadBeforeArray = (ArrayNode) proposal.get(CruiseControlRebalanceKeys.LOAD_BEFORE_OPTIMIZATION.getKey())
++                .get(CruiseControlRebalanceKeys.BROKERS.getKey());
++        ArrayNode loadAfterArray = (ArrayNode) proposal.get(CruiseControlRebalanceKeys.LOAD_AFTER_OPTIMIZATION.getKey())
++                .get(CruiseControlRebalanceKeys.BROKERS.getKey());
+ 
+-        JsonObject output = KafkaRebalanceAssemblyOperator.parseLoadStats(
++        JsonNode output = KafkaRebalanceAssemblyOperator.parseLoadStats(
+                 loadBeforeArray, loadAfterArray);
+ 
+-        assertThat(output.getMap(), hasKey("1"));
++        assertTrue(output.has("1"));
++        assertTrue(output.get("1").has(CruiseControlLoadParameters.REPLICAS.getKafkaRebalanceStatusKey()));
+ 
+-        assertThat(output.getJsonObject("1").getMap(), hasKey(CruiseControlLoadParameters.REPLICAS.getKafkaRebalanceStatusKey()));
++        JsonNode replicas = output.get("1").get("replicas");
+ 
+-        JsonObject replicas = output.getJsonObject("1").getJsonObject("replicas");
++        assertThat(replicas.get("before").asInt(), is(10));
++        assertThat(replicas.get("after").asInt(), is(5));
++        assertThat(replicas.get("diff").asInt(), is(-5));
+ 
+-        assertThat(replicas.getInteger("before"), is(10));
+-        assertThat(replicas.getInteger("after"), is(5));
+-        assertThat(replicas.getInteger("diff"), is(-5));
++        assertTrue(output.get("1").has(CruiseControlLoadParameters.CPU_PERCENTAGE.getKafkaRebalanceStatusKey()));
+ 
+-        assertThat(output.getJsonObject("1").getMap(), hasKey(CruiseControlLoadParameters.CPU_PERCENTAGE.getKafkaRebalanceStatusKey()));
++        JsonNode cpus = output.get("1").get("cpuPercentage");
+ 
+-        JsonObject cpus = output.getJsonObject("1").getJsonObject("cpuPercentage");
+-
+-        assertThat(cpus.getDouble("before"), is(10.));
+-        assertThat(cpus.getDouble("after"), is(20.0));
+-        assertThat(cpus.getDouble("diff"), is(10.0));
++        assertThat(cpus.get("before").asDouble(), is(10.));
++        assertThat(cpus.get("after").asDouble(), is(20.0));
++        assertThat(cpus.get("diff").asDouble(), is(10.0));
+ 
+     }
+ 
+     @Test
+     public void testProcessProposal() {
+ 
+-        JsonObject proposal = buildOptimizationProposal();
++        JsonNode proposal = buildOptimizationProposal();
+ 
+         KafkaRebalance kr =
+                 createKafkaRebalance(CLUSTER_NAMESPACE, CLUSTER_NAME, RESOURCE_NAME, new KafkaRebalanceSpecBuilder().build());
+@@ -143,9 +148,7 @@ public void testProcessProposal() {
+ 
+         try {
+ 
+-            ObjectMapper mapper = new ObjectMapper();
+-
+-            Map<String, LinkedHashMap<String, String>> brokerLoadMap = mapper.readValue(brokerMap.get(KafkaRebalanceAssemblyOperator.BROKER_LOAD_KEY), LinkedHashMap.class);
++            Map<String, LinkedHashMap<String, String>> brokerLoadMap = OBJECT_MAPPER.readValue(brokerMap.get(KafkaRebalanceAssemblyOperator.BROKER_LOAD_KEY), LinkedHashMap.class);
+ 
+             assertThat(brokerMap, hasKey(KafkaRebalanceAssemblyOperator.BROKER_LOAD_KEY));
+ 
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlClientTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlClientTest.java
+index a625e2478e..f4cc647721 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlClientTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/resource/cruisecontrol/CruiseControlClientTest.java
+@@ -81,7 +81,7 @@ public void testGetCCState() {
+ 
+         CruiseControlApi client = cruiseControlClientProvider();
+         client.getCruiseControlState(Reconciliation.DUMMY_RECONCILIATION, HOST, cruiseControlPort, false)
+-                .whenComplete((result, ex) -> assertThat(result.getJson().getJsonObject("ExecutorState"),
++                .whenComplete((result, ex) -> assertThat(result.getJson().get("ExecutorState"),
+                         hasEntry("state", "NO_TASK_IN_PROGRESS"))).join();
+     }
+ 
+@@ -129,7 +129,7 @@ public void testCCGetRebalanceUserTask() throws IOException, URISyntaxException
+ 
+         client.getUserTaskStatus(Reconciliation.DUMMY_RECONCILIATION, HOST, cruiseControlPort, userTaskID).whenComplete((result, ex) -> {
+             assertThat(result.getUserTaskId(), is(MockCruiseControl.USER_TASK_REBALANCE_NO_GOALS_RESPONSE_UTID));
+-            assertThat(result.getJson().getJsonObject(CruiseControlRebalanceKeys.SUMMARY.getKey()), is(notNullValue()));
++            assertThat(result.getJson().get(CruiseControlRebalanceKeys.SUMMARY.getKey()), is(notNullValue()));
+         }).join();
+     }
+ 
+@@ -502,7 +502,7 @@ public void testMockCCServerPendingCallsOverride() throws IOException, URISyntax
+         for (int i = 1; i <= pendingCalls1; i++) {
+             statusFuture = statusFuture.thenCompose(response -> {
+                 assertThat(
+-                    response.getJson().getString("Status"),
++                    response.getJson().get("Status").asText(),
+                     is(CruiseControlUserTaskStatus.IN_EXECUTION.toString()));
+                 return client.getUserTaskStatus(Reconciliation.DUMMY_RECONCILIATION, HOST, cruiseControlPort, userTaskID);
+             });
+@@ -510,7 +510,7 @@ public void testMockCCServerPendingCallsOverride() throws IOException, URISyntax
+ 
+         statusFuture = statusFuture.thenCompose(response -> {
+             assertThat(
+-                response.getJson().getString("Status"),
++                response.getJson().get("Status").asText(),
+                 is(CruiseControlUserTaskStatus.COMPLETED.toString()));
+             return CompletableFuture.completedFuture(response);
+         });
+@@ -530,7 +530,7 @@ public void testMockCCServerPendingCallsOverride() throws IOException, URISyntax
+         for (int i = 1; i <= pendingCalls2; i++) {
+             statusFuture = statusFuture.thenCompose(response -> {
+                 assertThat(
+-                    response.getJson().getString("Status"),
++                    response.getJson().get("Status").asText(),
+                     is(CruiseControlUserTaskStatus.IN_EXECUTION.toString()));
+                 return client.getUserTaskStatus(Reconciliation.DUMMY_RECONCILIATION, HOST, cruiseControlPort, userTaskID);
+             });
+@@ -538,7 +538,7 @@ public void testMockCCServerPendingCallsOverride() throws IOException, URISyntax
+ 
+         statusFuture.thenCompose(response -> {
+             assertThat(
+-                response.getJson().getString("Status"),
++                response.getJson().get("Status").asText(),
+                 is(CruiseControlUserTaskStatus.COMPLETED.toString()));
+             return CompletableFuture.completedFuture(response);
+         }).join();
+@@ -554,7 +554,7 @@ private void runTest(String userTaskID, int pendingCalls) throws IOException, UR
+         for (int i = 1; i <= pendingCalls; i++) {
+             statusFuture = statusFuture.thenCompose(response -> {
+                 assertThat(
+-                    response.getJson().getString("Status"),
++                    response.getJson().get("Status").asText(),
+                     is(CruiseControlUserTaskStatus.IN_EXECUTION.toString()));
+                 return client.getUserTaskStatus(Reconciliation.DUMMY_RECONCILIATION, HOST, cruiseControlPort, userTaskID);
+             });
+@@ -562,7 +562,7 @@ private void runTest(String userTaskID, int pendingCalls) throws IOException, UR
+ 
+         statusFuture.thenCompose(response -> {
+             assertThat(
+-                    response.getJson().getString("Status"),
++                    response.getJson().get("Status").asText(),
+                     is(CruiseControlUserTaskStatus.COMPLETED.toString()));
+             return CompletableFuture.completedFuture(response);
+         }).join();

@@ -1,0 +1,515 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 15874ed8..86794cd9 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -33,12 +33,6 @@ android {
+     kotlinOptions {
+         jvmTarget = '1.8'
+     }
+-    buildFeatures {
+-        compose true
+-    }
+-    composeOptions {
+-        kotlinCompilerExtensionVersion '1.4.3'
+-    }
+     packagingOptions {
+         resources.excludes.add("META-INF/*")
+     }
+@@ -54,7 +48,6 @@ configurations {
+ }
+ 
+ dependencies {
+-    implementation 'androidx.activity:activity-compose:1.9.0'
+     implementation 'androidx.appcompat:appcompat:1.7.0'
+     implementation 'com.google.android.material:material:1.12.0'
+     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+diff --git a/app/src/main/java/org/bepass/oblivion/BatteryOptimization.kt b/app/src/main/java/org/bepass/oblivion/BatteryOptimization.kt
+new file mode 100644
+index 00000000..2c1364b2
+--- /dev/null
++++ b/app/src/main/java/org/bepass/oblivion/BatteryOptimization.kt
+@@ -0,0 +1,66 @@
++package org.bepass.oblivion
++
++import android.annotation.SuppressLint
++import android.app.AlertDialog
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import android.os.Build
++import android.os.PowerManager
++import android.provider.Settings
++import android.view.LayoutInflater
++import android.widget.Button
++import android.widget.TextView
++
++/**
++ * Checks if the app is running in restricted background mode.
++ * Returns true if running in restricted mode, false otherwise.
++ */
++fun isBatteryOptimizationEnabled(context: Context): Boolean {
++    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
++        powerManager?.isIgnoringBatteryOptimizations(context.packageName) == false
++    } else {
++        false
++    }
++}
++
++/**
++ * Directly requests to ignore battery optimizations for the app.
++ */
++@SuppressLint("BatteryLife")
++fun requestIgnoreBatteryOptimizations(context: Context) {
++    val intent = Intent().apply {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++            action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
++            data = Uri.parse("package:${context.packageName}")
++        }
++    }
++    context.startActivity(intent)
++}
++
++
++/**
++ * Shows a dialog explaining the need for disabling battery optimization and navigates to the app's settings.
++ */
++fun showBatteryOptimizationDialog(context: Context) {
++    val dialogView = LayoutInflater.from(context).inflate(R.layout.dialog_battery_optimization, null)
++
++    val dialog = AlertDialog.Builder(context).apply {
++        setView(dialogView)
++    }.create()
++
++    dialogView.findViewById<TextView>(R.id.dialog_title).text = context.getString(R.string.batteryOpL)
++    dialogView.findViewById<TextView>(R.id.dialog_message).text = context.getString(R.string.dialBtText)
++
++    dialogView.findViewById<Button>(R.id.dialog_button_positive).setOnClickListener {
++        requestIgnoreBatteryOptimizations(context)
++        dialog.dismiss()
++    }
++
++    dialogView.findViewById<Button>(R.id.dialog_button_negative).setOnClickListener {
++        dialog.dismiss()
++    }
++
++    dialog.show()
++}
+diff --git a/app/src/main/java/org/bepass/oblivion/MainActivity.java b/app/src/main/java/org/bepass/oblivion/MainActivity.java
+index 657d502f..37a380f3 100644
+--- a/app/src/main/java/org/bepass/oblivion/MainActivity.java
++++ b/app/src/main/java/org/bepass/oblivion/MainActivity.java
+@@ -1,9 +1,9 @@
+ package org.bepass.oblivion;
+ 
++import static org.bepass.oblivion.OblivionVpnService.startVpnService;
+ import static org.bepass.oblivion.OblivionVpnService.stopVpnService;
+ 
+ import android.Manifest;
+-import android.annotation.SuppressLint;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.pm.PackageManager;
+@@ -11,12 +11,9 @@
+ import android.net.Network;
+ import android.net.NetworkCapabilities;
+ import android.net.NetworkInfo;
+-import android.net.Uri;
+ import android.os.Build;
+ import android.os.Bundle;
+ import android.os.Handler;
+-import android.os.PowerManager;
+-import android.provider.Settings;
+ import android.view.View;
+ import android.widget.FrameLayout;
+ import android.widget.ImageView;
+@@ -28,7 +25,6 @@
+ import androidx.activity.result.ActivityResultLauncher;
+ import androidx.activity.result.contract.ActivityResultContracts;
+ import androidx.annotation.NonNull;
+-import androidx.annotation.RequiresApi;
+ 
+ import com.google.android.material.floatingactionbutton.FloatingActionButton;
+ 
+@@ -43,12 +39,6 @@ public class MainActivity extends StateAwareBaseActivity {
+     private long backPressedTime;
+     private Toast backToast;
+     private LocaleHandler localeHandler;
+-    private final ActivityResultLauncher<Intent> batteryOptimizationLauncher = registerForActivityResult(
+-            new ActivityResultContracts.StartActivityForResult(),
+-            result -> {
+-                // Do nothing, as no return value is expected
+-            });
+-
+     private final Handler handler = new Handler();
+ 
+     @Override
+@@ -70,11 +60,6 @@ protected void onCreate(Bundle savedInstanceState) {
+         FloatingActionButton floatingActionButton = findViewById(R.id.floatingActionButton);
+         floatingActionButton.setOnClickListener(v -> localeHandler.showLanguageSelectionDialog(()->
+                 localeHandler.restartActivity(this)));
+-        if (!isIgnoringBatteryOptimizations()) {
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                requestIgnoreBatteryOptimizations();
+-            }
+-        }
+         // Views
+         ImageView infoIcon = findViewById(R.id.info_icon);
+         ImageView logIcon = findViewById(R.id.bug_icon);
+@@ -119,7 +104,7 @@ protected void onCreate(Bundle savedInstanceState) {
+             }
+             // Start the VPN service if it's disconnected
+             if (lastKnownConnectionState.isDisconnected()) {
+-                OblivionVpnService.startVpnService(this);
++                startVpnService(this);
+             }
+             // To check is Internet Connection is available
+             handler.postDelayed(new Runnable() {
+@@ -190,29 +175,6 @@ private void checkInternetConnectionAndDisconnectVPN() {
+             stopVpnService(this);
+         }
+     }
+-    private boolean isIgnoringBatteryOptimizations() {
+-        String packageName = getPackageName();
+-        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+-        if (pm != null) {
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-                return pm.isIgnoringBatteryOptimizations(packageName);
+-            }
+-        }
+-        return false;
+-    }
+-    @SuppressLint("BatteryLife")
+-    @RequiresApi(api = Build.VERSION_CODES.M)
+-    private void requestIgnoreBatteryOptimizations() {
+-        try {
+-            Intent intent = new Intent();
+-            String packageName = getPackageName();
+-            intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+-            intent.setData(Uri.parse("package:" + packageName));
+-            batteryOptimizationLauncher.launch(intent);
+-        } catch (Exception e) {
+-            Toast.makeText(this, "Unable to request ignore battery optimizations", Toast.LENGTH_SHORT).show();
+-        }
+-    }
+     protected void cleanOrMigrateSettings() {
+         // Get the global FileManager instance
+         FileManager fileManager = FileManager.getInstance(getApplicationContext());
+diff --git a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+index ea79071f..14809caa 100644
+--- a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
++++ b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+@@ -373,53 +373,67 @@ public void onDestroy() {
+     public void onRevoke() {
+         setLastKnownState(ConnectionState.DISCONNECTED);
+         Log.i(TAG, "Stopping VPN");
++
+         // Stop foreground service and notification
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+-            NotificationManager notificationManager = getSystemService(NotificationManager.class);
+-            if (notificationManager != null) {
+-                notificationManager.deleteNotificationChannel("oblivion");
+-            }
+-        }
+         try {
+             stopForeground(true);
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++                NotificationManager notificationManager = getSystemService(NotificationManager.class);
++                if (notificationManager != null) {
++                    notificationManager.deleteNotificationChannel("oblivion");
++                }
++            }
+         } catch (Exception e) {
+-            e.printStackTrace();
++            Log.e(TAG, "Error stopping foreground service and notification", e);
+         }
+ 
+         // Release the wake lock if held
+-        if (wLock != null && wLock.isHeld()) {
+-            wLock.release();
+-            wLock = null;
++        try {
++            if (wLock != null && wLock.isHeld()) {
++                wLock.release();
++                wLock = null;
++            }
++        } catch (Exception e) {
++            Log.e(TAG, "Error releasing wake lock", e);
+         }
+ 
+         // Close the VPN interface
+-        if (mInterface != null) {
+-            try {
++        try {
++            if (mInterface != null) {
+                 mInterface.close();
+-            } catch (IOException e) {
+-                Log.e(TAG, "Error closing the VPN interface", e);
+             }
++        } catch (IOException e) {
++            Log.e(TAG, "Error closing the VPN interface", e);
+         }
+ 
+         // Stop Tun2socks
+-        Tun2socks.stop();
++        try {
++            Tun2socks.stop();
++        } catch (Exception e) {
++            Log.e(TAG, "Error stopping Tun2socks", e);
++        }
+ 
+         // Shutdown executor service
+         if (executorService instanceof ExecutorService) {
+-            ((ExecutorService) executorService).shutdownNow();
+-        }
+-
+-        // Ensure all tasks are completed or terminated
+-        try {
+-            if (!((ExecutorService) executorService).awaitTermination(1, TimeUnit.SECONDS)) {
+-                Log.e(TAG, "Executor service did not terminate in the specified time.");
++            ExecutorService service = (ExecutorService) executorService;
++            service.shutdown(); // Attempt to gracefully shutdown
++            try {
++                // Wait a certain amount of time for tasks to complete
++                if (!service.awaitTermination(500, TimeUnit.MILLISECONDS)) {
++                    service.shutdownNow(); // Forcefully terminate if tasks are not completed
++                }
++            } catch (InterruptedException e) {
++                service.shutdownNow(); // Forcefully terminate if interrupted
++                Thread.currentThread().interrupt(); // Restore interrupted status
++                Log.e(TAG, "Executor service termination interrupted", e);
+             }
+-        } catch (InterruptedException e) {
+-            Log.e(TAG, "Executor service termination interrupted.", e);
+         }
++
++        Log.i(TAG, "VPN stopped successfully");
+     }
+ 
+ 
++
+     private void publishConnectionState(ConnectionState state) {
+         if (!connectionStateObservers.isEmpty()) {
+             for (String observerKey : connectionStateObservers.keySet())
+diff --git a/app/src/main/java/org/bepass/oblivion/SettingsActivity.java b/app/src/main/java/org/bepass/oblivion/SettingsActivity.java
+index a5dfafa8..38de084e 100644
+--- a/app/src/main/java/org/bepass/oblivion/SettingsActivity.java
++++ b/app/src/main/java/org/bepass/oblivion/SettingsActivity.java
+@@ -1,9 +1,11 @@
+ package org.bepass.oblivion;
+ 
++import static org.bepass.oblivion.BatteryOptimizationKt.isBatteryOptimizationEnabled;
++import static org.bepass.oblivion.BatteryOptimizationKt.showBatteryOptimizationDialog;
++
+ import android.content.Context;
+ import android.content.Intent;
+ import android.os.Bundle;
+-import android.util.Log;
+ import android.util.Pair;
+ import android.view.View;
+ import android.widget.AdapterView;
+@@ -38,6 +40,16 @@ protected void onCreate(Bundle savedInstanceState) {
+         context =  this;
+         fileManager = FileManager.getInstance(this);
+ 
++        LinearLayout batteryOptLayout = findViewById(R.id.battery_optimization_layout);
++        LinearLayout batteryOptLine = findViewById(R.id.battery_opt_line);
++        if(isBatteryOptimizationEnabled(this)){
++            batteryOptLayout.setOnClickListener(view -> {
++                showBatteryOptimizationDialog(this);
++            });
++        }else{
++            batteryOptLayout.setVisibility(View.GONE);
++            batteryOptLine.setVisibility(View.GONE);
++        }
+         LinearLayout endpointLayout = findViewById(R.id.endpoint_layout);
+         LinearLayout portLayout = findViewById(R.id.port_layout);
+         LinearLayout splitTunnelLayout = findViewById(R.id.split_tunnel_layout);
+diff --git a/app/src/main/res/layout/activity_settings.xml b/app/src/main/res/layout/activity_settings.xml
+index 578ecfff..9cb4c6d3 100644
+--- a/app/src/main/res/layout/activity_settings.xml
++++ b/app/src/main/res/layout/activity_settings.xml
+@@ -57,6 +57,53 @@
+       android:layout_height="wrap_content"
+       android:orientation="vertical">
+ 
++      <LinearLayout
++          android:id="@+id/battery_optimization_layout"
++          android:layout_width="match_parent"
++          android:layout_height="80dp"
++          android:background="?android:selectableItemBackground"
++          android:gravity="center"
++          android:paddingHorizontal="16dp"
++          android:orientation="vertical">
++
++        <LinearLayout
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:gravity="end">
++
++          <TextView
++              android:layout_width="wrap_content"
++              android:layout_height="wrap_content"
++              android:fontFamily="@font/shabnam"
++              android:minWidth="100dp"
++              android:text="@string/batteryOpL"
++              android:textAlignment="viewEnd"
++              android:textColor="@color/black"
++              android:textSize="20sp" />
++        </LinearLayout>
++
++        <TextView
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_marginTop="4dp"
++            android:fontFamily="@font/shabnam"
++            android:text="@string/batteryOpLText"
++            android:textColor="#9A9A9A"
++            android:textSize="16sp" />
++
++      </LinearLayout>
++      <LinearLayout
++          android:id="@+id/battery_opt_line"
++          android:layout_width="match_parent"
++          android:layout_height="10dp"
++          android:gravity="center"
++          android:orientation="vertical"
++          >
++        <View
++            android:layout_width="match_parent"
++            android:layout_height="1dp"
++            android:background="@android:color/darker_gray" />
++      </LinearLayout>
+       <LinearLayout
+         android:id="@+id/endpoint_layout"
+         android:layout_width="match_parent"
+diff --git a/app/src/main/res/layout/dialog_battery_optimization.xml b/app/src/main/res/layout/dialog_battery_optimization.xml
+new file mode 100644
+index 00000000..d2ca3d57
+--- /dev/null
++++ b/app/src/main/res/layout/dialog_battery_optimization.xml
+@@ -0,0 +1,64 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="wrap_content"
++    android:orientation="vertical"
++    android:padding="16dp"
++    android:background="@drawable/background_gradient">
++
++    <TextView
++        android:id="@+id/dialog_title"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="center"
++        android:layout_marginTop="16dp"
++        android:fontFamily="@font/shabnam"
++        android:text="@string/batteryOpL"
++        android:textColor="@color/black"
++        android:textSize="20sp"
++        android:textStyle="bold" />
++
++    <TextView
++        android:id="@+id/dialog_message"
++        android:layout_width="wrap_content"
++        android:layout_height="wrap_content"
++        android:layout_gravity="center"
++        android:layout_marginTop="8dp"
++        android:fontFamily="@font/shabnam"
++        android:text="@string/dialBtText"
++        android:textColor="@color/black"
++        android:textSize="16sp" />
++
++    <LinearLayout
++        style="?android:attr/buttonBarStyle"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_marginTop="24dp"
++        android:gravity="end"
++        android:orientation="horizontal">
++
++        <Button
++            android:id="@+id/dialog_button_negative"
++            style="?android:attr/buttonBarButtonStyle"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:background="?attr/selectableItemBackground"
++            android:fontFamily="@font/shabnam"
++            android:text="@string/cancel"
++            android:textColor="@color/black" />
++
++        <Button
++            android:id="@+id/dialog_button_positive"
++            style="?android:attr/buttonBarButtonStyle"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_marginStart="16dp"
++            android:background="#FFA200"
++            android:fontFamily="@font/shabnam"
++            android:padding="13dp"
++            android:text="@string/goToSettings"
++            android:textColor="@color/white" />
++    </LinearLayout>
++
++</LinearLayout>
+diff --git a/app/src/main/res/values-fa/strings.xml b/app/src/main/res/values-fa/strings.xml
+index 8c5bda7d..dd091aff 100644
+--- a/app/src/main/res/values-fa/strings.xml
++++ b/app/src/main/res/values-fa/strings.xml
+@@ -39,6 +39,10 @@
+     <string name="notConnected">متصل نیستید</string>
+     <string name="connecting">در حال اتصال…</string>
+     <string name="connected">اتصال برقرار شد</string>
++    <string name="batteryOpL">غیرفعال‌سازی بهینه‌سازی باتری</string>
++    <string name="batteryOpLText">غیرفعال‌سازی بهینه‌سازی باتری برای تجربه بهتر</string>
++    <string name="dialBtText">برای اطمینان از عملکرد صحیح برنامه، لطفاً بهینه‌سازی باتری برای این برنامه را غیرفعال کنید.</string>
++    <string name="goToSettings">به تنظیمات بروید</string>
+     <string-array name="countries">
+         <item>اتریش</item>
+         <item>بلژیک</item>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 6b7acc63..3a5e6a41 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -39,6 +39,10 @@
+     <string name="notConnected">Не подключено</string>
+     <string name="connecting">Подключение…</string>
+     <string name="connected">Подключено</string>
++    <string name="batteryOpL">Отключить оптимизацию батареи</string>
++    <string name="batteryOpLText">Отключение оптимизации батареи для лучшего опыта</string>
++    <string name="dialBtText">Чтобы приложение работало правильно, отключите оптимизацию батареи для этого приложения.</string>
++    <string name="goToSettings">Перейти к настройкам</string>
+     <string-array name="countries">
+         <item>Австрия</item>
+         <item>Бельгия</item>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index b66f5220..202af853 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -39,6 +39,10 @@
+     <string name="notConnected">未连接</string>
+     <string name="connecting">正在连接…</string>
+     <string name="connected">已连接</string>
++    <string name="batteryOpL">关闭电池优化</string>
++    <string name="batteryOpLText">为了更好的体验，关闭电池优化</string>
++    <string name="dialBtText">为了确保应用程序正常运行，请为此应用程序关闭电池优化。</string>
++    <string name="goToSettings">前往设置</string>
+     <string-array name="countries">
+         <item>奥地利</item>
+         <item>比利时</item>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 421bfca4..f7a97a68 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -39,6 +39,10 @@
+   <string name="notConnected">Not Connected</string>
+   <string name="connecting">Connecting…</string>
+   <string name="connected">Connected</string>
++  <string name="batteryOpL">Disable Battery optimization</string>
++  <string name="batteryOpLText">Disabling battery optimization for better experience</string>
++  <string name="dialBtText"> To ensure the app works properly, please disable battery optimization for this app. </string>
++  <string name="goToSettings"> Go to Settings </string>
+   <string-array name="countries">
+     <item>Austria</item>
+     <item>Belgium</item>

@@ -1,0 +1,972 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index a63e7055..43e5eb32 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -11,7 +11,8 @@
+     <uses-permission
+         android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED"
+         android:minSdkVersion="34" />
+-
++    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
++    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+     <application
+         android:allowBackup="true"
+         android:dataExtractionRules="@xml/data_extraction_rules"
+@@ -41,6 +42,20 @@
+                 android:value="true" />
+         </service>
+ 
++        <service
++            android:name=".QuickStartService"
++            android:exported="true"
++            android:label="Oblivion"
++            android:icon="@drawable/vpn_off"
++            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
++            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE"
++                android:value="true" />
++            <intent-filter>
++                <action android:name="android.service.quicksettings.action.QS_TILE" />
++            </intent-filter>
++
++    </service>
++
+         <activity
+             android:name="org.bepass.oblivion.MainActivity"
+             android:exported="true"
+diff --git a/app/src/main/java/org/bepass/oblivion/ConnectionState.java b/app/src/main/java/org/bepass/oblivion/ConnectionState.java
+new file mode 100644
+index 00000000..a3861845
+--- /dev/null
++++ b/app/src/main/java/org/bepass/oblivion/ConnectionState.java
+@@ -0,0 +1,7 @@
++package org.bepass.oblivion;
++
++public enum ConnectionState {
++    CONNECTING,
++    CONNECTED,
++    DISCONNECTED
++}
+diff --git a/app/src/main/java/org/bepass/oblivion/ConnectionStateChangeListener.java b/app/src/main/java/org/bepass/oblivion/ConnectionStateChangeListener.java
+new file mode 100644
+index 00000000..e64472f5
+--- /dev/null
++++ b/app/src/main/java/org/bepass/oblivion/ConnectionStateChangeListener.java
+@@ -0,0 +1,5 @@
++package org.bepass.oblivion;
++
++public interface ConnectionStateChangeListener {
++    void onChange(ConnectionState state);
++}
+diff --git a/app/src/main/java/org/bepass/oblivion/FileManager.java b/app/src/main/java/org/bepass/oblivion/FileManager.java
+index 0fd7a97c..31a3fc10 100644
+--- a/app/src/main/java/org/bepass/oblivion/FileManager.java
++++ b/app/src/main/java/org/bepass/oblivion/FileManager.java
+@@ -53,9 +53,16 @@ public String getString(String name) {
+         return sharedPreferences.getString(name, "");
+     }
+ 
++    public String getString(String name, String defaultValue) {
++        return sharedPreferences.getString(name, defaultValue);
++    }
++
+     public boolean getBoolean(String name) {
+         return sharedPreferences.getBoolean(name, false);
+     }
++    public boolean getBoolean(String name, boolean defaultValue) {
++        return sharedPreferences.getBoolean(name, defaultValue);
++    }
+ 
+     public int getInt(String name) {
+         return sharedPreferences.getInt(name, 0);
+diff --git a/app/src/main/java/org/bepass/oblivion/MainActivity.java b/app/src/main/java/org/bepass/oblivion/MainActivity.java
+index 1b298f1e..d73d6795 100644
+--- a/app/src/main/java/org/bepass/oblivion/MainActivity.java
++++ b/app/src/main/java/org/bepass/oblivion/MainActivity.java
+@@ -1,18 +1,14 @@
+ package org.bepass.oblivion;
+ 
+ import android.Manifest;
+-import android.app.ActivityManager;
+ import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
+ import android.content.ServiceConnection;
+ import android.os.Build;
+ import android.os.Bundle;
+-import android.os.Handler;
+ import android.os.IBinder;
+-import android.os.Message;
+ import android.os.Messenger;
+-import android.os.RemoteException;
+ import android.widget.ImageView;
+ import android.widget.TextView;
+ import android.widget.Toast;
+@@ -24,37 +20,33 @@
+ 
+ import com.suke.widget.SwitchButton;
+ 
+-import java.io.IOException;
+-import java.net.ServerSocket;
+-
+-import tun2socks.StartOptions;
+-
+ public class MainActivity extends AppCompatActivity {
++
++    private static final String ConnectionStateObserverKey = "mainActivity";
+     private ActivityResultLauncher<String> pushNotificationPermissionLauncher;
+     private ActivityResultLauncher<Intent> vpnPermissionLauncher;
+ 
+     private Messenger serviceMessenger;
+     private boolean isBound;
+ 
+-    // 1 Wait For Connect
+-    // 2 Connecting
+-    // 3 Connected
+-    int connectionState = 1;
+ 
+     // Views
+     ImageView infoIcon, bugIcon, settingsIcon;
+-    SwitchButton switchButton;
++    TouchAwareSwitch switchButton;
+     TextView stateText;
+ 
+     FileManager fileManager;
+ 
+     Boolean canShowNotification = false;
+ 
++    private ConnectionState lastKnownConnectionState = ConnectionState.DISCONNECTED;
++
+     private ServiceConnection connection = new ServiceConnection() {
+         @Override
+         public void onServiceConnected(ComponentName className, IBinder service) {
+             serviceMessenger = new Messenger(service);
+             isBound = true;
++            observeConnectionStatus();
+         }
+ 
+         @Override
+@@ -64,25 +56,23 @@ public void onServiceDisconnected(ComponentName arg0) {
+         }
+     };
+ 
++
+     private SwitchButton.OnCheckedChangeListener createSwitchCheckedChangeListener() {
+         return (view, isChecked) -> {
+             if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !canShowNotification) {
+                 pushNotificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS);
+                 return;
+             }
+-            if (connectionState == 1 && isChecked) {
+-                // From NoAction to Connecting
+-                stateText.setText("درحال اتصال ...");
+-                connectionState = 2;
+ 
++            if (lastKnownConnectionState == ConnectionState.DISCONNECTED && isChecked) {
++                // From NoAction to Connecting
+                 Intent vpnIntent = OblivionVpnService.prepare(this);
+                 if (vpnIntent != null) {
+                     vpnPermissionLauncher.launch(vpnIntent);
+                 } else {
+                     startVpnService();
+                 }
+-            } else if(connectionState < 4 && connectionState > 1) {
+-                disconnected();
++            } else if(lastKnownConnectionState == ConnectionState.CONNECTED || lastKnownConnectionState == ConnectionState.CONNECTING) {
+                 stopVpnService();
+             }
+         };
+@@ -92,39 +82,39 @@ private SwitchButton.OnCheckedChangeListener createSwitchCheckedChangeListener()
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
+         setContentView(R.layout.activity_main);
+-
+         init();
+         firstValueInit();
+-        if(isMyServiceRunning()) {
+-            connected();
+-        }
+         switchButton.setOnCheckedChangeListener(createSwitchCheckedChangeListener());
+     }
+ 
+-    private void sendMessageToService() {
++
++
++    private void observeConnectionStatus() {
+         if (!isBound) return;
+-        try {
+-            // Create a message for the service
+-            Message msg = Message.obtain(null, OblivionVpnService.MSG_PERFORM_TASK);
+-
+-            // Create a Messenger for the reply from the service
+-            Messenger replyMessenger = new Messenger(new Handler(message -> {
+-                if (message.what == OblivionVpnService.MSG_TASK_COMPLETED) {
+-                    // Handle task completion
+-                    Toast.makeText(getApplicationContext(), "متصل شدید!", Toast.LENGTH_LONG).show();
+-                    connected();
+-                } else {
+-                    disconnected();
+-                    stopVpnService();
+-                }
+-                return true;
+-            }));
+-            msg.replyTo = replyMessenger;
+-
+-            // Send the message
+-            serviceMessenger.send(msg);
+-        } catch (RemoteException e) {
+-            e.printStackTrace();
++        OblivionVpnService.registerConnectionStateObserver(ConnectionStateObserverKey, serviceMessenger, new ConnectionStateChangeListener() {
++            @Override
++            public void onChange(ConnectionState state) {
++                lastKnownConnectionState = state;
++                updateUi();
++            }
++        });
++    }
++
++    private void unsubscribeConnectionStatus() {
++        if (!isBound) return;
++        OblivionVpnService.unregisterConnectionStateObserver(ConnectionStateObserverKey, serviceMessenger);
++    }
++    private void updateUi() {
++        switch(lastKnownConnectionState) {
++            case DISCONNECTED:
++                disconnected();
++                break;
++            case CONNECTING:
++                connecting();
++                break;
++            case CONNECTED:
++                connected();
++                break;
+         }
+     }
+ 
+@@ -140,26 +130,25 @@ protected void onStop() {
+         super.onStop();
+         // Unbind from the service
+         if (isBound) {
++            unsubscribeConnectionStatus();
+             unbindService(connection);
+             isBound = false;
+         }
+     }
+ 
+     private void connected() {
+-        switchButton.setOnCheckedChangeListener(null);
+         stateText.setText("اتصال برقرار شد");
+-        connectionState = 3;
+-        switchButton.setChecked(true);
+-        switchButton.setOnCheckedChangeListener(createSwitchCheckedChangeListener());
++        switchButton.setChecked(true, false);
++    }
++
++    private void connecting() {
++        stateText.setText("در حال اتصال...");
++        switchButton.setChecked(true, false);
+     }
+ 
+     private void disconnected() {
+-        switchButton.setOnCheckedChangeListener(null);
+-        // From Connecting to Disconnecting
+         stateText.setText("متصل نیستید");
+-        connectionState = 1;
+-        switchButton.setChecked(false);
+-        switchButton.setOnCheckedChangeListener(createSwitchCheckedChangeListener());
++        switchButton.setChecked(false, false);
+     }
+ 
+     private void firstValueInit() {
+@@ -192,69 +181,19 @@ private void initPermissionLauncher() {
+                     if (result.getResultCode() == RESULT_OK) {
+                         startVpnService();
+                     } else {
++                        stopVpnService();
+                         Toast.makeText(this, "Really!?", Toast.LENGTH_LONG).show();
+                     }
+                 }
+         );
+     }
+ 
+-    private boolean isMyServiceRunning() {
+-        ActivityManager manager = (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+-        if (manager != null) {
+-            for (ActivityManager.RunningServiceInfo service : manager.getRunningServices(Integer.MAX_VALUE)) {
+-                if (OblivionVpnService.class.getName().equals(service.service.getClassName())) {
+-                    return true;
+-                }
+-            }
+-        }
+-        return false;
+-    }
+-
+-    private static int findFreePort() {
+-        ServerSocket socket = null;
+-        try {
+-            socket = new ServerSocket(0);
+-            socket.setReuseAddress(true);
+-            int port = socket.getLocalPort();
+-            try {
+-                socket.close();
+-            } catch (IOException e) {
+-                // Ignore IOException on close()
+-            }
+-            return port;
+-        } catch (IOException e) {
+-        } finally {
+-            if (socket != null) {
+-                try {
+-                    socket.close();
+-                } catch (IOException e) {
+-                }
+-            }
+-        }
+-        throw new IllegalStateException("Could not find a free TCP/IP port to start embedded Jetty HTTP Server on");
+-    }
+-
+-    private String getBindAddress() {
+-        String port = fileManager.getString("USERSETTING_port");
+-        boolean enableLan = fileManager.getBoolean("USERSETTING_lan");
+-        if(OblivionVpnService.isLocalPortInUse("127.0.0.1:" + port).equals("true")) {
+-            port = findFreePort()+"";
+-        }
+-        String Bind = "";
+-        Bind += "127.0.0.1:" + port;
+-        if(enableLan) {
+-            Bind = "0.0.0.0:" + port;
+-        }
+-        return Bind;
+-    }
+ 
+     private void startVpnService() {
+         //Toast.makeText(getApplicationContext(), calculateArgs(), Toast.LENGTH_LONG).show();
+         Intent intent = new Intent(this, OblivionVpnService.class);
+-        intent.putExtra("bindAddress", getBindAddress());
+         intent.setAction(OblivionVpnService.FLAG_VPN_START);
+         ContextCompat.startForegroundService(this, intent);
+-        sendMessageToService();
+     }
+ 
+     private void stopVpnService() {
+diff --git a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+index e0808e76..92f1d12b 100644
+--- a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
++++ b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+@@ -7,10 +7,10 @@
+ import android.app.PendingIntent;
+ import android.content.Context;
+ import android.content.Intent;
+-import android.content.SharedPreferences;
+ import android.content.pm.PackageManager;
+ import android.net.VpnService;
+ import android.os.Build;
++import android.os.Bundle;
+ import android.os.Handler;
+ import android.os.IBinder;
+ import android.os.Message;
+@@ -35,9 +35,6 @@
+ import java.net.InetSocketAddress;
+ import java.net.Proxy;
+ import java.net.ServerSocket;
+-import java.net.Socket;
+-import java.net.SocketException;
+-import java.net.UnknownHostException;
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.Objects;
+@@ -55,17 +52,56 @@ public class OblivionVpnService extends VpnService {
+     private String bindAddress;
+     private final Handler handler = new Handler();
+ 
+-    SharedPreferences fileManager;
++    private FileManager fileManager;
+ 
+-    static final int MSG_PERFORM_TASK = 1; // Identifier for the message
+-    static final int MSG_TASK_COMPLETED = 2; // Identifier for the response
+-    static final int MSG_TASK_FAILED = 3; // Identifier for the response
++    private ConnectionState lastKnownState = ConnectionState.DISCONNECTED;
++
++    static final int MSG_PERFORM_CONNECTION_TEST= 1;
++    static final int MSG_CONNECTION_STATE_SUBSCRIBE = 2;
++    static final int MSG_CONNECTION_STATE_UNSUBSCRIBE = 3;
++    static final int MSG_TILE_STATE_SUBSCRIPTION_RESULT = 4;
+ 
+     private final Messenger serviceMessenger = new Messenger(new IncomingHandler(this));
+ 
++    private final Map<String, Messenger> connectionStateObservers = new HashMap<>();
++
++
++    public static void registerConnectionStateObserver(String key, Messenger serviceMessenger, ConnectionStateChangeListener observer) {
++        // Create a message for the service
++        Message subscriptionMessage = Message.obtain(null, OblivionVpnService.MSG_CONNECTION_STATE_SUBSCRIBE);
++        Bundle data = new Bundle();
++        data.putString("key", key);
++        subscriptionMessage.setData(data);
++        // Create a Messenger for the reply from the service
++        subscriptionMessage.replyTo = new Messenger(new Handler(incomingMessage -> {
++            ConnectionState state = ConnectionState.valueOf(incomingMessage.getData().getString("state"));
++            if (incomingMessage.what == OblivionVpnService.MSG_TILE_STATE_SUBSCRIPTION_RESULT) {
++                observer.onChange(state);
++            }
++            return true;
++        }));
++        try {
++            // Send the message
++            serviceMessenger.send(subscriptionMessage);
++        } catch (RemoteException e) {
++            e.printStackTrace();
++        }
++    }
++
++    public static void unregisterConnectionStateObserver(String key, Messenger serviceMessenger) {
++        Message unsubscriptionMessage = Message.obtain(null, OblivionVpnService.MSG_CONNECTION_STATE_UNSUBSCRIBE);
++        Bundle data = new Bundle();
++        data.putString("key", key);
++        unsubscriptionMessage.setData(data);
++        try {
++            serviceMessenger.send(unsubscriptionMessage);
++        } catch (RemoteException e) {
++            e.printStackTrace();
++        }
++    }
+ 
+     public static Map<String, Integer> splitHostAndPort(String hostPort) {
+-        if(hostPort == null || hostPort.isEmpty()){
++        if (hostPort == null || hostPort.isEmpty()) {
+             return null;
+         }
+         Map<String, Integer> result = new HashMap<>();
+@@ -99,6 +135,7 @@ public static Map<String, Integer> splitHostAndPort(String hostPort) {
+         return result;
+     }
+ 
++
+     public static String pingOverHTTP(String bindAddress) {
+         Map<String, Integer> result = splitHostAndPort(bindAddress);
+         if (result == null) {
+@@ -131,6 +168,44 @@ public static String pingOverHTTP(String bindAddress) {
+         }
+     }
+ 
++    private static int findFreePort() {
++        ServerSocket socket = null;
++        try {
++            socket = new ServerSocket(0);
++            socket.setReuseAddress(true);
++            int port = socket.getLocalPort();
++            try {
++                socket.close();
++            } catch (IOException e) {
++                // Ignore IOException on close()
++            }
++            return port;
++        } catch (IOException e) {
++        } finally {
++            if (socket != null) {
++                try {
++                    socket.close();
++                } catch (IOException e) {
++                }
++            }
++        }
++        throw new IllegalStateException("Could not find a free TCP/IP port to start embedded Jetty HTTP Server on");
++    }
++
++    private String getBindAddress() {
++        String port = fileManager.getString("USERSETTING_port");
++        boolean enableLan = fileManager.getBoolean("USERSETTING_lan");
++        if (OblivionVpnService.isLocalPortInUse("127.0.0.1:" + port).equals("true")) {
++            port = findFreePort() + "";
++        }
++        String Bind = "";
++        Bind += "127.0.0.1:" + port;
++        if (enableLan) {
++            Bind = "0.0.0.0:" + port;
++        }
++        return Bind;
++    }
++
+     public static String isLocalPortInUse(String bindAddress) {
+         Map<String, Integer> result = splitHostAndPort(bindAddress);
+         if (result == null) {
+@@ -142,13 +217,13 @@ public static String isLocalPortInUse(String bindAddress) {
+             new ServerSocket(socksPort).close();
+             // local port can be opened, it's available
+             return "false";
+-        } catch(IOException e) {
++        } catch (IOException e) {
+             // local port cannot be opened, it's in use
+             return "true";
+         }
+     }
+ 
+-    private static void performPingTask(Message msg, String bindAddress) {
++    private static void performConnectionTest(String bindAddress, ConnectionStateChangeListener changeListener) {
+         new Thread(() -> {
+             long startTime = System.currentTimeMillis();
+             boolean isSuccessful = false;
+@@ -156,12 +231,8 @@ private static void performPingTask(Message msg, String bindAddress) {
+             while (System.currentTimeMillis() - startTime < 2 * 60 * 1000) { // 2 minutes
+                 String result = isLocalPortInUse(bindAddress);
+                 if (result.contains("exception")) {
+-                    Message replyMsg = Message.obtain(null, MSG_TASK_FAILED);
+-                    try {
+-                        msg.replyTo.send(replyMsg);
+-                    } catch (RemoteException e) {
+-                        e.printStackTrace();
+-                    }
++                    if (changeListener != null)
++                        changeListener.onChange(ConnectionState.DISCONNECTED);
+                     return;
+                 }
+                 if (result.contains("true")) {
+@@ -174,32 +245,79 @@ private static void performPingTask(Message msg, String bindAddress) {
+                     break; // Exit if interrupted (e.g., service stopping)
+                 }
+             }
+-
+-            Message replyMsg = Message.obtain(null, isSuccessful ? MSG_TASK_COMPLETED : MSG_TASK_FAILED);
+-            try {
+-                msg.replyTo.send(replyMsg);
+-            } catch (RemoteException e) {
+-                e.printStackTrace();
+-            }
++            if (changeListener != null)
++                changeListener.onChange(isSuccessful ? ConnectionState.CONNECTED : ConnectionState.DISCONNECTED);
+         }).start();
+     }
+ 
++
+     private static class IncomingHandler extends Handler {
+         private final WeakReference<OblivionVpnService> serviceRef;
+ 
+         IncomingHandler(OblivionVpnService service) {
+             serviceRef = new WeakReference<>(service);
+         }
++
+         @Override
+         public void handleMessage(Message msg) {
+             final Message message = new Message();
+             message.copyFrom(msg);
++            OblivionVpnService service = serviceRef.get();
++            if (service == null) return;
+             switch (msg.what) {
+-                case MSG_PERFORM_TASK:
+-                    performPingTask(message, serviceRef.get().bindAddress);
++                case MSG_PERFORM_CONNECTION_TEST: {
++                    performConnectionTest(service.bindAddress, new ConnectionStateChangeListener() {
++                        @Override
++                        public void onChange(ConnectionState state) {
++                            service.setLastKnownState(state);
++                            Bundle data = new Bundle();
++                            if (state == ConnectionState.DISCONNECTED) {
++                                data.putBoolean("success", false);
++                                Message replyMsg = Message.obtain(null, MSG_PERFORM_CONNECTION_TEST);
++                                replyMsg.setData(data);
++                                try {
++                                    message.replyTo.send(replyMsg);
++                                } catch (RemoteException e) {
++                                    e.printStackTrace();
++                                }
++                            } else {
++                                data.putBoolean("success", true);
++                                Message replyMsg = Message.obtain(null, MSG_PERFORM_CONNECTION_TEST);
++                                replyMsg.setData(data);
++                                try {
++                                    message.replyTo.send(replyMsg);
++                                } catch (RemoteException e) {
++                                    e.printStackTrace();
++                                }
++                            }
++
++                        }
++                    });
+                     break;
+-                default:
++                }
++                case MSG_CONNECTION_STATE_SUBSCRIBE: {
++                    String key = message.getData().getString("key");
++                    if (key == null)
++                        throw new RuntimeException("No key was provided for the connection state observer");
++                    if (service.connectionStateObservers.containsKey(key)) {
++                        //Already subscribed. Just push the latest known state to it.
++                        service.publishConnectionStateTo(key, service.lastKnownState);
++                        break;
++                    }
++                    service.addConnectionStateObserver(key, message.replyTo);
++                    service.publishConnectionState(service.lastKnownState);
++                    break;
++                }
++                case MSG_CONNECTION_STATE_UNSUBSCRIBE: {
++                    String key = message.getData().getString("key");
++                    if (key == null)
++                        throw new RuntimeException("No observer was specified to unregister");
++                    service.removeConnectionStateObserver(key, null);
++                    break;
++                }
++                default: {
+                     super.handleMessage(msg);
++                }
+             }
+         }
+     }
+@@ -235,8 +353,10 @@ private void clearLogFile() {
+     @Override
+     public int onStartCommand(Intent intent, int flags, int startId) {
+         if (intent != null && FLAG_VPN_START.equals(intent.getAction())) {
+-            bindAddress = intent.getStringExtra("bindAddress");
++            fileManager = FileManager.getInstance(this);
++            bindAddress = getBindAddress();
+             runVpn();
++            performConnectionTest(bindAddress, this::setLastKnownState);
+             return START_STICKY;
+         } else if (intent != null && FLAG_VPN_STOP.equals(intent.getAction())) {
+             stopVpn();
+@@ -263,7 +383,7 @@ public void onRevoke() {
+     }
+ 
+     private void runVpn() {
+-        fileManager = getApplicationContext().getSharedPreferences("UserData", Context.MODE_PRIVATE);
++        setLastKnownState(ConnectionState.CONNECTING);
+         Log.i(TAG, "Clearing Logs");
+         clearLogFile();
+         Log.i(TAG, "Create Notification");
+@@ -279,6 +399,7 @@ private void runVpn() {
+     }
+ 
+     private void stopVpn() {
++        setLastKnownState(ConnectionState.DISCONNECTED);
+         Log.i(TAG, "Stopping VPN");
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+             NotificationManager notificationManager = getSystemService(NotificationManager.class);
+@@ -306,14 +427,41 @@ private void stopVpn() {
+             }
+         }
+ 
+-        if(vpnThread != null){
++        if (vpnThread != null) {
+             try {
+                 vpnThread.join();
+                 vpnThread.stop();
+-            } catch (Exception e) {}
++            } catch (Exception e) {
++            }
+         }
+     }
+ 
++    private void publishConnectionState(ConnectionState state) {
++        if (!connectionStateObservers.isEmpty()) {
++            for (String observerKey : connectionStateObservers.keySet()) publishConnectionStateTo(observerKey, state);
++        }
++    }
++
++    private void publishConnectionStateTo(String observerKey, ConnectionState state) {
++        Log.i("Publisher", "Publishing state " + state);
++        Messenger observer = connectionStateObservers.get(observerKey);
++        if (observer == null) return;
++        Bundle args = new Bundle();
++        args.putString("state", state.toString());
++        Message replyMsg = Message.obtain(null, MSG_TILE_STATE_SUBSCRIPTION_RESULT);
++        replyMsg.setData(args);
++        try {
++            observer.send(replyMsg);
++        } catch (RemoteException e) {
++            e.printStackTrace();
++        }
++    }
++
++    public void setLastKnownState(ConnectionState lastKnownState) {
++        this.lastKnownState = lastKnownState;
++        publishConnectionState(lastKnownState);
++    }
++
+     private void createNotification() {
+         NotificationManagerCompat notificationManager = NotificationManagerCompat.from(this);
+         NotificationChannelCompat notificationChannel = new NotificationChannelCompat.Builder(
+@@ -337,6 +485,14 @@ private void createNotification() {
+                 .build();
+     }
+ 
++    public void addConnectionStateObserver(String key, Messenger messenger) {
++        connectionStateObservers.put(key, messenger);
++    }
++
++    public void removeConnectionStateObserver(String key, Messenger messenger) {
++        connectionStateObservers.remove(key);
++    }
++
+     private StartOptions calculateArgs() {
+         StartOptions so = new StartOptions();
+         so.setPath(getApplicationContext().getFilesDir().getAbsolutePath());
+@@ -349,7 +505,7 @@ private StartOptions calculateArgs() {
+         boolean enablePsiphon = fileManager.getBoolean("USERSETTING_psiphon", false);
+         boolean enableGool = fileManager.getBoolean("USERSETTING_gool", false);
+ 
+-        if(!endpoint.contains("engage.cloudflareclient.com")) {
++        if (!endpoint.contains("engage.cloudflareclient.com")) {
+             so.setEndpoint(endpoint);
+         } else {
+             so.setEndpoint("notset");
+@@ -358,20 +514,20 @@ private StartOptions calculateArgs() {
+ 
+         so.setBindAddress(bindAddress);
+ 
+-        if(!license.trim().isEmpty()) {
++        if (!license.trim().isEmpty()) {
+             so.setLicense(license.trim());
+         } else {
+             so.setLicense("notset");
+         }
+ 
+-        if(enablePsiphon && !enableGool) {
++        if (enablePsiphon && !enableGool) {
+             so.setPsiphonEnabled(true);
+-            if(!country.trim().isEmpty() && country.length() == 2) {
++            if (!country.trim().isEmpty() && country.length() == 2) {
+                 so.setCountry(country.trim());
+             }
+         }
+ 
+-        if(!enablePsiphon && enableGool) {
++        if (!enablePsiphon && enableGool) {
+             so.setGool(true);
+         }
+ 
+diff --git a/app/src/main/java/org/bepass/oblivion/QuickStartService.java b/app/src/main/java/org/bepass/oblivion/QuickStartService.java
+new file mode 100644
+index 00000000..ad819995
+--- /dev/null
++++ b/app/src/main/java/org/bepass/oblivion/QuickStartService.java
+@@ -0,0 +1,128 @@
++package org.bepass.oblivion;
++
++import android.content.ComponentName;
++import android.content.Context;
++import android.content.Intent;
++import android.content.ServiceConnection;
++import android.graphics.drawable.Icon;
++import android.os.Build;
++import android.os.IBinder;
++import android.os.Messenger;
++import android.service.quicksettings.Tile;
++import android.service.quicksettings.TileService;
++import android.widget.Toast;
++
++import androidx.annotation.RequiresApi;
++import androidx.core.content.ContextCompat;
++
++@RequiresApi(api = Build.VERSION_CODES.N)
++public class QuickStartService extends TileService  {
++    private boolean isBound;
++    private Messenger serviceMessenger;
++
++    private final static String CONNECTION_OBSERVER_KEY = "quickstartToggleButton";
++
++    private ServiceConnection connection = new ServiceConnection() {
++        @Override
++        public void onServiceConnected(ComponentName className, IBinder service) {
++            serviceMessenger = new Messenger(service);
++            isBound = true;
++            subscribe();
++        }
++
++        @Override
++        public void onServiceDisconnected(ComponentName arg0) {
++            serviceMessenger = null;
++            isBound = false;
++        }
++    };
++
++
++
++    // Called when your app can update your tile.
++    @Override
++    public void onStartListening() {
++        bindService(new Intent(this, OblivionVpnService.class), connection, Context.BIND_AUTO_CREATE);
++    }
++
++    // Called when your app can no longer update your tile.
++    @Override
++    public void onStopListening() {
++        // Unbind from the service
++        if (isBound) {
++            unsubscribe();
++            isBound = false;
++        }
++        try {
++            unbindService(connection);
++        } catch (Exception e) {
++            //Swallow unbound unbind exceptions
++        }
++    }
++
++    // Called when the user taps on your tile in an active or inactive state.
++    @Override
++    public void onClick() {
++        Tile tile = getQsTile();
++        if (tile.getState() == Tile.STATE_INACTIVE) {
++            Intent vpnIntent = OblivionVpnService.prepare(this);
++            if (vpnIntent != null) {
++                Toast.makeText(this, "لطفا یک‌بار از درون اپلیکیشن متصل شوید", Toast.LENGTH_LONG).show();
++            } else {
++                startVpnService();
++            }
++        } else {
++            stopVpnService();
++        }
++    }
++
++
++    private void startVpnService() {
++        //Toast.makeText(getApplicationContext(), calculateArgs(), Toast.LENGTH_LONG).show();
++        Intent intent = new Intent(this, OblivionVpnService.class);
++        intent.setAction(OblivionVpnService.FLAG_VPN_START);
++        ContextCompat.startForegroundService(this, intent);
++    }
++
++
++    private void stopVpnService() {
++        Intent intent = new Intent(this, OblivionVpnService.class);
++        intent.setAction(OblivionVpnService.FLAG_VPN_STOP);
++        ContextCompat.startForegroundService(this, intent);
++    }
++
++    private void subscribe() {
++        if (!isBound) return;
++        OblivionVpnService.registerConnectionStateObserver(CONNECTION_OBSERVER_KEY, serviceMessenger, new ConnectionStateChangeListener() {
++            @Override
++            public void onChange(ConnectionState state) {
++                Tile tile = getQsTile();
++                switch (state) {
++                    case DISCONNECTED:
++                        tile.setState(Tile.STATE_INACTIVE);
++                        tile.setLabel("Oblivion");
++                        tile.setIcon(Icon.createWithResource(getApplicationContext(), R.drawable.vpn_off));
++                        tile.updateTile();
++                        break;
++                    case CONNECTING:
++                        tile.setState(Tile.STATE_ACTIVE);
++                        tile.setLabel("Connecting");
++                        tile.setIcon(Icon.createWithResource(getApplicationContext(), R.drawable.vpn_off));
++                        tile.updateTile();
++                        break;
++                    case CONNECTED:
++                        tile.setState(Tile.STATE_ACTIVE);
++                        tile.setLabel("Connected");
++                        tile.setIcon(Icon.createWithResource(getApplicationContext(), R.drawable.vpn_on));
++                        tile.updateTile();
++                }
++            }
++        });
++    }
++
++    private void unsubscribe() {
++        if (!isBound) return;
++        OblivionVpnService.unregisterConnectionStateObserver(CONNECTION_OBSERVER_KEY, serviceMessenger);
++    }
++
++}
+diff --git a/app/src/main/java/org/bepass/oblivion/TouchAwareSwitch.java b/app/src/main/java/org/bepass/oblivion/TouchAwareSwitch.java
+new file mode 100644
+index 00000000..5751c1bf
+--- /dev/null
++++ b/app/src/main/java/org/bepass/oblivion/TouchAwareSwitch.java
+@@ -0,0 +1,51 @@
++package org.bepass.oblivion;
++
++import android.annotation.SuppressLint;
++import android.content.Context;
++import android.util.AttributeSet;
++import android.view.MotionEvent;
++import android.view.View;
++
++import com.suke.widget.SwitchButton;
++
++public class TouchAwareSwitch extends SwitchButton {
++
++    public TouchAwareSwitch(Context context) {
++        super(context);
++    }
++
++    public TouchAwareSwitch(Context context, AttributeSet attrs) {
++        super(context, attrs);
++    }
++
++    public TouchAwareSwitch(Context context, AttributeSet attrs, int defStyleAttr) {
++        super(context, attrs, defStyleAttr);
++    }
++    @SuppressLint("ClickableViewAccessibility")
++    @Override
++    public void setOnCheckedChangeListener(final OnCheckedChangeListener listener) {
++        setOnTouchListener((v, event) -> {
++            setTag(null);
++            return false;
++        });
++
++        super.setOnCheckedChangeListener((view, isChecked) -> {
++            if (getTag() != null) {
++                setTag(null);
++                return;
++            }
++            listener.onCheckedChanged(view, isChecked);
++        });
++    }
++
++    public void setChecked(boolean checked, boolean notify) {
++        if (!notify) setTag("TAG");
++        setChecked(checked);
++    }
++
++
++
++
++
++
++}
+diff --git a/app/src/main/res/drawable/vpn_off.xml b/app/src/main/res/drawable/vpn_off.xml
+new file mode 100644
+index 00000000..d33949b7
+--- /dev/null
++++ b/app/src/main/res/drawable/vpn_off.xml
+@@ -0,0 +1,5 @@
++<vector android:height="24dp" android:tint="#000000"
++    android:viewportHeight="24" android:viewportWidth="24"
++    android:width="24dp" xmlns:android="http://schemas.android.com/apk/res/android">
++    <path android:fillColor="@android:color/white" android:pathData="M20.83,18H21v-4h2v-4H12.83L20.83,18zM19.78,22.61l1.41,-1.41L2.81,2.81L1.39,4.22l2.59,2.59C2.2,7.85 1,9.79 1,12c0,3.31 2.69,6 6,6c2.21,0 4.15,-1.2 5.18,-2.99L19.78,22.61zM8.99,11.82C9,11.88 9,11.94 9,12c0,1.1 -0.9,2 -2,2s-2,-0.9 -2,-2s0.9,-2 2,-2c0.06,0 0.12,0 0.18,0.01L8.99,11.82z"/>
++</vector>
+diff --git a/app/src/main/res/drawable/vpn_on.xml b/app/src/main/res/drawable/vpn_on.xml
+new file mode 100644
+index 00000000..1339fb3b
+--- /dev/null
++++ b/app/src/main/res/drawable/vpn_on.xml
+@@ -0,0 +1,5 @@
++<vector android:height="24dp" android:tint="#000000"
++    android:viewportHeight="24" android:viewportWidth="24"
++    android:width="24dp" xmlns:android="http://schemas.android.com/apk/res/android">
++    <path android:fillColor="@android:color/white" android:pathData="M12.65,10C11.83,7.67 9.61,6 7,6c-3.31,0 -6,2.69 -6,6s2.69,6 6,6c2.61,0 4.83,-1.67 5.65,-4H17v4h4v-4h2v-4H12.65zM7,14c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2 -0.9,2 -2,2z"/>
++</vector>
+diff --git a/app/src/main/res/layout/activity_main.xml b/app/src/main/res/layout/activity_main.xml
+index 33c6bf79..cd5f90e8 100644
+--- a/app/src/main/res/layout/activity_main.xml
++++ b/app/src/main/res/layout/activity_main.xml
+@@ -64,7 +64,7 @@
+     </LinearLayout>
+ 
+ 
+-    <com.suke.widget.SwitchButton
++    <org.bepass.oblivion.TouchAwareSwitch
+         android:id="@+id/switch_button"
+         android:layout_width="160dp"
+         android:layout_height="75dp"
+diff --git a/build.gradle b/build.gradle
+index 068a5d0f..de4390ff 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -1,5 +1,5 @@
+ // Top-level build file where you can add configuration options common to all sub-projects/modules.
+ plugins {
+-id 'com.android.application' version '8.1.2' apply false
++    id 'com.android.application' version '8.1.2' apply false
+     id 'org.jetbrains.kotlin.android' version '1.8.10' apply false
+ }
+\ No newline at end of file

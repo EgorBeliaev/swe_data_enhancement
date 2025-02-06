@@ -1,0 +1,656 @@
+diff --git a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconciler.java b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconciler.java
+index b7f2f71aa7..be817e7c6d 100644
+--- a/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconciler.java
++++ b/cluster-operator/src/main/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconciler.java
+@@ -95,6 +95,8 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.ExecutionException;
+ import java.util.function.Function;
+ import java.util.stream.Collectors;
+@@ -1107,46 +1109,59 @@ protected Future<Void> sharedKafkaConfigurationCleanup() {
+      * types are done because it requires the Kafka brokers to be scheduled and running to collect their node addresses.
+      * Without that, we do not know on which node would they be running.
+      *
++     * Note: To avoid issues with big clusters with many nodes, we first get the used nodes from the Pods and then get
++     * the node information individually for each node instead of listing all nodes and then picking up the information
++     * we need. This means more Kubernetes API calls, but helps us to avoid running out of memory.
++     *
+      * @return  Future which completes when the Listener status is created for all node port listeners
+      */
+     protected Future<Void> nodePortExternalListenerStatus() {
+-        List<Node> allNodes = new ArrayList<>();
+-
+         if (!ListenersUtils.nodePortListeners(kafka.getListeners()).isEmpty())   {
+-            return nodeOperator.listAsync(Labels.EMPTY)
+-                    .compose(result -> {
+-                        allNodes.addAll(result);
+-                        return podOperator.listAsync(reconciliation.namespace(), kafka.getSelectorLabels());
+-                    })
+-                    .map(pods -> {
+-                        Map<Integer, Node> brokerNodes = new HashMap<>();
++            Map<Integer, String> brokerNodes = new HashMap<>();
++            ConcurrentMap<String, Node> nodes = new ConcurrentHashMap<>();
+ 
++            // First we collect all the broker pods we have so that we can find out on which worker nodes they run
++            return podOperator.listAsync(reconciliation.namespace(), kafka.getSelectorLabels().withStrimziBrokerRole(true))
++                    .compose(pods -> {
++                        // We collect the nodes used by the brokers upfront to avoid asking for the same node multiple times later
+                         for (Pod broker : pods) {
+-                            String podName = broker.getMetadata().getName();
+-                            Integer podIndex = ReconcilerUtils.getPodIndexFromPodName(podName);
+-
+-                            if (broker.getStatus() != null && broker.getStatus().getHostIP() != null) {
+-                                String hostIP = broker.getStatus().getHostIP();
+-                                allNodes.stream()
+-                                        .filter(node -> {
+-                                            if (Labels.booleanLabel(broker, Labels.STRIMZI_BROKER_ROLE_LABEL, false)
+-                                                    && node.getStatus() != null
+-                                                    && node.getStatus().getAddresses() != null) {
+-                                                return node.getStatus().getAddresses().stream().anyMatch(address -> hostIP.equals(address.getAddress()));
+-                                            } else {
+-                                                return false;
+-                                            }
+-                                        })
+-                                        .findFirst()
+-                                        .ifPresent(podNode -> brokerNodes.put(podIndex, podNode));
++                            if (broker.getSpec() != null && broker.getSpec().getNodeName() != null) {
++                                Integer podIndex = ReconcilerUtils.getPodIndexFromPodName(broker.getMetadata().getName());
++                                brokerNodes.put(podIndex, broker.getSpec().getNodeName());
++                            } else {
++                                // This should not happen, but to avoid some chain of errors downstream we check it and raise exception
++                                LOGGER.warnCr(reconciliation, "Kafka Pod {} has no node name specified", broker.getMetadata().getName());
++                                return Future.failedFuture(new RuntimeException("Kafka Pod " + broker.getMetadata().getName() + " has no node name specified"));
+                             }
+                         }
+ 
++                        List<Future<Void>> nodeFutures = new ArrayList<>();
++
++                        // We get the full node resource for each node with a broker
++                        for (String nodeName : brokerNodes.values().stream().distinct().toList()) {
++                            LOGGER.debugCr(reconciliation, "Getting information on worker node {} used by one or more brokers", nodeName);
++                            Future<Void> nodeFuture = nodeOperator.getAsync(nodeName).compose(node -> {
++                                if (node != null) {
++                                    nodes.put(nodeName, node);
++                                } else {
++                                    // Node was not found, but we do not want to fail because of this as it might be just some race condition
++                                    LOGGER.warnCr(reconciliation, "Worker node {} does not seem to exist", nodeName);
++                                }
++
++                                return Future.succeededFuture();
++                            });
++                            nodeFutures.add(nodeFuture);
++                        }
++
++                        return Future.join(nodeFutures);
++                    })
++                    .map(i -> {
++                        // We extract the address information from the nodes
+                         for (GenericKafkaListener listener : ListenersUtils.nodePortListeners(kafka.getListeners())) {
+                             // Set is used to ensure each node/port is listed only once. It is later converted to List.
+                             Set<ListenerAddress> statusAddresses = new HashSet<>(brokerNodes.size());
+ 
+-                            for (Map.Entry<Integer, Node> entry : brokerNodes.entrySet())   {
++                            for (Map.Entry<Integer, String> entry : brokerNodes.entrySet())   {
+                                 String advertisedHost = ListenersUtils.brokerAdvertisedHost(listener, kafka.nodePoolForNodeId(entry.getKey()).nodeRef(entry.getKey()));
+                                 ListenerAddress address;
+ 
+@@ -1155,11 +1170,15 @@ protected Future<Void> nodePortExternalListenerStatus() {
+                                             .withHost(advertisedHost)
+                                             .withPort(listenerReconciliationResults.bootstrapNodePorts.get(ListenersUtils.identifier(listener)))
+                                             .build();
+-                                } else {
++                                } else if (nodes.get(entry.getValue()) != null) {
+                                     address = new ListenerAddressBuilder()
+-                                            .withHost(NodeUtils.findAddress(entry.getValue().getStatus().getAddresses(), ListenersUtils.preferredNodeAddressType(listener)))
++                                            .withHost(NodeUtils.findAddress(nodes.get(entry.getValue()).getStatus().getAddresses(), ListenersUtils.preferredNodeAddressType(listener)))
+                                             .withPort(listenerReconciliationResults.bootstrapNodePorts.get(ListenersUtils.identifier(listener)))
+                                             .build();
++                                } else {
++                                    // Node was not found, but we do not want to fail because of this as it might be just some race condition
++                                    LOGGER.warnCr(reconciliation, "Kafka node {} is running on an unknown node and its node port address cannot be found", entry.getKey());
++                                    continue;
+                                 }
+ 
+                                 statusAddresses.add(address);
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaAssemblyOperatorTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaAssemblyOperatorTest.java
+index 3c6124b828..9bbb1d67e6 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaAssemblyOperatorTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaAssemblyOperatorTest.java
+@@ -70,7 +70,6 @@
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.DeploymentOperator;
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.IngressOperator;
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.NetworkPolicyOperator;
+-import io.strimzi.operator.cluster.operator.resource.kubernetes.NodeOperator;
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.PodDisruptionBudgetOperator;
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.PodOperator;
+ import io.strimzi.operator.cluster.operator.resource.kubernetes.PvcOperator;
+@@ -603,10 +602,6 @@ private void createCluster(VertxTestContext context, Kafka kafka, List<KafkaNode
+         when(mockIngressOps.batchReconcile(any(), eq(NAMESPACE), any(), any())).thenCallRealMethod();
+         when(mockIngressOps.listAsync(eq(NAMESPACE), any(Labels.class))).thenReturn(Future.succeededFuture(emptyList()));
+ 
+-        // Nodes
+-        NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(emptyList()));
+-
+         KafkaAssemblyOperator ops = new KafkaAssemblyOperator(vertx, new PlatformFeaturesAvailability(openShift, kubernetesVersion),
+                 CERT_MANAGER,
+                 PASSWORD_GENERATOR,
+@@ -977,10 +972,6 @@ private void updateCluster(VertxTestContext context, Kafka originalKafka, Kafka
+         PodDisruptionBudgetOperator mockPdbOps = supplier.podDisruptionBudgetOperator;
+         when(mockPdbOps.reconcile(any(), eq(NAMESPACE), any(), any())).thenReturn(Future.succeededFuture());
+ 
+-        // Nodes
+-        NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(emptyList()));
+-
+         // Ingress resources
+         IngressOperator mockIngressOps = supplier.ingressOperations;
+         when(mockIngressOps.batchReconcile(any(), eq(NAMESPACE), any(), any())).thenCallRealMethod();
+diff --git a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconcilerStatusTest.java b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconcilerStatusTest.java
+index fc1e20c7c8..de022891d8 100644
+--- a/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconcilerStatusTest.java
++++ b/cluster-operator/src/test/java/io/strimzi/operator/cluster/operator/assembly/KafkaReconcilerStatusTest.java
+@@ -331,6 +331,9 @@ public void testKafkaReconcilerStatusWithNodePorts(VertxTestContext context) {
+                     .withName(CLUSTER_NAME + "-mixed-" + 0)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.1")
+                 .endStatus()
+@@ -341,6 +344,9 @@ public void testKafkaReconcilerStatusWithNodePorts(VertxTestContext context) {
+                     .withName(CLUSTER_NAME + "-mixed-" + 1)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-1")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.25")
+                 .endStatus()
+@@ -351,6 +357,9 @@ public void testKafkaReconcilerStatusWithNodePorts(VertxTestContext context) {
+                     .withName(CLUSTER_NAME + "-mixed-" + 2)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-3")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.13")
+                 .endStatus()
+@@ -366,7 +375,7 @@ public void testKafkaReconcilerStatusWithNodePorts(VertxTestContext context) {
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+@@ -397,7 +406,17 @@ public void testKafkaReconcilerStatusWithNodePorts(VertxTestContext context) {
+     }
+ 
+     @Test
+-    public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestContext context) {
++    public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext context) {
++        GenericKafkaListenerConfigurationBroker broker0 = new GenericKafkaListenerConfigurationBrokerBuilder()
++                .withBroker(0)
++                .withAdvertisedHost("my-address-0")
++                .build();
++
++        GenericKafkaListenerConfigurationBroker broker1 = new GenericKafkaListenerConfigurationBrokerBuilder()
++                .withBroker(1)
++                .withAdvertisedHost("my-address-1")
++                .build();
++
+         Kafka kafka = new KafkaBuilder(KAFKA)
+                 .editOrNewSpec()
+                     .editOrNewKafka()
+@@ -406,36 +425,25 @@ public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestC
+                                 .withPort(9094)
+                                 .withType(KafkaListenerType.NODEPORT)
+                                 .withTls(true)
++                                .withNewConfiguration()
++                                    .withBrokers(broker0, broker1)
++                                .endConfiguration()
+                                 .build())
+                     .endKafka()
+                 .endSpec()
+                 .build();
+ 
+-        KafkaNodePool brokers = new KafkaNodePoolBuilder(KAFKA_NODE_POOL)
+-                .editMetadata()
+-                    .withName("broker")
+-                .endMetadata()
+-                .editSpec()
+-                    .withRoles(ProcessRoles.BROKER)
+-                .endSpec()
+-                .build();
+-        KafkaNodePool controllers = new KafkaNodePoolBuilder(KAFKA_NODE_POOL)
+-                .editMetadata()
+-                    .withName("controller")
+-                .endMetadata()
+-                .editSpec()
+-                    .withRoles(ProcessRoles.CONTROLLER)
+-                .endSpec()
+-                .build();
+-
+         ResourceOperatorSupplier supplier = ResourceUtils.supplierWithMocks(false);
+ 
+         // Mock Kafka broker pods
+         Pod pod0 = new PodBuilder()
+                 .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-broker-" + 0)
++                    .withName(CLUSTER_NAME + "-mixed-" + 0)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.1")
+                 .endStatus()
+@@ -443,9 +451,12 @@ public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestC
+ 
+         Pod pod1 = new PodBuilder()
+                 .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-broker-" + 1)
++                    .withName(CLUSTER_NAME + "-mixed-" + 1)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-1")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.25")
+                 .endStatus()
+@@ -453,39 +464,12 @@ public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestC
+ 
+         Pod pod2 = new PodBuilder()
+                 .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-broker-" + 2)
++                    .withName(CLUSTER_NAME + "-mixed-" + 2)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
+-                .withNewStatus()
+-                    .withHostIP("10.0.0.13")
+-                .endStatus()
+-                .build();
+-
+-        Pod pod3 = new PodBuilder()
+-                .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-controller-" + 3)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "false", Labels.STRIMZI_CONTROLLER_ROLE_LABEL, "true"))
+-                .endMetadata()
+-                .withNewStatus()
+-                    .withHostIP("10.0.0.1")
+-                .endStatus()
+-                .build();
+-
+-        Pod pod4 = new PodBuilder()
+-                .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-controller-" + 4)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "false", Labels.STRIMZI_CONTROLLER_ROLE_LABEL, "true"))
+-                .endMetadata()
+-                .withNewStatus()
+-                    .withHostIP("10.0.0.16") // Make sure this host is not used for any of the brokers => we test that it is not included in the status!
+-                .endStatus()
+-                .build();
+-
+-        Pod pod5 = new PodBuilder()
+-                .withNewMetadata()
+-                    .withName(CLUSTER_NAME + "-controller-" + 5)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "false", Labels.STRIMZI_CONTROLLER_ROLE_LABEL, "true"))
+-                .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-3")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.13")
+                 .endStatus()
+@@ -495,23 +479,20 @@ public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestC
+         pods.add(pod0);
+         pods.add(pod1);
+         pods.add(pod2);
+-        pods.add(pod3);
+-        pods.add(pod4);
+-        pods.add(pod5);
+ 
+         PodOperator mockPodOps = supplier.podOperations;
+         when(mockPodOps.listAsync(eq(NAMESPACE), any(Labels.class))).thenReturn(Future.succeededFuture(pods));
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+                 new Reconciliation("test-trigger", Kafka.RESOURCE_KIND, NAMESPACE, CLUSTER_NAME),
+                 supplier,
+                 kafka,
+-                List.of(controllers, brokers));
++                List.of(KAFKA_NODE_POOL));
+ 
+         KafkaStatus status = new KafkaStatus();
+ 
+@@ -522,30 +503,20 @@ public void testKafkaReconcilerStatusWithNodePortsAndKRaftControllers(VertxTestC
+             // Check listener status
+             assertThat(status.getListeners().size(), is(1));
+             assertThat(status.getListeners().get(0).getName(), is("external"));
+-            assertThat(status.getListeners().get(0).getBootstrapServers(), is("5.124.16.8:31234,50.35.18.119:31234,55.36.78.115:31234"));
++            assertThat(status.getListeners().get(0).getBootstrapServers(), is("5.124.16.8:31234,my-address-0:31234,my-address-1:31234"));
+             assertThat(status.getListeners().get(0).getAddresses().size(), is(3));
+ 
+             // Assert the listener addresses independently on their order
++            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "my-address-0".equals(a.getHost())), is(true));
++            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "my-address-1".equals(a.getHost())), is(true));
+             assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "5.124.16.8".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "55.36.78.115".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "50.35.18.119".equals(a.getHost())), is(true));
+ 
+             async.flag();
+         }));
+     }
+ 
+     @Test
+-    public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext context) {
+-        GenericKafkaListenerConfigurationBroker broker0 = new GenericKafkaListenerConfigurationBrokerBuilder()
+-                .withBroker(0)
+-                .withAdvertisedHost("my-address-0")
+-                .build();
+-
+-        GenericKafkaListenerConfigurationBroker broker1 = new GenericKafkaListenerConfigurationBrokerBuilder()
+-                .withBroker(1)
+-                .withAdvertisedHost("my-address-1")
+-                .build();
+-
++    public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(VertxTestContext context) {
+         Kafka kafka = new KafkaBuilder(KAFKA)
+                 .editOrNewSpec()
+                     .editOrNewKafka()
+@@ -555,7 +526,7 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+                                 .withType(KafkaListenerType.NODEPORT)
+                                 .withTls(true)
+                                 .withNewConfiguration()
+-                                    .withBrokers(broker0, broker1)
++                                    .withPreferredNodePortAddressType(NodeAddressType.INTERNAL_DNS)
+                                 .endConfiguration()
+                                 .build())
+                     .endKafka()
+@@ -570,6 +541,9 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+                     .withName(CLUSTER_NAME + "-mixed-" + 0)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.1")
+                 .endStatus()
+@@ -580,6 +554,9 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+                     .withName(CLUSTER_NAME + "-mixed-" + 1)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-1")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.25")
+                 .endStatus()
+@@ -590,6 +567,9 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+                     .withName(CLUSTER_NAME + "-mixed-" + 2)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-3")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.13")
+                 .endStatus()
+@@ -605,7 +585,7 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+@@ -623,20 +603,20 @@ public void testKafkaReconcilerStatusWithNodePortsAndOverrides(VertxTestContext
+             // Check listener status
+             assertThat(status.getListeners().size(), is(1));
+             assertThat(status.getListeners().get(0).getName(), is("external"));
+-            assertThat(status.getListeners().get(0).getBootstrapServers(), is("5.124.16.8:31234,my-address-0:31234,my-address-1:31234"));
++            assertThat(status.getListeners().get(0).getBootstrapServers(), is("node-0.my-kube:31234,node-1.my-kube:31234,node-3.my-kube:31234"));
+             assertThat(status.getListeners().get(0).getAddresses().size(), is(3));
+ 
+             // Assert the listener addresses independently on their order
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "my-address-0".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "my-address-1".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "5.124.16.8".equals(a.getHost())), is(true));
++            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-0.my-kube".equals(a.getHost())), is(true));
++            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-1.my-kube".equals(a.getHost())), is(true));
++            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-3.my-kube".equals(a.getHost())), is(true));
+ 
+             async.flag();
+         }));
+     }
+ 
+     @Test
+-    public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(VertxTestContext context) {
++    public void testKafkaReconcilerStatusWithNodePortsOnSameNode(VertxTestContext context) {
+         Kafka kafka = new KafkaBuilder(KAFKA)
+                 .editOrNewSpec()
+                     .editOrNewKafka()
+@@ -645,9 +625,6 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+                                 .withPort(9094)
+                                 .withType(KafkaListenerType.NODEPORT)
+                                 .withTls(true)
+-                                .withNewConfiguration()
+-                                    .withPreferredNodePortAddressType(NodeAddressType.INTERNAL_DNS)
+-                                .endConfiguration()
+                                 .build())
+                     .endKafka()
+                 .endSpec()
+@@ -661,6 +638,9 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+                     .withName(CLUSTER_NAME + "-mixed-" + 0)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+                     .withHostIP("10.0.0.1")
+                 .endStatus()
+@@ -671,8 +651,11 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+                     .withName(CLUSTER_NAME + "-mixed-" + 1)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+-                    .withHostIP("10.0.0.25")
++                    .withHostIP("10.0.0.1")
+                 .endStatus()
+                 .build();
+ 
+@@ -681,8 +664,11 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+                     .withName(CLUSTER_NAME + "-mixed-" + 2)
+                     .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-0")
++                .endSpec()
+                 .withNewStatus()
+-                    .withHostIP("10.0.0.13")
++                    .withHostIP("10.0.0.1")
+                 .endStatus()
+                 .build();
+ 
+@@ -696,7 +682,7 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+@@ -714,20 +700,17 @@ public void testKafkaReconcilerStatusWithNodePortsWithPreferredAddressType(Vertx
+             // Check listener status
+             assertThat(status.getListeners().size(), is(1));
+             assertThat(status.getListeners().get(0).getName(), is("external"));
+-            assertThat(status.getListeners().get(0).getBootstrapServers(), is("node-0.my-kube:31234,node-1.my-kube:31234,node-3.my-kube:31234"));
+-            assertThat(status.getListeners().get(0).getAddresses().size(), is(3));
+-
+-            // Assert the listener addresses independently on their order
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-0.my-kube".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-1.my-kube".equals(a.getHost())), is(true));
+-            assertThat(status.getListeners().get(0).getAddresses().stream().anyMatch(a -> a.getPort() == 31234 && "node-3.my-kube".equals(a.getHost())), is(true));
++            assertThat(status.getListeners().get(0).getBootstrapServers(), is("50.35.18.119:31234"));
++            assertThat(status.getListeners().get(0).getAddresses().size(), is(1));
++            assertThat(status.getListeners().get(0).getAddresses().get(0).getPort(), is(31234));
++            assertThat(status.getListeners().get(0).getAddresses().get(0).getHost(), is("50.35.18.119"));
+ 
+             async.flag();
+         }));
+     }
+ 
+     @Test
+-    public void testKafkaReconcilerStatusWithNodePortsOnSameNode(VertxTestContext context) {
++    public void testKafkaReconcilerStatusWithNodePortsAndMissingNode(VertxTestContext context) {
+         Kafka kafka = new KafkaBuilder(KAFKA)
+                 .editOrNewSpec()
+                     .editOrNewKafka()
+@@ -747,30 +730,36 @@ public void testKafkaReconcilerStatusWithNodePortsOnSameNode(VertxTestContext co
+         Pod pod0 = new PodBuilder()
+                 .withNewMetadata()
+                     .withName(CLUSTER_NAME + "-mixed-" + 0)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-999")
++                .endSpec()
+                 .withNewStatus()
+-                    .withHostIP("10.0.0.1")
++                    .withHostIP("10.0.0.5")
+                 .endStatus()
+                 .build();
+ 
+         Pod pod1 = new PodBuilder()
+                 .withNewMetadata()
+                     .withName(CLUSTER_NAME + "-mixed-" + 1)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-999")
++                .endSpec()
+                 .withNewStatus()
+-                    .withHostIP("10.0.0.1")
++                    .withHostIP("10.0.0.5")
+                 .endStatus()
+                 .build();
+ 
+         Pod pod2 = new PodBuilder()
+                 .withNewMetadata()
+                     .withName(CLUSTER_NAME + "-mixed-" + 2)
+-                    .withLabels(Map.of(Labels.STRIMZI_BROKER_ROLE_LABEL, "true"))
+                 .endMetadata()
++                .withNewSpec()
++                    .withNodeName("node-999")
++                .endSpec()
+                 .withNewStatus()
+-                    .withHostIP("10.0.0.1")
++                    .withHostIP("10.0.0.5")
+                 .endStatus()
+                 .build();
+ 
+@@ -784,7 +773,7 @@ public void testKafkaReconcilerStatusWithNodePortsOnSameNode(VertxTestContext co
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+@@ -802,17 +791,15 @@ public void testKafkaReconcilerStatusWithNodePortsOnSameNode(VertxTestContext co
+             // Check listener status
+             assertThat(status.getListeners().size(), is(1));
+             assertThat(status.getListeners().get(0).getName(), is("external"));
+-            assertThat(status.getListeners().get(0).getBootstrapServers(), is("50.35.18.119:31234"));
+-            assertThat(status.getListeners().get(0).getAddresses().size(), is(1));
+-            assertThat(status.getListeners().get(0).getAddresses().get(0).getPort(), is(31234));
+-            assertThat(status.getListeners().get(0).getAddresses().get(0).getHost(), is("50.35.18.119"));
++            assertThat(status.getListeners().get(0).getBootstrapServers(), is(nullValue()));
++            assertThat(status.getListeners().get(0).getAddresses(), is(List.of()));
+ 
+             async.flag();
+         }));
+     }
+ 
+     @Test
+-    public void testKafkaReconcilerStatusWithNodePortsAndMissingNode(VertxTestContext context) {
++    public void testKafkaReconcilerStatusWithPodMissingNodeName(VertxTestContext context) {
+         Kafka kafka = new KafkaBuilder(KAFKA)
+                 .editOrNewSpec()
+                     .editOrNewKafka()
+@@ -866,7 +853,7 @@ public void testKafkaReconcilerStatusWithNodePortsAndMissingNode(VertxTestContex
+ 
+         // Mock Kubernetes worker nodes
+         NodeOperator mockNodeOps = supplier.nodeOperator;
+-        when(mockNodeOps.listAsync(any(Labels.class))).thenReturn(Future.succeededFuture(kubernetesWorkerNodes()));
++        mockKubernetesWorkerNodes(mockNodeOps);
+ 
+         // Run the test
+         KafkaReconciler reconciler = new MockKafkaReconcilerStatusTasks(
+@@ -879,19 +866,14 @@ public void testKafkaReconcilerStatusWithNodePortsAndMissingNode(VertxTestContex
+ 
+         Checkpoint async = context.checkpoint();
+         reconciler.reconcile(status, Clock.systemUTC()).onComplete(res -> context.verify(() -> {
+-            assertThat(res.succeeded(), is(true));
+-
+-            // Check listener status
+-            assertThat(status.getListeners().size(), is(1));
+-            assertThat(status.getListeners().get(0).getName(), is("external"));
+-            assertThat(status.getListeners().get(0).getBootstrapServers(), is(nullValue()));
+-            assertThat(status.getListeners().get(0).getAddresses(), is(List.of()));
++            assertThat(res.succeeded(), is(false));
++            assertThat(res.cause().getMessage(), is(containsString("has no node name specified")));
+ 
+             async.flag();
+         }));
+     }
+ 
+-    private static List<Node> kubernetesWorkerNodes()    {
++    private static void mockKubernetesWorkerNodes(NodeOperator mockNodeOps)    {
+         Node node0 = new NodeBuilder()
+                 .withNewMetadata()
+                     .withName("node-0")
+@@ -940,13 +922,11 @@ private static List<Node> kubernetesWorkerNodes()    {
+                 .endStatus()
+                 .build();
+ 
+-        List<Node> nodes = new ArrayList<>();
+-        nodes.add(node0);
+-        nodes.add(node1);
+-        nodes.add(node2);
+-        nodes.add(node3);
+-
+-        return nodes;
++        when(mockNodeOps.getAsync(eq("node-0"))).thenReturn(Future.succeededFuture(node0));
++        when(mockNodeOps.getAsync(eq("node-1"))).thenReturn(Future.succeededFuture(node1));
++        when(mockNodeOps.getAsync(eq("node-2"))).thenReturn(Future.succeededFuture(node2));
++        when(mockNodeOps.getAsync(eq("node-3"))).thenReturn(Future.succeededFuture(node3));
++        when(mockNodeOps.getAsync(eq("node-999"))).thenReturn(Future.succeededFuture(null)); // Node that does not exist
+     }
+ 
+     static class MockKafkaReconcilerStatusTasks extends KafkaReconciler {

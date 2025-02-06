@@ -1,0 +1,143 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 7f7a2dd5..257b11eb 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -52,5 +52,6 @@ dependencies {
+     implementation 'com.github.zcweng:switch-button:0.0.3@aar'
+     implementation 'androidx.recyclerview:recyclerview:1.3.2'
+     implementation 'com.github.bumptech.glide:glide:4.16.0'
++    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+     implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+ }
+diff --git a/app/src/main/java/org/bepass/oblivion/ConnectionAwareBaseActivity.java b/app/src/main/java/org/bepass/oblivion/ConnectionAwareBaseActivity.java
+index 622c4a59..45b3ffe3 100644
+--- a/app/src/main/java/org/bepass/oblivion/ConnectionAwareBaseActivity.java
++++ b/app/src/main/java/org/bepass/oblivion/ConnectionAwareBaseActivity.java
+@@ -41,6 +41,7 @@ public void onServiceDisconnected(ComponentName arg0) {
+     private void observeConnectionStatus() {
+         if (!isBound) return;
+         OblivionVpnService.registerConnectionStateObserver(getKey(), serviceMessenger, state -> {
++            if (lastKnownConnectionState == state) return;
+             lastKnownConnectionState = state;
+             onConnectionStateChange(state);
+         });
+diff --git a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+index d12ce272..a2b7bb9e 100644
+--- a/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
++++ b/app/src/main/java/org/bepass/oblivion/OblivionVpnService.java
+@@ -27,12 +27,19 @@
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.lang.ref.WeakReference;
++import java.net.InetSocketAddress;
++import java.net.Proxy;
+ import java.net.ServerSocket;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
++import java.util.concurrent.TimeUnit;
+ 
++import okhttp3.OkHttpClient;
++import okhttp3.Request;
++import okhttp3.Response;
+ import tun2socks.StartOptions;
+ import tun2socks.Tun2socks;
+ 
+@@ -167,6 +174,51 @@ private static int findFreePort() {
+         throw new IllegalStateException("Could not find a free TCP/IP port to start embedded Jetty HTTP Server on");
+     }
+ 
++
++    private static boolean waitForConnection(String bindAddress) {
++        long startTime = System.currentTimeMillis();
++        boolean isSuccessful = false;
++        while (System.currentTimeMillis() - startTime < 60 * 1000) { //60 seconds
++            boolean result = pingOverHTTP(bindAddress);
++            if (result) {
++                isSuccessful = true;
++                break;
++            }
++            try {
++                Thread.sleep(500); // Sleep before retrying
++            } catch (InterruptedException e) {
++                break; // Exit if interrupted (e.g., service stopping)
++            }
++        }
++        return isSuccessful;
++    }
++
++    public static boolean pingOverHTTP(String bindAddress) {
++        System.out.println("Pinging");
++        Map<String, Integer> result = splitHostAndPort(bindAddress);
++        if (result == null) {
++            throw new RuntimeException("Could not split host and port of " + bindAddress);
++        }
++        String socksHost = result.keySet().iterator().next();
++        int socksPort = result.values().iterator().next();
++        Proxy proxy = new Proxy(Proxy.Type.SOCKS, new InetSocketAddress(socksHost, socksPort));
++        OkHttpClient client = new OkHttpClient.Builder()
++                .proxy(proxy)
++                .connectTimeout(5, TimeUnit.SECONDS) // 5 seconds connection timeout
++                .readTimeout(5, TimeUnit.SECONDS) // 5 seconds read timeout
++                .build();
++        Request request = new Request.Builder()
++                .url("https://1.1.1.1")
++                .build();
++        try (Response response = client.newCall(request).execute()) {
++            return response.isSuccessful();
++        } catch (IOException e) {
++            //e.printStackTrace();
++            return false;
++        }
++    }
++
++
+     public static String isLocalPortInUse(String bindAddress) {
+         Map<String, Integer> result = splitHostAndPort(bindAddress);
+         if (result == null) {
+@@ -184,7 +236,7 @@ public static String isLocalPortInUse(String bindAddress) {
+         }
+     }
+ 
+-    private static void performConnectionTest(String bindAddress, ConnectionStateChangeListener changeListener) {
++    private static void performConnectionTest(String bindAddress, boolean psiphonMode, ConnectionStateChangeListener changeListener) {
+         new Thread(() -> {
+             long startTime = System.currentTimeMillis();
+             boolean isSuccessful = false;
+@@ -197,7 +249,7 @@ private static void performConnectionTest(String bindAddress, ConnectionStateCha
+                     return;
+                 }
+                 if (result.contains("true")) {
+-                    isSuccessful = true;
++                    isSuccessful = !psiphonMode || waitForConnection(bindAddress);
+                     break;
+                 }
+                 try {
+@@ -252,7 +304,14 @@ public int onStartCommand(Intent intent, int flags, int startId) {
+             fileManager = FileManager.getInstance(this);
+             bindAddress = getBindAddress();
+             runVpn();
+-            performConnectionTest(bindAddress, this::setLastKnownState);
++            boolean psiphonMode = fileManager.getBoolean("USERSETTING_psiphon");
++            performConnectionTest(bindAddress, psiphonMode, (state) -> {
++                if (state == ConnectionState.DISCONNECTED) {
++                    stopVpnService(getApplicationContext());
++                    return;
++                }
++                setLastKnownState(state);
++            });
+             return START_STICKY;
+         } else if (intent != null && FLAG_VPN_STOP.equals(intent.getAction())) {
+             stopVpn();
+@@ -511,7 +570,8 @@ public void handleMessage(Message msg) {
+             if (service == null) return;
+             switch (msg.what) {
+                 case MSG_PERFORM_CONNECTION_TEST: {
+-                    performConnectionTest(service.bindAddress, new ConnectionStateChangeListener() {
++                    boolean psiphonMode = service.fileManager.getBoolean("USERSETTING_psiphon");
++                    performConnectionTest(service.bindAddress, psiphonMode, new ConnectionStateChangeListener() {
+                         @Override
+                         public void onChange(ConnectionState state) {
+                             service.setLastKnownState(state);

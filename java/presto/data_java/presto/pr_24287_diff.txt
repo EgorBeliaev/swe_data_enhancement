@@ -1,0 +1,117 @@
+diff --git a/presto-hive-common/src/main/java/com/facebook/presto/hive/rule/BaseSubfieldExtractionRewriter.java b/presto-hive-common/src/main/java/com/facebook/presto/hive/rule/BaseSubfieldExtractionRewriter.java
+index 917760aa090c2..add6ddb6b7a60 100644
+--- a/presto-hive-common/src/main/java/com/facebook/presto/hive/rule/BaseSubfieldExtractionRewriter.java
++++ b/presto-hive-common/src/main/java/com/facebook/presto/hive/rule/BaseSubfieldExtractionRewriter.java
+@@ -436,7 +436,7 @@ private boolean isCandidate(Map<ColumnHandle, NullableValue> bindings)
+ 
+             // Skip pruning if evaluation fails in a recoverable way. Failing here can cause
+             // spurious query failures for partitions that would otherwise be filtered out.
+-            Object optimized = null;
++            RowExpression optimized;
+             try {
+                 optimized = evaluator.getExpressionOptimizer().optimize(expression, OPTIMIZED, session, variableResolver);
+             }
+@@ -446,8 +446,11 @@ private boolean isCandidate(Map<ColumnHandle, NullableValue> bindings)
+             }
+ 
+             // If any conjuncts evaluate to FALSE or null, then the whole predicate will never be true and so the partition should be pruned
+-            return !Boolean.FALSE.equals(optimized) && optimized != null
+-                    && (!(optimized instanceof ConstantExpression) || !((ConstantExpression) optimized).isNull());
++            if (!(optimized instanceof ConstantExpression)) {
++                return true;
++            }
++            ConstantExpression constantExpression = (ConstantExpression) optimized;
++            return !Boolean.FALSE.equals(constantExpression.getValue()) && !constantExpression.isNull();
+         }
+ 
+         private static void propagateIfUnhandled(PrestoException e)
+diff --git a/presto-hive/src/test/java/com/facebook/presto/hive/TestDomainTranslator.java b/presto-hive/src/test/java/com/facebook/presto/hive/TestDomainTranslator.java
+index f036e5dfd60ed..7a02c67825c47 100644
+--- a/presto-hive/src/test/java/com/facebook/presto/hive/TestDomainTranslator.java
++++ b/presto-hive/src/test/java/com/facebook/presto/hive/TestDomainTranslator.java
+@@ -95,7 +95,7 @@ public RowExpression optimize(RowExpression rowExpression, Level level, Connecto
+         }
+ 
+         @Override
+-        public Object optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
++        public RowExpression optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
+         {
+             throw new UnsupportedOperationException();
+         }
+diff --git a/presto-hive/src/test/java/com/facebook/presto/hive/TestSubfieldExtractor.java b/presto-hive/src/test/java/com/facebook/presto/hive/TestSubfieldExtractor.java
+index 7762f808f4e38..3b6b8328852a4 100644
+--- a/presto-hive/src/test/java/com/facebook/presto/hive/TestSubfieldExtractor.java
++++ b/presto-hive/src/test/java/com/facebook/presto/hive/TestSubfieldExtractor.java
+@@ -80,7 +80,7 @@ public RowExpression optimize(RowExpression rowExpression, Level level, Connecto
+         }
+ 
+         @Override
+-        public Object optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
++        public RowExpression optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
+         {
+             throw new UnsupportedOperationException();
+         }
+diff --git a/presto-iceberg/src/main/java/com/facebook/presto/iceberg/optimizer/IcebergMetadataOptimizer.java b/presto-iceberg/src/main/java/com/facebook/presto/iceberg/optimizer/IcebergMetadataOptimizer.java
+index e390f45f05fbc..f21d39f956473 100644
+--- a/presto-iceberg/src/main/java/com/facebook/presto/iceberg/optimizer/IcebergMetadataOptimizer.java
++++ b/presto-iceberg/src/main/java/com/facebook/presto/iceberg/optimizer/IcebergMetadataOptimizer.java
+@@ -356,7 +356,7 @@ else if (scalarFunctionName.equals("least")) {
+                         throw new PrestoException(StandardErrorCode.NOT_SUPPORTED, "unsupported function: " + scalarFunctionName);
+                     }
+ 
+-                    Object reducedValue = rowExpressionService.getExpressionOptimizer().optimize(
++                    RowExpression reducedValue = rowExpressionService.getExpressionOptimizer().optimize(
+                             new CallExpression(
+                                     Optional.empty(),
+                                     scalarFunctionName,
+@@ -366,7 +366,8 @@ else if (scalarFunctionName.equals("least")) {
+                             Level.EVALUATED,
+                             connectorSession,
+                             variableReferenceExpression -> null);
+-                    reducedArguments.add(new ConstantExpression(reducedValue, returnType));
++                    checkArgument(reducedValue instanceof ConstantExpression, "unexpected expression type: %s", reducedValue.getClass().getSimpleName());
++                    reducedArguments.add(reducedValue);
+                 }
+                 arguments = reducedArguments;
+             }
+diff --git a/presto-main/src/main/java/com/facebook/presto/sql/relational/RowExpressionOptimizer.java b/presto-main/src/main/java/com/facebook/presto/sql/relational/RowExpressionOptimizer.java
+index 1ab9d2ead2e6c..15dcc1d43f804 100644
+--- a/presto-main/src/main/java/com/facebook/presto/sql/relational/RowExpressionOptimizer.java
++++ b/presto-main/src/main/java/com/facebook/presto/sql/relational/RowExpressionOptimizer.java
+@@ -46,9 +46,9 @@ public RowExpression optimize(RowExpression rowExpression, Level level, Connecto
+     }
+ 
+     @Override
+-    public Object optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
++    public RowExpression optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver)
+     {
+         RowExpressionInterpreter interpreter = new RowExpressionInterpreter(expression, metadata.getFunctionAndTypeManager(), session, level);
+-        return interpreter.optimize(variableResolver::apply);
++        return toRowExpression(expression.getSourceLocation(), interpreter.optimize(variableResolver::apply), expression.getType());
+     }
+ }
+diff --git a/presto-spi/src/main/java/com/facebook/presto/spi/relation/ExpressionOptimizer.java b/presto-spi/src/main/java/com/facebook/presto/spi/relation/ExpressionOptimizer.java
+index 70f72a555058c..90db2841a2879 100644
+--- a/presto-spi/src/main/java/com/facebook/presto/spi/relation/ExpressionOptimizer.java
++++ b/presto-spi/src/main/java/com/facebook/presto/spi/relation/ExpressionOptimizer.java
+@@ -20,11 +20,17 @@
+ public interface ExpressionOptimizer
+ {
+     /**
+-     * Optimize a RowExpression to
++     * Optimize a RowExpression to its simplest equivalent form.
+      */
+-    RowExpression optimize(RowExpression rowExpression, Level level, ConnectorSession session);
++    default RowExpression optimize(RowExpression rowExpression, Level level, ConnectorSession session)
++    {
++        return optimize(rowExpression, level, session, variable -> variable);
++    }
+ 
+-    Object optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver);
++    /**
++     * Optimize a RowExpression to its simplest equivalent form, replacing VariableReferenceExpressions with their associated values.
++     */
++    RowExpression optimize(RowExpression expression, Level level, ConnectorSession session, Function<VariableReferenceExpression, Object> variableResolver);
+ 
+     enum Level
+     {
