@@ -90,7 +90,9 @@ os.makedirs('repos_filtered', exist_ok=True)
 
 def process_repo(repo_url, repo_name):
     # Define paths
-    data_folder = f"../{repo_name}/data_{repo_name}"
+    data_folder = f"{repo_name}/data_{repo_name}"
+
+    repo_name = repo_name.split("/")[-1]
 
     # Iterate over all JSON files in the data folder
     for json_filename in os.listdir(data_folder):
@@ -194,7 +196,7 @@ def process_repo(repo_url, repo_name):
                 print(f"Error for PR {pr_number}\n\n")
 
 # Explore subfolders in the "java" directory
-java_directory = 'java'
+java_directory = '../java'
 subfolders = [name for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
 
 for subfolder in subfolders:
