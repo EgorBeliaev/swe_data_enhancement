@@ -1,0 +1,1702 @@
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+index 0f576e2e..c4d3430e 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+@@ -220,6 +220,8 @@ public async Task Start(CancellationToken ct)
+         }*/
+         var fightEndFlag = false;
+         string lastFighttName = "";
++        //统计切换人打架次数
++        var countFight = 0;
+         // 战斗操作
+         var fightTask = Task.Run(async () =>
+         {
+@@ -239,7 +241,11 @@ public async Task Start(CancellationToken ct)
+                         }
+ 
+                         command.Execute(combatScenes);
+-
++                        //统计战斗人次
++                        if (i==combatCommands.Count - 1 ||  command.Name!=combatCommands[i+1].Name)
++                        {
++                            countFight++;
++                        }
+ 
+                         lastFighttName = command.Name;
+                         if (!fightEndFlag && _taskParam is { FightFinishDetectEnabled: true })
+@@ -331,9 +337,9 @@ public async Task Start(CancellationToken ct)
+             var kazuha = combatScenes.Avatars.FirstOrDefault(a => a.Name == "枫原万叶");
+             if (kazuha != null)
+             {
+-                var time = DateTime.UtcNow - kazuha.LastSkillTime;
+-                //当万叶最后一个出招，并且cd大于3时，此时不再触发万叶拾取
+-                if (!(lastFighttName == "枫原万叶" && time.TotalSeconds > 3))
++                var time = DateTime.UtcNow -  kazuha.LastSkillTime;
++                //当万叶cd大于3时或战斗人次少于2时（通常无怪物情况下），此时不再触发万叶拾取，
++                if (!(countFight < 2 || lastFighttName== "枫原万叶" && time.TotalSeconds>3))
+                 {
+                     Logger.LogInformation("使用枫原万叶长E拾取掉落物");
+                     await Delay(300, ct);
+@@ -353,7 +359,7 @@ public async Task Start(CancellationToken ct)
+                 }
+                 else
+                 {
+-                    Logger.LogInformation("最后一次由万叶出招，不再重复拾取！");
++                    Logger.LogInformation((countFight < 2 ? "首个人出招就结束战斗，应该无怪物":"距最近一次万叶出招，时间过短")+"，跳过此次万叶拾取！");
+                 }
+             }
+         }
+@@ -423,9 +429,9 @@ private async Task<bool> CheckFightFinish(int delayTime = 1500)
+         Simulation.SendInput.SimulateAction(GIActions.OpenPartySetupScreen);
+         await Delay(450, _ct);
+         var ra = CaptureToRectArea();
+-        var b3 = ra.SrcMat.At<Vec3b>(50, 790);
+-
+-        if (AreDifferencesWithinBounds(_finishDetectConfig.BattleEndProgressBarColor, (b3.Item0, b3.Item1, b3.Item2), _finishDetectConfig.BattleEndProgressBarColorTolerance))
++        var b3 = ra.SrcMat.At<Vec3b>(50, 790);//进度条颜色
++        var whiteTile = ra.SrcMat.At<Vec3b>(50, 772);//白块
++        if (IsWhite(whiteTile.Item2, whiteTile.Item1, whiteTile.Item0)&&IsYellow(b3.Item2, b3.Item1, b3.Item0)/* AreDifferencesWithinBounds(_finishDetectConfig.BattleEndProgressBarColor, (b3.Item0, b3.Item1, b3.Item2), _finishDetectConfig.BattleEndProgressBarColorTolerance)*/)
+         {
+             Logger.LogInformation("识别到战斗结束");
+             Simulation.SendInput.SimulateAction(GIActions.Drop);
+@@ -441,7 +447,22 @@ private async Task<bool> CheckFightFinish(int delayTime = 1500)
+ 
+         return false;
+     }
+-
++     bool IsYellow(int r, int g, int b)
++    {
++        //Logger.LogInformation($"IsYellow({r},{g},{b})");
++        // 黄色范围：R高，G高，B低
++        return (r >= 200 && r <= 255) && 
++               (g >= 200 && g <= 255) && 
++               (b >= 0 && b <= 100);
++    }
++     bool IsWhite(int r, int g, int b)
++    {
++        //Logger.LogInformation($"IsWhite({r},{g},{b})");
++        // 白色范围：R高，G高，B低
++        return (r >= 240 && r <= 255) && 
++               (g >= 240 && g <= 255) && 
++               (b >= 240 && b <= 255);
++    }
+     private bool HasFightFlagByYolo(ImageRegion imageRegion)
+     {
+         // if (RuntimeHelper.IsDebug)
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+index 4beff1ef..2cd61fe3 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+@@ -318,14 +318,14 @@ private void UnknownInterfaceCheckingTaskStart()
+                 ImageRegion imageRegion = TaskTriggerDispatcher.Instance().CaptureToRectArea();
+ 
+                 var cookRa = imageRegion.Find(AutoSkipAssets.Instance.CookRo);
+-                if (cookRa.IsExist())
++                if (cookRa.IsExist()&&!pathExecutorSuspend.IsSuspended)
+                 {
+                     Logger.LogInformation("检测到烹饪界面，使用ESC关闭界面");
+                     Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+                 }
+ 
+                 var mainRa2 = imageRegion.Find(AutoSkipAssets.Instance.PageCloseMainRo);
+-                if (mainRa2.IsExist())
++                if (mainRa2.IsExist()&&!pathExecutorSuspend.IsSuspended)
+                 {
+                     Logger.LogInformation("检测到主界面，使用ESC关闭界面");
+                     Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_ESCAPE);
+diff --git a/BetterGenshinImpact/GameTask/LogParse/LogParse.cs b/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
+index 9ec4517b..8feb53e5 100644
+--- a/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
++++ b/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
+@@ -1,20 +1,19 @@
+-﻿using System.Collections.Generic;
+-using System;
+-using System.Data;
++﻿using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
+ using System.Text;
++using System.Text.Json;
+ using System.Text.RegularExpressions;
++using BetterGenshinImpact.Core.Config;
++using Wpf.Ui.Violeta.Controls;
+ using static LogParse.LogParse.ConfigGroupEntity;
+-using System.Reflection;
+-using System.IO;
+-using System.Linq;
+-using System.Threading.Tasks;
+-using Vanara.PInvoke;
+ 
+ namespace LogParse
+ {
+     public class LogParse
+     {
+-
+         public static List<string> SafeReadAllLines(string filePath)
+         {
+             var lines = new List<string>();
+@@ -35,6 +34,7 @@ public static List<string> SafeReadAllLines(string filePath)
+             {
+                 Console.WriteLine($"无法读取文件 {filePath}: {ex.Message}");
+             }
++
+             return lines;
+         }
+ 
+@@ -48,13 +48,13 @@ public static List<ConfigGroupEntity> ParseFile(List<(string, string)> logFiles)
+                 {
+                     logLines.Add((logstr, logFile.Item2));
+                 }
+-
+             }
++
+             return Parse(logLines);
+         }
++
+         public static List<ConfigGroupEntity> Parse(List<(string, string)> logLines)
+         {
+-
+             // var logstrs = log.Item1;
+             List<ConfigGroupEntity> configGroupEntities = new();
+             ConfigGroupEntity configGroupEntity = null;
+@@ -76,26 +76,21 @@ public static List<ConfigGroupEntity> Parse(List<(string, string)> logLines)
+                     configGroupEntity.StartDate = parsePreDataTime(logLines, i - 1, logrq);
+                     configGroupEntities.Add(configGroupEntity);
+                 }
++
+                 if (configGroupEntity != null)
+                 {
+                     //配置组 "战斗" 执行结束
+                     result = parseBgiLine($"配置组 \"{configGroupEntity.Name}\" 执行结束", logstr);
+                     if (result.Item1)
+                     {
+-
+                         configGroupEntity.EndDate = parsePreDataTime(logLines, i - 1, logrq);
+                         configGroupEntity = null;
+                     }
+-
+                 }
+ 
+ 
+-
+-
+-
+                 if (configGroupEntity != null)
+                 {
+-
+                     result = parseBgiLine(@"→ 开始执行路径追踪任务: ""(.+?)""", logstr);
+                     if (result.Item1)
+                     {
+@@ -107,35 +102,44 @@ public static List<ConfigGroupEntity> Parse(List<(string, string)> logLines)
+ 
+                     if (configTask != null)
+                     {
+-
+                         if (logstr.StartsWith("→ 脚本执行结束: \"" + configTask.Name + "\""))
+                         {
+                             configTask.EndDate = parsePreDataTime(logLines, i - 1, logrq);
+                             configTask = null;
+                         }
++
+                         result = parseBgiLine(@"交互或拾取：""(.+?)""", logstr);
+                         if (result.Item1)
+                         {
+                             configTask.addPick(result.Item2[1]);
+                         }
+-
+                     }
+                 }
+ 
+ 
+-
+-
+-                Console.WriteLine(logstr);
+             }
+ 
+-            //if (configGroupEntity != null)
+-            //{
+-            //    configGroupEntities.Add(configGroupEntity);
+-            //}
++            //无论如何给个结束时间
++            if (configGroupEntity != null && configGroupEntity.EndDate == null)
++            {
++                if ( configGroupEntity.ConfigTaskList.Count>0)
++                {
++                    ConfigTask ct = configGroupEntity.ConfigTaskList[^1];
++                    if (ct != null)
++                    {
++                        configGroupEntity.EndDate = ct.EndDate;
++                        if (configGroupEntity.EndDate == null)
++                        {
++                            configGroupEntity.EndDate = ct.StartDate;
++                        }
++                    }
++                }
+ 
++            }
+ 
+             return configGroupEntities;
+         }
++
+         private static (bool, List<string>) parseBgiLine(string pattern, string str)
+         {
+             Match match = Regex.Match(str, pattern);
+@@ -143,63 +147,66 @@ private static (bool, List<string>) parseBgiLine(string pattern, string str)
+             {
+                 return (true, match.Groups.Cast<Group>().Select(g => g.Value).ToList());
+             }
++
+             return (false, []);
+         }
++
+         private static DateTime? parsePreDataTime(List<(string, string)> list, int index, string logrq)
+         {
+-
+             if (index < 0)
+             {
+                 return null;
+             }
++
+             (bool, List<string>) result = parseBgiLine(@"\[(\d{2}:\d{2}:\d{2})\.\d+\]", list[index].Item1);
+             if (result.Item1)
+             {
+-
+                 DateTime dateTime = DateTime.ParseExact(logrq + " " + result.Item2[1], "yyyy-MM-dd HH:mm:ss", null);
+                 return dateTime;
+             }
++
+             return null;
+         }
++
+         public class ConfigGroupEntity
+         {
+-
+             //配置组名字
+             public string Name { get; set; }
++
+             //开始日期
+             public DateTime? StartDate { get; set; }
+ 
+             //结束日期
+             public DateTime? EndDate { get; set; }
++
+             //配置人物列表xxx.json
+             public List<ConfigTask> ConfigTaskList { get; } = new();
+ 
+             public class ConfigTask
+             {
+                 public string Name { get; set; }
++
+                 //开始日期
+                 public DateTime? StartDate { get; set; }
+ 
+                 //结束日期
+                 public DateTime? EndDate { get; set; }
++
+                 //拾取字典
+                 public Dictionary<string, int> Picks { get; } = new();
++
+                 public void addPick(string val)
+                 {
+                     if (!Picks.ContainsKey(val))
+                     {
+                         Picks.Add(val, 0);
+                     }
++
+                     Picks[val] = Picks[val] + 1;
+                 }
+             }
+-
+-
+-
+-
+-
+-
+         }
++
+         public static List<(string FileName, string Date)> GetLogFiles(string folderPath)
+         {
+             // 定义返回的元组列表
+@@ -229,7 +236,8 @@ public void addPick(string val)
+                     string dateString = match.Groups[1].Value;
+ 
+                     // 尝试将日期字符串格式化为 yyyy-MM-dd
+-                    if (DateTime.TryParseExact(dateString, "yyyyMMdd", null, System.Globalization.DateTimeStyles.None, out DateTime parsedDate))
++                    if (DateTime.TryParseExact(dateString, "yyyyMMdd", null, DateTimeStyles.None,
++                            out DateTime parsedDate))
+                     {
+                         result.Add((folderPath + "\\" + fileName, parsedDate.ToString("yyyy-MM-dd")));
+                     }
+@@ -256,10 +264,12 @@ public static string ConvertSecondsToTime(double totalSeconds)
+             {
+                 result += $"{hours}小时";
+             }
++
+             if (minutes > 0 || hours > 0)
+             {
+                 result += $"{minutes}分钟";
+             }
++
+             if (seconds > 0 || (hours == 0 && minutes == 0))
+             {
+                 // 根据小数点后是否为0决定是否保留小数
+@@ -275,18 +285,80 @@ public static string ConvertSecondsToTime(double totalSeconds)
+ 
+             return result;
+         }
+-        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups) {
+-            (string name, Func<ConfigTask, string> value)[] colConfigs = [
+-         (name: "名称", value: task => task.Name)
+-                ,(name: "开始日期", value: task => task.StartDate?.ToString("yyyy-MM-dd HH:mm:ss")??"")
+-                ,(name: "结束日期", value: task => task.EndDate?.ToString("yyyy-MM-dd HH:mm:ss")??"")
+-                ,(name: "耗时", value: task => ConvertSecondsToTime((task.EndDate - task.StartDate)?.TotalSeconds ?? 0))
+-         ];
+-            return GenerHtmlByConfigGroupEntity(configGroups, "日志分析", colConfigs);
++
++        // 根据时间获取对应的“自定义天”，即以凌晨 4 点为分组的开始
++        static DateTime GetCustomDay(string timeStr)
++        {
++            // 解析字符串为 DateTime 对象
++            DateTime time = DateTime.ParseExact(timeStr, "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
++
++            // 获取当天的午夜 00:00 时间
++            DateTime midnight = time.Date;
++
++            // 计算自定义“天”的起始时间（午夜时间 + 4小时）
++            DateTime customDayStart = midnight.AddHours(4);
++
++            // 如果当前时间早于自定义天的起始时间，则属于前一天
++            if (time < customDayStart)
++            {
++                customDayStart = customDayStart.AddDays(-1);
++            }
++
++            return customDayStart;
+         }
+-        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups,string title, (string name, Func<ConfigTask, string> value)[] colConfigs)
++
++        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups, GameInfo gameInfo)
+         {
++            (string name, Func<ConfigTask, string> value)[] colConfigs =
++            [
++                (name: "名称", value: task => task.Name),
++                (name: "开始日期", value: task => task.StartDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? ""),
++                (name: "结束日期", value: task => task.EndDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? ""),
++                (name: "耗时", value: task => ConvertSecondsToTime((task.EndDate - task.StartDate)?.TotalSeconds ?? 0))
++            ];
++            
++            
++            
++            (string name, Func<MoraStatistics, string> value)[] msColConfigs =
++            [
++                (name: "日期", value: ms => ms.Name), (name: "小怪", value: ms => ms.SmallMonsterStatistics.ToString()),
++                (name: "最后小怪日期", value: ms => ms.LastSmallTime),
++                (name: "精英", value: ms => ms.EliteGameStatistics.ToString()),
++                (name: "精英详细", value: ms => ms.EliteDetails), (name: "最后精英日期", value: ms => ms.LastEliteTime),
++                (name: "总计锄地摩拉", value: ms => ms.TotalMoraKillingMonstersMora.ToString())
++            ];
++            //锄地部分新曾字段
++            (string name, Func<MoraStatistics, string> value)[] col2Configs=[..msColConfigs.ToList().Where(item=>item.name!="日期" && item.name!="最后小怪日期" && item.name!="最后精英日期"),
++                (name: "摩拉（每秒）", value: ms => (ms.TotalMoraKillingMonstersMora/(ms.StatisticsEnd-ms.StatisticsStart)?.TotalSeconds ?? 0).ToString("F2")),
++            ];
++                
++                
++                
++            StringBuilder html = new StringBuilder();
++            //从文件解析札记数据
++            List<ActionItem> actionItems = new();
++            if (gameInfo != null)
++            {
++
++                actionItems = TravelsDiaryDetailManager.loadAllActionItems(gameInfo, configGroups);
++            }
+ 
++            return GenerHtmlByConfigGroupEntity(configGroups, "日志分析", colConfigs,col2Configs, actionItems, msColConfigs);
++        }
++        public static string ConcatenateStrings(string a, string b)
++        {
++            if (string.IsNullOrEmpty(b) || b == "0")
++            {
++                return "";
++            }
++            return a + b;
++        }
++        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups, string title,
++            (string name, Func<ConfigTask, string> value)[] colConfigs,
++            (string name, Func<MoraStatistics, string> value)[] col2Configs,
++            List<ActionItem> actionItems,
++            (string name, Func<MoraStatistics, string> value)[] msColConfigs)
++        {
+             StringBuilder html = new StringBuilder();
+ 
+             // HTML头部
+@@ -303,24 +375,88 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+             html.AppendLine("    </style>");
+             html.AppendLine("</head>");
+             html.AppendLine("<body>");
++            int colspan = colConfigs.Length;
++
++            if (actionItems.Count > 0)
++            {
++                
++                colspan = colspan +col2Configs.Length;
++                // 按时间分组，考虑每天凌晨4点为新的一天
++                var groupedByCustomDay = actionItems.GroupBy(item => GetCustomDay(item.Time))
++                    .OrderBy(group => group.Key)
++                    .Reverse().ToList();
+ 
++                html.AppendLine($"<h2>按日锄地摩拉统计</h2>");
++                html.AppendLine("<table>");
++                
++                html.AppendLine("    <tr>");
++                foreach (var item in msColConfigs)
++                {
++                    html.AppendLine($"        <th>{item.name}</th>");
++                }
++
++                html.AppendLine("    </tr>");
++
++
++                foreach (var group in groupedByCustomDay)
++                {
++                    //按天统计
++                    MoraStatistics ms = new MoraStatistics();
++                    ms.Name = group.Key.ToString("D");
++                    ms.ActionItems.AddRange(group.ToList());
++                    html.AppendLine("    <tr>");
++                    foreach (var item in msColConfigs)
++                    {
++                        html.AppendLine($"        <td >{item.value.Invoke(ms)}</td>");
++                    }
+ 
+- 
++                    html.AppendLine("    </tr>");
++                }
++                html.AppendLine("</table>");
++            }
++
++            MoraStatistics allms = new MoraStatistics();
++            allms.ActionItems.AddRange(actionItems);
++         
++            
+             // 遍历每个配置组生成表格
+             foreach (var group in configGroups)
+             {
+                 TimeSpan? timeDiff = group.EndDate - group.StartDate;
+                 double totalSeconds = timeDiff?.TotalSeconds ?? 0;
++                MoraStatistics groupms = allms.GetFilterMoraStatistics(item =>
++                    {
++                        DateTime dt = DateTime.Parse(item.Time);
++                        if (dt>=group.StartDate && dt<=group.EndDate)
++                        {
++                            return true;
++                        }
++                        return false;
++                    }
++                );
++                groupms.StatisticsStart=group.StartDate;
++                groupms.StatisticsEnd=group.EndDate;
++                html.AppendLine(
++                $"<h2>配置组：{group.Name}({group.StartDate?.ToString("yyyy-MM-dd HH:mm:ss")}-{group.EndDate?.ToString("yyyy-MM-dd HH:mm:ss")})，耗时{ConvertSecondsToTime(totalSeconds)}</h2>");
+                 
+-                html.AppendLine($"<h2>配置组：{group.Name}({group.StartDate?.ToString("yyyy-MM-dd HH:mm:ss")}-{group.EndDate?.ToString("yyyy-MM-dd HH:mm:ss")})，耗时{ConvertSecondsToTime(totalSeconds)}</h2>");
+                 html.AppendLine("<table>");
+                 html.AppendLine("    <tr>");
+                 foreach (var item in colConfigs)
+                 {
+                     html.AppendLine($"        <th>{item.name}</th>");
+                 }
+-                html.AppendLine("    </tr>");
+ 
++                if (actionItems.Count > 0)
++                {
++                    foreach (var item in col2Configs)
++                    {
++                        html.AppendLine($"        <th>{item.name}</th>");
++                    }
++                }
++
++                html.AppendLine("    </tr>");
++                
++                
+                 // 合并所有任务的 Picks
+                 Dictionary<string, int> mergedPicks = new Dictionary<string, int>();
+                 foreach (var task in group.ConfigTaskList)
+@@ -331,6 +467,7 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+                         {
+                             mergedPicks[pick.Key] = 0;
+                         }
++
+                         mergedPicks[pick.Key] += pick.Value;
+                     }
+ 
+@@ -343,18 +480,58 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+                     {
+                         html.AppendLine($"        <td>{item.value.Invoke(task)}</td>");
+                     }
++                    if (actionItems.Count > 0)
++                    {
++                        MoraStatistics configTaskMs = groupms.GetFilterMoraStatistics(item =>
++                            {
++                                DateTime dt = DateTime.Parse(item.Time);
++                                if (dt>=task.StartDate && dt<=task.EndDate)
++                                {
++                                    return true;
++                                }
++                                return false;
++                            }
++                        );
++                        configTaskMs.StatisticsStart=task.StartDate;
++                        configTaskMs.StatisticsEnd=task.EndDate;
++                        foreach (var item in col2Configs)
++                        {
++
++                            html.AppendLine($"        <td>{item.value.Invoke(configTaskMs)}</td>");
++                        }
++                    }
+                     html.AppendLine("    </tr>");
+                 }
+ 
+                 // 按 Value 倒序排列 Picks
+                 var sortedPicks = mergedPicks.OrderByDescending(p => p.Value)
+-                                             .Select(p => $"{p.Key} ({p.Value})");
++                    .Select(p => $"{p.Key} ({p.Value})");
+ 
+                 // Picks 行
+                 html.AppendLine("    <tr>");
+-                html.AppendLine($"        <td colspan=\"4\">拾取物: {string.Join(", ", sortedPicks)}</td>");
++
++                html.AppendLine(
++                    $"        <td colspan=\"{colspan}\">拾取物: {string.Join(", ", sortedPicks)}</td>");
+                 html.AppendLine("    </tr>");
+ 
++                if (actionItems.Count > 0)
++                {
++                    //锄地总计
++                    html.AppendLine("    <tr>");
++
++                    html.AppendLine(
++                        $"        <td colspan=\"{colspan}\">锄地总计:{ ConcatenateStrings("小怪：", groupms.SmallMonsterStatistics.ToString()) +
++                                                                   /*ConcatenateStrings(",最后一只小怪挂于", groupms.LastSmallTime) +*/
++                                                                   ConcatenateStrings(",精英怪数量：", groupms.EliteGameStatistics.ToString()) +
++                                                                   ConcatenateStrings(",精英详细:", groupms.EliteDetails) +
++                                                                   /*ConcatenateStrings(",最后一只精英挂于", groupms.LastEliteTime) +*/
++                                                                   ConcatenateStrings(",合计锄地摩拉：", groupms.TotalMoraKillingMonstersMora.ToString())+
++                                                                   ConcatenateStrings("，每秒摩拉", (groupms.TotalMoraKillingMonstersMora/(groupms.StatisticsEnd-groupms.StatisticsStart)?.TotalSeconds ?? 0).ToString("F2"))}");
++                    html.AppendLine("    </tr>");
++
++                }
++                
++                
+                 html.AppendLine("</table>");
+             }
+ 
+@@ -364,5 +541,48 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+ 
+             return html.ToString();
+         }
++
++        private static string configPath = Global.Absolute(@"log\logparse\config.json");
++
++        public static void WriteConfigFile(LogParseConfig config)
++        {
++            var options = new JsonSerializerOptions
++            {
++                WriteIndented = true // 启用格式化（缩进）
++            };
++            var content = JsonSerializer.Serialize(config, options);
++            string directoryPath = Path.GetDirectoryName(configPath);
++
++            if (!Directory.Exists(directoryPath))
++            {
++                // 如果文件夹不存在，创建文件夹
++                Directory.CreateDirectory(directoryPath);
++            }
++
++            File.WriteAllText(configPath, content);
++        }
++
++        public static LogParseConfig LoadConfig()
++        {
++            LogParseConfig config = null;
++            if (File.Exists(configPath))
++            {
++                try
++                {
++                    config = JsonSerializer.Deserialize<LogParseConfig>(File.ReadAllText(configPath));
++                }
++                catch (Exception e)
++                {
++                    Toast.Warning("读取日志分析配置文件失败！");
++                    config = new LogParseConfig();
++                }
++            }
++            else
++            {
++                config = new LogParseConfig();
++            }
++
++            return config;
++        }
+     }
+-}
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs b/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs
+new file mode 100644
+index 00000000..7588ab5d
+--- /dev/null
++++ b/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs
+@@ -0,0 +1,18 @@
++﻿using System.Collections.Generic;
++using CommunityToolkit.Mvvm.ComponentModel;
++
++namespace LogParse;
++
++public partial class LogParseConfig : ObservableObject
++{
++    [ObservableProperty] string _cookie = "";
++    [ObservableProperty] private Dictionary<string, GameInfo> _cookieDictionary = new();
++    [ObservableProperty] private Dictionary<string, ScriptGroupLogParseConfig> _scriptGroupLogDictionary = new();
++
++    public partial class ScriptGroupLogParseConfig() : ObservableObject
++    {
++        [ObservableProperty] private string _rangeValue = "CurrentConfig";
++        [ObservableProperty] private string _dayRangeValue = "7";
++        [ObservableProperty] private bool _hoeingStatsSwitch = false;
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs b/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs
+new file mode 100644
+index 00000000..50ca2b3e
+--- /dev/null
++++ b/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs
+@@ -0,0 +1,66 @@
++﻿using System;
++using System.Collections.Generic;
++using System.Linq;
++
++namespace LogParse
++{
++    public class MoraStatistics
++    {
++        public string Name;
++        public DateTime Date;
++        public DateTime? StatisticsStart;
++        public DateTime? StatisticsEnd;
++        public List<ActionItem> ActionItems { get; set; } = new List<ActionItem>();
++        public MoraStatistics GetFilterMoraStatistics(Func<ActionItem, bool> predicate)
++        {
++            MoraStatistics moraStatistics = new MoraStatistics();
++            moraStatistics.ActionItems.AddRange(ActionItems.Where(predicate));
++            return moraStatistics;
++        }
++
++        public List<ActionItem> MonsterActionItems => this.ActionItems.Where(item => item.ActionId == 37).ToList();
++
++        public List<ActionItem> EliteMonsterActionItems =>
++            this.MonsterActionItems.Where(item => (item.Num >= 200)).ToList();
++
++        public List<ActionItem> SmallMonsterActionItems =>
++            this.MonsterActionItems.Except(EliteMonsterActionItems).ToList();
++
++        public string LastEliteTime => EliteMonsterActionItems.MaxBy(item => item?.Time)?.Time ?? null;
++        public string LastSmallTime => SmallMonsterActionItems.MaxBy(item => item?.Time)?.Time ?? null;
++
++        public string EliteDetails => string.Join(", ", EliteMonsterActionItems
++            .GroupBy(item => item.Num).OrderBy(item => item.Key) // 按 Num 属性分组
++            .Select(group => $"{group.Key}*{group.Count()}"));
++
++        public int EliteStatistics => EliteMonsterActionItems?.Count ?? 0;
++
++        //游戏里的上限计算
++        public int EliteGameStatistics => EliteMonsterActionItems.Sum(item =>
++        {
++            if (item?.Num >= 3000)
++            {
++                return 3;
++            }
++            else if (item.Num >= 1200)
++            {
++                return 2;
++            }
++            else
++            {
++                return 1;
++            }
++        });
++
++        public int EliteMora => EliteMonsterActionItems?.Sum(item => item.Num) ?? 0;
++        public int SmallMonsterStatistics => SmallMonsterActionItems?.Count ?? 0;
++        public int SmallMonsterMora => SmallMonsterActionItems?.Sum(item => item.Num) ?? 0;
++        public int TotalMoraKillingMonstersMora => this.MonsterActionItems.Sum((item) => item.Num);
++        public int OtherMora => this.ActionItems.Except(MonsterActionItems).Sum((item) => item.Num);
++        public int AllMora => this.ActionItems.Sum((item) => item.Num);
++
++        public MoraStatistics()
++        {
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/NoLoginException.cs b/BetterGenshinImpact/GameTask/LogParse/NoLoginException.cs
+new file mode 100644
+index 00000000..ff8fa934
+--- /dev/null
++++ b/BetterGenshinImpact/GameTask/LogParse/NoLoginException.cs
+@@ -0,0 +1,7 @@
++﻿using System;
++
++namespace LogParse;
++
++public class NoLoginException : Exception
++{
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/TravelsDiaryDetailManager.cs b/BetterGenshinImpact/GameTask/LogParse/TravelsDiaryDetailManager.cs
+new file mode 100644
+index 00000000..a8db8801
+--- /dev/null
++++ b/BetterGenshinImpact/GameTask/LogParse/TravelsDiaryDetailManager.cs
+@@ -0,0 +1,221 @@
++﻿using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Text.Json;
++using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
++using Wpf.Ui.Violeta.Controls;
++
++namespace LogParse;
++
++public class TravelsDiaryDetailManager
++{
++    public static List<(int year, int month)> GetInvolvedMonths(List<LogParse.ConfigGroupEntity> configGroups)
++    {
++        // HashSet 用于存储不重复的年份和月份
++        HashSet<(int year, int month)> involvedMonths = new HashSet<(int year, int month)>();
++
++        foreach (var group in configGroups)
++        {
++            // 如果 StartDate 有值，添加对应的年份和月份
++            if (group.StartDate.HasValue)
++            {
++                involvedMonths.Add((group.StartDate.Value.Year, group.StartDate.Value.Month));
++            }
++
++            // 如果 EndDate 有值，添加对应的年份和月份
++            if (group.EndDate.HasValue)
++            {
++                involvedMonths.Add((group.EndDate.Value.Year, group.EndDate.Value.Month));
++            }
++        }
++
++        // 返回按年份和月份排序的列表
++        return involvedMonths.OrderBy(m => m.year).ThenBy(m => m.month).ToList();
++    }
++
++    public static string basePath = Global.Absolute(@"log\logparse");
++
++    public static List<ActionItem> loadAllActionItems(GameInfo gameInfo, List<LogParse.ConfigGroupEntity> configGroups)
++    {
++        List<(int year, int month)> ms = GetInvolvedMonths(configGroups);
++        string tddPath = Global.Absolute(@$"{basePath}\{gameInfo.GameUid}\travelsdiarydetail");
++        List<ActionItem> actionItems = new List<ActionItem>();
++        foreach (var m in ms)
++        {
++            string tddfile = Global.Absolute($@"{tddPath}\{m.year}_{m.month}.json");
++            if (File.Exists(tddfile))
++            {
++                var _temp = JsonSerializer.Deserialize<ApiResponse<ActionItem>>(File.ReadAllText(tddfile));
++                if (_temp != null)
++                {
++                    //只统计杀怪的
++                    actionItems.AddRange(_temp.Data.List.Where(item => item.ActionId == 37));
++                }
++            }
++        }
++
++        return actionItems.OrderBy(m => DateTime.Parse(m.Time)).ToList();
++    }
++
++    /*
++     * 增量更新，米游社札记摩拉记录
++     */
++    public static async Task<GameInfo> UpdateTravelsDiaryDetailManager(string cookie)
++    {
++        List<(int year, int month)> months = GetCurrentAndPreviousTwoMonths();
++        months.Reverse();
++
++        YsClient ys = new YsClient();
++        var apiResponse = await ys.GetGenshinGameRolesAsync(cookie);
++        GameInfo gameInfo = apiResponse.Data.List[0];
++        string tddPath = Global.Absolute(@$"{basePath}\{gameInfo.GameUid}\travelsdiarydetail");
++
++        try
++        {
++            for (int i = 0; i < months.Count; i++)
++            {
++                var month = months[i];
++                string tddfile = Global.Absolute($@"{tddPath}\{month.year}_{month.month}.json");
++                var fileExists = File.Exists(tddfile);
++
++                //文件存在，进行增量更新
++                if (i > 0 && fileExists)
++                {
++                    bool canUpdate = true;
++                    //上个月的如果这个月更新过，就不再更新了
++                    if (i == 1 && IsFileModifiedThisMonth(tddfile))
++                    {
++                        canUpdate = false;
++                    }
++
++                    if (canUpdate)
++                    {
++                        // 读取文件内容
++                        string jsonString2 = File.ReadAllText(tddfile);
++                        //文件内容
++                        var _temp = JsonSerializer.Deserialize<ApiResponse<ActionItem>>(jsonString2);
++                        //增量
++                        var _temp2 = await ys.GetTravelsDiaryDetailAsync(gameInfo, cookie, month.month, 2, 100, default,
++                            _temp.Data.List[0]);
++                        var addList = _temp2.Data.List;
++                        _temp2.Data.List.AddRange(_temp.Data.List);
++                        writeFile(tddfile, _temp2);
++                    }
++                }
++
++                //文件不存在，全量更新
++                if (!fileExists)
++                {
++                    var _temp2 = await ys.GetTravelsDiaryDetailAsync(gameInfo, cookie, month.month, 2, 100);
++                    writeFile(tddfile, _temp2);
++                    Toast.Information($"{month.year}_{month.month}数据获取成功！");
++                }
++                /*else
++                {
++                    var _temp = JsonSerializer.Deserialize<ApiResponse<ActionItem>>(File.ReadAllText(tddfile));
++
++                }*/
++            }
++        }
++        catch (NoLoginException e)
++        {
++            Toast.Warning("token未登录，请重新登录获取，此次将不新最新数据！");
++        }
++
++        return gameInfo;
++    }
++
++    static void writeFile(string path, ApiResponse<ActionItem> apiResponse)
++    {
++        var options = new JsonSerializerOptions
++        {
++            WriteIndented = true // 启用格式化（缩进）
++        };
++        string jsonString = JsonSerializer.Serialize(apiResponse, options);
++        string directory = Path.GetDirectoryName(path);
++
++        // 如果目录不存在，则创建它
++        if (!Directory.Exists(directory))
++        {
++            Directory.CreateDirectory(directory);
++        }
++
++        // 将格式化后的 JSON 写入文件
++        File.WriteAllText(path, jsonString);
++    }
++
++    static bool IsFileModifiedThisMonth(string filePath)
++    {
++        if (!File.Exists(filePath))
++        {
++            throw new FileNotFoundException("文件未找到", filePath);
++        }
++
++        DateTime lastModified = File.GetLastWriteTime(filePath);
++
++        // 获取当前月份的开始和结束日期
++        DateTime startOfMonth = new DateTime(DateTime.Now.Year, DateTime.Now.Month, 1);
++        DateTime endOfMonth = startOfMonth.AddMonths(1).AddDays(-1);
++
++        // 判断文件最后修改时间是否在本月
++        return lastModified >= startOfMonth && lastModified <= endOfMonth;
++    }
++
++    static List<(int year, int month)> GetCurrentAndPreviousTwoMonths()
++    {
++        List<(int year, int month)> months = new List<(int year, int month)>();
++        DateTime now = DateTime.Now;
++
++        for (int i = 0; i < 3; i++)
++        {
++            int year = now.Year;
++            int month = now.Month - i;
++
++            // 如果月份小于 1，则向前推一年并调整月份
++            if (month < 1)
++            {
++                month += 12;
++                year -= 1;
++            }
++
++            months.Add((year, month));
++        }
++
++        return months;
++    }
++
++    public static string generHtmlMessage()
++    {
++        string htmlContent = @"
++                        <!DOCTYPE html>
++                        <html lang='zh'>
++                        <head>
++                            <meta charset='UTF-8'>
++                            <meta name='viewport' content='width=device-width, initial-scale=1.0'>
++                            <title>锄地统计说明</title>
++                            <style>
++                                body { font-family: Arial, sans-serif; margin: 20px; }
++                                .content { padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); }
++                                h1 { font-size: 24px; color: #333; }
++                                p { font-size: 16px; color: #555; line-height: 1.6; }
++                                a { color: #007bff; text-decoration: none; }
++                                a:hover { text-decoration: underline; }
++                                .cookie-input { margin-top: 15px; padding: 8px; width: 100%; max-width: 300px; border: 1px solid #ccc; border-radius: 4px; }
++                            </style>
++                        </head>
++                        <body>
++                            <div class='content'>
++                                <h1>锄地统计说明</h1>
++                                <p>锄地统计基于米游社旅行札记（不实时，有误差但不大），需要获取米游社cookie，参照下面地址获取：</p>
++                                <p><a href='https://www.bilibili.com/video/BV1Cr4y1e7wJ' target='_blank'>点此查看如何获取米游社Cookie</a></p>
++                                <p>PC端获取一样，登录后，按F12，输入上面页面中的代码(javascript:(function(){prompt('', document.cookie)})();)，能更快的拿到。</p>
++                                <p>按步骤获取cookie，填入前面文本框。一次可管好多天，如果提示未登录，再次获取即可。</p>
++                                <p>首次获取是全量获取最近3个月的数据，会比较慢，后续增量更新会快。</p>
++                            </div>
++                        </body>
++                        </html>";
++        return htmlContent;
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/YsHttp.cs b/BetterGenshinImpact/GameTask/LogParse/YsHttp.cs
+new file mode 100644
+index 00000000..9f3b52b7
+--- /dev/null
++++ b/BetterGenshinImpact/GameTask/LogParse/YsHttp.cs
+@@ -0,0 +1,272 @@
++﻿using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Net;
++using System.Net.Http;
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.Json;
++using System.Text.Json.Serialization;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace LogParse
++{
++    public class ApiResponse<T>
++    {
++        [JsonPropertyName("retcode")] public int Retcode { get; set; }
++
++        [JsonPropertyName("message")] public string Message { get; set; }
++        public Data<T> Data { get; set; }
++    }
++
++    public class Data<T>
++    {
++        [JsonPropertyName("uid")] public long Uid { get; set; }
++
++        [JsonPropertyName("region")] public string Region { get; set; }
++
++        [JsonPropertyName("account_id")] public long AccountId { get; set; }
++
++        [JsonPropertyName("nickname")] public string Nickname { get; set; }
++
++        [JsonPropertyName("date")] public string Date { get; set; }
++
++        [JsonPropertyName("month")] public int Month { get; set; }
++
++        [JsonPropertyName("optional_month")] public List<int> OptionalMonth { get; set; }
++
++        [JsonPropertyName("data_month")] public int DataMonth { get; set; }
++
++        [JsonPropertyName("page")] public int Page { get; set; }
++        public List<T> List { get; set; }
++    }
++
++    public class ActionItem
++    {
++        [JsonPropertyName("action_id")] public int ActionId { get; set; }
++
++        [JsonPropertyName("action")] public string Action { get; set; }
++
++        [JsonPropertyName("time")] public string Time { get; set; }
++
++        [JsonPropertyName("num")] public int Num { get; set; }
++    }
++
++    public class GameInfo
++    {
++        [JsonPropertyName("game_biz")] public string GameBiz { get; set; }
++
++        [JsonPropertyName("region")] public string Region { get; set; }
++
++        [JsonPropertyName("game_uid")] public string GameUid { get; set; }
++
++        [JsonPropertyName("nickname")] public string Nickname { get; set; }
++
++        [JsonPropertyName("level")] public int Level { get; set; }
++
++        [JsonPropertyName("is_chosen")] public bool IsChosen { get; set; }
++
++        [JsonPropertyName("region_name")] public string RegionName { get; set; }
++
++        [JsonPropertyName("is_official")] public bool IsOfficial { get; set; }
++    }
++
++    public class YsClient
++    {
++        protected const string Accept = "Accept";
++        protected const string Cookie = "Cookie";
++        protected const string UserAgent = "User-Agent";
++        protected const string X_Request_With = "X-Requested-With";
++        protected const string DS = "DS";
++        protected const string Referer = "Referer";
++        protected const string Application_Json = "application/json";
++        protected const string com_mihoyo_hyperion = "com.mihoyo.hyperion";
++        protected const string com_mihoyo_hoyolab = "com.mihoyo.hoyolab";
++        protected const string x_rpc_app_version = "x-rpc-app_version";
++        protected const string x_rpc_device_id = "x-rpc-device_id";
++        protected const string x_rpc_device_fp = "x-rpc-device_fp";
++        protected const string x_rpc_client_type = "x-rpc-client_type";
++        protected const string x_rpc_language = "X-Rpc-Language";
++
++        public string UAContent =>
++            $"Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/118.0.0.0 Mobile Safari/537.36 miHoYoBBS/{AppVersion}";
++
++        public string AppVersion => "2.71.1";
++
++        protected string ApiSalt => "t0qEgfub6cvueAPgR5m9aQWWVciEer7v";
++
++        protected string ApiSalt2 => "xV8v4Qu54lUKrEYFZkJhB8cuOh9Asafs";
++
++        protected string CreateSecret2(string url)
++        {
++            int t = (int)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
++            string r = Random.Shared.Next(100000, 200000).ToString();
++            string b = "";
++            string q = "";
++            string[] urls = url.Split('?');
++            if (urls.Length == 2)
++            {
++                string[] queryParams = urls[1].Split('&').OrderBy(x => x).ToArray();
++                q = string.Join("&", queryParams);
++            }
++
++            var bytes = MD5.HashData(Encoding.UTF8.GetBytes($"salt={ApiSalt2}&t={t}&r={r}&b={b}&q={q}"));
++            var check = Convert.ToHexString(bytes).ToLower();
++            string result = $"{t},{r},{check}";
++            return result;
++        }
++
++        protected readonly HttpClient _httpClient = new HttpClient();
++
++        protected virtual async Task<ApiResponse<T>> CommonSendAsync<T>(HttpRequestMessage request,
++            CancellationToken cancellationToken = default)
++        {
++            request.Version = HttpVersion.Version20;
++            request.Headers.Add(Accept, Application_Json);
++            request.Headers.Add(UserAgent, UAContent);
++            var response = await _httpClient.SendAsync(request, cancellationToken);
++            response.EnsureSuccessStatusCode();
++
++            var content = await response.Content.ReadAsStringAsync(cancellationToken);
++            var apiResponse = JsonSerializer.Deserialize<ApiResponse<T>>(content, new JsonSerializerOptions
++            {
++                PropertyNameCaseInsensitive = true
++            });
++            if (apiResponse.Message == "未登录")
++            {
++                throw new NoLoginException();
++            }
++
++            return apiResponse;
++        }
++
++        /// <summary>
++        /// 获取原神账号信息
++        /// </summary>
++        /// <param name="cookie"></param>
++        /// <param name="cancellationToken"></param>
++        /// <returns></returns>
++        public async Task<ApiResponse<GameInfo>> GetGenshinGameRolesAsync(string cookie,
++            CancellationToken cancellationToken = default)
++        {
++            if (string.IsNullOrWhiteSpace(cookie))
++            {
++                throw new ArgumentNullException(nameof(cookie));
++            }
++
++            var url = "https://api-takumi.mihoyo.com/binding/api/getUserGameRolesByCookie?game_biz=hk4e_cn";
++            var request = new HttpRequestMessage(HttpMethod.Get, url);
++            request.Headers.Add(Cookie, cookie);
++            request.Headers.Add(DS, CreateSecret2(url));
++            request.Headers.Add(X_Request_With, com_mihoyo_hyperion);
++            request.Headers.Add(x_rpc_app_version, AppVersion);
++            request.Headers.Add(x_rpc_client_type, "5");
++            request.Headers.Add(Referer, "https://webstatic.mihoyo.com/");
++            var data = await CommonSendAsync<GameInfo>(request, cancellationToken);
++            //data.List?.ForEach(x => x.Cookie = cookie);
++            return data;
++        }
++
++        /// <summary>
++        /// 旅行札记总览
++        /// </summary>
++        /// <param name="role"></param>
++        /// <param name="month">0 当前月</param>
++        /// <param name="cancellationToken"></param>
++        /// <returns></returns>
++        public async Task<ApiResponse<ActionItem>> GetTravelsDiarySummaryAsync(GameInfo role, string cookie,
++            int month = 0, CancellationToken cancellationToken = default)
++        {
++            var url =
++                $"https://hk4e-api.mihoyo.com/event/ys_ledger/monthInfo?month={month}&bind_uid={role.GameUid}&bind_region={role.Region}&bbs_presentation_style=fullscreen&bbs_auth_required=true&utm_source=bbs&utm_medium=mys&utm_campaign=icon";
++            var request = new HttpRequestMessage(HttpMethod.Get, url);
++            request.Headers.Add(Cookie, cookie);
++            request.Headers.Add(Referer, "https://webstatic.mihoyo.com/");
++            request.Headers.Add(X_Request_With, com_mihoyo_hyperion);
++            return await CommonSendAsync<ActionItem>(request, cancellationToken);
++        }
++
++        /// <summary>
++        /// 旅行札记收入详情
++        /// </summary>
++        /// <param name="role"></param>
++        /// <param name="month"></param>
++        /// <param name="type">1原石，2摩拉</param>
++        /// <param name="page">从1开始</param>
++        /// <param name="limit">最大100</param>
++        /// <param name="cancellationToken"></param>
++        /// <returns>返回一页收入记录</returns>
++        public async Task<ApiResponse<ActionItem>> GetTravelsDiaryDetailByPageAsync(GameInfo role, string cookie,
++            int month, int type, int page, int limit = 100, CancellationToken cancellationToken = default)
++        {
++            var url =
++                $"https://hk4e-api.mihoyo.com/event/ys_ledger/monthDetail?page={page}&month={month}&limit={limit}&type={type}&bind_uid={role.GameUid}&bind_region={role.Region}&bbs_presentation_style=fullscreen&bbs_auth_required=true&utm_source=bbs&utm_medium=mys&utm_campaign=icon";
++            var request = new HttpRequestMessage(HttpMethod.Get, url);
++            request.Headers.Add(Cookie, cookie);
++            request.Headers.Add(Referer, "https://webstatic.mihoyo.com/");
++            request.Headers.Add(X_Request_With, com_mihoyo_hyperion);
++            var data = await CommonSendAsync<ActionItem>(request, cancellationToken);
++            //foreach (var item in data.List)
++            //{
++            //    item.Type = type;
++            //}
++            return data;
++        }
++
++
++        /// <summary>
++        /// 旅行札记收入详情
++        /// </summary>
++        /// <param name="role"></param>
++        /// <param name="month"></param>
++        /// <param name="type">1原石，2摩拉</param>
++        /// <param name="limit">最大100</param>
++        /// <param name="cancellationToken"></param>
++        /// <returns>返回该月所有收入记录</returns>
++        public async Task<ApiResponse<ActionItem>> GetTravelsDiaryDetailAsync(GameInfo role, string cookie, int month,
++            int type, int limit = 100, CancellationToken cancellationToken = default, ActionItem lastActionItem = null)
++        {
++            var data = await GetTravelsDiaryDetailByPageAsync(role, cookie, month, type, 1, limit, cancellationToken);
++            if (lastActionItem != null)
++            {
++                if (DateTime.Parse(data.Data.List.FindLast(item => true).Time) <= DateTime.Parse(lastActionItem.Time))
++                {
++                    data.Data.List = data.Data.List
++                        .Where(item => DateTime.Parse(item.Time) > DateTime.Parse(lastActionItem.Time)).ToList();
++                    return data;
++                }
++            }
++
++            if (data.Data.List.Count < limit)
++            {
++                return data;
++            }
++
++            for (int i = 2;; i++)
++            {
++                var addData =
++                    await GetTravelsDiaryDetailByPageAsync(role, cookie, month, type, i, limit, cancellationToken);
++
++                data.Data.List.AddRange(addData.Data.List);
++                if (lastActionItem != null)
++                {
++                    if (DateTime.Parse(data.Data.List.FindLast(item => true).Time) <=
++                        DateTime.Parse(lastActionItem.Time))
++                    {
++                        data.Data.List = data.Data.List
++                            .Where(item => DateTime.Parse(item.Time) > DateTime.Parse(lastActionItem.Time)).ToList();
++                        return data;
++                    }
++                }
++
++                if (addData.Data.List.Count < limit)
++                {
++                    break;
++                }
++            }
++
++            return data;
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+index 8dd23635..21912df1 100644
+--- a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
++++ b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+@@ -67,6 +67,9 @@
+                             <MenuItem Command="{Binding RenameScriptGroupCommand}"
+                                       CommandParameter="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType=ContextMenu}, Path=PlacementTarget.SelectedItem}"
+                                       Header="重命名" />
++                            <MenuItem Command="{Binding CopyScriptGroupCommand}"
++                                      CommandParameter="{Binding RelativeSource={RelativeSource Mode=FindAncestor, AncestorType=ContextMenu}, Path=PlacementTarget.SelectedItem}"
++                                      Header="复制组" />
+                         </ContextMenu>
+                     </ui:ListView.ContextMenu>
+                 </ui:ListView>
+@@ -212,7 +215,8 @@
+                             <ContextMenu>
+                                 <MenuItem Header="清空" Command="{Binding ClearTasksCommand}" />
+                                 <MenuItem Header="日志分析" Command="{Binding OpenLogParseCommand}" />
+-                                <!--<MenuItem Header="根据文件夹更新" Command="{Binding UpdateTasksCommand}" />-->
++                                <MenuItem Header="打开脚本仓库" Command="{Binding OpenLocalScriptRepoCommand}" />
++                                <MenuItem Header="根据文件夹更新" Command="{Binding UpdateTasksCommand}" />
+                             </ContextMenu>
+                         </ui:DropDownButton.Flyout>
+                     </ui:DropDownButton>
+diff --git a/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml b/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
+index f2b94f33..8f419032 100644
+--- a/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
++++ b/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
+@@ -569,7 +569,7 @@
+                                             MinWidth="120"
+                                             Text="{Binding Config.AutoFightConfig.FinishDetectConfig.CheckEndDelay}" />
+                             </Grid>
+-                            <Grid Margin="16">
++                            <!--<Grid Margin="16">
+                                 <Grid.RowDefinitions>
+                                     <RowDefinition Height="Auto" />
+                                     <RowDefinition Height="Auto" />
+@@ -618,7 +618,7 @@
+                                             Grid.Column="1"
+                                             MinWidth="120"
+                                             Text="{Binding Config.AutoFightConfig.FinishDetectConfig.BattleEndProgressBarColorTolerance}" />
+-                            </Grid>
++                            </Grid>-->
+ 
+                         </StackPanel>
+                     </ui:CardExpander>
+diff --git a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+index f4f704a0..c1bf7ab8 100644
+--- a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
++++ b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+@@ -1,17 +1,4 @@
+-﻿using BetterGenshinImpact.Core.Config;
+-using BetterGenshinImpact.Core.Script.Group;
+-using BetterGenshinImpact.Core.Script.Project;
+-using BetterGenshinImpact.GameTask.AutoPathing.Model;
+-using BetterGenshinImpact.Helpers.Ui;
+-using BetterGenshinImpact.Model;
+-using BetterGenshinImpact.Service.Interface;
+-using BetterGenshinImpact.View.Pages.View;
+-using BetterGenshinImpact.View.Windows;
+-using BetterGenshinImpact.View.Windows.Editable;
+-using CommunityToolkit.Mvvm.ComponentModel;
+-using CommunityToolkit.Mvvm.Input;
+-using Microsoft.Extensions.Logging;
+-using System;
++﻿using System;
+ using System.Collections.Generic;
+ using System.Collections.ObjectModel;
+ using System.Collections.Specialized;
+@@ -20,20 +7,36 @@
+ using System.Dynamic;
+ using System.IO;
+ using System.Linq;
++using System.Text.Json;
+ using System.Threading.Tasks;
+ using System.Windows;
+ using System.Windows.Controls;
++using BetterGenshinImpact.Core.Config;
++using BetterGenshinImpact.Core.Script;
++using BetterGenshinImpact.Core.Script.Group;
++using BetterGenshinImpact.Core.Script.Project;
+ using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.AutoPathing.Model;
++using BetterGenshinImpact.Helpers.Ui;
++using BetterGenshinImpact.Model;
++using BetterGenshinImpact.Service.Interface;
++using BetterGenshinImpact.View.Controls.Webview;
++using BetterGenshinImpact.View.Pages.View;
++using BetterGenshinImpact.View.Windows;
++using BetterGenshinImpact.View.Windows.Editable;
++using BetterGenshinImpact.ViewModel.Pages.View;
++using CommunityToolkit.Mvvm.ComponentModel;
++using CommunityToolkit.Mvvm.Input;
++using LogParse;
++using Microsoft.Extensions.Logging;
+ using Wpf.Ui;
+ using Wpf.Ui.Controls;
+ using Wpf.Ui.Violeta.Controls;
+ using StackPanel = Wpf.Ui.Controls.StackPanel;
+-using System.Windows.Navigation;
+-using BetterGenshinImpact.View.Controls.Webview;
+-using Newtonsoft.Json.Linq;
+-using static Vanara.PInvoke.User32;
+ using TextBox = Wpf.Ui.Controls.TextBox;
+-using BetterGenshinImpact.ViewModel.Pages.View;
++using Button = Wpf.Ui.Controls.Button;
++using MessageBoxResult = Wpf.Ui.Controls.MessageBoxResult;
++using TextBlock = Wpf.Ui.Controls.TextBlock;
+ 
+ namespace BetterGenshinImpact.ViewModel.Pages;
+ 
+@@ -109,6 +112,18 @@ private void ClearTasks()
+ 	[RelayCommand]
+     private async Task OpenLogParse()
+     {
++        
++        GameInfo gameInfo = null;
++        var config = LogParse.LogParse.LoadConfig();
++        if (!string.IsNullOrEmpty(config.Cookie))
++        {
++            config.CookieDictionary.TryGetValue(config.Cookie, out gameInfo);
++        }
++        LogParseConfig.ScriptGroupLogParseConfig sgpc;
++        if (!config.ScriptGroupLogDictionary.TryGetValue(_selectedScriptGroup.Name,out sgpc))
++        {
++            sgpc=new LogParseConfig.ScriptGroupLogParseConfig();
++        }
+ 
+ 
+         // 创建 StackPanel
+@@ -148,6 +163,10 @@ private async Task OpenLogParse()
+             {
+                 new { Text = "3天", Value = "3" },
+                 new { Text = "7天", Value = "7" },
++                new { Text = "15天", Value = "15" },
++                new { Text = "31天", Value = "31" },
++                new { Text = "61天", Value = "61" },
++                new { Text = "92天", Value = "92" },
+                 new { Text = "所有", Value = "All" }
+             };
+         dayRangeComboBox.ItemsSource = dayRangeComboBoxItems;
+@@ -157,6 +176,44 @@ private async Task OpenLogParse()
+         stackPanel.Children.Add(dayRangeComboBox);
+ 
+ 
++        // 开关控件：ToggleButton 或 CheckBox
++        CheckBox hoeingStatsSwitch = new CheckBox
++        {
++            Content = "统计锄地摩拉怪物数",
++            VerticalAlignment = VerticalAlignment.Center
++        };
++        //firstRow.Children.Add(toggleSwitch);
++
++        // 将第一行添加到 StackPanel
++        stackPanel.Children.Add(hoeingStatsSwitch);
++        
++        // 第二行：文本框和“？”按钮
++        StackPanel secondRow = new StackPanel
++        {
++            Orientation = Orientation.Horizontal,
++            Margin = new Thickness(0, 0, 0, 10)
++        };
++
++        // 文本框
++        TextBox cookieTextBox = new TextBox
++        {
++            Width = 200,
++            Margin = new Thickness(0, 0, 10, 0)
++        };
++        secondRow.Children.Add(cookieTextBox);
++
++        // “？”按钮
++        Button questionButton = new Button
++        {
++            Content = "?",
++            Width = 30,
++            Height = 30
++        };
++
++        secondRow.Children.Add(questionButton);
++
++        // 将第二行添加到 StackPanel
++        stackPanel.Children.Add(secondRow);
+ 
+         //PrimaryButtonText
+         var uiMessageBox = new Wpf.Ui.Controls.MessageBox
+@@ -167,10 +224,48 @@ private async Task OpenLogParse()
+             PrimaryButtonText = "确定",
+             Owner = Application.Current.MainWindow,
+         };
+-        Wpf.Ui.Controls.MessageBoxResult result = await uiMessageBox.ShowDialogAsync();
++        questionButton.Click += (sender, args) =>
++        {
++
++            WebpageWindow cookieWin = new()
++            {
++                Title = "日志分析",
++                Width = 800,
++                Height = 600,
++                Owner = uiMessageBox,
++                WindowStartupLocation = WindowStartupLocation.CenterOwner
++            };
++            cookieWin.NavigateToHtml(TravelsDiaryDetailManager.generHtmlMessage());
++            cookieWin.Show();
++
++        };
+         
++        //对象赋值
++        rangeComboBox.SelectedValue = sgpc.RangeValue;
++        dayRangeComboBox.SelectedValue = sgpc.DayRangeValue;
++        cookieTextBox.Text = config.Cookie;
++        hoeingStatsSwitch.IsChecked = sgpc.HoeingStatsSwitch;
+         
+-        if (result == Wpf.Ui.Controls.MessageBoxResult.Primary) {
++        
++        MessageBoxResult result = await uiMessageBox.ShowDialogAsync();
++
++        
++        if (result == MessageBoxResult.Primary) {
++            string rangeValue = ((dynamic)rangeComboBox.SelectedItem).Value;
++            string dayRangeValue = ((dynamic)dayRangeComboBox.SelectedItem).Value;
++            string cookieValue =cookieTextBox.Text;
++            
++            //保存配置文件
++            sgpc.DayRangeValue=dayRangeValue;
++            sgpc.RangeValue = rangeValue;
++            sgpc.HoeingStatsSwitch = hoeingStatsSwitch.IsChecked ?? false;
++            config.Cookie = cookieValue;
++            config.ScriptGroupLogDictionary[_selectedScriptGroup.Name]=sgpc;
++            
++            LogParse.LogParse.WriteConfigFile(config);
++            
++            
++            
+             WebpageWindow win = new()
+             {
+                 Title = "日志分析",
+@@ -179,8 +274,6 @@ private async Task OpenLogParse()
+                 Owner = Application.Current.MainWindow,
+                 WindowStartupLocation = WindowStartupLocation.CenterOwner
+             };
+-            string rangeValue = ((dynamic)rangeComboBox.SelectedItem).Value;
+-            string dayRangeValue = ((dynamic)dayRangeComboBox.SelectedItem).Value;
+ 
+ 
+             List<(string FileName, string Date)> fs = LogParse.LogParse.GetLogFiles(LogPath);
+@@ -191,8 +284,52 @@ private async Task OpenLogParse()
+                     fs = fs.GetRange(fs.Count - n, n);
+                 }
+             }
++            
++            
++            //最终确定是否打开锄地开关
++            bool hoeingStats = false;
++            
++            if ((hoeingStatsSwitch.IsChecked ?? false) && string.IsNullOrEmpty(cookieValue))
++            {
++                Toast.Warning("未填写cookie，此次将不启用锄地统计！");
++            }
++            //真正存储的gameinfo
++            GameInfo realGameInfo = gameInfo;
++            //统计锄地开关打开，并且不为cookie不为空
++            if ((hoeingStatsSwitch.IsChecked ?? false) && !string.IsNullOrEmpty(cookieValue))
++            {
++                try
++                {
++                    Toast.Information("正在从米游社获取旅行札记数据，请耐心等待！");
++                    gameInfo = await TravelsDiaryDetailManager.UpdateTravelsDiaryDetailManager(cookieValue);
++                    Toast.Success($"米游社数据获取成功，开始进行解析，请耐心等待！");
++                    
++                }
++                catch (Exception e)
++                {
++                    if (realGameInfo!=null)
++                    {
++                        Toast.Warning("访问米游社接口异常，此次将锄地统计将不更新最新数据！");
++                    }
++                    else
++                    {
++                        Toast.Warning("访问米游社接口异常，此次将不启用锄地统计！");
++                    }
+ 
++                }
++            }
++            if (gameInfo != null)
++            {
++                realGameInfo=gameInfo;
++               
++                config.CookieDictionary[cookieValue] = realGameInfo;
++                LogParse.LogParse.WriteConfigFile(config);
++            }
+ 
++            if ((hoeingStatsSwitch.IsChecked ?? false) && realGameInfo!=null)
++            {
++                hoeingStats = true;
++            }
+             var configGroupEntities = LogParse.LogParse.ParseFile(fs);
+             if (rangeValue == "CurrentConfig") {
+                 //Toast.Success(_selectedScriptGroup.Name);
+@@ -204,7 +341,9 @@ private async Task OpenLogParse()
+             }
+             else {
+                 configGroupEntities.Reverse();
+-                win.NavigateToHtml(LogParse.LogParse.GenerHtmlByConfigGroupEntity(configGroupEntities));
++                //realGameInfo
++                //小怪摩拉统计
++                win.NavigateToHtml(LogParse.LogParse.GenerHtmlByConfigGroupEntity(configGroupEntities,hoeingStats ? realGameInfo : null));
+                 win.ShowDialog();
+             }
+ 
+@@ -212,11 +351,104 @@ private async Task OpenLogParse()
+ 
+ 
+     }
+-    private void UpdateTasks()
++    static string[] GetJsonFiles(string folderPath)
++    {
++        // 检查文件夹是否存在
++        if (!Directory.Exists(folderPath))
++        {
++            return new string[0];
++        }
++
++        // 获取所有 .json 文件
++        return Directory.GetFiles(folderPath, "*.json", SearchOption.TopDirectoryOnly);
++    }
++    [RelayCommand]
++    public void OnOpenLocalScriptRepo()
++    {
++        TaskContext.Instance().Config.ScriptConfig.ScriptRepoHintDotVisible = false;
++        ScriptRepoUpdater.Instance.OpenLocalRepoInWebView();
++    }
++    [RelayCommand]
++    private async Task UpdateTasks()
++    {
++            List<ScriptGroupProject> projects = new();
++            List<ScriptGroupProject> oldProjects = new();
++            oldProjects.AddRange(SelectedScriptGroup?.Projects);
++            var oldcount = oldProjects.Count;
++            List<string> folderNames = new();
++            foreach (var project in oldProjects)
++            {
++                if (project.Type == "Pathing")
++                {
++                    if (!folderNames.Contains(project.FolderName))
++                    {
++                        folderNames.Add(project.FolderName);
++                        //根据文件夹更新
++                        var dirPath = $@"{MapPathingViewModel.PathJsonPath}\{project.FolderName}";
++                        foreach (var jsonFile in GetJsonFiles(dirPath))
++                        {
++                            var fileInfo = new FileInfo(jsonFile);
++                            var oldProject = oldProjects.FirstOrDefault(item => item.Name == fileInfo.Name);
++                            if (oldProject == null)
++                            {
++                                projects.Add(ScriptGroupProject.BuildPathingProject(fileInfo.Name, project.FolderName));
++                            }
++                            else
++                            {
++                                projects.Add(oldProject);
++                            }
++                        }
++                    }
++                }
++                else
++                {
++                    projects.Add(project);
++                }
++            }
++
++            SelectedScriptGroup.Projects.Clear();
++            foreach (var scriptGroupProject in projects)
++            {
++                SelectedScriptGroup?.AddProject(scriptGroupProject);
++            }
++
++            Toast.Success($"增加了{projects.Count - oldcount}个路径追踪任务");
++            WriteScriptGroup(SelectedScriptGroup);
++        
++    }
++    
++
++    [RelayCommand]
++    public void OnCopyScriptGroup(ScriptGroup? item)
+     {
+-        //PromptDialog.Prompt
+-        // SelectedScriptGroup.Projects.Clear();
+-        // WriteScriptGroup(SelectedScriptGroup);
++        if (item == null)
++        {
++            return;
++        }
++
++        var str = PromptDialog.Prompt("请输入配置组名称", "复制配置组", item.Name);
++        if (!string.IsNullOrEmpty(str))
++        {
++
++            // 检查是否已存在
++            if (ScriptGroups.Any(x => x.Name == str))
++            {
++                _snackbarService.Show(
++                    "配置组已存在",
++                    $"配置组 {str} 已经存在，复制失败",
++                    ControlAppearance.Caution,
++                    null,
++                    TimeSpan.FromSeconds(2)
++                );
++            }
++            else
++            {
++                var newScriptGroup =JsonSerializer.Deserialize<ScriptGroup>(JsonSerializer.Serialize(item)) ;
++                newScriptGroup.Name = str;
++                ScriptGroups.Add(newScriptGroup);
++                //WriteScriptGroup(newScriptGroup);
++            }
++        }
+     }
+ 
+     [RelayCommand]
+@@ -678,6 +910,8 @@ private void ScriptProjectsCollectionChanged(object? sender, NotifyCollectionCha
+         }
+     }
+ 
++
++
+     private void WriteScriptGroup(ScriptGroup scriptGroup)
+     {
+         try
+@@ -967,7 +1201,7 @@ public async Task OnStartMultiScriptGroupAsync()
+         };
+ 
+         var result = await uiMessageBox.ShowDialogAsync();
+-        if (result == Wpf.Ui.Controls.MessageBoxResult.Primary)
++        if (result == MessageBoxResult.Primary)
+         {
+             var selectedGroups = checkBoxes
+                 .Where(kv => kv.Value.IsChecked == true)

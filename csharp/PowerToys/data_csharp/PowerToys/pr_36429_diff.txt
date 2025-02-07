@@ -1,0 +1,436 @@
+diff --git a/src/common/ManagedCommon/NativeMethods.cs b/src/common/ManagedCommon/NativeMethods.cs
+index feffafa94637..998010f10a29 100644
+--- a/src/common/ManagedCommon/NativeMethods.cs
++++ b/src/common/ManagedCommon/NativeMethods.cs
+@@ -42,6 +42,9 @@ internal static class NativeMethods
+         [DllImport("user32.dll")]
+         internal static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+ 
++        [DllImport("dwmapi")]
++        internal static extern IntPtr DwmExtendFrameIntoClientArea(IntPtr hWnd, ref MARGINS pMarInset);
++
+         [StructLayout(LayoutKind.Sequential)]
+         public struct INPUT
+         {
+@@ -100,5 +103,14 @@ internal enum INPUTTYPE : uint
+             INPUT_KEYBOARD = 1,
+             INPUT_HARDWARE = 2,
+         }
++
++        [StructLayout(LayoutKind.Sequential)]
++        internal struct MARGINS
++        {
++            public int cxLeftWidth;
++            public int cxRightWidth;
++            public int cyTopHeight;
++            public int cyBottomHeight;
++        }
+     }
+ }
+diff --git a/src/common/Common.UI/OSVersionHelper.cs b/src/common/ManagedCommon/OSVersionHelper.cs
+similarity index 75%
+rename from src/common/Common.UI/OSVersionHelper.cs
+rename to src/common/ManagedCommon/OSVersionHelper.cs
+index aa2a2a953a4f..6a865b7ae18e 100644
+--- a/src/common/Common.UI/OSVersionHelper.cs
++++ b/src/common/ManagedCommon/OSVersionHelper.cs
+@@ -4,10 +4,15 @@
+ 
+ using System;
+ 
+-namespace Common.UI
++namespace ManagedCommon
+ {
+     public static class OSVersionHelper
+     {
++        public static bool IsWindows10()
++        {
++            return Environment.OSVersion.Version.Major >= 10 && Environment.OSVersion.Version.Minor < 22000;
++        }
++
+         public static bool IsWindows11()
+         {
+             return Environment.OSVersion.Version.Major >= 10 && Environment.OSVersion.Version.Build >= 22000;
+diff --git a/src/common/ManagedCommon/WindowHelpers.cs b/src/common/ManagedCommon/WindowHelpers.cs
+index bd9d3347229b..c5ee13f69cfd 100644
+--- a/src/common/ManagedCommon/WindowHelpers.cs
++++ b/src/common/ManagedCommon/WindowHelpers.cs
+@@ -35,5 +35,20 @@ public static void BringToForeground(IntPtr handle)
+                 }
+             }
+         }
++
++        /// <summary>
++        /// Workaround for a WinUI bug on Windows 10 in which a window's top border is always
++        /// black. Calls <c>DwmExtendFrameIntoClientArea()</c> with a <c>cyTopHeight</c> of 2 to force
++        /// the window's top border to be visible.<br/><br/>
++        /// Is a no-op on versions other than Windows 10.
++        /// </summary>
++        public static void ForceTopBorder1PixelInsetOnWindows10(IntPtr handle)
++        {
++            if (OSVersionHelper.IsWindows10())
++            {
++                var margins = new NativeMethods.MARGINS { cxLeftWidth = 0, cxRightWidth = 0, cyBottomHeight = 0, cyTopHeight = 2 };
++                NativeMethods.DwmExtendFrameIntoClientArea(handle, ref margins);
++            }
++        }
+     }
+ }
+diff --git a/src/modules/AdvancedPaste/AdvancedPaste/AdvancedPasteXAML/MainWindow.xaml.cs b/src/modules/AdvancedPaste/AdvancedPaste/AdvancedPasteXAML/MainWindow.xaml.cs
+index 18295f231567..7743e6764bb2 100644
+--- a/src/modules/AdvancedPaste/AdvancedPaste/AdvancedPasteXAML/MainWindow.xaml.cs
++++ b/src/modules/AdvancedPaste/AdvancedPaste/AdvancedPasteXAML/MainWindow.xaml.cs
+@@ -82,6 +82,7 @@ double GetHeight(int maxCustomActionCount) =>
+             };
+ 
+             WindowHelpers.BringToForeground(this.GetWindowHandle());
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(this.GetWindowHandle());
+         }
+ 
+         private void OnActivated(object sender, WindowActivatedEventArgs args)
+diff --git a/src/modules/EnvironmentVariables/EnvironmentVariables/EnvironmentVariablesXAML/MainWindow.xaml.cs b/src/modules/EnvironmentVariables/EnvironmentVariables/EnvironmentVariablesXAML/MainWindow.xaml.cs
+index 891fadfe1df9..57639312e157 100644
+--- a/src/modules/EnvironmentVariables/EnvironmentVariables/EnvironmentVariablesXAML/MainWindow.xaml.cs
++++ b/src/modules/EnvironmentVariables/EnvironmentVariables/EnvironmentVariablesXAML/MainWindow.xaml.cs
+@@ -40,6 +40,7 @@ public MainWindow()
+             var handle = this.GetWindowHandle();
+             RegisterWindow(handle);
+ 
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(handle);
+             WindowHelpers.BringToForeground(handle);
+ 
+             MainPage = App.GetService<EnvironmentVariablesMainPage>();
+diff --git a/src/modules/FileLocksmith/FileLocksmithUI/FileLocksmithXAML/MainWindow.xaml.cs b/src/modules/FileLocksmith/FileLocksmithUI/FileLocksmithXAML/MainWindow.xaml.cs
+index 324044d49f0b..bb4cfafe7b29 100644
+--- a/src/modules/FileLocksmith/FileLocksmithUI/FileLocksmithXAML/MainWindow.xaml.cs
++++ b/src/modules/FileLocksmith/FileLocksmithUI/FileLocksmithXAML/MainWindow.xaml.cs
+@@ -3,7 +3,7 @@
+ // See the LICENSE file in the project root for more information.
+ 
+ using System;
+-
++using ManagedCommon;
+ using Microsoft.UI.Windowing;
+ using Microsoft.UI.Xaml;
+ using Microsoft.UI.Xaml.Media;
+@@ -22,6 +22,7 @@ public MainWindow(bool isElevated)
+             SetTitleBar(AppTitleBar);
+             Activated += MainWindow_Activated;
+             AppWindow.SetIcon("Assets/FileLocksmith/Icon.ico");
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(this.GetWindowHandle());
+ 
+             var loader = ResourceLoaderInstance.ResourceLoader;
+             var title = isElevated ? loader.GetString("AppAdminTitle") : loader.GetString("AppTitle");
+diff --git a/src/modules/Hosts/Hosts/HostsXAML/MainWindow.xaml.cs b/src/modules/Hosts/Hosts/HostsXAML/MainWindow.xaml.cs
+index d1632c21ee6e..bab06fcfbb6a 100644
+--- a/src/modules/Hosts/Hosts/HostsXAML/MainWindow.xaml.cs
++++ b/src/modules/Hosts/Hosts/HostsXAML/MainWindow.xaml.cs
+@@ -39,6 +39,7 @@ public MainWindow()
+ 
+             var handle = this.GetWindowHandle();
+ 
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(handle);
+             WindowHelpers.BringToForeground(handle);
+             Activated += MainWindow_Activated;
+ 
+diff --git a/src/modules/colorPicker/ColorPickerUI/ColorEditorWindow.xaml.cs b/src/modules/colorPicker/ColorPickerUI/ColorEditorWindow.xaml.cs
+index eb94d86d1ec8..323fa77b5e31 100644
+--- a/src/modules/colorPicker/ColorPickerUI/ColorEditorWindow.xaml.cs
++++ b/src/modules/colorPicker/ColorPickerUI/ColorEditorWindow.xaml.cs
+@@ -5,7 +5,7 @@
+ using System;
+ 
+ using ColorPicker.Helpers;
+-using Common.UI;
++using ManagedCommon;
+ using Wpf.Ui.Controls;
+ 
+ namespace ColorPicker
+diff --git a/src/modules/imageresizer/ui/Views/MainWindow.xaml.cs b/src/modules/imageresizer/ui/Views/MainWindow.xaml.cs
+index c64a43552c3b..47092b602e66 100644
+--- a/src/modules/imageresizer/ui/Views/MainWindow.xaml.cs
++++ b/src/modules/imageresizer/ui/Views/MainWindow.xaml.cs
+@@ -7,9 +7,8 @@
+ using System;
+ using System.Collections.Generic;
+ using System.Linq;
+-
+-using Common.UI;
+ using ImageResizer.ViewModels;
++using ManagedCommon;
+ using Microsoft.Win32;
+ using Wpf.Ui.Controls;
+ 
+diff --git a/src/modules/launcher/PowerLauncher/Helper/ThemeManager.cs b/src/modules/launcher/PowerLauncher/Helper/ThemeManager.cs
+index 67ad40221810..4f7ff85b47cf 100644
+--- a/src/modules/launcher/PowerLauncher/Helper/ThemeManager.cs
++++ b/src/modules/launcher/PowerLauncher/Helper/ThemeManager.cs
+@@ -6,6 +6,7 @@
+ using System.IO;
+ using System.Windows;
+ using System.Windows.Media;
++using ManagedCommon;
+ using Microsoft.Win32;
+ using Wox.Infrastructure.Image;
+ using Wox.Infrastructure.UserSettings;
+@@ -50,7 +51,7 @@ private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventAr
+ 
+         private void SetSystemTheme(ManagedCommon.Theme theme)
+         {
+-            _mainWindow.Background = Common.UI.OSVersionHelper.IsWindows11() is false ? SystemColors.WindowBrush : null;
++            _mainWindow.Background = OSVersionHelper.IsWindows11() is false ? SystemColors.WindowBrush : null;
+ 
+             _mainWindow.Resources.MergedDictionaries.Clear();
+             _mainWindow.Resources.MergedDictionaries.Add(new ResourceDictionary
+@@ -66,7 +67,7 @@ private void SetSystemTheme(ManagedCommon.Theme theme)
+                     Source = new Uri(themeString, UriKind.Absolute),
+                 };
+                 _mainWindow.Resources.MergedDictionaries.Add(fluentThemeDictionary);
+-                if (!Common.UI.OSVersionHelper.IsWindows11())
++                if (!OSVersionHelper.IsWindows11())
+                 {
+                     // Apply background only on Windows 10
+                     // Windows theme does not work properly for dark and light mode so right now set the background color manual.
+@@ -95,7 +96,7 @@ private void SetSystemTheme(ManagedCommon.Theme theme)
+                 {
+                     Source = new Uri(styleThemeString, UriKind.Relative),
+                 });
+-                if (Common.UI.OSVersionHelper.IsWindows11())
++                if (OSVersionHelper.IsWindows11())
+                 {
+                     // Apply background only on Windows 11 to keep the same style as WPFUI
+                     _mainWindow.Background = new SolidColorBrush
+diff --git a/src/modules/launcher/PowerLauncher/MainWindow.xaml.cs b/src/modules/launcher/PowerLauncher/MainWindow.xaml.cs
+index f627116126eb..c19701f304e9 100644
+--- a/src/modules/launcher/PowerLauncher/MainWindow.xaml.cs
++++ b/src/modules/launcher/PowerLauncher/MainWindow.xaml.cs
+@@ -15,6 +15,7 @@
+ using System.Windows.Media.Imaging;
+ 
+ using Common.UI;
++using ManagedCommon;
+ using Microsoft.PowerLauncher.Telemetry;
+ using Microsoft.PowerToys.Telemetry;
+ using PowerLauncher.Helper;
+diff --git a/src/modules/launcher/Wox.Plugin/Common/VirtualDesktop/VirtualDesktopHelper.cs b/src/modules/launcher/Wox.Plugin/Common/VirtualDesktop/VirtualDesktopHelper.cs
+index 22eda6e28e7c..777048855188 100644
+--- a/src/modules/launcher/Wox.Plugin/Common/VirtualDesktop/VirtualDesktopHelper.cs
++++ b/src/modules/launcher/Wox.Plugin/Common/VirtualDesktop/VirtualDesktopHelper.cs
+@@ -7,8 +7,7 @@
+ using System.Diagnostics;
+ using System.Runtime.InteropServices;
+ using System.Text;
+-
+-using Common.UI;
++using ManagedCommon;
+ using Microsoft.Win32;
+ using Wox.Plugin.Common.VirtualDesktop.Interop;
+ using Wox.Plugin.Common.Win32;
+diff --git a/src/modules/peek/Peek.UI/PeekXAML/MainWindow.xaml.cs b/src/modules/peek/Peek.UI/PeekXAML/MainWindow.xaml.cs
+index ae94b0cb4462..3ac494b652ef 100644
+--- a/src/modules/peek/Peek.UI/PeekXAML/MainWindow.xaml.cs
++++ b/src/modules/peek/Peek.UI/PeekXAML/MainWindow.xaml.cs
+@@ -48,7 +48,8 @@ public MainWindow()
+             ViewModel = Application.Current.GetService<MainWindowViewModel>();
+ 
+             TitleBarControl.SetTitleBarToWindow(this);
+-            AppWindow.TitleBar.ExtendsContentIntoTitleBar = true;
++            ExtendsContentIntoTitleBar = true;
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(this.GetWindowHandle());
+             AppWindow.TitleBar.PreferredHeightOption = TitleBarHeightOption.Tall;
+             AppWindow.SetIcon("Assets/Peek/Icon.ico");
+ 
+diff --git a/src/modules/peek/Peek.UI/PeekXAML/Views/TitleBar.xaml.cs b/src/modules/peek/Peek.UI/PeekXAML/Views/TitleBar.xaml.cs
+index 17d9724d7999..7e2759cc5dbc 100644
+--- a/src/modules/peek/Peek.UI/PeekXAML/Views/TitleBar.xaml.cs
++++ b/src/modules/peek/Peek.UI/PeekXAML/Views/TitleBar.xaml.cs
+@@ -231,7 +231,7 @@ private void UpdateTitleBarCustomization(MainWindow mainWindow)
+             if (AppWindowTitleBar.IsCustomizationSupported())
+             {
+                 AppWindow appWindow = mainWindow.AppWindow;
+-                appWindow.TitleBar.ExtendsContentIntoTitleBar = true;
++                mainWindow.ExtendsContentIntoTitleBar = true;
+                 appWindow.TitleBar.ButtonBackgroundColor = Colors.Transparent;
+                 appWindow.TitleBar.ButtonInactiveBackgroundColor = Colors.Transparent;
+                 appWindow.TitleBar.ButtonForegroundColor = ThemeHelpers.GetAppTheme() == AppTheme.Light ? Colors.DarkSlateGray : Colors.White;
+diff --git a/src/modules/registrypreview/RegistryPreview/RegistryPreviewXAML/MainWindow.xaml.cs b/src/modules/registrypreview/RegistryPreview/RegistryPreviewXAML/MainWindow.xaml.cs
+index 4c0a3566e5fe..673e47590d5a 100644
+--- a/src/modules/registrypreview/RegistryPreview/RegistryPreviewXAML/MainWindow.xaml.cs
++++ b/src/modules/registrypreview/RegistryPreview/RegistryPreviewXAML/MainWindow.xaml.cs
+@@ -38,8 +38,8 @@ internal MainWindow()
+             OpenWindowPlacementFile(settingsFolder, windowPlacementFile);
+ 
+             // Update the Win32 looking window with the correct icon (and grab the appWindow handle for later)
+-            IntPtr windowHandle = WinRT.Interop.WindowNative.GetWindowHandle(this);
+-            Microsoft.UI.WindowId windowId = Win32Interop.GetWindowIdFromWindow(windowHandle);
++            IntPtr windowHandle = this.GetWindowHandle();
++            WindowId windowId = Win32Interop.GetWindowIdFromWindow(windowHandle);
+             appWindow = Microsoft.UI.Windowing.AppWindow.GetFromWindowId(windowId);
+             appWindow.SetIcon("Assets\\RegistryPreview\\RegistryPreview.ico");
+ 
+@@ -49,6 +49,7 @@ internal MainWindow()
+ 
+             // Extend the canvas to include the title bar so the app can support theming
+             ExtendsContentIntoTitleBar = true;
++            WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(windowHandle);
+             SetTitleBar(titleBar);
+ 
+             // if have settings, update the location of the window
+diff --git a/src/settings-ui/Settings.UI/Helpers/StartProcessHelper.cs b/src/settings-ui/Settings.UI/Helpers/StartProcessHelper.cs
+index 70157075acf3..ce172b2aa2f4 100644
+--- a/src/settings-ui/Settings.UI/Helpers/StartProcessHelper.cs
++++ b/src/settings-ui/Settings.UI/Helpers/StartProcessHelper.cs
+@@ -3,8 +3,7 @@
+ // See the LICENSE file in the project root for more information.
+ 
+ using System.Diagnostics;
+-
+-using Common.UI;
++using ManagedCommon;
+ 
+ namespace Microsoft.PowerToys.Settings.UI.Helpers
+ {
+diff --git a/src/settings-ui/Settings.UI/SettingsXAML/App.xaml.cs b/src/settings-ui/Settings.UI/SettingsXAML/App.xaml.cs
+index 85f64f62cc79..3b6b3a768155 100644
+--- a/src/settings-ui/Settings.UI/SettingsXAML/App.xaml.cs
++++ b/src/settings-ui/Settings.UI/SettingsXAML/App.xaml.cs
+@@ -241,6 +241,10 @@ private void OnLaunchedFromRunner(string[] cmdArgs)
+                 // https://github.com/microsoft/microsoft-ui-xaml/issues/7595 - Activate doesn't bring window to the foreground
+                 // Need to call SetForegroundWindow to actually gain focus.
+                 WindowHelpers.BringToForeground(settingsWindow.GetWindowHandle());
++
++                // https://github.com/microsoft/microsoft-ui-xaml/issues/8948 - A window's top border incorrectly
++                // renders as black on Windows 10.
++                WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(settingsWindow));
+             }
+             else
+             {
+@@ -255,6 +259,7 @@ private void OnLaunchedFromRunner(string[] cmdArgs)
+                     OobeWindow oobeWindow = new OobeWindow(OOBE.Enums.PowerToysModules.Overview);
+                     oobeWindow.Activate();
+                     oobeWindow.ExtendsContentIntoTitleBar = true;
++                    WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(settingsWindow));
+                     SetOobeWindow(oobeWindow);
+                 }
+                 else if (ShowScoobe)
+@@ -263,6 +268,7 @@ private void OnLaunchedFromRunner(string[] cmdArgs)
+                     OobeWindow scoobeWindow = new OobeWindow(OOBE.Enums.PowerToysModules.WhatsNew);
+                     scoobeWindow.Activate();
+                     scoobeWindow.ExtendsContentIntoTitleBar = true;
++                    WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(settingsWindow));
+                     SetOobeWindow(scoobeWindow);
+                 }
+                 else if (ShowFlyout)
+@@ -310,6 +316,7 @@ protected override void OnLaunched(Microsoft.UI.Xaml.LaunchActivatedEventArgs ar
+                 // Window is also needed to show MessageDialog
+                 settingsWindow = new MainWindow();
+                 settingsWindow.ExtendsContentIntoTitleBar = true;
++                WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(settingsWindow));
+                 settingsWindow.Activate();
+                 settingsWindow.NavigateToSection(StartupPage);
+                 ShowMessageDialog("The application is running in Debug mode.", "DEBUG");
+diff --git a/src/settings-ui/Settings.UI/SettingsXAML/OOBE/Views/OobeShellPage.xaml.cs b/src/settings-ui/Settings.UI/SettingsXAML/OOBE/Views/OobeShellPage.xaml.cs
+index 02df4de73582..ef16dd46bd96 100644
+--- a/src/settings-ui/Settings.UI/SettingsXAML/OOBE/Views/OobeShellPage.xaml.cs
++++ b/src/settings-ui/Settings.UI/SettingsXAML/OOBE/Views/OobeShellPage.xaml.cs
+@@ -6,12 +6,13 @@
+ using System.Collections.ObjectModel;
+ using System.Globalization;
+ 
+-using global::PowerToys.GPOWrapper;
++using ManagedCommon;
+ using Microsoft.PowerToys.Settings.UI.Library;
+ using Microsoft.PowerToys.Settings.UI.OOBE.Enums;
+ using Microsoft.PowerToys.Settings.UI.OOBE.ViewModel;
+ using Microsoft.UI.Xaml;
+ using Microsoft.UI.Xaml.Controls;
++using WinRT.Interop;
+ 
+ namespace Microsoft.PowerToys.Settings.UI.OOBE.Views
+ {
+@@ -306,6 +307,7 @@ private void SetTitleBar()
+                 // A custom title bar is required for full window theme and Mica support.
+                 // https://docs.microsoft.com/windows/apps/develop/title-bar?tabs=winui3#full-customization
+                 u.ExtendsContentIntoTitleBar = true;
++                WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(u));
+                 u.SetTitleBar(AppTitleBar);
+             }
+         }
+diff --git a/src/settings-ui/Settings.UI/SettingsXAML/Views/ShellPage.xaml.cs b/src/settings-ui/Settings.UI/SettingsXAML/Views/ShellPage.xaml.cs
+index 9ff088b78736..e416e7ae59ff 100644
+--- a/src/settings-ui/Settings.UI/SettingsXAML/Views/ShellPage.xaml.cs
++++ b/src/settings-ui/Settings.UI/SettingsXAML/Views/ShellPage.xaml.cs
+@@ -14,6 +14,7 @@
+ using Microsoft.UI.Xaml.Controls;
+ using Windows.Data.Json;
+ using Windows.System;
++using WinRT.Interop;
+ 
+ namespace Microsoft.PowerToys.Settings.UI.Views
+ {
+@@ -421,6 +422,7 @@ private void SetTitleBar()
+                 // A custom title bar is required for full window theme and Mica support.
+                 // https://docs.microsoft.com/windows/apps/develop/title-bar?tabs=winui3#full-customization
+                 u.ExtendsContentIntoTitleBar = true;
++                WindowHelpers.ForceTopBorder1PixelInsetOnWindows10(WindowNative.GetWindowHandle(u));
+                 u.SetTitleBar(AppTitleBar);
+                 var loader = ResourceLoaderInstance.ResourceLoader;
+                 AppTitleBarText.Text = App.IsElevated ? loader.GetString("SettingsWindow_AdminTitle") : loader.GetString("SettingsWindow_Title");
+diff --git a/src/settings-ui/Settings.UI/ViewModels/AlwaysOnTopViewModel.cs b/src/settings-ui/Settings.UI/ViewModels/AlwaysOnTopViewModel.cs
+index a45c66a1ef6d..f8787f763481 100644
+--- a/src/settings-ui/Settings.UI/ViewModels/AlwaysOnTopViewModel.cs
++++ b/src/settings-ui/Settings.UI/ViewModels/AlwaysOnTopViewModel.cs
+@@ -6,9 +6,8 @@
+ using System.Globalization;
+ using System.Runtime.CompilerServices;
+ using System.Text.Json;
+-
+-using Common.UI;
+ using global::PowerToys.GPOWrapper;
++using ManagedCommon;
+ using Microsoft.PowerToys.Settings.UI.Library;
+ using Microsoft.PowerToys.Settings.UI.Library.Helpers;
+ using Microsoft.PowerToys.Settings.UI.Library.Interfaces;
+diff --git a/src/settings-ui/Settings.UI/ViewModels/FancyZonesViewModel.cs b/src/settings-ui/Settings.UI/ViewModels/FancyZonesViewModel.cs
+index 2b01dc3cec79..50195b34ffab 100644
+--- a/src/settings-ui/Settings.UI/ViewModels/FancyZonesViewModel.cs
++++ b/src/settings-ui/Settings.UI/ViewModels/FancyZonesViewModel.cs
+@@ -4,9 +4,8 @@
+ 
+ using System;
+ using System.Runtime.CompilerServices;
+-
+-using Common.UI;
+ using global::PowerToys.GPOWrapper;
++using ManagedCommon;
+ using Microsoft.PowerToys.Settings.UI.Library;
+ using Microsoft.PowerToys.Settings.UI.Library.Helpers;
+ using Microsoft.PowerToys.Settings.UI.Library.Interfaces;
+diff --git a/src/settings-ui/Settings.UI/ViewModels/NewPlusViewModel.cs b/src/settings-ui/Settings.UI/ViewModels/NewPlusViewModel.cs
+index 11e3d3ee4620..73c8335e1209 100644
+--- a/src/settings-ui/Settings.UI/ViewModels/NewPlusViewModel.cs
++++ b/src/settings-ui/Settings.UI/ViewModels/NewPlusViewModel.cs
+@@ -10,8 +10,6 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using System.Windows;
+-
+-using Common.UI;
+ using global::PowerToys.GPOWrapper;
+ using ManagedCommon;
+ using Microsoft.PowerToys.Settings.UI.Helpers;
+diff --git a/src/settings-ui/Settings.UI/ViewModels/PowerOcrViewModel.cs b/src/settings-ui/Settings.UI/ViewModels/PowerOcrViewModel.cs
+index 0fe65516ca73..e64db726143f 100644
+--- a/src/settings-ui/Settings.UI/ViewModels/PowerOcrViewModel.cs
++++ b/src/settings-ui/Settings.UI/ViewModels/PowerOcrViewModel.cs
+@@ -9,9 +9,8 @@
+ using System.Linq;
+ using System.Text.Json;
+ using System.Timers;
+-
+-using Common.UI;
+ using global::PowerToys.GPOWrapper;
++using ManagedCommon;
+ using Microsoft.PowerToys.Settings.UI.Library;
+ using Microsoft.PowerToys.Settings.UI.Library.Helpers;
+ using Microsoft.PowerToys.Settings.UI.Library.Interfaces;

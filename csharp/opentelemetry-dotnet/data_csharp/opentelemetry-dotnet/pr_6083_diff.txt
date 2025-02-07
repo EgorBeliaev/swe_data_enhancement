@@ -1,0 +1,309 @@
+diff --git a/Directory.Packages.props b/Directory.Packages.props
+index 5379f0a7bef..70564887f83 100644
+--- a/Directory.Packages.props
++++ b/Directory.Packages.props
+@@ -67,6 +67,7 @@
+     -->
+     <PackageVersion Include="Google.Protobuf" Version="[3.22.5,4.0)" />
+     <PackageVersion Include="Grpc" Version="[2.44.0,3.0)" />
++    <PackageVersion Include="Grpc.Core" Version="[2.44.0,3.0)" />
+     <PackageVersion Include="Grpc.Net.Client" Version="[2.52.0,3.0)" />
+   </ItemGroup>
+ 
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/CHANGELOG.md b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/CHANGELOG.md
+index 9607eb6682c..fcb906a677b 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/CHANGELOG.md
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/CHANGELOG.md
+@@ -7,6 +7,10 @@ Notes](../../RELEASENOTES.md).
+ 
+ ## Unreleased
+ 
++* Fixed an issue where the OTLP gRPC exporter did not export logs, metrics, or
++  traces in .NET Framework projects.
++  ([#6067](https://github.com/open-telemetry/opentelemetry-dotnet/issues/6067))
++
+ ## 1.11.0
+ 
+ Released 2025-Jan-15
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/GrpcExportClient.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/GrpcExportClient.cs
+new file mode 100644
+index 00000000000..6803890f75a
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/GrpcExportClient.cs
+@@ -0,0 +1,109 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#if NET462_OR_GREATER || NETSTANDARD2_0
++using Grpc.Core;
++using OpenTelemetry.Internal;
++
++using InternalStatus = OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient.Grpc.Status;
++using InternalStatusCode = OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient.Grpc.StatusCode;
++using Status = Grpc.Core.Status;
++using StatusCode = Grpc.Core.StatusCode;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++
++internal sealed class GrpcExportClient : IExportClient
++{
++    private static readonly ExportClientGrpcResponse SuccessExportResponse = new(
++        success: false,
++        deadlineUtc: default,
++        exception: null,
++        status: null,
++        grpcStatusDetailsHeader: null);
++
++    private static readonly Marshaller<byte[]> ByteArrayMarshaller = Marshallers.Create(
++        serializer: static input => input,
++        deserializer: static data => data);
++
++    private readonly Method<byte[], byte[]> exportMethod;
++
++    private readonly CallInvoker callInvoker;
++
++    public GrpcExportClient(OtlpExporterOptions options, string signalPath)
++    {
++        Guard.ThrowIfNull(options);
++        Guard.ThrowIfInvalidTimeout(options.TimeoutMilliseconds);
++        Guard.ThrowIfNull(signalPath);
++
++        var exporterEndpoint = options.Endpoint.AppendPathIfNotPresent(signalPath);
++        this.Endpoint = new UriBuilder(exporterEndpoint).Uri;
++        this.Channel = options.CreateChannel();
++        this.Headers = options.GetMetadataFromHeaders();
++
++        var serviceAndMethod = signalPath.Split('/');
++        this.exportMethod = new Method<byte[], byte[]>(MethodType.Unary, serviceAndMethod[0], serviceAndMethod[1], ByteArrayMarshaller, ByteArrayMarshaller);
++        this.callInvoker = this.Channel.CreateCallInvoker();
++    }
++
++    internal Channel Channel { get; }
++
++    internal Uri Endpoint { get; }
++
++    internal Metadata Headers { get; }
++
++    public ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default)
++    {
++        try
++        {
++            var contentSpan = buffer.AsSpan(0, contentLength);
++            this.callInvoker?.BlockingUnaryCall(this.exportMethod, null, new CallOptions(this.Headers, deadlineUtc, cancellationToken), contentSpan.ToArray());
++            return SuccessExportResponse;
++        }
++        catch (RpcException rpcException)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.FailedToReachCollector(this.Endpoint, rpcException);
++            return new ExportClientGrpcResponse(success: false, deadlineUtc: deadlineUtc, exception: rpcException, ConvertGrpcStatusToStatus(rpcException.Status), rpcException.Trailers.ToString());
++        }
++    }
++
++    public bool Shutdown(int timeoutMilliseconds)
++    {
++        if (this.Channel == null)
++        {
++            return true;
++        }
++
++        if (timeoutMilliseconds == -1)
++        {
++            this.Channel.ShutdownAsync().Wait();
++            return true;
++        }
++        else
++        {
++            return Task.WaitAny([this.Channel.ShutdownAsync(), Task.Delay(timeoutMilliseconds)]) == 0;
++        }
++    }
++
++    private static InternalStatus ConvertGrpcStatusToStatus(Status grpcStatus) => grpcStatus.StatusCode switch
++    {
++        StatusCode.OK => new InternalStatus(InternalStatusCode.OK, grpcStatus.Detail),
++        StatusCode.Cancelled => new InternalStatus(InternalStatusCode.Cancelled, grpcStatus.Detail),
++        StatusCode.Unknown => new InternalStatus(InternalStatusCode.Unknown, grpcStatus.Detail),
++        StatusCode.InvalidArgument => new InternalStatus(InternalStatusCode.InvalidArgument, grpcStatus.Detail),
++        StatusCode.DeadlineExceeded => new InternalStatus(InternalStatusCode.DeadlineExceeded, grpcStatus.Detail),
++        StatusCode.NotFound => new InternalStatus(InternalStatusCode.NotFound, grpcStatus.Detail),
++        StatusCode.AlreadyExists => new InternalStatus(InternalStatusCode.AlreadyExists, grpcStatus.Detail),
++        StatusCode.PermissionDenied => new InternalStatus(InternalStatusCode.PermissionDenied, grpcStatus.Detail),
++        StatusCode.Unauthenticated => new InternalStatus(InternalStatusCode.Unauthenticated, grpcStatus.Detail),
++        StatusCode.ResourceExhausted => new InternalStatus(InternalStatusCode.ResourceExhausted, grpcStatus.Detail),
++        StatusCode.FailedPrecondition => new InternalStatus(InternalStatusCode.FailedPrecondition, grpcStatus.Detail),
++        StatusCode.Aborted => new InternalStatus(InternalStatusCode.Aborted, grpcStatus.Detail),
++        StatusCode.OutOfRange => new InternalStatus(InternalStatusCode.OutOfRange, grpcStatus.Detail),
++        StatusCode.Unimplemented => new InternalStatus(InternalStatusCode.Unimplemented, grpcStatus.Detail),
++        StatusCode.Internal => new InternalStatus(InternalStatusCode.Internal, grpcStatus.Detail),
++        StatusCode.Unavailable => new InternalStatus(InternalStatusCode.Unavailable, grpcStatus.Detail),
++        StatusCode.DataLoss => new InternalStatus(InternalStatusCode.DataLoss, grpcStatus.Detail),
++        _ => new InternalStatus(InternalStatusCode.Unknown, grpcStatus.Detail),
++    };
++}
++#endif
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OpenTelemetry.Exporter.OpenTelemetryProtocol.csproj b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OpenTelemetry.Exporter.OpenTelemetryProtocol.csproj
+index 2277f25a16b..a29ba23649e 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OpenTelemetry.Exporter.OpenTelemetryProtocol.csproj
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OpenTelemetry.Exporter.OpenTelemetryProtocol.csproj
+@@ -23,6 +23,10 @@
+     <ProjectReference Include="$(RepoRoot)\src\OpenTelemetry\OpenTelemetry.csproj" />
+   </ItemGroup>
+ 
++  <ItemGroup>
++    <PackageReference Include="Grpc.Core" Condition="'$(TargetFramework)' == 'netstandard2.0' OR '$(TargetFramework)' == '$(NetFrameworkMinimumSupportedVersion)'" />
++  </ItemGroup>
++
+   <ItemGroup>
+     <Reference Include="System.Net.Http" Condition="'$(TargetFramework)' == '$(NetFrameworkMinimumSupportedVersion)'" />
+   </ItemGroup>
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
+index 9db0404a63a..c4bea6931e3 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
+@@ -9,6 +9,9 @@
+ using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation;
+ using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
+ using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmission;
++#if NET462_OR_GREATER || NETSTANDARD2_0
++using Grpc.Core;
++#endif
+ 
+ namespace OpenTelemetry.Exporter;
+ 
+@@ -22,6 +25,30 @@ internal static class OtlpExporterOptionsExtensions
+     private const string MetricsHttpServicePath = "v1/metrics";
+     private const string LogsHttpServicePath = "v1/logs";
+ 
++#if NET462_OR_GREATER || NETSTANDARD2_0
++    public static Channel CreateChannel(this OtlpExporterOptions options)
++    {
++        if (options.Endpoint.Scheme != Uri.UriSchemeHttp && options.Endpoint.Scheme != Uri.UriSchemeHttps)
++        {
++            throw new NotSupportedException($"Endpoint URI scheme ({options.Endpoint.Scheme}) is not supported. Currently only \"http\" and \"https\" are supported.");
++        }
++
++        ChannelCredentials channelCredentials;
++        if (options.Endpoint.Scheme == Uri.UriSchemeHttps)
++        {
++            channelCredentials = new SslCredentials();
++        }
++        else
++        {
++            channelCredentials = ChannelCredentials.Insecure;
++        }
++
++        return new Channel(options.Endpoint.Authority, channelCredentials);
++    }
++
++    public static Metadata GetMetadataFromHeaders(this OtlpExporterOptions options) => options.GetHeaders<Metadata>((m, k, v) => m.Add(k, v));
++#endif
++
+     public static THeaders GetHeaders<THeaders>(this OtlpExporterOptions options, Action<THeaders, string, string> addHeader)
+         where THeaders : new()
+     {
+@@ -97,6 +124,20 @@ public static IExportClient GetExportClient(this OtlpExporterOptions options, Ot
+             throw new NotSupportedException($"Protocol {options.Protocol} is not supported.");
+         }
+ 
++#if NET462_OR_GREATER || NETSTANDARD2_0
++        if (options.Protocol == OtlpExportProtocol.Grpc)
++        {
++            var servicePath = otlpSignalType switch
++            {
++                OtlpSignalType.Traces => TraceGrpcServicePath,
++                OtlpSignalType.Metrics => MetricsGrpcServicePath,
++                OtlpSignalType.Logs => LogsGrpcServicePath,
++                _ => throw new NotSupportedException($"OtlpSignalType {otlpSignalType} is not supported."),
++            };
++            return new GrpcExportClient(options, servicePath);
++        }
++#endif
++
+         return otlpSignalType switch
+         {
+             OtlpSignalType.Traces => options.Protocol == OtlpExportProtocol.Grpc
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
+index 2ac41e5aca1..a87c9ad4d96 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
+@@ -58,7 +58,11 @@ internal OtlpLogExporter(
+ 
+         this.experimentalOptions = experimentalOptions!;
+         this.sdkLimitOptions = sdkLimitOptions!;
++#if NET462_OR_GREATER || NETSTANDARD2_0
++        this.startWritePosition = 0;
++#else
+         this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
++#endif
+         this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions!, OtlpSignalType.Logs);
+     }
+ 
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
+index 88bafa3007c..8c596e9c61c 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
+@@ -51,7 +51,11 @@ internal OtlpMetricExporter(
+         Debug.Assert(exporterOptions != null, "exporterOptions was null");
+         Debug.Assert(experimentalOptions != null, "experimentalOptions was null");
+ 
++#if NET462_OR_GREATER || NETSTANDARD2_0
++        this.startWritePosition = 0;
++#else
+         this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
++#endif
+         this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions!, OtlpSignalType.Metrics);
+     }
+ 
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
+index 5a1f2f19d24..d30abeeece0 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
+@@ -54,7 +54,11 @@ internal OtlpTraceExporter(
+         Debug.Assert(sdkLimitOptions != null, "sdkLimitOptions was null");
+ 
+         this.sdkLimitOptions = sdkLimitOptions!;
++#if NET462_OR_GREATER || NETSTANDARD2_0
++        this.startWritePosition = 0;
++#else
+         this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? GrpcStartWritePosition : 0;
++#endif
+         this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetExportTransmissionHandler(experimentalOptions, OtlpSignalType.Traces);
+     }
+ 
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpExporterOptionsExtensionsTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpExporterOptionsExtensionsTests.cs
+index 51fc87891ef..636383f5a09 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpExporterOptionsExtensionsTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpExporterOptionsExtensionsTests.cs
+@@ -35,7 +35,11 @@ public void GetHeaders_NoOptionHeaders_ReturnsStandardHeaders(string? optionHead
+     }
+ 
+     [Theory]
++#if NET462_OR_GREATER
++    [InlineData(OtlpExportProtocol.Grpc, typeof(GrpcExportClient))]
++#else
+     [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient))]
++#endif
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient))]
+     public void GetTraceExportClient_SupportedProtocol_ReturnsCorrectExportClient(OtlpExportProtocol protocol, Type expectedExportClientType)
+     {
+@@ -75,13 +79,19 @@ public void AppendPathIfNotPresent_TracesPath_AppendsCorrectly(string inputUri,
+     }
+ 
+     [Theory]
++#if NET462_OR_GREATER
++    [InlineData(OtlpExportProtocol.Grpc, typeof(GrpcExportClient), false, 10000, null)]
++    [InlineData(OtlpExportProtocol.Grpc, typeof(GrpcExportClient), false, 10000, "in_memory")]
++    [InlineData(OtlpExportProtocol.Grpc, typeof(GrpcExportClient), false, 10000, "disk")]
++#else
+     [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient), false, 10000, null)]
++    [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient), false, 10000, "in_memory")]
++    [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient), false, 10000, "disk")]
++#endif
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), false, 10000, null)]
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), true, 8000, null)]
+-    [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient), false, 10000, "in_memory")]
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), false, 10000, "in_memory")]
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), true, 8000, "in_memory")]
+-    [InlineData(OtlpExportProtocol.Grpc, typeof(OtlpGrpcExportClient), false, 10000, "disk")]
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), false, 10000, "disk")]
+     [InlineData(OtlpExportProtocol.HttpProtobuf, typeof(OtlpHttpExportClient), true, 8000, "disk")]
+     public void GetTransmissionHandler_InitializesCorrectHandlerExportClientAndTimeoutValue(OtlpExportProtocol protocol, Type exportClientType, bool customHttpClient, int expectedTimeoutMilliseconds, string? retryStrategy)

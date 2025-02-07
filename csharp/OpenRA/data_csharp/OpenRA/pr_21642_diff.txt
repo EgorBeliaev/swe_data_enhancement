@@ -1,0 +1,593 @@
+diff --git a/OpenRA.Mods.Common/EditorBrushes/EditorBlit.cs b/OpenRA.Mods.Common/EditorBrushes/EditorBlit.cs
+new file mode 100644
+index 000000000000..7472e22cd3ca
+--- /dev/null
++++ b/OpenRA.Mods.Common/EditorBrushes/EditorBlit.cs
+@@ -0,0 +1,215 @@
++#region Copyright & License Information
++/*
++ * Copyright (c) The OpenRA Developers and Contributors
++ * This file is part of OpenRA, which is free software. It is made
++ * available to you under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version. For more
++ * information, see COPYING.
++ */
++#endregion
++
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using OpenRA.Mods.Common.Traits;
++
++namespace OpenRA.Mods.Common.EditorBrushes
++{
++	public readonly struct BlitTile
++	{
++		public readonly TerrainTile TerrainTile;
++		public readonly ResourceTile ResourceTile;
++		public readonly ResourceLayerContents? ResourceLayerContents;
++		public readonly byte Height;
++
++		public BlitTile(TerrainTile terrainTile, ResourceTile resourceTile, ResourceLayerContents? resourceLayerContents, byte height)
++		{
++			TerrainTile = terrainTile;
++			ResourceTile = resourceTile;
++			ResourceLayerContents = resourceLayerContents;
++			Height = height;
++		}
++	}
++
++	public readonly struct EditorBlitSource
++	{
++		public readonly CellRegion CellRegion;
++		public readonly Dictionary<string, EditorActorPreview> Actors;
++		public readonly Dictionary<CPos, BlitTile> Tiles;
++
++		public EditorBlitSource(CellRegion cellRegion, Dictionary<string, EditorActorPreview> actors, Dictionary<CPos, BlitTile> tiles)
++		{
++			CellRegion = cellRegion;
++			Actors = actors;
++			Tiles = tiles;
++		}
++	}
++
++	[Flags]
++	public enum MapBlitFilters
++	{
++		None = 0,
++		Terrain = 1,
++		Resources = 2,
++		Actors = 4,
++		All = Terrain | Resources | Actors
++	}
++
++	/// <summary>
++	/// Core implementation for EditorActions which overwrite a region of the map (such as
++	/// copy-paste).
++	/// </summary>
++	public sealed class EditorBlit
++	{
++		readonly MapBlitFilters blitFilters;
++		readonly IResourceLayer resourceLayer;
++		readonly EditorActorLayer editorActorLayer;
++		readonly EditorBlitSource blitSource;
++		readonly EditorBlitSource revertBlitSource;
++		readonly CPos blitPosition;
++		readonly Map map;
++		readonly bool respectBounds;
++
++		public EditorBlit(
++			MapBlitFilters blitFilters,
++			IResourceLayer resourceLayer,
++			CPos blitPosition,
++			Map map,
++			EditorBlitSource blitSource,
++			EditorActorLayer editorActorLayer,
++			bool respectBounds)
++		{
++			this.blitFilters = blitFilters;
++			this.resourceLayer = resourceLayer;
++			this.blitSource = blitSource;
++			this.blitPosition = blitPosition;
++			this.editorActorLayer = editorActorLayer;
++			this.map = map;
++			this.respectBounds = respectBounds;
++
++			var blitSize = blitSource.CellRegion.BottomRight - blitSource.CellRegion.TopLeft;
++			revertBlitSource = CopyRegionContents(
++				map,
++				editorActorLayer,
++				resourceLayer,
++				new CellRegion(map.Grid.Type, blitPosition, blitPosition + blitSize),
++				blitFilters);
++		}
++
++		/// <summary>
++		/// Returns an EditorBlitSource containing the map contents for a given region.
++		/// </summary>
++		public static EditorBlitSource CopyRegionContents(
++			Map map,
++			EditorActorLayer editorActorLayer,
++			IResourceLayer resourceLayer,
++			CellRegion region,
++			MapBlitFilters blitFilters)
++		{
++			var mapTiles = map.Tiles;
++			var mapHeight = map.Height;
++			var mapResources = map.Resources;
++
++			var previews = new Dictionary<string, EditorActorPreview>();
++			var tiles = new Dictionary<CPos, BlitTile>();
++
++			foreach (var cell in region.CellCoords)
++			{
++				if (!mapTiles.Contains(cell))
++					continue;
++
++				tiles.Add(
++					cell,
++					new BlitTile(mapTiles[cell],
++					mapResources[cell],
++					resourceLayer?.GetResource(cell),
++					mapHeight[cell]));
++			}
++
++			if (blitFilters.HasFlag(MapBlitFilters.Actors))
++				foreach (var preview in editorActorLayer.PreviewsInCellRegion(region.CellCoords))
++					previews.TryAdd(preview.ID, preview);
++
++			return new EditorBlitSource(region, previews, tiles);
++		}
++
++		void Blit(EditorBlitSource source, bool isRevert)
++		{
++			var blitPos = isRevert ? source.CellRegion.TopLeft : blitPosition;
++			var blitVec = blitPos - source.CellRegion.TopLeft;
++			var blitSize = source.CellRegion.BottomRight - source.CellRegion.TopLeft;
++			var blitRegion = new CellRegion(map.Grid.Type, blitPos, blitPos + blitSize);
++
++			if (blitFilters.HasFlag(MapBlitFilters.Actors))
++			{
++				// Clear any existing actors in the paste cells.
++				foreach (var regionActor in editorActorLayer.PreviewsInCellRegion(blitRegion.CellCoords).ToList())
++					editorActorLayer.Remove(regionActor);
++			}
++
++			foreach (var tileKeyValuePair in source.Tiles)
++			{
++				var position = tileKeyValuePair.Key + blitVec;
++				if (!map.Tiles.Contains(position) || (respectBounds && !map.Contains(position)))
++					continue;
++
++				// Clear any existing resources.
++				if (resourceLayer != null && blitFilters.HasFlag(MapBlitFilters.Resources))
++					resourceLayer.ClearResources(position);
++
++				var tile = tileKeyValuePair.Value;
++				var resourceLayerContents = tile.ResourceLayerContents;
++
++				if (blitFilters.HasFlag(MapBlitFilters.Terrain))
++				{
++					map.Tiles[position] = tile.TerrainTile;
++					map.Height[position] = tile.Height;
++				}
++
++				if (blitFilters.HasFlag(MapBlitFilters.Resources) &&
++					resourceLayerContents.HasValue &&
++					!string.IsNullOrWhiteSpace(resourceLayerContents.Value.Type))
++					resourceLayer.AddResource(resourceLayerContents.Value.Type, position, resourceLayerContents.Value.Density);
++			}
++
++			if (blitFilters.HasFlag(MapBlitFilters.Actors))
++			{
++				if (isRevert)
++				{
++					// For reverts, just place the original actors back exactly how they were.
++					foreach (var actor in source.Actors.Values)
++						editorActorLayer.Add(actor);
++				}
++				else
++				{
++					// Create copies of the original actors, update their locations, and place.
++					foreach (var actorKeyValuePair in source.Actors)
++					{
++						var copy = actorKeyValuePair.Value.Export();
++						var locationInit = copy.GetOrDefault<LocationInit>();
++						if (locationInit != null)
++						{
++							var actorPosition = locationInit.Value + blitVec;
++							if (respectBounds && !map.Contains(actorPosition))
++								continue;
++
++							copy.RemoveAll<LocationInit>();
++							copy.Add(new LocationInit(actorPosition));
++						}
++
++						editorActorLayer.Add(copy);
++					}
++				}
++			}
++		}
++
++		public void Commit() => Blit(blitSource, false);
++		public void Revert() => Blit(revertBlitSource, true);
++
++		public int TileCount()
++		{
++			return blitSource.Tiles.Count;
++		}
++	}
++}
+diff --git a/OpenRA.Mods.Common/EditorBrushes/EditorClipboard.cs b/OpenRA.Mods.Common/EditorBrushes/EditorClipboard.cs
+deleted file mode 100644
+index b505822fc5d8..000000000000
+--- a/OpenRA.Mods.Common/EditorBrushes/EditorClipboard.cs
++++ /dev/null
+@@ -1,46 +0,0 @@
+-﻿#region Copyright & License Information
+-/*
+- * Copyright (c) The OpenRA Developers and Contributors
+- * This file is part of OpenRA, which is free software. It is made
+- * available to you under the terms of the GNU General Public License
+- * as published by the Free Software Foundation, either version 3 of
+- * the License, or (at your option) any later version. For more
+- * information, see COPYING.
+- */
+-#endregion
+-
+-using System.Collections.Generic;
+-using OpenRA.Mods.Common.Traits;
+-
+-namespace OpenRA.Mods.Common.EditorBrushes
+-{
+-	public readonly struct ClipboardTile
+-	{
+-		public readonly TerrainTile TerrainTile;
+-		public readonly ResourceTile ResourceTile;
+-		public readonly ResourceLayerContents? ResourceLayerContents;
+-		public readonly byte Height;
+-
+-		public ClipboardTile(TerrainTile terrainTile, ResourceTile resourceTile, ResourceLayerContents? resourceLayerContents, byte height)
+-		{
+-			TerrainTile = terrainTile;
+-			ResourceTile = resourceTile;
+-			ResourceLayerContents = resourceLayerContents;
+-			Height = height;
+-		}
+-	}
+-
+-	public readonly struct EditorClipboard
+-	{
+-		public readonly CellRegion CellRegion;
+-		public readonly Dictionary<string, EditorActorPreview> Actors;
+-		public readonly Dictionary<CPos, ClipboardTile> Tiles;
+-
+-		public EditorClipboard(CellRegion cellRegion, Dictionary<string, EditorActorPreview> actors, Dictionary<CPos, ClipboardTile> tiles)
+-		{
+-			CellRegion = cellRegion;
+-			Actors = actors;
+-			Tiles = tiles;
+-		}
+-	}
+-}
+diff --git a/OpenRA.Mods.Common/EditorBrushes/EditorCopyPasteBrush.cs b/OpenRA.Mods.Common/EditorBrushes/EditorCopyPasteBrush.cs
+index eb5ea2af38e7..c1f1a1b7d98e 100644
+--- a/OpenRA.Mods.Common/EditorBrushes/EditorCopyPasteBrush.cs
++++ b/OpenRA.Mods.Common/EditorBrushes/EditorCopyPasteBrush.cs
+@@ -11,7 +11,6 @@
+ 
+ using System;
+ using System.Collections.Generic;
+-using System.Linq;
+ using OpenRA.Graphics;
+ using OpenRA.Mods.Common.EditorBrushes;
+ using OpenRA.Mods.Common.Graphics;
+@@ -19,25 +18,15 @@
+ 
+ namespace OpenRA.Mods.Common.Widgets
+ {
+-	[Flags]
+-	public enum MapCopyFilters
+-	{
+-		None = 0,
+-		Terrain = 1,
+-		Resources = 2,
+-		Actors = 4,
+-		All = Terrain | Resources | Actors
+-	}
+-
+ 	public sealed class EditorCopyPasteBrush : IEditorBrush
+ 	{
+ 		readonly WorldRenderer worldRenderer;
+ 		readonly EditorViewportControllerWidget editorWidget;
+ 		readonly EditorActorLayer editorActorLayer;
+ 		readonly EditorActionManager editorActionManager;
+-		readonly EditorClipboard clipboard;
++		readonly EditorBlitSource clipboard;
+ 		readonly IResourceLayer resourceLayer;
+-		readonly Func<MapCopyFilters> getCopyFilters;
++		readonly Func<MapBlitFilters> getCopyFilters;
+ 
+ 		public CPos? PastePreviewPosition { get; private set; }
+ 
+@@ -46,9 +35,9 @@ public sealed class EditorCopyPasteBrush : IEditorBrush
+ 		public EditorCopyPasteBrush(
+ 			EditorViewportControllerWidget editorWidget,
+ 			WorldRenderer wr,
+-			EditorClipboard clipboard,
++			EditorBlitSource clipboard,
+ 			IResourceLayer resourceLayer,
+-			Func<MapCopyFilters> getCopyFilters)
++			Func<MapBlitFilters> getCopyFilters)
+ 		{
+ 			this.getCopyFilters = getCopyFilters;
+ 			this.editorWidget = editorWidget;
+@@ -80,13 +69,15 @@ public bool HandleMouseInput(MouseInput mi)
+ 			if (mi.Button == MouseButton.Left && mi.Event == MouseInputEvent.Down)
+ 			{
+ 				var pastePosition = worldRenderer.Viewport.ViewToWorld(Viewport.LastMousePos);
+-				var action = new CopyPasteEditorAction(
++				var editorBlit = new EditorBlit(
+ 					getCopyFilters(),
+ 					resourceLayer,
+ 					pastePosition,
+ 					worldRenderer.World.Map,
+ 					clipboard,
+-					editorActorLayer);
++					editorActorLayer,
++					true);
++				var action = new CopyPasteEditorAction(editorBlit);
+ 
+ 				editorActionManager.Add(action);
+ 				return true;
+@@ -121,65 +112,13 @@ sealed class CopyPasteEditorAction : IEditorAction
+ 
+ 		public string Text { get; }
+ 
+-		readonly MapCopyFilters copyFilters;
+-		readonly IResourceLayer resourceLayer;
+-		readonly EditorActorLayer editorActorLayer;
+-		readonly EditorClipboard clipboard;
+-		readonly EditorClipboard undoClipboard;
+-		readonly CPos pastePosition;
+-		readonly Map map;
+-
+-		public CopyPasteEditorAction(
+-			MapCopyFilters copyFilters,
+-			IResourceLayer resourceLayer,
+-			CPos pastePosition,
+-			Map map,
+-			EditorClipboard clipboard,
+-			EditorActorLayer editorActorLayer)
+-		{
+-			this.copyFilters = copyFilters;
+-			this.resourceLayer = resourceLayer;
+-			this.clipboard = clipboard;
+-			this.pastePosition = pastePosition;
+-			this.editorActorLayer = editorActorLayer;
+-			this.map = map;
+-
+-			undoClipboard = CopySelectionContents();
+-
+-			Text = FluentProvider.GetMessage(CopiedTiles, "amount", clipboard.Tiles.Count);
+-		}
++		readonly EditorBlit editorBlit;
+ 
+-		/// <summary>
+-		/// TODO: This is pretty much repeated in MapEditorSelectionLogic.
+-		/// </summary>
+-		/// <returns>Clipboard containing map contents for this region.</returns>
+-		EditorClipboard CopySelectionContents()
++		public CopyPasteEditorAction(EditorBlit editorBlit)
+ 		{
+-			var selectionSize = clipboard.CellRegion.BottomRight - clipboard.CellRegion.TopLeft;
+-			var source = new CellCoordsRegion(pastePosition, pastePosition + selectionSize);
+-			var selection = new CellRegion(map.Grid.Type, pastePosition, pastePosition + selectionSize);
++			this.editorBlit = editorBlit;
+ 
+-			var mapTiles = map.Tiles;
+-			var mapHeight = map.Height;
+-			var mapResources = map.Resources;
+-
+-			var previews = new Dictionary<string, EditorActorPreview>();
+-			var tiles = new Dictionary<CPos, ClipboardTile>();
+-
+-			foreach (var cell in source)
+-			{
+-				if (!mapTiles.Contains(cell))
+-					continue;
+-
+-				var resourceLayerContents = resourceLayer?.GetResource(cell);
+-				tiles.Add(cell, new ClipboardTile(mapTiles[cell], mapResources[cell], resourceLayerContents, mapHeight[cell]));
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-					foreach (var preview in editorActorLayer.PreviewsInCellRegion(selection.CellCoords))
+-						previews.TryAdd(preview.ID, preview);
+-			}
+-
+-			return new EditorClipboard(selection, previews, tiles);
++			Text = FluentProvider.GetMessage(CopiedTiles, "amount", editorBlit.TileCount());
+ 		}
+ 
+ 		public void Execute()
+@@ -189,103 +128,12 @@ public void Execute()
+ 
+ 		public void Do()
+ 		{
+-			var sourcePos = clipboard.CellRegion.TopLeft;
+-			var pasteVec = new CVec(pastePosition.X - sourcePos.X, pastePosition.Y - sourcePos.Y);
+-
+-			if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-			{
+-				// Clear any existing actors in the paste cells.
+-				var selectionSize = clipboard.CellRegion.BottomRight - clipboard.CellRegion.TopLeft;
+-				var pasteRegion = new CellRegion(map.Grid.Type, pastePosition, pastePosition + selectionSize);
+-				foreach (var regionActor in editorActorLayer.PreviewsInCellRegion(pasteRegion.CellCoords).ToList())
+-					editorActorLayer.Remove(regionActor);
+-			}
+-
+-			foreach (var tileKeyValuePair in clipboard.Tiles)
+-			{
+-				var position = tileKeyValuePair.Key + pasteVec;
+-				if (!map.Contains(position))
+-					continue;
+-
+-				// Clear any existing resources.
+-				if (resourceLayer != null && copyFilters.HasFlag(MapCopyFilters.Resources))
+-					resourceLayer.ClearResources(position);
+-
+-				var tile = tileKeyValuePair.Value;
+-				var resourceLayerContents = tile.ResourceLayerContents;
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Terrain))
+-				{
+-					map.Tiles[position] = tile.TerrainTile;
+-					map.Height[position] = tile.Height;
+-				}
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Resources) &&
+-					resourceLayerContents.HasValue &&
+-					!string.IsNullOrWhiteSpace(resourceLayerContents.Value.Type))
+-					resourceLayer.AddResource(resourceLayerContents.Value.Type, position, resourceLayerContents.Value.Density);
+-			}
+-
+-			if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-			{
+-				// Now place actors.
+-				foreach (var actorKeyValuePair in clipboard.Actors)
+-				{
+-					var selection = clipboard.CellRegion;
+-					var copy = actorKeyValuePair.Value.Export();
+-					var locationInit = copy.GetOrDefault<LocationInit>();
+-					if (locationInit != null)
+-					{
+-						var actorPosition = locationInit.Value + new CVec(pastePosition.X - selection.TopLeft.X, pastePosition.Y - selection.TopLeft.Y);
+-						if (!map.Contains(actorPosition))
+-							continue;
+-
+-						copy.RemoveAll<LocationInit>();
+-						copy.Add(new LocationInit(actorPosition));
+-					}
+-
+-					editorActorLayer.Add(copy);
+-				}
+-			}
++			editorBlit.Commit();
+ 		}
+ 
+ 		public void Undo()
+ 		{
+-			if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-			{
+-				// Clear existing actors.
+-				foreach (var regionActor in editorActorLayer.PreviewsInCellRegion(undoClipboard.CellRegion.CellCoords).ToList())
+-					editorActorLayer.Remove(regionActor);
+-			}
+-
+-			foreach (var tileKeyValuePair in undoClipboard.Tiles)
+-			{
+-				var position = tileKeyValuePair.Key;
+-				var tile = tileKeyValuePair.Value;
+-				var resourceLayerContents = tile.ResourceLayerContents;
+-
+-				// Clear any existing resources.
+-				if (resourceLayer != null && copyFilters.HasFlag(MapCopyFilters.Resources))
+-					resourceLayer.ClearResources(position);
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Terrain))
+-				{
+-					map.Tiles[position] = tile.TerrainTile;
+-					map.Height[position] = tile.Height;
+-				}
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Resources) &&
+-					resourceLayerContents.HasValue &&
+-					!string.IsNullOrWhiteSpace(resourceLayerContents.Value.Type))
+-					resourceLayer.AddResource(resourceLayerContents.Value.Type, position, resourceLayerContents.Value.Density);
+-			}
+-
+-			if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-			{
+-				// Place actors back again.
+-				foreach (var actor in undoClipboard.Actors.Values)
+-					editorActorLayer.Add(actor);
+-			}
++			editorBlit.Revert();
+ 		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Widgets/Logic/Editor/MapEditorSelectionLogic.cs b/OpenRA.Mods.Common/Widgets/Logic/Editor/MapEditorSelectionLogic.cs
+index fb0ecf6253cc..bb73f139e354 100644
+--- a/OpenRA.Mods.Common/Widgets/Logic/Editor/MapEditorSelectionLogic.cs
++++ b/OpenRA.Mods.Common/Widgets/Logic/Editor/MapEditorSelectionLogic.cs
+@@ -10,7 +10,6 @@
+ #endregion
+ 
+ using System;
+-using System.Collections.Generic;
+ using OpenRA.Graphics;
+ using OpenRA.Mods.Common.EditorBrushes;
+ using OpenRA.Mods.Common.Traits;
+@@ -34,8 +33,8 @@ public class MapEditorSelectionLogic : ChromeLogic
+ 		public LabelWidget DiagonalLabel;
+ 		public LabelWidget ResourceCounterLabel;
+ 
+-		MapCopyFilters copyFilters = MapCopyFilters.All;
+-		EditorClipboard? clipboard;
++		MapBlitFilters copyFilters = MapBlitFilters.All;
++		EditorBlitSource? clipboard;
+ 
+ 		[ObjectCreator.UseCtor]
+ 		public MapEditorSelectionLogic(Widget widget, World world, WorldRenderer worldRenderer)
+@@ -91,39 +90,22 @@ public MapEditorSelectionLogic(Widget widget, World world, WorldRenderer worldRe
+ 			var closeAreaSelectionButton = areaEditPanel.Get<ButtonWidget>("SELECTION_CANCEL_BUTTON");
+ 			closeAreaSelectionButton.OnClick = () => editor.DefaultBrush.ClearSelection(updateSelectedTab: true);
+ 
+-			CreateCategoryPanel(MapCopyFilters.Terrain, copyTerrainCheckbox);
+-			CreateCategoryPanel(MapCopyFilters.Resources, copyResourcesCheckbox);
+-			CreateCategoryPanel(MapCopyFilters.Actors, copyActorsCheckbox);
++			CreateCategoryPanel(MapBlitFilters.Terrain, copyTerrainCheckbox);
++			CreateCategoryPanel(MapBlitFilters.Resources, copyResourcesCheckbox);
++			CreateCategoryPanel(MapBlitFilters.Actors, copyActorsCheckbox);
+ 		}
+ 
+-		EditorClipboard CopySelectionContents()
++		EditorBlitSource CopySelectionContents()
+ 		{
+-			var selection = editor.DefaultBrush.Selection.Area;
+-			var source = new CellCoordsRegion(selection.TopLeft, selection.BottomRight);
+-
+-			var mapTiles = map.Tiles;
+-			var mapHeight = map.Height;
+-			var mapResources = map.Resources;
+-
+-			var previews = new Dictionary<string, EditorActorPreview>();
+-			var tiles = new Dictionary<CPos, ClipboardTile>();
+-
+-			foreach (var cell in source)
+-			{
+-				if (!mapTiles.Contains(cell))
+-					continue;
+-
+-				tiles.Add(cell, new ClipboardTile(mapTiles[cell], mapResources[cell], resourceLayer?.GetResource(cell), mapHeight[cell]));
+-
+-				if (copyFilters.HasFlag(MapCopyFilters.Actors))
+-					foreach (var preview in editorActorLayer.PreviewsInCellRegion(selection.CellCoords))
+-						previews.TryAdd(preview.ID, preview);
+-			}
+-
+-			return new EditorClipboard(selection, previews, tiles);
++			return EditorBlit.CopyRegionContents(
++				map,
++				editorActorLayer,
++				resourceLayer,
++				editor.DefaultBrush.Selection.Area,
++				copyFilters);
+ 		}
+ 
+-		void CreateCategoryPanel(MapCopyFilters copyFilter, CheckboxWidget checkbox)
++		void CreateCategoryPanel(MapBlitFilters copyFilter, CheckboxWidget checkbox)
+ 		{
+ 			checkbox.GetText = () => copyFilter.ToString();
+ 			checkbox.IsChecked = () => copyFilters.HasFlag(copyFilter);

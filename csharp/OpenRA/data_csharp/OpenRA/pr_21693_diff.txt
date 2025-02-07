@@ -1,0 +1,630 @@
+diff --git a/OpenRA.Game/Settings.cs b/OpenRA.Game/Settings.cs
+index a586fed11939..444f535ec84f 100644
+--- a/OpenRA.Game/Settings.cs
++++ b/OpenRA.Game/Settings.cs
+@@ -251,6 +251,14 @@ public class PlayerSettings
+ 		public Color[] CustomColors = Array.Empty<Color>();
+ 	}
+ 
++	public class SinglePlayerGameSettings
++	{
++		[Desc("Sets the Auto-save frequency, in seconds")]
++		public int AutoSaveInterval = 0;
++		[Desc("Sets the AutoSave number of max files to bes saved on the file-system")]
++		public int AutoSaveMaxFileCount = 10;
++	}
++
+ 	public class GameSettings
+ 	{
+ 		public string Platform = "Default";
+@@ -308,8 +316,8 @@ public class Settings
+ 		public readonly GraphicSettings Graphics = new();
+ 		public readonly ServerSettings Server = new();
+ 		public readonly DebugSettings Debug = new();
++		public readonly SinglePlayerGameSettings SinglePlayerSettings = new();
+ 		internal Dictionary<string, Hotkey> Keys = new();
+-
+ 		public readonly Dictionary<string, object> Sections;
+ 
+ 		// A direct clone of the file loaded from disk.
+@@ -328,6 +336,7 @@ public Settings(string file, Arguments args)
+ 				{ "Graphics", Graphics },
+ 				{ "Server", Server },
+ 				{ "Debug", Debug },
++				{ "SinglePlayerSettings", SinglePlayerSettings },
+ 			};
+ 
+ 			// Override fieldloader to ignore invalid entries
+diff --git a/OpenRA.Mods.Common/Traits/World/AutoSave.cs b/OpenRA.Mods.Common/Traits/World/AutoSave.cs
+new file mode 100644
+index 000000000000..a2f4077867e1
+--- /dev/null
++++ b/OpenRA.Mods.Common/Traits/World/AutoSave.cs
+@@ -0,0 +1,99 @@
++#region Copyright & License Information
++/*
++ * Copyright (c) The OpenRA Developers and Contributors
++ * This file is part of OpenRA, which is free software. It is made
++ * available to you under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version. For more
++ * information, see COPYING.
++ */
++#endregion
++
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using OpenRA.Traits;
++
++namespace OpenRA.Mods.Common.Traits
++{
++	[TraitLocation(SystemActors.World)]
++	[Desc("Add this trait to the world actor to enable auto-save.")]
++	public class AutoSaveInfo : TraitInfo
++	{
++		public override object Create(ActorInitializer init) { return new AutoSave(init.Self, this); }
++	}
++
++	public class AutoSave : ITick
++	{
++		const string AutoSavePattern = "autosave-";
++		const string SaveFileExtension = ".orasav";
++		int ticksUntilAutoSave;
++		int lastSaveInverval;
++		readonly bool isDisabled;
++
++		public AutoSave(Actor self, AutoSaveInfo info)
++		{
++			ticksUntilAutoSave = GetTicksBetweenAutosaves(self);
++			lastSaveInverval = Game.Settings.SinglePlayerSettings.AutoSaveInterval;
++
++			isDisabled = self.World.LobbyInfo.GlobalSettings.Dedicated || self.World.LobbyInfo.NonBotClients.Count() > 1;
++		}
++
++		void ITick.Tick(Actor self)
++		{
++			if (isDisabled || self.World.IsReplay || self.World.IsLoadingGameSave)
++				return;
++
++			var autoSaveValue = Game.Settings.SinglePlayerSettings.AutoSaveInterval;
++
++			if (autoSaveValue == 0)
++				return;
++
++			var autoSaveFileLimit = Game.Settings.SinglePlayerSettings.AutoSaveMaxFileCount;
++
++			autoSaveFileLimit = autoSaveFileLimit < 3 ? 3 : autoSaveFileLimit;
++
++			if (lastSaveInverval != autoSaveValue)
++			{
++				lastSaveInverval = autoSaveValue;
++				ticksUntilAutoSave = GetTicksBetweenAutosaves(self);
++			}
++
++			if (--ticksUntilAutoSave > 0)
++				return;
++
++			var oldAutoSaveFiles = GetAutoSaveFiles()
++				.OrderByDescending(f => f.CreationTime)
++				.Skip(autoSaveFileLimit - 1);
++
++			foreach (var oldAutoSaveFile in oldAutoSaveFiles)
++				oldAutoSaveFile.Delete();
++
++			var dateTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHHmmssZ", CultureInfo.InvariantCulture);
++			var fileName = $"{AutoSavePattern}{dateTime}{SaveFileExtension}";
++			self.World.RequestGameSave(fileName);
++			ticksUntilAutoSave = GetTicksBetweenAutosaves(self);
++		}
++
++		static IEnumerable<FileSystemInfo> GetAutoSaveFiles()
++		{
++			var mod = Game.ModData.Manifest;
++
++			var saveFolderPath = Path.Combine(Platform.SupportDir, "Saves", mod.Id, mod.Metadata.Version);
++
++			var autoSaveDirectoryInfo = new DirectoryInfo(saveFolderPath);
++
++			if (!autoSaveDirectoryInfo.Exists)
++				return Array.Empty<FileInfo>();
++
++			return autoSaveDirectoryInfo.EnumerateFiles($"{AutoSavePattern}*{SaveFileExtension}");
++		}
++
++		static int GetTicksBetweenAutosaves(Actor self)
++		{
++			return 1000 / self.World.Timestep * Game.Settings.SinglePlayerSettings.AutoSaveInterval;
++		}
++	}
++}
+diff --git a/OpenRA.Mods.Common/Widgets/Logic/Settings/GamePlaySettingsLogic.cs b/OpenRA.Mods.Common/Widgets/Logic/Settings/GamePlaySettingsLogic.cs
+new file mode 100644
+index 000000000000..9773e9d48d83
+--- /dev/null
++++ b/OpenRA.Mods.Common/Widgets/Logic/Settings/GamePlaySettingsLogic.cs
+@@ -0,0 +1,127 @@
++#region Copyright & License Information
++/*
++ * Copyright (c) The OpenRA Developers and Contributors
++ * This file is part of OpenRA, which is free software. It is made
++ * available to you under the terms of the GNU General Public License
++ * as published by the Free Software Foundation, either version 3 of
++ * the License, or (at your option) any later version. For more
++ * information, see COPYING.
++ */
++#endregion
++
++using System;
++using System.Collections.Generic;
++using OpenRA.Widgets;
++
++namespace OpenRA.Mods.Common.Widgets.Logic
++{
++	public class GameplaySettingsLogic : ChromeLogic
++	{
++		[FluentReference]
++		const string AutoSaveIntervalOptions = "auto-save-interval.options";
++
++		[FluentReference]
++		const string AutoSaveIntervalDisabled = "auto-save-interval.disabled";
++
++		[FluentReference]
++		const string AutoSaveIntervalMinuteOptions = "auto-save-interval.minute-options";
++
++		[FluentReference]
++		const string AutoSaveMaxFileNumber = "auto-save-max-file-number";
++		readonly int[] autoSaveSeconds = { 0, 10, 30, 45, 60, 120, 180, 300, 600 };
++
++		readonly int[] autoSaveFileNumbers = { 3, 5, 10, 20, 50, 100 };
++
++		[ObjectCreator.UseCtor]
++		public GameplaySettingsLogic(Action<string, string, Func<Widget, Func<bool>>, Func<Widget, Action>> registerPanel, string panelID, string label)
++		{
++			registerPanel(panelID, label, InitPanel, ResetPanel);
++		}
++
++		Func<bool> InitPanel(Widget panel)
++		{
++			var scrollPanel = panel.Get<ScrollPanelWidget>("SETTINGS_SCROLLPANEL");
++			SettingsUtils.AdjustSettingsScrollPanelLayout(scrollPanel);
++
++			// Setup dropdown for auto-save interval
++			var autoSaveIntervalDropDown = panel.Get<DropDownButtonWidget>("AUTO_SAVE_INTERVAL_DROP_DOWN");
++
++			autoSaveIntervalDropDown.OnClick = () =>
++				ShowAutoSaveIntervalDropdown(autoSaveIntervalDropDown, autoSaveSeconds);
++
++			autoSaveIntervalDropDown.GetText = () => GetMessageForAutoSaveInterval(Game.Settings.SinglePlayerSettings.AutoSaveInterval);
++
++			// Setup dropdown for auto-save nr.
++			var autoSaveNoDropDown = panel.Get<DropDownButtonWidget>("AUTO_SAVE_FILE_NUMBER_DROP_DOWN");
++
++			autoSaveNoDropDown.OnMouseDown = _ =>
++				ShowAutoSaveFileNumberDropdown(autoSaveNoDropDown, autoSaveFileNumbers);
++
++			autoSaveNoDropDown.GetText = () => FluentProvider.GetMessage(AutoSaveMaxFileNumber, "saves", Game.Settings.SinglePlayerSettings.AutoSaveMaxFileCount);
++
++			autoSaveNoDropDown.IsDisabled = () => Game.Settings.SinglePlayerSettings.AutoSaveInterval <= 0;
++
++			return () => false;
++		}
++
++		Action ResetPanel(Widget panel)
++		{
++			return () => { };
++		}
++
++		void ShowAutoSaveIntervalDropdown(DropDownButtonWidget dropdown, IEnumerable<int> options)
++		{
++			var gsp = Game.Settings.SinglePlayerSettings;
++
++			ScrollItemWidget SetupItem(int o, ScrollItemWidget itemTemplate)
++			{
++				var item = ScrollItemWidget.Setup(itemTemplate,
++					() => gsp.AutoSaveInterval == o,
++					() =>
++					{
++						gsp.AutoSaveInterval = o;
++						Game.Settings.Save();
++					});
++
++				var deviceLabel = item.Get<LabelWidget>("LABEL");
++				deviceLabel.GetText = () => GetMessageForAutoSaveInterval(o);
++
++				return item;
++			}
++
++			dropdown.ShowDropDown("LABEL_DROPDOWN_TEMPLATE", 500, options, SetupItem);
++		}
++
++		void ShowAutoSaveFileNumberDropdown(DropDownButtonWidget dropdown, IEnumerable<int> options)
++		{
++			var gsp = Game.Settings.SinglePlayerSettings;
++
++			ScrollItemWidget SetupItem(int o, ScrollItemWidget itemTemplate)
++			{
++				var item = ScrollItemWidget.Setup(itemTemplate,
++					() => gsp.AutoSaveMaxFileCount == o,
++					() =>
++					{
++						gsp.AutoSaveMaxFileCount = o;
++						Game.Settings.Save();
++					});
++
++				var deviceLabel = item.Get<LabelWidget>("LABEL");
++
++				deviceLabel.GetText = () => FluentProvider.GetMessage(AutoSaveMaxFileNumber, "saves", o);
++
++				return item;
++			}
++
++			dropdown.ShowDropDown("LABEL_DROPDOWN_TEMPLATE", 500, options, SetupItem);
++		}
++
++		static string GetMessageForAutoSaveInterval(int value) =>
++			value switch
++			{
++				0 => FluentProvider.GetMessage(AutoSaveIntervalDisabled),
++				< 60 => FluentProvider.GetMessage(AutoSaveIntervalOptions, "seconds", value),
++				_ => FluentProvider.GetMessage(AutoSaveIntervalMinuteOptions, "minutes", value / 60)
++			};
++	}
++}
+diff --git a/mods/cnc/chrome/settings-gameplay.yaml b/mods/cnc/chrome/settings-gameplay.yaml
+new file mode 100644
+index 000000000000..78a48b7256db
+--- /dev/null
++++ b/mods/cnc/chrome/settings-gameplay.yaml
+@@ -0,0 +1,59 @@
++Container@GAMEPLAY_PANEL:
++	Logic: GameplaySettingsLogic
++	Width: PARENT_WIDTH
++	Height: PARENT_HEIGHT
++	Children:
++		ScrollPanel@SETTINGS_SCROLLPANEL:
++			Width: PARENT_WIDTH
++			Height: PARENT_HEIGHT
++			CollapseHiddenChildren: True
++			TopBottomSpacing: 5
++			ItemSpacing: 10
++			Children:
++				Background@INPUT_SECTION_HEADER:
++					X: 5
++					Width: PARENT_WIDTH - 24 - 10
++					Height: 13
++					Background: separator
++					ClickThrough: True
++					Children:
++						Label@LABEL:
++							Width: PARENT_WIDTH
++							Height: PARENT_HEIGHT
++							Font: TinyBold
++							Align: Center
++							Text: label-game-play-section-header
++				Container@ROW:
++					Width: PARENT_WIDTH - 24
++					Height: 50
++					Children:
++						Container@AUTO_SAVE_INTERVAL_CONTAINER:
++							X: 10
++							Width: PARENT_WIDTH / 2 - 20
++							Children:
++								LabelForInput@AUTO_SAVE_INTERVAL_DROP_DOWN_LABEL:
++									Width: PARENT_WIDTH
++									Height: 20
++									Font: Regular
++									Text: auto-save-interval-label
++									For: AUTO_SAVE_INTERVAL_DROP_DOWN
++								DropDownButton@AUTO_SAVE_INTERVAL_DROP_DOWN:
++									Y: 25
++									Width: PARENT_WIDTH
++									Height: 25
++									Font: Regular
++						Container@AUTO_SAVE_NO_CONTAINER:
++							X: PARENT_WIDTH / 2 + 10
++							Width: PARENT_WIDTH / 2 - 20
++							Children:
++								LabelForInput@AUTO_SAVE_FILE_NUMBER_DROP_DOWN_LABEL:
++									Width: PARENT_WIDTH
++									Height: 20
++									Font: Regular
++									Text: auto-save-max-file-number-label
++									For: AUTO_SAVE_FILE_NUMBER_DROP_DOWN
++								DropDownButton@AUTO_SAVE_FILE_NUMBER_DROP_DOWN:
++									Y: 25
++									Width: PARENT_WIDTH
++									Height: 25
++									Font: Regular
+diff --git a/mods/cnc/chrome/settings.yaml b/mods/cnc/chrome/settings.yaml
+index bf44017c87ae..0f15249e8eca 100644
+--- a/mods/cnc/chrome/settings.yaml
++++ b/mods/cnc/chrome/settings.yaml
+@@ -7,6 +7,7 @@ Container@SETTINGS_PANEL:
+ 			INPUT_PANEL: Input
+ 			HOTKEYS_PANEL: Hotkeys
+ 			ADVANCED_PANEL: Advanced
++			GAMEPLAY_PANEL: Gameplay
+ 	X: (WINDOW_WIDTH - WIDTH) / 2
+ 	Y: (WINDOW_HEIGHT - HEIGHT) / 2
+ 	Width: 640
+diff --git a/mods/cnc/fluent/chrome.ftl b/mods/cnc/fluent/chrome.ftl
+index 1f441002c03e..b20a0d1353e1 100644
+--- a/mods/cnc/fluent/chrome.ftl
++++ b/mods/cnc/fluent/chrome.ftl
+@@ -651,6 +651,11 @@ label-audio-device-container = Audio Device:
+ label-video-volume-container = Video Volume:
+ label-restart-required-container-audio-desc = Device changes will be applied after the game is restarted
+ 
++## settings-gameplay.yaml
++label-game-play-section-header = Auto-save
++auto-save-interval-label = Auto-save frequency:
++auto-save-max-file-number-label = Auto-save limit:
++
+ ## settings-display.yaml
+ label-target-lines-dropdown-container = Target Lines:
+ label-status-bar-dropdown-container-bars = Status Bars:
+diff --git a/mods/cnc/maps/blank-shellmap/map.yaml b/mods/cnc/maps/blank-shellmap/map.yaml
+index c1d3c68d3127..ceb8319b4db4 100644
+--- a/mods/cnc/maps/blank-shellmap/map.yaml
++++ b/mods/cnc/maps/blank-shellmap/map.yaml
+@@ -46,6 +46,7 @@ Rules:
+ 		-SpawnStartingUnits:
+ 		-MapStartingLocations:
+ 		-CrateSpawner:
++		-AutoSave:
+ 		MusicPlaylist:
+ 			BackgroundMusic: map1
+ 			AllowMuteBackgroundMusic: true
+diff --git a/mods/cnc/mod.yaml b/mods/cnc/mod.yaml
+index 325b07df1ded..f54ee23f2ff2 100644
+--- a/mods/cnc/mod.yaml
++++ b/mods/cnc/mod.yaml
+@@ -133,6 +133,7 @@ ChromeLayout:
+ 	cnc|chrome/music.yaml
+ 	cnc|chrome/settings.yaml
+ 	cnc|chrome/settings-display.yaml
++	cnc|chrome/settings-gameplay.yaml
+ 	cnc|chrome/settings-audio.yaml
+ 	cnc|chrome/settings-input.yaml
+ 	cnc|chrome/settings-hotkeys.yaml
+diff --git a/mods/cnc/rules/world.yaml b/mods/cnc/rules/world.yaml
+index 20c4c488f3e9..e054307164ce 100644
+--- a/mods/cnc/rules/world.yaml
++++ b/mods/cnc/rules/world.yaml
+@@ -154,6 +154,7 @@ World:
+ 	DevCommands:
+ 	DebugVisualizationCommands:
+ 	PathFinderOverlay:
++	AutoSave:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:
+diff --git a/mods/common/chrome/settings-gameplay.yaml b/mods/common/chrome/settings-gameplay.yaml
+new file mode 100644
+index 000000000000..54776de8bb38
+--- /dev/null
++++ b/mods/common/chrome/settings-gameplay.yaml
+@@ -0,0 +1,57 @@
++Container@GAMEPLAY_PANEL:
++	Logic: GameplaySettingsLogic
++	Width: PARENT_WIDTH
++	Height: PARENT_HEIGHT
++	Children:
++		ScrollPanel@SETTINGS_SCROLLPANEL:
++			Width: PARENT_WIDTH
++			Height: PARENT_HEIGHT
++			CollapseHiddenChildren: True
++			TopBottomSpacing: 5
++			ItemSpacing: 10
++			Children:
++				Background@INPUT_SECTION_HEADER:
++					X: 5
++					Width: PARENT_WIDTH - 24 - 10
++					Height: 13
++					Background: separator
++					ClickThrough: True
++					Children:
++						Label@LABEL:
++							Width: PARENT_WIDTH
++							Height: PARENT_HEIGHT
++							Font: TinyBold
++							Align: Center
++							Text: label-game-play-section-header
++				Container@ROW:
++					Width: PARENT_WIDTH - 24
++					Height: 50
++					Children:
++						Container@AUTO_SAVE_INTERVAL_CONTAINER:
++							X: 10
++							Width: PARENT_WIDTH / 2 - 20
++							Children:
++								Label@AUTO_SAVE_INTERVAL_DROP_DOWN_LABEL:
++									Width: PARENT_WIDTH
++									Height: 20
++									Font: Regular
++									Text: auto-save-interval-label
++								DropDownButton@AUTO_SAVE_INTERVAL_DROP_DOWN:
++									Y: 25
++									Width: PARENT_WIDTH
++									Height: 25
++									Font: Regular
++						Container@AUTO_SAVE_NO_CONTAINER:
++							X: PARENT_WIDTH / 2 + 10
++							Width: PARENT_WIDTH / 2 - 20
++							Children:
++								Label@AUTO_SAVE_FILE_NUMBER_DROP_DOWN_LABEL:
++									Width: PARENT_WIDTH
++									Height: 20
++									Font: Regular
++									Text: auto-save-nr-label
++								DropDownButton@AUTO_SAVE_FILE_NUMBER_DROP_DOWN:
++									Y: 25
++									Width: PARENT_WIDTH
++									Height: 25
++									Font: Regular
+diff --git a/mods/common/chrome/settings.yaml b/mods/common/chrome/settings.yaml
+index a8fa616068db..4c2959795e4d 100644
+--- a/mods/common/chrome/settings.yaml
++++ b/mods/common/chrome/settings.yaml
+@@ -7,6 +7,7 @@ Background@SETTINGS_PANEL:
+ 			INPUT_PANEL: Input
+ 			HOTKEYS_PANEL: Hotkeys
+ 			ADVANCED_PANEL: Advanced
++			GAMEPLAY_PANEL: Gameplay
+ 	X: (WINDOW_WIDTH - WIDTH) / 2
+ 	Y: (WINDOW_HEIGHT -  HEIGHT) / 2
+ 	Width: 900
+diff --git a/mods/common/fluent/chrome.ftl b/mods/common/fluent/chrome.ftl
+index f231a6732a16..074eb008208c 100644
+--- a/mods/common/fluent/chrome.ftl
++++ b/mods/common/fluent/chrome.ftl
+@@ -473,6 +473,11 @@ label-audio-device-container = Audio Device:
+ label-video-volume-container = Video Volume:
+ label-restart-required-container-audio-desc = Device changes will be applied after the game is restarted
+ 
++## settings-gameplay.yaml
++label-game-play-section-header = Auto-save
++auto-save-interval-label = Auto-save frequency:
++auto-save-nr-label = Auto-save limit:
++
+ ## settings-display.yaml
+ label-target-lines-dropdown-container = Target Lines:
+ label-status-bar-dropdown-container-bars = Status Bars:
+diff --git a/mods/common/fluent/common.ftl b/mods/common/fluent/common.ftl
+index b999d22aef2d..319fa989aec6 100644
+--- a/mods/common/fluent/common.ftl
++++ b/mods/common/fluent/common.ftl
+@@ -408,6 +408,22 @@ label-original-notice = The default is "{ $key }"
+ label-duplicate-notice = This is already used for "{ $key }" in the { $context } context
+ hotkey-context-any = Any
+ 
++## GameplaySettingsLogic
++auto-save-interval =
++    .disabled = Disabled
++    .options =
++        { $seconds ->
++            [one] 1 second
++           *[other] { $seconds } seconds
++        }
++    .minute-options =
++        { $minutes ->
++            [one] 1 minute
++           *[other] { $minutes } minutes
++        }
++
++auto-save-max-file-number = { $saves } saves
++
+ ## InputSettingsLogic
+ options-mouse-scroll-type =
+     .disabled = Disabled
+diff --git a/mods/d2k/maps/shellmap/rules.yaml b/mods/d2k/maps/shellmap/rules.yaml
+index 852fb14fdb2a..64321b65e960 100644
+--- a/mods/d2k/maps/shellmap/rules.yaml
++++ b/mods/d2k/maps/shellmap/rules.yaml
+@@ -7,6 +7,7 @@ Player:
+ 
+ World:
+ 	-CrateSpawner:
++	-AutoSave:
+ 	-SpawnStartingUnits:
+ 	-MapStartingLocations:
+ 	ActorSpawnManager:
+diff --git a/mods/d2k/mod.yaml b/mods/d2k/mod.yaml
+index 7584145fe97b..f04c811e0c55 100644
+--- a/mods/d2k/mod.yaml
++++ b/mods/d2k/mod.yaml
+@@ -100,6 +100,7 @@ ChromeLayout:
+ 	common|chrome/mainmenu-prompts.yaml
+ 	common|chrome/settings.yaml
+ 	common|chrome/settings-display.yaml
++	common|chrome/settings-gameplay.yaml
+ 	common|chrome/settings-audio.yaml
+ 	common|chrome/settings-input.yaml
+ 	common|chrome/settings-hotkeys.yaml
+diff --git a/mods/d2k/rules/world.yaml b/mods/d2k/rules/world.yaml
+index 43b14fcb34b5..8095bc857319 100644
+--- a/mods/d2k/rules/world.yaml
++++ b/mods/d2k/rules/world.yaml
+@@ -125,6 +125,7 @@ World:
+ 	HierarchicalPathFinderOverlay:
+ 	PlayerCommands:
+ 	HelpCommand:
++	AutoSave:
+ 	ScreenShaker:
+ 	BuildingInfluence:
+ 	ProductionQueueFromSelection:
+diff --git a/mods/ra/maps/desert-shellmap/rules.yaml b/mods/ra/maps/desert-shellmap/rules.yaml
+index daf2c9591d3e..2d2e10ce91fd 100644
+--- a/mods/ra/maps/desert-shellmap/rules.yaml
++++ b/mods/ra/maps/desert-shellmap/rules.yaml
+@@ -10,6 +10,7 @@ Player:
+ 
+ World:
+ 	-CrateSpawner:
++	-AutoSave:
+ 	-SpawnStartingUnits:
+ 	-MapStartingLocations:
+ 	MusicPlaylist:
+diff --git a/mods/ra/mod.yaml b/mods/ra/mod.yaml
+index e906dbda5e0e..709988a9eddf 100644
+--- a/mods/ra/mod.yaml
++++ b/mods/ra/mod.yaml
+@@ -137,6 +137,7 @@ ChromeLayout:
+ 	common|chrome/settings-audio.yaml
+ 	common|chrome/settings-input.yaml
+ 	common|chrome/settings-hotkeys.yaml
++	common|chrome/settings-gameplay.yaml
+ 	common|chrome/settings-advanced.yaml
+ 	common|chrome/credits.yaml
+ 	common|chrome/lobby.yaml
+diff --git a/mods/ra/rules/world.yaml b/mods/ra/rules/world.yaml
+index df468b920279..8b762a1fffe5 100644
+--- a/mods/ra/rules/world.yaml
++++ b/mods/ra/rules/world.yaml
+@@ -276,6 +276,7 @@ World:
+ 	LoadWidgetAtGameStart:
+ 	ScriptTriggers:
+ 	CellTriggerOverlay:
++	AutoSave:
+ 	TimeLimitManager:
+ 		TimeLimitDisplayOrder: 2
+ 		TimeLimitWarnings:
+diff --git a/mods/ts/maps/fields-of-green/rules.yaml b/mods/ts/maps/fields-of-green/rules.yaml
+index b2ea4c84da5a..bfed0b6c1103 100644
+--- a/mods/ts/maps/fields-of-green/rules.yaml
++++ b/mods/ts/maps/fields-of-green/rules.yaml
+@@ -9,6 +9,7 @@ World:
+ 	-CrateSpawner:
+ 	-StartGameNotification:
+ 	-SpawnStartingUnits:
++	-AutoSave:
+ 	-MapStartingLocations:
+ 	LuaScript:
+ 		Scripts: fields-of-green.lua
+diff --git a/mods/ts/mod.yaml b/mods/ts/mod.yaml
+index 37e484d5a23b..8ad1ac53276d 100644
+--- a/mods/ts/mod.yaml
++++ b/mods/ts/mod.yaml
+@@ -142,6 +142,7 @@ ChromeLayout:
+ 	ts|chrome/mainmenu-prerelease-notification.yaml
+ 	common|chrome/settings.yaml
+ 	common|chrome/settings-display.yaml
++	common|chrome/settings-gameplay.yaml
+ 	common|chrome/settings-audio.yaml
+ 	common|chrome/settings-input.yaml
+ 	ts|chrome/settings-hotkeys.yaml
+diff --git a/mods/ts/rules/world.yaml b/mods/ts/rules/world.yaml
+index 33ba443af0c0..bb1579eb1356 100644
+--- a/mods/ts/rules/world.yaml
++++ b/mods/ts/rules/world.yaml
+@@ -236,6 +236,7 @@ World:
+ 	Inherits: ^BaseWorld
+ 	ChatCommands:
+ 	DevCommands:
++	AutoSave:
+ 	DebugVisualizationCommands:
+ 	PathFinderOverlay:
+ 	HierarchicalPathFinderOverlay:

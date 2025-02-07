@@ -1,0 +1,3736 @@
+diff --git a/OpenRA.Game/Support/MersenneTwister.cs b/OpenRA.Game/Support/MersenneTwister.cs
+index e83097c2245c..6329518b8cff 100644
+--- a/OpenRA.Game/Support/MersenneTwister.cs
++++ b/OpenRA.Game/Support/MersenneTwister.cs
+@@ -11,7 +11,6 @@
+ 
+ using System;
+ using System.Collections.Generic;
+-using System.Linq;
+ 
+ namespace OpenRA.Support
+ {
+@@ -35,7 +34,7 @@ public MersenneTwister(int seed)
+ 		}
+ 
+ 		/// <summary>
+-		/// Produces an unsigned integer between -0x80000000 and 0x7fffffff inclusive.
++		/// Produces a random unsigned 32-bit integer.
+ 		/// </summary>
+ 		public uint NextUint()
+ 		{
+@@ -54,7 +53,7 @@ public uint NextUint()
+ 		}
+ 
+ 		/// <summary>
+-		/// Produces an unsigned integer between -0x80000000 and 0x7fffffff inclusive.
++		/// Produces a random unsigned 64-bit integer.
+ 		/// </summary>
+ 		public ulong NextUlong()
+ 		{
+@@ -98,48 +97,32 @@ public float NextFloat()
+ 		}
+ 
+ 		/// <summary>
+-		/// Produces uniformally distributed random floats between 0 inclusive and 1 exclusive.
+-		/// Note that whilst floats are 32-bit (23-bit mantissa), each output contains exactly 23 bits of entropy.
++		/// Pick a random index from a list of weights.
+ 		/// </summary>
+-		public float NextFloatExclusive()
++		public int PickWeighted(IReadOnlyList<int> weights)
+ 		{
+-			return (NextUint() & 0x7fffff) / (float)0x800000;
+-		}
++			ulong total = 0;
++			foreach (var weight in weights)
++			{
++				if (weight < 0)
++					throw new ArgumentException("Found a negative weight.");
++				total += (ulong)weight;
++			}
+ 
+-		/// <summary>
+-		/// Produces uniformally distributed random doubles between 0 inclusive and 1 exclusive.
+-		/// Note that whilst doubles are 64-bit (52-bit mantissa), each output contains exactly 52 bits of entropy.
+-		/// </summary>
+-		public double NextDoubleExclusive()
+-		{
+-			return (NextUlong() & 0xfffffffffffffL) / (double)0x10000000000000L;
+-		}
++			if (total == 0)
++				return Next(0, weights.Count);
+ 
+-		/// <summary>
+-		/// Pick a random an index from a list of weights.
+-		/// </summary>
+-		public int PickWeighted(IReadOnlyList<float> weights)
+-		{
+-			var total = weights.Sum();
+-			var spin = NextFloatExclusive() * total;
++			var spin = NextUlong() % total;
+ 			int i;
+-			float acc = 0;
++			ulong acc = 0;
+ 			for (i = 0; i < weights.Count; i++)
+ 			{
+-				acc += weights[i];
++				acc += (ulong)weights[i];
+ 				if (spin < acc)
+ 					return i;
+ 			}
+ 
+-			// This might be possible due to floating point precision loss
+-			// (in rare cases). Or we might have been given rubbish
+-			// weights. Return anything > 0.
+-			for (i = 0; i < weights.Count; i++)
+-				if (weights[i] > 0)
+-					return i;
+-
+-			// All <= 0!
+-			return Next(0, weights.Count);
++			throw new InvalidOperationException("unreachable");
+ 		}
+ 
+ 		/// <summary>
+diff --git a/OpenRA.Mods.Common/MapGenerator/CellLayerUtils.cs b/OpenRA.Mods.Common/MapGenerator/CellLayerUtils.cs
+index 00afee593515..cc8b45cb641a 100644
+--- a/OpenRA.Mods.Common/MapGenerator/CellLayerUtils.cs
++++ b/OpenRA.Mods.Common/MapGenerator/CellLayerUtils.cs
+@@ -255,14 +255,14 @@ public static T[] Entries<T>(CellLayer<T> cellLayer)
+ 		}
+ 
+ 		/// <summary>
+-		/// Uniformally add to or subtract from all matrix cells such that the given quantile,
+-		/// fraction, has the given target value.
++		/// Uniformally add to or subtract from all cells such that count out of every outOf cells,
++		/// are no greater than the given target value.
+ 		/// </summary>
+-		public static void CalibrateQuantileInPlace(CellLayer<float> cellLayer, float target, float fraction)
++		public static void CalibrateQuantileInPlace(CellLayer<int> cellLayer, int target, int count, int outOf)
+ 		{
+ 			var sorted = Entries(cellLayer);
+ 			Array.Sort(sorted);
+-			var adjustment = target - MatrixUtils.ArrayQuantile(sorted, fraction);
++			var adjustment = target - sorted[(sorted.Length - 1) * count / outOf];
+ 			foreach (var mpos in cellLayer.CellRegion.MapCoords)
+ 				cellLayer[mpos] += adjustment;
+ 		}
+@@ -381,12 +381,15 @@ public static void ChebyshevRoom(
+ 			FromMatrix(output, roominess);
+ 		}
+ 
+-		/// <summary>Wrapper around MatrixUtils.WalkingDistance in CPos space.</summary>
++		/// <summary>
++		/// Wrapper around MatrixUtils.WalkingDistance in CPos space.
++		/// Returns world distances (1024ths).
++		/// </summary>
+ 		public static void WalkingDistances(
+-			CellLayer<float> distances,
++			CellLayer<int> distances,
+ 			CellLayer<bool> passable,
+ 			IEnumerable<CPos> seeds,
+-			float maxDistance)
++			int maxDistance)
+ 		{
+ 			var passableMatrix = ToMatrix(passable, false);
+ 			var cellBounds = CellBounds(passable);
+@@ -428,7 +431,7 @@ public static (MPos MPos, T Value) FindRandomBest<T>(
+ 		/// Pick a random MPos position in a CellLayer where each cell is a
+ 		/// selection weight.
+ 		/// </summary>
+-		public static MPos PickWeighted(CellLayer<float> weights, MersenneTwister random)
++		public static MPos PickWeighted(CellLayer<int> weights, MersenneTwister random)
+ 		{
+ 			var entries = Entries(weights);
+ 			var choice = random.PickWeighted(entries);
+diff --git a/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs b/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
+index 16315dfad9b3..3c5c34b290fe 100644
+--- a/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
++++ b/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
+@@ -20,6 +20,8 @@ namespace OpenRA.Mods.Common.MapGenerator
+ {
+ 	public static class MatrixUtils
+ 	{
++		public const int MaxBinomialKernelRadius = 10;
++
+ 		/// <summary>
+ 		/// Debugging method that prints a matrix to stderr.
+ 		/// </summary>
+@@ -156,22 +158,20 @@ public static void FloodFill<P>(
+ 
+ 		/// <summary>
+ 		/// <para>
+-		/// Compute the in-game walking distances from a set of seeds.
++		/// Compute the in-game walking distances (in 1024ths) from a set of seeds.
+ 		/// </para>
+ 		/// <para>
+ 		/// The output matrix cells will contain either the distance (if reachable) or
+-		/// PositiveInfinity.
++		/// int.MaxValue.
+ 		/// </para>
+ 		/// </summary>
+-		public static Matrix<float> WalkingDistances(Matrix<bool> passable, IEnumerable<int2> seeds, float maxDistance)
++		public static Matrix<int> WalkingDistances(Matrix<bool> passable, IEnumerable<int2> seeds, int maxDistance)
+ 		{
+-			const float SQRT2 = 1.4142135623730951f;
+-
+-			if (maxDistance == float.PositiveInfinity)
+-				maxDistance = float.MaxValue;
++			const int Diagonal = 1448;
++			const int Straight = 1024;
+ 
+-			var output = new Matrix<float>(passable.Size).Fill(float.PositiveInfinity);
+-			var unprocessed = new PriorityArray<float>(passable.Size.X * passable.Size.Y, float.PositiveInfinity);
++			var output = new Matrix<int>(passable.Size).Fill(int.MaxValue);
++			var unprocessed = new PriorityArray<int>(passable.Size.X * passable.Size.Y, int.MaxValue);
+ 			foreach (var seed in seeds)
+ 				unprocessed[passable.Index(seed)] = 0;
+ 
+@@ -186,7 +186,7 @@ public static Matrix<float> WalkingDistances(Matrix<bool> passable, IEnumerable<
+ 
+ 				if (distance <= maxDistance && output.ContainsXY(xy))
+ 					output[xy] = distance;
+-				unprocessed[i] = float.PositiveInfinity;
++				unprocessed[i] = int.MaxValue;
+ 
+ 				foreach (var (offset, direction) in Direction.Spread8D)
+ 				{
+@@ -195,13 +195,13 @@ public static Matrix<float> WalkingDistances(Matrix<bool> passable, IEnumerable<
+ 						continue;
+ 					if (!passable[nextXY])
+ 						continue;
+-					if (output[nextXY] != float.PositiveInfinity)
++					if (output[nextXY] != int.MaxValue)
+ 						continue;
+-					float nextDistance;
++					int nextDistance;
+ 					if (Direction.IsDiagonal(direction))
+-						nextDistance = distance + SQRT2;
++						nextDistance = distance + Diagonal;
+ 					else
+-						nextDistance = distance + 1;
++						nextDistance = distance + Straight;
+ 
+ 					var nextI = passable.Index(nextXY);
+ 					if (nextDistance < unprocessed[nextI])
+@@ -390,83 +390,89 @@ void InnerLoop()
+ 
+ 		/// <summary>
+ 		/// <para>
+-		/// Create a one-dimensional gaussian kernel.
++		/// Create a one-dimensional binomial kernel of size (2 * radius + 1, 1).
++		/// The total of all kernel cells is 1 &lt;&lt; (radius * 2).
+ 		/// </para>
+ 		/// <para>
+-		/// This can be applied once, transposed, then applied again to perform a full gaussian blur.
+-		/// See <see cref="GaussianBlur"/>.
++		/// This can be applied once, transposed, then applied again to perform a full binomial blur.
++		/// See <see cref="BinomialBlur"/>. Maximum supported radius is MaxBinomialKernelRadius.
+ 		/// </para>
+ 		/// </summary>
+-		public static Matrix<float> GaussianKernel1D(int radius, float standardDeviation)
++		static Matrix<long> BinomialKernel1D(int radius)
+ 		{
++			if (radius < 0 || radius > 10)
++				throw new ArgumentException($"Binomial kernel radius was not in supported range (0 to {MaxBinomialKernelRadius} inclusive).");
++
+ 			var span = radius * 2 + 1;
+-			var kernel = new Matrix<float>(new int2(span, 1));
+-			var dsd2 = 2 * standardDeviation * standardDeviation;
+-			var total = 0.0f;
+-			for (var x = -radius; x <= radius; x++)
+-			{
+-				var value = MathF.Exp(-x * x / dsd2);
+-				kernel[x + radius] = value;
+-				total += value;
+-			}
++			var kernel = new Matrix<long>(new int2(span, 1));
++			var factorials = new long[span];
++			factorials[0] = 1;
++			for (var i = 1; i < span; i++)
++				factorials[i] = factorials[i - 1] * i;
+ 
+-			// Instead of dividing by sqrt(PI * dsd2), divide by the total.
+-			for (var i = 0; i < span; i++)
+-				kernel[i] /= total;
++			var n = span - 1;
++			for (var k = 0; k < span; k++)
++				kernel[k] = factorials[n] / (factorials[k] * factorials[n - k]);
+ 
+ 			return kernel;
+ 		}
+ 
+ 		/// <summary>
+ 		/// Apply an arithmetic convolution of a kernel over an input matrix.
++		/// Cells outside the input matrix take the value of the nearest edge/corner cell.
+ 		/// </summary>
+-		public static Matrix<float> KernelBlur(Matrix<float> input, Matrix<float> kernel, int2 kernelCenter)
++		public static Matrix<long> KernelFilter(Matrix<long> input, Matrix<long> kernel, int2 kernelCenter)
+ 		{
+-			var output = new Matrix<float>(input.Size);
++			var output = new Matrix<long>(input.Size);
+ 			for (var cy = 0; cy < input.Size.Y; cy++)
+ 				for (var cx = 0; cx < input.Size.X; cx++)
+ 				{
+-					var total = 0.0f;
++					long total = 0;
+ 					var samples = 0;
+ 					for (var ky = 0; ky < kernel.Size.Y; ky++)
+ 						for (var kx = 0; kx < kernel.Size.X; kx++)
+ 						{
+ 							var x = cx + kx - kernelCenter.X;
+ 							var y = cy + ky - kernelCenter.Y;
+-							if (!input.ContainsXY(x, y))
+-								continue;
+-							total += input[x, y] * kernel[kx, ky];
++							total += input[input.ClampXY(new int2(x, y))] * kernel[kx, ky];
+ 							samples++;
+ 						}
+ 
+-					output[cx, cy] = total / samples;
++					output[cx, cy] = total;
+ 				}
+ 
+ 			return output;
+ 		}
+ 
+ 		/// <summary>
+-		/// Apply a square gaussian blur to a matrix, returning a new matrix.
++		/// Apply a binomial filter-based blur to a matrix, returning a new matrix. The result is
++		/// somewhat similar to a gaussian blur. Maximum supported radius is MaxBinomialKernelRadius.
+ 		/// </summary>
+-		public static Matrix<float> GaussianBlur(Matrix<float> input, int radius, float standardDeviation)
++		public static Matrix<int> BinomialBlur(Matrix<int> input, int radius)
+ 		{
+-			var kernel = GaussianKernel1D(radius, standardDeviation);
+-			var stage1 = KernelBlur(input, kernel, new int2(radius, 0));
+-			var stage2 = KernelBlur(stage1, kernel.Transpose(), new int2(0, radius));
+-			return stage2;
++			var kernel = BinomialKernel1D(radius);
++			var downscale = 2 * radius;
++			var stage1 = KernelFilter(input.Map(v => (long)v), kernel, new int2(radius, 0));
++			for (var i = 0; i < stage1.Data.Length; i++)
++				stage1[i] >>= downscale;
++			var stage2 = KernelFilter(stage1, kernel.Transpose(), new int2(0, radius));
++			for (var i = 0; i < stage2.Data.Length; i++)
++				stage2[i] >>= downscale;
++
++			return stage2.Map(v => (int)v);
+ 		}
+ 
+ 		/// <summary>
+ 		/// Finds the local variance of points in a grid (using a square sample area).
+ 		/// Sample areas are centered on data point corners, so output is (size + 1) * (size + 1).
+ 		/// </summary>
+-		public static Matrix<float> GridVariance(Matrix<float> input, int radius)
++		public static Matrix<int> GridVariance(Matrix<int> input, int radius)
+ 		{
+-			var output = new Matrix<float>(input.Size + new int2(1, 1));
++			var output = new Matrix<int>(input.Size + new int2(1, 1));
+ 			for (var cy = 0; cy < output.Size.Y; cy++)
+ 				for (var cx = 0; cx < output.Size.X; cx++)
+ 				{
+-					var total = 0.0f;
++					var total = 0;
+ 					var samples = 0;
+ 					for (var ry = -radius; ry < radius; ry++)
+ 						for (var rx = -radius; rx < radius; rx++)
+@@ -480,7 +486,7 @@ public static Matrix<float> GridVariance(Matrix<float> input, int radius)
+ 						}
+ 
+ 					var mean = total / samples;
+-					var sumOfSquares = 0.0f;
++					long sumOfSquares = 0;
+ 					for (var ry = -radius; ry < radius; ry++)
+ 						for (var rx = -radius; rx < radius; rx++)
+ 						{
+@@ -488,10 +494,11 @@ public static Matrix<float> GridVariance(Matrix<float> input, int radius)
+ 							var x = cx + rx;
+ 							if (!input.ContainsXY(x, y))
+ 								continue;
+-							sumOfSquares += MathF.Pow(mean - input[x, y], 2);
++							long difference = mean - input[x, y];
++							sumOfSquares += difference * difference;
+ 						}
+ 
+-					output[cx, cy] = sumOfSquares / samples;
++					output[cx, cy] = (int)(sumOfSquares / samples);
+ 				}
+ 
+ 			return output;
+@@ -503,8 +510,9 @@ public static Matrix<float> GridVariance(Matrix<float> input, int radius)
+ 		/// if the neighborhood is significantly different based on a threshold.
+ 		/// </para>
+ 		/// <para>
+-		/// For example, a threshold of 0.75 means any change requires a 75%
+-		/// majority within the kernel.
++		/// The threshold / thresholdOutOf is the size of a majority needed to
++		/// change a value. For example, a threshold of 20 / 25 means, 80% of
++		/// cells must agree to change a cell's value.
+ 		/// </para>
+ 		/// <para>
+ 		/// The space outside of the matrix is treated as if the border was
+@@ -522,21 +530,22 @@ public static Matrix<float> GridVariance(Matrix<float> input, int radius)
+ 		/// </para>
+ 		/// </summary>
+ 		public static (Matrix<bool> Output, int Changes) BooleanBlur(
+-			Matrix<bool> input, int radius, float threshold)
++			Matrix<bool> input, int radius, int threshold, int thresholdOutOf)
+ 		{
+-			if (threshold < 0.5f || threshold > 1.0f)
+-				throw new ArgumentException("threshold must between 0.5 and 1.0 inclusive");
+-
+-			var output = new Matrix<bool>(input.Size);
+-			var changes = 0;
+-
+ 			// Sum radius-by-1 kernels first in O((size.X + radius) * size.Y) time using a diffing sliding
+ 			// window, then sum 1-by-radius kernels in O(size.X * (size.Y + radius)) time.
+ 			var hTrueCounts = new Matrix<int>(input.Size);
+ 			var kernelArea = (2 * radius + 1) * (2 * radius + 1);
+-			var trueThreshold = (int)MathF.Ceiling(kernelArea * threshold);
++
++			if (threshold < 1 || thresholdOutOf < 1 || threshold * 2 < thresholdOutOf)
++				throw new ArgumentException("invalid threshold");
++
++			var trueThreshold = (kernelArea * threshold + thresholdOutOf - 1) / thresholdOutOf;
+ 			var falseThreshold = kernelArea - trueThreshold;
+ 
++			var output = new Matrix<bool>(input.Size);
++			var changes = 0;
++
+ 			for (var cy = 0; cy < input.Size.Y; cy++)
+ 			{
+ 				var trueCount = 0;
+@@ -642,19 +651,35 @@ bool IsRetained()
+ 			return (output, changes);
+ 		}
+ 
+-		/// <summary>Read a linearly interpolated value between the cells of a matrix.</summary>
+-		public static float Interpolate(Matrix<float> matrix, float x, float y)
++		/// <summary>
++		/// Read a linearly interpolated value between the cells of a matrix. xWeight and yWeight
++		/// must be between 0 and scale inclusive and define the interpolation position
++		/// between x and x+1, and y and y+1.
++		/// </summary>
++		public static int IntegerInterpolate(
++			Matrix<int> matrix,
++			int x,
++			int y,
++			int xWeight,
++			int yWeight,
++			int scale)
+ 		{
+-			var xa = (int)MathF.Floor(x);
+-			var xb = (int)MathF.Ceiling(x);
+-			var ya = (int)MathF.Floor(y);
+-			var yb = (int)MathF.Ceiling(y);
++			var xa = x;
++			var xb = x + 1;
++			var ya = y;
++			var yb = y + 1;
++
++			if (scale <= 0)
++				throw new ArgumentException("Interpolation scale was not > 0");
++
++			if (xWeight < 0 || yWeight < 0 || xWeight > scale || yWeight > scale)
++				throw new ArgumentException("Interpolation weights were not between 0 and scale inclusive.");
+ 
+ 			// "w" for "weight"
+-			var xbw = x - xa;
+-			var ybw = y - ya;
+-			var xaw = 1.0f - xbw;
+-			var yaw = 1.0f - ybw;
++			var xbw = xWeight;
++			var ybw = yWeight;
++			var xaw = scale - xWeight;
++			var yaw = scale - yWeight;
+ 
+ 			if (xa < 0)
+ 			{
+@@ -678,46 +703,22 @@ public static float Interpolate(Matrix<float> matrix, float x, float y)
+ 				yb = matrix.Size.Y - 1;
+ 			}
+ 
+-			var naa = matrix[xa, ya];
+-			var nba = matrix[xb, ya];
+-			var nab = matrix[xa, yb];
+-			var nbb = matrix[xb, yb];
+-			return (naa * xaw + nba * xbw) * yaw + (nab * xaw + nbb * xbw) * ybw;
+-		}
+-
+-		/// <summary>
+-		/// Finds the (linearly interpolated) value a given fraction through a sorted array.
+-		/// </summary>
+-		public static float ArrayQuantile(float[] array, float quantile)
+-		{
+-			if (array.Length == 0)
+-				throw new ArgumentException("Cannot get quantile of empty array");
+-
+-			var iFloat = quantile * (array.Length - 1);
+-			if (iFloat < 0)
+-				iFloat = 0;
+-
+-			if (iFloat > array.Length - 1)
+-				iFloat = array.Length - 1;
+-
+-			var iLow = (int)iFloat;
+-			if (iLow == iFloat)
+-				return array[iLow];
+-
+-			var iHigh = iLow + 1;
+-			var weight = iFloat - iLow;
+-			return array[iLow] * (1 - weight) + array[iHigh] * weight;
++			long naa = matrix[xa, ya];
++			long nba = matrix[xb, ya];
++			long nab = matrix[xa, yb];
++			long nbb = matrix[xb, yb];
++			return (int)(((naa * xaw + nba * xbw) * yaw + (nab * xaw + nbb * xbw) * ybw) / scale / scale);
+ 		}
+ 
+ 		/// <summary>
+-		/// Uniformally add to or subtract from all matrix cells such that the given quantile,
+-		/// fraction, has the given target value.
++		/// Uniformally add to or subtract from all cells such that count out of every outOf cells,
++		/// are no greater than the given target value.
+ 		/// </summary>
+-		public static void CalibrateQuantileInPlace(Matrix<float> matrix, float target, float fraction)
++		public static void CalibrateQuantileInPlace(Matrix<int> matrix, int target, int count, int outOf)
+ 		{
+-			var sorted = (float[])matrix.Data.Clone();
++			var sorted = (int[])matrix.Data.Clone();
+ 			Array.Sort(sorted);
+-			var adjustment = target - ArrayQuantile(sorted, fraction);
++			var adjustment = target - sorted[(sorted.Length - 1) * count / outOf];
+ 			for (var i = 0; i < matrix.Data.Length; i++)
+ 				matrix[i] += adjustment;
+ 		}
+@@ -1017,14 +1018,15 @@ void TracePath(int sx, int sy, int direction)
+ 		public static Matrix<bool> BooleanBlotch(
+ 			Matrix<bool> input,
+ 			int terrainSmoothing,
+-			float smoothingThreshold,
++			int smoothingThreshold,
++			int smoothingThresholdOutOf,
+ 			int minimumThickness,
+ 			bool bias)
+ 		{
+ 			var maxSpan = Math.Max(input.Size.X, input.Size.Y);
+ 			var matrix = input;
+ 
+-			(matrix, _) = BooleanBlur(matrix, terrainSmoothing, 0.5f);
++			(matrix, _) = BooleanBlur(matrix, terrainSmoothing, 1, 2);
+ 			for (var i1 = 0; i1 < /*max passes*/16; i1++)
+ 			{
+ 				for (var i2 = 0; i2 < maxSpan; i2++)
+@@ -1033,7 +1035,7 @@ public static Matrix<bool> BooleanBlotch(
+ 					var changesAcc = 0;
+ 					for (var r = 1; r <= terrainSmoothing; r++)
+ 					{
+-						(matrix, changes) = BooleanBlur(matrix, r, smoothingThreshold);
++						(matrix, changes) = BooleanBlur(matrix, r, smoothingThreshold, smoothingThresholdOutOf);
+ 						changesAcc += changes;
+ 					}
+ 
+@@ -1067,8 +1069,8 @@ public static Matrix<bool> BooleanBlotch(
+ 								if (diff[x, y])
+ 									OverCircle(
+ 										matrix: matrix,
+-										center: new float2(x, y),
+-										radius: minimumThickness * 2,
++										centerIn1024ths: new int2(x * 1024 + 512, y * 1024 + 512),
++										radiusIn1024ths: minimumThickness * 2048,
+ 										outside: false,
+ 										action: (xy, _) => matrix[xy] = bias);
+ 							}
+@@ -1425,22 +1427,25 @@ public static int2[][] MaskPathPoints(IEnumerable<int2[]> pointArrayArray, Matri
+ 
+ 		/// <summary>
+ 		/// <para>
+-		/// Run an action over the inside or outside of a circle of given center and radius. The
+-		/// action is called with the int2 position and the squared distance to the circle's
+-		/// center. If outside is true, the action is run for cells outside of the circle instead
++		/// Run an action over the inside or outside of a circle of given center and radius,
++		/// measured in 1024ths of a cell. The action is called with the int2 cell position (NOT in
++		/// 1024ths), and the square of the distance-in-1024ths from the cell's center to the
++		/// circle's center. (Square root and divide by 1024 to get the distance in whole cells.)
++		/// (0, 0) is a corner of the matrix, and (512, 512) is the center of the first cell.
++		/// If outside is true, the action is run for cells outside of the circle instead
+ 		/// of the inside.
+ 		/// </para>
+ 		/// <para>
+-		/// A matrix cell is inside the circle if its position is &lt;= radius from center.
++		/// A matrix cell is inside the circle if its center is &lt;= radius from center.
+ 		/// Coordinates outside of the Matrix are ignored.
+ 		/// </para>
+ 		/// </summary>
+ 		public static void OverCircle<T>(
+ 			Matrix<T> matrix,
+-			float2 center,
+-			float radius,
++			int2 centerIn1024ths,
++			int radiusIn1024ths,
+ 			bool outside,
+-			Action<int2, float> action)
++			Action<int2, long> action)
+ 		{
+ 			var size = matrix.Size;
+ 			int minX;
+@@ -1456,10 +1461,10 @@ public static void OverCircle<T>(
+ 			}
+ 			else
+ 			{
+-				minX = (int)MathF.Floor(center.X - radius);
+-				minY = (int)MathF.Floor(center.Y - radius);
+-				maxX = (int)MathF.Ceiling(center.X + radius);
+-				maxY = (int)MathF.Ceiling(center.Y + radius);
++				minX = (centerIn1024ths.X - radiusIn1024ths) / 1024;
++				minY = (centerIn1024ths.Y - radiusIn1024ths) / 1024;
++				maxX = (centerIn1024ths.X + radiusIn1024ths + 1023) / 1024;
++				maxY = (centerIn1024ths.Y + radiusIn1024ths + 1023) / 1024;
+ 				if (minX < 0)
+ 					minX = 0;
+ 				if (minY < 0)
+@@ -1470,16 +1475,32 @@ public static void OverCircle<T>(
+ 					maxY = size.Y - 1;
+ 			}
+ 
+-			var radiusSquared = radius * radius;
++			var radiusSquared = (long)radiusIn1024ths * radiusIn1024ths;
+ 			for (var y = minY; y <= maxY; y++)
+ 				for (var x = minX; x <= maxX; x++)
+ 				{
+-					var rx = x - center.X;
+-					var ry = y - center.Y;
+-					var thisRadiusSquared = rx * rx + ry * ry;
++					var rx = x * 1024 + 512 - centerIn1024ths.X;
++					var ry = y * 1024 + 512 - centerIn1024ths.Y;
++					var thisRadiusSquared = (long)rx * rx + (long)ry * ry;
+ 					if (thisRadiusSquared <= radiusSquared != outside)
+ 						action(new int2(x, y), thisRadiusSquared);
+ 				}
+ 		}
++
++		/// <summary>
++		/// Linearly scales the range of values in a matrix to the given target amplitude.
++		/// Returns the modified input. If the input matrix is all zeros, it is left unmodified.
++		/// </summary>
++		public static Matrix<int> NormalizeRangeInPlace(Matrix<int> matrix, int targetAmplitude)
++		{
++			long inputAmplitude = matrix.Data.Max(Math.Abs);
++			if (inputAmplitude == 0)
++				return matrix;
++
++			for (var i = 0; i < matrix.Data.Length; i++)
++				matrix[i] = (int)((long)matrix[i] * targetAmplitude / inputAmplitude);
++
++			return matrix;
++		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/MapGenerator/MultiBrush.cs b/OpenRA.Mods.Common/MapGenerator/MultiBrush.cs
+index 0d363fe6b010..de661bcc33ee 100644
+--- a/OpenRA.Mods.Common/MapGenerator/MultiBrush.cs
++++ b/OpenRA.Mods.Common/MapGenerator/MultiBrush.cs
+@@ -24,7 +24,7 @@ namespace OpenRA.Mods.Common.MapGenerator
+ 	/// </summary>
+ 	public sealed class MultiBrushInfo
+ 	{
+-		public readonly float Weight;
++		public readonly int Weight;
+ 		public readonly ImmutableArray<string> Actors;
+ 		public readonly TerrainTile? BackingTile;
+ 		public readonly ImmutableArray<ushort> Templates;
+@@ -33,7 +33,7 @@ public sealed class MultiBrushInfo
+ 		// Currently doesn't support specifying offsets. Add this capability if/when needed.
+ 		public MultiBrushInfo(MiniYaml my)
+ 		{
+-			Weight = 1.0f;
++			Weight = MultiBrush.DefaultWeight;
+ 			var actors = new List<string>();
+ 			var templates = new List<ushort>();
+ 			var tiles = new List<TerrainTile>();
+@@ -41,7 +41,7 @@ public MultiBrushInfo(MiniYaml my)
+ 				switch (node.Key.Split('@')[0])
+ 				{
+ 					case "Weight":
+-						if (!Exts.TryParseFloatOrPercentInvariant(node.Value.Value, out Weight))
++						if (!Exts.TryParseInt32Invariant(node.Value.Value, out Weight))
+ 							throw new YamlException($"Invalid MultiBrush Weight `${node.Value.Value}`");
+ 						break;
+ 					case "Actor":
+@@ -89,6 +89,8 @@ public static ImmutableArray<MultiBrushInfo> ParseCollection(MiniYaml my)
+ 	/// <summary>A super template that can be used to paint both tiles and actors.</summary>
+ 	sealed class MultiBrush
+ 	{
++		public const int DefaultWeight = 1000;
++
+ 		public enum Replaceability
+ 		{
+ 			/// <summary>Area cannot be replaced by a tile or obstructing actor.</summary>
+@@ -104,7 +106,7 @@ public enum Replaceability
+ 			Any = 3,
+ 		}
+ 
+-		public float Weight;
++		public int Weight;
+ 		readonly List<(CVec, TerrainTile)> tiles;
+ 		readonly List<ActorPlan> actorPlans;
+ 		CVec[] shape;
+@@ -134,7 +136,7 @@ public Replaceability Contract()
+ 		/// </summary>
+ 		public MultiBrush()
+ 		{
+-			Weight = 1.0f;
++			Weight = DefaultWeight;
+ 			tiles = new List<(CVec, TerrainTile)>();
+ 			actorPlans = new List<ActorPlan>();
+ 			shape = Array.Empty<CVec>();
+@@ -264,10 +266,10 @@ public MultiBrush WithBackingTile(TerrainTile tile)
+ 		}
+ 
+ 		/// <summary>Update the weight.</summary>
+-		public MultiBrush WithWeight(float weight)
++		public MultiBrush WithWeight(int weight)
+ 		{
+-			if (!(weight > 0.0f))
+-				throw new ArgumentException("Weight was not > 0.0");
++			if (weight <= 0)
++				throw new ArgumentException("Weight was not > 0");
+ 			Weight = weight;
+ 			return this;
+ 		}
+@@ -438,7 +440,7 @@ Replaceability ReserveShape(CPos paintAt, IEnumerable<CVec> shape, Replaceabilit
+ 				var remainingQuota =
+ 					brushArea == 1
+ 						? int.MaxValue
+-						: (int)Math.Ceiling(replaceMposes.Count * brushWeightForArea / brushTotalWeight);
++						: (int)(((long)replaceMposes.Count * brushWeightForArea + brushTotalWeight - 1) / brushTotalWeight);
+ 				RefreshIndices();
+ 				foreach (var mpos in mposes)
+ 				{
+diff --git a/OpenRA.Mods.Common/MapGenerator/NoiseUtils.cs b/OpenRA.Mods.Common/MapGenerator/NoiseUtils.cs
+index da1b08674366..651e16b9b105 100644
+--- a/OpenRA.Mods.Common/MapGenerator/NoiseUtils.cs
++++ b/OpenRA.Mods.Common/MapGenerator/NoiseUtils.cs
+@@ -10,21 +10,25 @@
+ #endregion
+ 
+ using System;
++using System.Numerics;
+ using OpenRA.Support;
+ 
+ namespace OpenRA.Mods.Common.MapGenerator
+ {
+ 	public static class NoiseUtils
+ 	{
++		const int Scale = 1024;
++		const int ScaledSqrt2 = 1448;
++
+ 		/// <summary>Amplitude proportional to wavelength.</summary>
+-		public static float PinkAmplitude(float wavelength) => wavelength;
++		public static int PinkAmplitude(int wavelength) => wavelength;
+ 
+ 		/// <summary>
+ 		/// <para>
+ 		/// Create noise by combining multiple layers of Perlin noise of halving wavelengths.
+ 		/// </para>
+ 		/// <para>
+-		/// wavelengthScale defines the largest wavelength as a fraction of the largest dimension of
++		/// featureSize defines the largest wavelength in 1024ths of a matrix cell.
+ 		/// the output.
+ 		/// </para>
+ 		/// <para>
+@@ -32,38 +36,45 @@ public static class NoiseUtils
+ 		/// choice.
+ 		/// </para>
+ 		/// </summary>
+-		public static Matrix<float> FractalNoise(
++		public static Matrix<int> FractalNoise(
+ 			MersenneTwister random,
+ 			int2 size,
+-			float featureSize,
+-			Func<float, float> ampFunc)
++			int featureSize,
++			Func<int, int> ampFunc)
+ 		{
+ 			var span = Math.Max(size.X, size.Y);
+-			var wavelengths = new float[(int)Math.Log2(span)];
++			var wavelengths = new int[BitOperations.Log2((uint)span)];
+ 			for (var i = 0; i < wavelengths.Length; i++)
+-				wavelengths[i] = featureSize / (1 << i);
++				wavelengths[i] = featureSize >> i;
+ 
+-			var noise = new Matrix<float>(size);
++			var noise = new Matrix<int>(size);
+ 			foreach (var wavelength in wavelengths)
+ 			{
+-				if (wavelength <= 0.5)
++				if (wavelength <= Scale / 2)
+ 					break;
+ 
+ 				var amps = ampFunc(wavelength);
+-				var subSpan = (int)(span / wavelength) + 2;
++				var subSpan = span * Scale / wavelength + 2;
+ 				var subNoise = PerlinNoise(random, subSpan);
+ 
+ 				// Offsets should align to grid.
+ 				// (The wavelength is divided back out later.)
+-				var offsetX = (int)(random.NextFloat() * wavelength);
+-				var offsetY = (int)(random.NextFloat() * wavelength);
++				var scaledOffsetX = (int)(random.NextUint() % (wavelength + 1));
++				var scaledOffsetY = (int)(random.NextUint() % (wavelength + 1));
+ 				for (var y = 0; y < size.Y; y++)
+ 					for (var x = 0; x < size.X; x++)
++					{
++						var scaledMappedX = x * Scale + scaledOffsetX;
++						var scaledMappedY = y * Scale + scaledOffsetY;
+ 						noise[y * size.X + x] +=
+-							amps * MatrixUtils.Interpolate(
++							amps * MatrixUtils.IntegerInterpolate(
+ 								subNoise,
+-								(offsetX + x) / wavelength,
+-								(offsetY + y) / wavelength);
++								scaledMappedX / wavelength,
++								scaledMappedY / wavelength,
++								scaledMappedX % wavelength,
++								scaledMappedY % wavelength,
++								wavelength);
++					}
+ 			}
+ 
+ 			return noise;
+@@ -71,25 +82,25 @@ public static Matrix<float> FractalNoise(
+ 
+ 		/// <summary>
+ 		/// 2D Perlin Noise generator without interpolation, producing a span-by-span sized matrix.
++		/// Output values range from -5792 to +5792.
+ 		/// </summary>
+-		public static Matrix<float> PerlinNoise(MersenneTwister random, int span)
++		public static Matrix<int> PerlinNoise(MersenneTwister random, int span)
+ 		{
+-			var noise = new Matrix<float>(span, span);
+-			const float D = 0.25f;
++			var noise = new Matrix<int>(span, span);
+ 			for (var y = 0; y <= span; y++)
+ 				for (var x = 0; x <= span; x++)
+ 				{
+-					var phase = MathF.Tau * random.NextFloatExclusive();
+-					var vx = MathF.Cos(phase);
+-					var vy = MathF.Sin(phase);
++					var phase = new WAngle((int)random.NextUint() % 1024);
++					var vx = phase.Cos();
++					var vy = phase.Sin();
+ 					if (x > 0 && y > 0)
+-						noise[x - 1, y - 1] += vx * -D + vy * -D;
++						noise[x - 1, y - 1] += -vx + -vy;
+ 					if (x < span && y > 0)
+-						noise[x, y - 1] += vx * D + vy * -D;
++						noise[x, y - 1] += vx + -vy;
+ 					if (x > 0 && y < span)
+-						noise[x - 1, y] += vx * -D + vy * D;
++						noise[x - 1, y] += -vx + vy;
+ 					if (x < span && y < span)
+-						noise[x, y] += vx * D + vy * D;
++						noise[x, y] += vx + vy;
+ 				}
+ 
+ 			return noise;
+@@ -105,13 +116,13 @@ public static Matrix<float> PerlinNoise(MersenneTwister random, int span)
+ 		/// noise with different properties to simple Perlin noise.
+ 		/// </para>
+ 		/// </summary>
+-		public static Matrix<float> SymmetricFractalNoise(
++		public static Matrix<int> SymmetricFractalNoise(
+ 			MersenneTwister random,
+ 			int2 size,
+ 			int rotations,
+ 			Symmetry.Mirror mirror,
+-			float featureSize,
+-			Func<float, float> ampFunc)
++			int featureSize,
++			Func<int, int> ampFunc)
+ 		{
+ 			if (rotations < 1)
+ 				throw new ArgumentException("rotations must be >= 1");
+@@ -119,32 +130,37 @@ public static Matrix<float> SymmetricFractalNoise(
+ 			// Need higher resolution due to cropping and rotation artifacts
+ 			var templateSpan = Math.Max(size.X, size.Y) * 2 + 2;
+ 			var templateSize = new int2(templateSpan, templateSpan);
+-			var templateCenter = new float2(templateSpan - 1, templateSpan - 1) / 2.0f;
++			var scaledTemplateCenter = new int2(templateSpan - 1, templateSpan - 1) * Scale / 2;
+ 			var template = FractalNoise(random, templateSize, featureSize, ampFunc);
+ 
+-			var output = new Matrix<float>(size);
++			var output = new Matrix<int>(size);
+ 
+ 			var inclusiveOutputSize = size - new int2(1, 1);
+-			var outputMid = new float2(inclusiveOutputSize) / 2.0f;
++			var scaledOutputMid = inclusiveOutputSize * Scale / 2;
+ 
+ 			for (var y = 0; y < size.Y; y++)
+ 				for (var x = 0; x < size.X; x++)
+ 				{
+-					const float Sqrt2 = 1.4142135623730951f;
+-					var outputXy = new float2(x, y);
+-					var outputXyFromCenter = outputXy - outputMid;
+-					var templateXyFromCenter = outputXyFromCenter * Sqrt2;
+-					var templateXy = templateXyFromCenter + templateCenter;
++					var outputXy = new int2(x, y);
++					var scaledOutputXy = outputXy * Scale;
++					var scaledOutputXyFromCenter = scaledOutputXy - scaledOutputMid;
++
++					// Apply sqrt2 scaling so that diagonal samples don't alias.
++					var scaledTemplateXyFromCenter = scaledOutputXyFromCenter * ScaledSqrt2 / Scale;
++					var scaledTemplateXy = scaledTemplateXyFromCenter + scaledTemplateCenter;
+ 
+ 					var projections = Symmetry.RotateAndMirrorPointAround(
+-						templateXy, templateCenter, rotations, mirror);
++						scaledTemplateXy, scaledTemplateCenter, rotations, mirror);
+ 
+ 					foreach (var projection in projections)
+ 						output[x, y] +=
+-							MatrixUtils.Interpolate(
++							MatrixUtils.IntegerInterpolate(
+ 								template,
+-								projection.X,
+-								projection.Y);
++								projection.X / Scale,
++								projection.Y / Scale,
++								projection.X % Scale,
++								projection.Y % Scale,
++								Scale);
+ 				}
+ 
+ 			return output;
+@@ -156,11 +172,11 @@ public static Matrix<float> SymmetricFractalNoise(
+ 		/// </summary>
+ 		public static void SymmetricFractalNoiseIntoCellLayer(
+ 			MersenneTwister random,
+-			CellLayer<float> cellLayer,
++			CellLayer<int> cellLayer,
+ 			int rotations,
+ 			Symmetry.Mirror mirror,
+-			float featureSize,
+-			Func<float, float> ampFunc)
++			int featureSize,
++			Func<int, int> ampFunc)
+ 		{
+ 			var cellBounds = CellLayerUtils.CellBounds(cellLayer);
+ 			var size = new int2(cellBounds.Size.Width, cellBounds.Size.Height);
+diff --git a/OpenRA.Mods.Common/MapGenerator/Symmetry.cs b/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
+index 7906114e298a..50e0cacdc24b 100644
+--- a/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
++++ b/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
+@@ -44,26 +44,26 @@ public enum Mirror
+ 		/// Mirrors a (zero-area) point around a given center.
+ 		/// </para>
+ 		/// <para>
+-		/// For example, if using a center of (4.0, 4.0) a point at (0.1, 0.1) could be projected
+-		/// to (0.1, 0.1), (0.1, 7.9), (7.9, 0.1), or (7.9, 7.9).
++		/// For example, if using a center of (40, 40) a point at (1, 1) could be projected
++		/// to (1, 1), (1, 79), (79, 1), or (79, 79).
+ 		/// </para>
+ 		/// </summary>
+-		public static float2 MirrorPointAround(Mirror mirror, float2 original, float2 center)
++		public static int2 MirrorPointAround(Mirror mirror, int2 original, int2 center)
+ 		{
+ 			switch (mirror)
+ 			{
+ 				case Mirror.None:
+ 					throw new ArgumentException("Mirror.None has no transformed point");
+ 				case Mirror.LeftMatchesRight:
+-					return new float2(2.0f * center.X - original.X, original.Y);
++					return new int2(2 * center.X - original.X, original.Y);
+ 				case Mirror.TopLeftMatchesBottomRight:
+-					return new float2(
++					return new int2(
+ 						center.Y - original.Y + center.X,
+ 						center.X - original.X + center.Y);
+ 				case Mirror.TopMatchesBottom:
+-					return new float2(original.X, 2.0f * center.Y - original.Y);
++					return new int2(original.X, 2 * center.Y - original.Y);
+ 				case Mirror.TopRightMatchesBottomLeft:
+-					return new float2(
++					return new int2(
+ 						center.X + original.Y - center.Y,
+ 						center.Y + original.X - center.X);
+ 				default:
+@@ -73,27 +73,11 @@ public static float2 MirrorPointAround(Mirror mirror, float2 original, float2 ce
+ 
+ 		public static WPos MirrorWPosAround(Mirror mirror, WPos original, WPos center)
+ 		{
+-			switch (mirror)
+-			{
+-				case Mirror.None:
+-					throw new ArgumentException("Mirror.None has no transformed point");
+-				case Mirror.LeftMatchesRight:
+-					return new WPos(2 * center.X - original.X, original.Y, original.Z);
+-				case Mirror.TopLeftMatchesBottomRight:
+-					return new WPos(
+-						center.Y - original.Y + center.X,
+-						center.X - original.X + center.Y,
+-						original.Z);
+-				case Mirror.TopMatchesBottom:
+-					return new WPos(original.X, 2 * center.Y - original.Y, original.Z);
+-				case Mirror.TopRightMatchesBottomLeft:
+-					return new WPos(
+-						center.X + original.Y - center.Y,
+-						center.Y + original.X - center.X,
+-						original.Z);
+-				default:
+-					throw new ArgumentException("Bad mirror");
+-			}
++			var result = MirrorPointAround(
++				mirror,
++				new int2(original.X, original.Y),
++				new int2(center.X, center.Y));
++			return new WPos(result.X, result.Y, original.Z);
+ 		}
+ 
+ 		/// <summary>
+@@ -199,17 +183,17 @@ public static int ProjectionProximity(CPos[] projections)
+ 		/// functions. This may be slightly imprecise for non-trivial rotations.
+ 		/// </para>
+ 		/// <para>
+-		/// For example, if using a center of (4.0, 4.0) a point at (0.1, 0.1) could be projected
+-		/// to (0.1, 0.1), (0.1, 7.9), (7.9, 0.1), and (7.9, 7.9).
++		/// For example, if using a center of (40, 40) a point at (1, 1) could be projected
++		/// to (1, 1), (1, 79), (79, 1), and (79, 79).
+ 		/// </para>
+ 		/// </summary>
+-		public static float2[] RotateAndMirrorPointAround(
+-			float2 original,
+-			float2 center,
++		public static int2[] RotateAndMirrorPointAround(
++			int2 original,
++			int2 center,
+ 			int rotations,
+ 			Mirror mirror)
+ 		{
+-			var projections = new float2[RotateAndMirrorProjectionCount(rotations, mirror)];
++			var projections = new int2[RotateAndMirrorProjectionCount(rotations, mirror)];
+ 			var projectionIndex = 0;
+ 
+ 			for (var rotation = 0; rotation < rotations; rotation++)
+@@ -217,12 +201,12 @@ public static float2[] RotateAndMirrorPointAround(
+ 				// This could be made more accurate using dedicated, higher precision
+ 				// rotation count to cos and sin lookup tables.
+ 				var wangle = new WAngle(rotation * 1024 / rotations);
+-				var cos = wangle.Cos() / 1024.0f;
+-				var sin = wangle.Sin() / 1024.0f;
++				long cos = wangle.Cos();
++				long sin = wangle.Sin();
+ 				var relOrig = original - center;
+-				var projX = relOrig.X * cos - relOrig.Y * sin + center.X;
+-				var projY = relOrig.X * sin + relOrig.Y * cos + center.Y;
+-				var projection = new float2(projX, projY);
++				var projX = (relOrig.X * cos - relOrig.Y * sin) / 1024 + center.X;
++				var projY = (relOrig.X * sin + relOrig.Y * cos) / 1024 + center.Y;
++				var projection = new int2((int)projX, (int)projY);
+ 				projections[projectionIndex++] = projection;
+ 
+ 				if (mirror != Mirror.None)
+@@ -303,7 +287,7 @@ public static void RotateAndMirrorOverCPos<T>(
+ 		public static bool IsCPosNearCenter<T>(
+ 			CPos cpos,
+ 			CellLayer<T> cellLayer,
+-			float reservationRadius,
++			int reservationRadius,
+ 			Mirror mirror)
+ 		{
+ 			CPos[] testPoints;
+@@ -313,7 +297,7 @@ public static bool IsCPosNearCenter<T>(
+ 				testPoints = RotateAndMirrorCPos(cpos, cellLayer, 1, mirror);
+ 
+ 			var separation = (testPoints[1] - testPoints[0]).LengthSquared;
+-			return separation <= reservationRadius * reservationRadius * 4.0f;
++			return separation <= reservationRadius * reservationRadius * 4;
+ 		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+index ac2b598c0379..aead5839fc5e 100644
+--- a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
++++ b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+@@ -58,6 +58,9 @@ static List<string> FluentReferencesLoader(MiniYaml my)
+ 
+ 	public sealed class RaMapGenerator : IMapGenerator
+ 	{
++		const int FractionMax = 1000;
++		const int EntityBonusMax = 1000000;
++
+ 		sealed class Parameters
+ 		{
+ 			[FieldLoader.Ignore]
+@@ -74,17 +77,17 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int Players = default;
+ 			[FieldLoader.Require]
+-			public readonly float TerrainFeatureSize = default;
++			public readonly int TerrainFeatureSize = default;
+ 			[FieldLoader.Require]
+-			public readonly float ForestFeatureSize = default;
++			public readonly int ForestFeatureSize = default;
+ 			[FieldLoader.Require]
+-			public readonly float ResourceFeatureSize = default;
++			public readonly int ResourceFeatureSize = default;
+ 			[FieldLoader.Require]
+-			public readonly float Water = default;
++			public readonly int Water = default;
+ 			[FieldLoader.Require]
+-			public readonly float Mountains = default;
++			public readonly int Mountains = default;
+ 			[FieldLoader.Require]
+-			public readonly float Forests = default;
++			public readonly int Forests = default;
+ 			[FieldLoader.Require]
+ 			public readonly int ForestCutout = default;
+ 			[FieldLoader.Require]
+@@ -94,7 +97,7 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int TerrainSmoothing = default;
+ 			[FieldLoader.Require]
+-			public readonly float SmoothingThreshold = default;
++			public readonly int SmoothingThreshold = default;
+ 			[FieldLoader.Require]
+ 			public readonly int MinimumLandSeaThickness = default;
+ 			[FieldLoader.Require]
+@@ -104,13 +107,13 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int RoughnessRadius = default;
+ 			[FieldLoader.Require]
+-			public readonly float Roughness = default;
++			public readonly int Roughness = default;
+ 			[FieldLoader.Require]
+ 			public readonly int MinimumTerrainContourSpacing = default;
+ 			[FieldLoader.Require]
+ 			public readonly int MinimumCliffLength = default;
+ 			[FieldLoader.Require]
+-			public readonly float ForestClumpiness = default;
++			public readonly int ForestClumpiness = default;
+ 			[FieldLoader.Require]
+ 			public readonly bool DenyWalledAreas = default;
+ 			[FieldLoader.Require]
+@@ -124,11 +127,11 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly bool CreateEntities = default;
+ 			[FieldLoader.Require]
+-			public readonly float AreaEntityBonus = default;
++			public readonly int AreaEntityBonus = default;
+ 			[FieldLoader.Require]
+-			public readonly float PlayerCountEntityBonus = default;
++			public readonly int PlayerCountEntityBonus = default;
+ 			[FieldLoader.Require]
+-			public readonly float CentralSpawnReservationFraction = default;
++			public readonly int CentralSpawnReservationFraction = default;
+ 			[FieldLoader.Require]
+ 			public readonly int ResourceSpawnReservation = default;
+ 			[FieldLoader.Require]
+@@ -140,13 +143,13 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int SpawnReservation = default;
+ 			[FieldLoader.Require]
+-			public readonly float SpawnResourceBias = default;
++			public readonly int SpawnResourceBias = default;
+ 			[FieldLoader.Require]
+ 			public readonly int ResourcesPerPlayer = default;
+ 			[FieldLoader.Require]
+-			public readonly float OreUniformity = default;
++			public readonly int OreUniformity = default;
+ 			[FieldLoader.Require]
+-			public readonly float OreClumpiness = default;
++			public readonly int OreClumpiness = default;
+ 			[FieldLoader.Require]
+ 			public readonly int MaximumExpansionResourceSpawns = default;
+ 			[FieldLoader.Require]
+@@ -164,7 +167,7 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int MaximumBuildings = default;
+ 			[FieldLoader.LoadUsing(nameof(BuildingWeightsLoader))]
+-			public readonly IReadOnlyDictionary<string, float> BuildingWeights = default;
++			public readonly IReadOnlyDictionary<string, int> BuildingWeights = default;
+ 
+ 			[FieldLoader.Require]
+ 			public readonly ushort LandTile = default;
+@@ -188,7 +191,7 @@ sealed class Parameters
+ 			[FieldLoader.Ignore]
+ 			public readonly IReadOnlyDictionary<string, ResourceTypeInfo> ResourceSpawnSeeds;
+ 			[FieldLoader.LoadUsing(nameof(ResourceSpawnWeightsLoader))]
+-			public readonly IReadOnlyDictionary<string, float> ResourceSpawnWeights = default;
++			public readonly IReadOnlyDictionary<string, int> ResourceSpawnWeights = default;
+ 
+ 			[FieldLoader.Ignore]
+ 			public readonly IReadOnlySet<byte> ClearTerrain;
+@@ -311,22 +314,22 @@ static object MirrorLoader(MiniYaml my)
+ 					throw new YamlException($"Invalid Mirror value `{my.NodeWithKey("Mirror").Value.Value}`");
+ 			}
+ 
+-			static IReadOnlyDictionary<string, float> BuildingWeightsLoader(MiniYaml my)
++			static IReadOnlyDictionary<string, int> BuildingWeightsLoader(MiniYaml my)
+ 			{
+ 				return my.NodeWithKey("BuildingWeights").Value.ToDictionary(subMy =>
+ 					{
+-						if (Exts.TryParseFloatOrPercentInvariant(subMy.Value, out var f))
++						if (Exts.TryParseInt32Invariant(subMy.Value, out var f))
+ 							return f;
+ 						else
+ 							throw new YamlException($"Invalid building weight `{subMy.Value}`");
+ 					});
+ 			}
+ 
+-			static IReadOnlyDictionary<string, float> ResourceSpawnWeightsLoader(MiniYaml my)
++			static IReadOnlyDictionary<string, int> ResourceSpawnWeightsLoader(MiniYaml my)
+ 			{
+ 				return my.NodeWithKey("ResourceSpawnWeights").Value.ToDictionary(subMy =>
+ 					{
+-						if (Exts.TryParseFloatOrPercentInvariant(subMy.Value, out var f))
++						if (Exts.TryParseInt32Invariant(subMy.Value, out var f))
+ 							return f;
+ 						else
+ 							throw new YamlException($"Invalid resource spawn weight `{subMy.Value}`");
+@@ -337,34 +340,34 @@ public void Validate()
+ 			{
+ 				if (Rotations < 1)
+ 					throw new MapGenerationException("Rotations must be >= 1");
+-				if (TerrainFeatureSize < 1.0f)
+-					throw new MapGenerationException("TerrainFeatureSize must be >= 1.0");
+-				if (ForestFeatureSize < 1.0f)
+-					throw new MapGenerationException("ForestFeatureSize must be >= 1.0");
+-				if (ResourceFeatureSize < 1.0f)
+-					throw new MapGenerationException("ResourceFeatureSize must be >= 1.0");
+-				if (TerrainSmoothing < 1)
+-					throw new MapGenerationException("TerrainSmoothing must be < 1");
+-				if (SmoothingThreshold < 0.5f || SmoothingThreshold > 1.0f)
+-					throw new MapGenerationException("SmoothingThreshold must be between 0.5 and 1.0 inclusive");
++				if (TerrainFeatureSize < 1)
++					throw new MapGenerationException("TerrainFeatureSize must be >= 1");
++				if (ForestFeatureSize < 1)
++					throw new MapGenerationException("ForestFeatureSize must be >= 1");
++				if (ResourceFeatureSize < 1)
++					throw new MapGenerationException("ResourceFeatureSize must be >= 1");
++				if (TerrainSmoothing < 0 || TerrainSmoothing > MatrixUtils.MaxBinomialKernelRadius)
++					throw new MapGenerationException($"TerrainSmoothing must be between 0 and {MatrixUtils.MaxBinomialKernelRadius} inclusive");
++				if (SmoothingThreshold < (FractionMax + 1) / 2 || SmoothingThreshold > FractionMax)
++					throw new MapGenerationException($"SmoothingThreshold must be between {(FractionMax + 1) / 2} and {FractionMax} inclusive");
+ 				if (MinimumLandSeaThickness < 1)
+ 					throw new MapGenerationException("MinimumLandSeaThickness must be >= 1");
+ 				if (MinimumMountainThickness < 1)
+ 					throw new MapGenerationException("MinimumMountainThickness must be >= 1");
+-				if (Water < 0.0f || Water > 1.0f)
+-					throw new MapGenerationException("Water must be between 0.0 and 1.0 inclusive");
+-				if (Forests < 0.0f || Forests > 1.0f)
+-					throw new MapGenerationException("Forest must be between 0.0 and 1.0 inclusive");
++				if (Water < 0 || Water > FractionMax)
++					throw new MapGenerationException($"Water must be between 0 and {FractionMax} inclusive");
++				if (Forests < 0 || Forests > FractionMax)
++					throw new MapGenerationException($"Forest must be between 0 and {FractionMax} inclusive");
+ 				if (ForestCutout < 0)
+ 					throw new MapGenerationException("ForestCutout must be >= 0");
+ 				if (MaximumCutoutSpacing < 0)
+ 					throw new MapGenerationException("TopologyAugmentationThreshold must be >= 0");
+-				if (ForestClumpiness < 0.0f)
+-					throw new MapGenerationException("ForestClumpiness must be >= 0.0");
+-				if (Mountains < 0.0f || Mountains > 1.0f)
+-					throw new MapGenerationException("Mountains must be between 0.0 and 1.0 inclusive");
+-				if (Roughness < 0.0f || Roughness > 1.0f)
+-					throw new MapGenerationException("Roughness must be between 0.0 and 1.0");
++				if (ForestClumpiness < 0)
++					throw new MapGenerationException("ForestClumpiness must be >= 0");
++				if (Mountains < 0 || Mountains > FractionMax)
++					throw new MapGenerationException($"Mountains must be between 0 and {FractionMax} inclusive");
++				if (Roughness < 0 || Roughness > FractionMax)
++					throw new MapGenerationException("Roughness must be between 0 and {FractionMax}");
+ 				if (RoughnessRadius < 1)
+ 					throw new MapGenerationException("RoughnessRadius must be >= 1");
+ 				if (MaximumAltitude < 0)
+@@ -379,12 +382,12 @@ public void Validate()
+ 					throw new MapGenerationException("RoadShrink must be >= 0");
+ 				if (Players < 0)
+ 					throw new MapGenerationException("Players must be >= 0");
+-				if (CentralSpawnReservationFraction < 0.0f)
+-					throw new MapGenerationException("CentralSpawnReservationFraction must be >= 0.0");
+-				if (AreaEntityBonus < 0.0f)
+-					throw new MapGenerationException("PlayableAreaDensityBonus must be >= 0.0");
+-				if (PlayerCountEntityBonus < 0.0f)
+-					throw new MapGenerationException("PlayerCountDensityBonus must be >= 0.0");
++				if (CentralSpawnReservationFraction < 0)
++					throw new MapGenerationException("CentralSpawnReservationFraction must be >= 0");
++				if (AreaEntityBonus < 0)
++					throw new MapGenerationException("PlayableAreaDensityBonus must be >= 0");
++				if (PlayerCountEntityBonus < 0)
++					throw new MapGenerationException("PlayerCountDensityBonus must be >= 0");
+ 				if (SpawnRegionSize < 1)
+ 					throw new MapGenerationException("SpawnRegionSize must be >= 1");
+ 				if (SpawnReservation < 1)
+@@ -417,16 +420,16 @@ public void Validate()
+ 					throw new MapGenerationException("MinimumBuildings must be <= maximumBuildings");
+ 				if (ResourcesPerPlayer < 0)
+ 					throw new MapGenerationException("ResourcesPerPlayer must be >= 0");
+-				if (OreUniformity < 0.0f)
+-					throw new MapGenerationException("OreUniformity must be >= 0.0");
+-				if (OreClumpiness < 0.0f)
+-					throw new MapGenerationException("OreClumpiness must be >= 0.0");
++				if (OreUniformity < 0)
++					throw new MapGenerationException("OreUniformity must be >= 0");
++				if (OreClumpiness < 0)
++					throw new MapGenerationException("OreClumpiness must be >= 0");
+ 				foreach (var kv in BuildingWeights)
+-					if (kv.Value < 0.0f)
+-						throw new MapGenerationException("BuildingWeights.* must be >= 0.0");
++					if (kv.Value < 0)
++						throw new MapGenerationException("BuildingWeights.* must be >= 0");
+ 				foreach (var kv in ResourceSpawnWeights)
+-					if (kv.Value < 0.0f)
+-						throw new MapGenerationException("ResourceSpawnWeights.* must be >= 0.0");
++					if (kv.Value < 0)
++						throw new MapGenerationException("ResourceSpawnWeights.* must be >= 0");
+ 				foreach (var kv in ResourceSpawnWeights)
+ 					if (!ResourceSpawnSeeds.ContainsKey(kv.Key))
+ 						throw new MapGenerationException($"ResourceSpawnSeeds does not contain possible resource spawn `{kv.Key}`");
+@@ -440,7 +443,7 @@ public void Validate()
+ 					throw new MapGenerationException("Total number of players must not exceed 32");
+ 			}
+ 
+-			public static (T[] Types, float[] Weights) SplitWeights<T>(IReadOnlyDictionary<T, float> typeWeights)
++			public static (T[] Types, int[] Weights) SplitWeights<T>(IReadOnlyDictionary<T, int> typeWeights)
+ 			{
+ 				var types = typeWeights
+ 					.Select(kv => kv.Key)
+@@ -469,14 +472,14 @@ public MapGeneratorSettings GetSettings(Map map)
+ 
+ 		public void Generate(Map map, MiniYaml settings)
+ 		{
+-			const float ExternalBias = 1000000.0f;
++			const int ExternalBias = 4096;
+ 
+ 			var size = map.MapSize;
+ 			var minSpan = Math.Min(size.X, size.Y);
+ 			var maxSpan = Math.Max(size.X, size.Y);
+-			var mapCenter = (size.ToFloat2() - new float2(1.0f, 1.0f)) / 2.0f;
++			var mapCenter1024ths = size * 512;
+ 			var wMapCenter = CellLayerUtils.Center(map.Tiles);
+-			var matrixMapCenter = (CellLayerUtils.CellBounds(map).Size.ToInt2().ToFloat2() - new float2(1.0f, 1.0f)) / 2.0f;
++			var matrixMapCenter1024ths = CellLayerUtils.CellBounds(map).Size.ToInt2() * 512;
+ 			var cellBounds = CellLayerUtils.CellBounds(map);
+ 			var minCSpan = Math.Min(cellBounds.Size.Width, cellBounds.Size.Height);
+ 			var gridType = map.Grid.Type;
+@@ -596,32 +599,33 @@ TerrainTile PickTile(ushort tileType)
+ 				param.Mirror,
+ 				param.TerrainFeatureSize,
+ 				NoiseUtils.PinkAmplitude);
++			MatrixUtils.NormalizeRangeInPlace(elevation, 1024);
+ 
+ 			if (param.TerrainSmoothing > 0)
+ 			{
+ 				var radius = param.TerrainSmoothing;
+-				elevation = MatrixUtils.GaussianBlur(elevation, radius, radius);
++				elevation = MatrixUtils.BinomialBlur(elevation, radius);
+ 			}
+ 
+ 			MatrixUtils.CalibrateQuantileInPlace(
+ 				elevation,
+-				0.0f,
+-				param.Water);
++				0,
++				param.Water, FractionMax);
+ 
+ 			if (param.ExternalCircularBias != 0)
+ 				MatrixUtils.OverCircle(
+ 					matrix: elevation,
+-					center: mapCenter,
+-					radius: externalCircleRadius,
++					centerIn1024ths: mapCenter1024ths,
++					radiusIn1024ths: externalCircleRadius * 1024,
+ 					outside: true,
+ 					action: (xy, _) => elevation[xy] = param.ExternalCircularBias * ExternalBias);
+ 
+ 			var landPlan = MatrixUtils.BooleanBlotch(
+ 				elevation.Map(v => v >= 0),
+ 				param.TerrainSmoothing,
+-				param.SmoothingThreshold,
++				param.SmoothingThreshold, FractionMax,
+ 				param.MinimumLandSeaThickness,
+-				/*bias=*/param.Water < 0.5);
++				/*bias=*/param.Water < FractionMax / 2);
+ 
+ 			var beaches = CellLayerUtils.FromMatrixPoints(
+ 				MatrixUtils.BordersToPoints(landPlan),
+@@ -712,24 +716,23 @@ TerrainTile PickTile(ushort tileType)
+ 				}
+ 			}
+ 
+-			if (param.Mountains > 0.0f || param.ExternalCircularBias == 1)
++			if (param.Mountains > 0 || param.ExternalCircularBias == 1)
+ 			{
+ 				var roughnessMatrix = MatrixUtils.GridVariance(
+ 					elevation,
+-					param.RoughnessRadius)
+-						.Map(v => MathF.Sqrt(v));
++					param.RoughnessRadius);
+ 				MatrixUtils.CalibrateQuantileInPlace(
+ 					roughnessMatrix,
+-					0.0f,
+-					1.0f - param.Roughness);
+-				var cliffMask = roughnessMatrix.Map(v => v >= 0.0f);
++					0,
++					FractionMax - param.Roughness, FractionMax);
++				var cliffMask = roughnessMatrix.Map(v => v >= 0);
+ 				var mountainElevation = elevation.Clone();
+ 				var cliffPlan = landPlan;
+ 				if (param.ExternalCircularBias > 0)
+ 					MatrixUtils.OverCircle(
+ 						matrix: cliffPlan,
+-						center: matrixMapCenter,
+-						radius: externalCircleRadius,
++						centerIn1024ths: matrixMapCenter1024ths,
++						radiusIn1024ths: externalCircleRadius * 1024,
+ 						outside: true,
+ 						action: (xy, _) => cliffPlan[xy] = false);
+ 
+@@ -742,22 +745,21 @@ TerrainTile PickTile(ushort tileType)
+ 					for (var n = 0; n < mountainElevation.Data.Length; n++)
+ 					{
+ 						if (roominess.Data[n] < param.MinimumTerrainContourSpacing)
+-							mountainElevation.Data[n] = -1.0f;
++							mountainElevation.Data[n] = -1;
+ 						else
+ 							available++;
+ 
+ 						total++;
+ 					}
+ 
+-					var availableFraction = (float)available / total;
+ 					MatrixUtils.CalibrateQuantileInPlace(
+ 						mountainElevation,
+-						0.0f,
+-						1.0f - availableFraction * param.Mountains);
++						0,
++						total - available * param.Mountains / FractionMax, total);
+ 					cliffPlan = MatrixUtils.BooleanBlotch(
+ 						mountainElevation.Map(v => v >= 0),
+ 						param.TerrainSmoothing,
+-						param.SmoothingThreshold,
++						param.SmoothingThreshold, FractionMax,
+ 						param.MinimumMountainThickness,
+ 						/*bias=*/false);
+ 					var unmaskedCliffs = MatrixUtils.BordersToPoints(cliffPlan);
+@@ -795,24 +797,24 @@ TerrainTile PickTile(ushort tileType)
+ 				}
+ 			}
+ 
+-			if (param.Forests > 0.0f)
++			if (param.Forests > 0)
+ 			{
+-				var forestNoise = new CellLayer<float>(map);
++				var forestNoise = new CellLayer<int>(map);
+ 				NoiseUtils.SymmetricFractalNoiseIntoCellLayer(
+ 					forestRandom,
+ 					forestNoise,
+ 					param.Rotations,
+ 					param.Mirror,
+ 					param.ForestFeatureSize,
+-					wavelength => MathF.Pow(wavelength, param.ForestClumpiness));
++					wavelength => ClumpinessAmplitude(wavelength, param.ForestClumpiness));
+ 				CellLayerUtils.CalibrateQuantileInPlace(
+ 					forestNoise,
+-					0.0f,
+-					1.0f - param.Forests);
++					0,
++					FractionMax - param.Forests, FractionMax);
+ 
+ 				var forestPlan = new CellLayer<bool>(map);
+ 				foreach (var mpos in map.AllCells.MapCoords)
+-					if (param.ClearTerrain.Contains(map.GetTerrainIndex(mpos)) && forestNoise[mpos] >= 0.0f)
++					if (param.ClearTerrain.Contains(map.GetTerrainIndex(mpos)) && forestNoise[mpos] >= 0)
+ 						forestPlan[mpos] = true;
+ 
+ 				if (param.ForestCutout > 0)
+@@ -1081,8 +1083,8 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 				var kernel = new Matrix<bool>(param.RoadSpacing * 2 + 1, param.RoadSpacing * 2 + 1);
+ 				MatrixUtils.OverCircle(
+ 					matrix: kernel,
+-					center: new float2(param.RoadSpacing, param.RoadSpacing),
+-					radius: param.RoadSpacing,
++					centerIn1024ths: kernel.Size * 512,
++					radiusIn1024ths: param.RoadSpacing * 1024,
+ 					outside: false,
+ 					action: (xy, _) => kernel[xy] = true);
+ 				var dilated = MatrixUtils.KernelDilateOrErode(
+@@ -1165,7 +1167,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					(projections, cpos) =>
+ 						projectionSpacing[cpos] = Symmetry.ProjectionProximity(projections) / 2);
+ 
+-				var spawnReservationRadius = minSpan * param.CentralSpawnReservationFraction;
++				var spawnReservationRadius = minSpan * param.CentralSpawnReservationFraction / FractionMax;
+ 				var spawnReservation = new CellLayer<bool>(map);
+ 				foreach (var mpos in map.AllCells.MapCoords)
+ 					spawnReservation[mpos] = Symmetry.IsCPosNearCenter(
+@@ -1209,8 +1211,8 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 
+ 				var zoneableArea = zoneable.Count(v => v);
+ 				var entityMultiplier =
+-					zoneableArea * param.AreaEntityBonus +
+-					param.TotalPlayers * param.PlayerCountEntityBonus;
++					(long)zoneableArea * param.AreaEntityBonus +
++					(long)param.TotalPlayers * param.PlayerCountEntityBonus;
+ 				var perSymmetryEntityMultiplier = entityMultiplier / param.SymmetryCount;
+ 
+ 				// Spawn generation
+@@ -1242,18 +1244,18 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 						Location = chosenMPos.ToCPos(gridType),
+ 					};
+ 
+-					var preferedRange = (param.SpawnBuildSize + param.SpawnRegionSize * 2) / 2;
+-					var resourceSpawnPreferences = new CellLayer<float>(map);
++					var preferedRange1024ths = (param.SpawnBuildSize + param.SpawnRegionSize * 2) * 512;
++					var resourceSpawnPreferences = new CellLayer<int>(map);
+ 					CellLayerUtils.WalkingDistances(
+ 						resourceSpawnPreferences,
+ 						zoneable,
+ 						new[] { chosenMPos.ToCPos(gridType) },
+-						param.SpawnRegionSize);
++						param.SpawnRegionSize * 1024);
+ 					foreach (var mpos in map.AllCells.MapCoords)
+ 					{
+ 						var v = resourceSpawnPreferences[mpos];
+-						resourceSpawnPreferences[mpos] = MathF.Ceiling(
+-							v > preferedRange ? 2 * preferedRange - v : v);
++						resourceSpawnPreferences[mpos] =
++							((v > preferedRange1024ths ? 2 * preferedRange1024ths - v : v) + 1023) / 1024;
+ 					}
+ 
+ 					var resourceSpawns = new List<ActorPlan>();
+@@ -1263,7 +1265,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 							resourceSpawnPreferences,
+ 							playerRandom,
+ 							(a, b) => a.CompareTo(b));
+-						if (value <= 1.0f)
++						if (value <= 1)
+ 							break;
+ 
+ 						var resourceSpawnType = resourceSpawnTypes[playerRandom.PickWeighted(resourceSpawnWeights)];
+@@ -1278,7 +1280,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 							wCenter: resourceSpawnPlan.WPosLocation,
+ 							wRadius: 1024,
+ 							outside: false,
+-							action: (mpos, _, _, _) => resourceSpawnPreferences[mpos] = 0.0f);
++							action: (mpos, _, _, _) => resourceSpawnPreferences[mpos] = 0);
+ 					}
+ 
+ 					var projectedSpawns = Symmetry.RotateAndMirrorActorPlan(spawn, param.Rotations, param.Mirror);
+@@ -1304,7 +1306,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 
+ 				// Expansions
+ 				{
+-					var resourceSpawnsRemaining = (int)(param.MaximumExpansionResourceSpawns * perSymmetryEntityMultiplier);
++					var resourceSpawnsRemaining = (int)(param.MaximumExpansionResourceSpawns * perSymmetryEntityMultiplier / EntityBonusMax);
+ 					while (resourceSpawnsRemaining > 0)
+ 					{
+ 						var roominess = new CellLayer<int>(map);
+@@ -1327,20 +1329,23 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 						var resourceSpawnCount = Math.Min(resourceSpawnsRemaining, expansionRandom.Next(param.MaximumResourceSpawnsPerExpansion) + 1);
+ 						resourceSpawnsRemaining -= resourceSpawnCount;
+ 
+-						if (radius1 < 1.0f)
++						if (radius1 < 1)
+ 							break;
+ 
+ 						var resourceSpawns = new List<ActorPlan>();
+-						var resourceSpawnPreferences = new CellLayer<float>(map);
+-						var wRadius1Sq = (long)radius1 * radius1 * 1024 * 1024;
++						var resourceSpawnPreferences = new CellLayer<int>(map);
++						var radius1Sq = radius1 * radius1;
+ 						CellLayerUtils.OverCircle(
+ 							cellLayer: resourceSpawnPreferences,
+ 							wCenter: CellLayerUtils.MPosToWPos(chosenMPos, gridType),
+ 							wRadius: radius2 * 1024,
+ 							outside: false,
+-							action: (mpos, _, _, rSq) =>
++							action: (mpos, _, _, wrSq) =>
++							{
++								var rSq = (int)(wrSq / (1024 * 1024));
+ 								resourceSpawnPreferences[mpos] =
+-									rSq >= wRadius1Sq ? rSq : 0.0f);
++									rSq >= radius1Sq ? rSq : 0;
++							});
+ 						for (var resourceSpawn = 0; resourceSpawn < resourceSpawnCount; resourceSpawn++)
+ 						{
+ 							var mpos = CellLayerUtils.PickWeighted(resourceSpawnPreferences, expansionRandom);
+@@ -1356,7 +1361,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 								wCenter: resourceSpawnPlan.WPosLocation,
+ 								wRadius: 1024,
+ 								outside: false,
+-								action: (mpos, _, _, _) => resourceSpawnPreferences[mpos] = 0.0f);
++								action: (mpos, _, _, _) => resourceSpawnPreferences[mpos] = 0);
+ 						}
+ 
+ 						var projectedResourceSpawns = Symmetry.RotateAndMirrorActorPlans(resourceSpawns, param.Rotations, param.Mirror);
+@@ -1376,8 +1381,8 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					var targetBuildingCount =
+ 						(param.MaximumBuildings != 0)
+ 							? expansionRandom.Next(
+-								(int)(param.MinimumBuildings * perSymmetryEntityMultiplier),
+-								(int)(param.MaximumBuildings * perSymmetryEntityMultiplier) + 1)
++								(int)(param.MinimumBuildings * perSymmetryEntityMultiplier / EntityBonusMax),
++								(int)(param.MaximumBuildings * perSymmetryEntityMultiplier / EntityBonusMax) + 1)
+ 							: 0;
+ 					for (var i = 0; i < targetBuildingCount; i++)
+ 					{
+@@ -1415,128 +1420,126 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 
+ 				// Grow resources
+ 				{
+-					var pattern = new CellLayer<float>(map);
++					var pattern1024ths = new CellLayer<int>(map);
+ 					NoiseUtils.SymmetricFractalNoiseIntoCellLayer(
+ 						resourceRandom,
+-						pattern,
++						pattern1024ths,
+ 						param.Rotations,
+ 						param.Mirror,
+ 						param.ResourceFeatureSize,
+-						wavelength => MathF.Pow(wavelength, param.OreClumpiness));
++						wavelength => ClumpinessAmplitude(wavelength, param.OreClumpiness));
+ 					{
+ 						CellLayerUtils.CalibrateQuantileInPlace(
+-							pattern,
+-							0.0f,
+-							0.0f);
+-						var max = pattern.Max();
++							pattern1024ths,
++							0,
++							0, 1);
++						var max1024ths = pattern1024ths.Max();
++						var uniformity1024ths = param.OreUniformity * 1024 / FractionMax;
+ 						foreach (var mpos in map.AllCells.MapCoords)
+-						{
+-							pattern[mpos] /= max;
+-							pattern[mpos] += param.OreUniformity;
+-						}
++							pattern1024ths[mpos] = uniformity1024ths + 1024 * pattern1024ths[mpos] / max1024ths;
+ 					}
+ 
+-					var strengths = new Dictionary<ResourceTypeInfo, CellLayer<float>>();
++					var strengths1024ths = new Dictionary<ResourceTypeInfo, CellLayer<int>>();
+ 					foreach (var actorPlan in actorPlans)
+ 					{
+ 						var type = actorPlan.Reference.Type;
+ 						if (param.ResourceSpawnWeights.ContainsKey(type))
+ 						{
+ 							var resource = param.ResourceSpawnSeeds[type];
+-							if (!strengths.TryGetValue(resource, out var strength))
++							if (!strengths1024ths.TryGetValue(resource, out var strength1024ths))
+ 							{
+-								strength = new CellLayer<float>(map);
+-								strengths.Add(resource, strength);
++								strength1024ths = new CellLayer<int>(map);
++								strengths1024ths.Add(resource, strength1024ths);
+ 							}
+ 
+ 							CellLayerUtils.OverCircle(
+-								cellLayer: strength,
++								cellLayer: strength1024ths,
+ 								wCenter: actorPlan.WPosLocation,
+ 								wRadius: 16 * 1024,
+ 								outside: false,
+-								action: (mpos, _, _, rSq) =>
+-									strength[mpos] +=
+-										1024.0f / (1024.0f + MathF.Sqrt(rSq)));
++								action: (mpos, _, _, wrSq) =>
++									strength1024ths[mpos] +=
++										(int)(1024 * 1024 / (1024 + Exts.ISqrt(wrSq))));
+ 						}
+ 					}
+ 
+-					var maxStrength = new CellLayer<float>(map);
++					var maxStrength1024ths = new CellLayer<int>(map);
+ 					var bestResource = new CellLayer<ResourceTypeInfo>(map);
+ 					bestResource.Clear(param.DefaultResource);
+-					foreach (var resourceStrength in strengths)
++					foreach (var resourceStrength in strengths1024ths)
+ 					{
+ 						var resource = resourceStrength.Key;
+-						var strength = resourceStrength.Value;
++						var strength1024ths = resourceStrength.Value;
+ 						foreach (var mpos in map.AllCells.MapCoords)
+-							if (strength[mpos] > maxStrength[mpos])
++							if (strength1024ths[mpos] > maxStrength1024ths[mpos])
+ 							{
+-								maxStrength[mpos] = strength[mpos];
++								maxStrength1024ths[mpos] = strength1024ths[mpos];
+ 								bestResource[mpos] = resource;
+ 							}
+ 					}
+ 
+ 					// Closer to +inf means "more preferable" for plan.
+-					var plan = new CellLayer<float>(map);
++					var plan1024ths = new CellLayer<int>(map);
+ 					foreach (var mpos in map.AllCells.MapCoords)
+ 						if (playableArea[mpos] && param.AllowedTerrainResourceCombos.Contains((bestResource[mpos], map.GetTerrainIndex(mpos))))
+-							plan[mpos] = pattern[mpos] * maxStrength[mpos];
++							plan1024ths[mpos] = pattern1024ths[mpos] * maxStrength1024ths[mpos] / 1024;
+ 						else
+-							plan[mpos] = float.NegativeInfinity;
++							plan1024ths[mpos] = -int.MaxValue;
+ 
+ 					var wSpawnBuildSizeSq = (long)param.SpawnBuildSize * param.SpawnBuildSize * 1024 * 1024;
+ 					foreach (var actorPlan in actorPlans)
+ 						if (actorPlan.Reference.Type == "mpspawn")
+ 							CellLayerUtils.OverCircle(
+-								cellLayer: plan,
++								cellLayer: plan1024ths,
+ 								wCenter: actorPlan.WPosLocation,
+ 								wRadius: param.SpawnRegionSize * 2 * 1024,
+ 								outside: false,
+ 								action: (mpos, _, _, rSq) =>
+-									plan[mpos] *= 1.0f + param.SpawnResourceBias * wSpawnBuildSizeSq / rSq);
++									plan1024ths[mpos] += (int)(plan1024ths[mpos] * param.SpawnResourceBias * wSpawnBuildSizeSq / Math.Max(rSq, 1024 * 1024) / FractionMax));
+ 
+ 					foreach (var actorPlan in actorPlans)
+ 						if (actorPlan.Reference.Type == "mpspawn")
+ 							CellLayerUtils.OverCircle(
+-								cellLayer: plan,
++								cellLayer: plan1024ths,
+ 								wCenter: actorPlan.WPosLocation,
+ 								wRadius: param.SpawnBuildSize * 1024,
+ 								outside: false,
+-								action: (mpos, _, _, _) => plan[mpos] = float.NegativeInfinity);
++								action: (mpos, _, _, _) => plan1024ths[mpos] = -int.MaxValue);
+ 
+ 					foreach (var actorPlan in actorPlans)
+ 						foreach (var (cpos, _) in actorPlan.Footprint())
+-							if (plan.Contains(cpos))
+-								plan[cpos] = float.NegativeInfinity;
++							if (plan1024ths.Contains(cpos))
++								plan1024ths[cpos] = -int.MaxValue;
+ 
+ 					// Improve symmetry.
+ 					{
+-						var newPlan = new CellLayer<float>(map);
++						var newPlan = new CellLayer<int>(map);
+ 						Symmetry.RotateAndMirrorOverCPos(
+-							plan,
++							plan1024ths,
+ 							param.Rotations,
+ 							param.Mirror,
+ 							(sources, destination)
+ 								=> newPlan[destination] =
+-									sources.Min(source => plan.TryGetValue(source, out var value) ? value : float.NegativeInfinity));
+-						plan = newPlan;
++									sources.Min(source => plan1024ths.TryGetValue(source, out var value) ? value : -int.MaxValue));
++						plan1024ths = newPlan;
+ 					}
+ 
+-					var remaining = param.ResourcesPerPlayer * entityMultiplier;
++					var remaining = param.ResourcesPerPlayer * entityMultiplier / EntityBonusMax;
+ 
+ 					// Closer to -inf means "more preferable" for priorities.
+-					var priorities = new PriorityArray<float>(
+-						plan.Size.Width * plan.Size.Height,
+-						float.PositiveInfinity);
++					var priorities = new PriorityArray<int>(
++						plan1024ths.Size.Width * plan1024ths.Size.Height,
++						int.MaxValue);
+ 					{
+ 						var i = 0;
+-						foreach (var v in plan)
++						foreach (var v in plan1024ths)
+ 							priorities[i++] = -v;
+ 					}
+ 
+-					int PriorityIndex(MPos mpos) => mpos.V * plan.Size.Width + mpos.U;
++					int PriorityIndex(MPos mpos) => mpos.V * plan1024ths.Size.Width + mpos.U;
+ 					MPos PriorityMPos(int index)
+ 					{
+-						var v = Math.DivRem(index, plan.Size.Width, out var u);
++						var v = Math.DivRem(index, plan1024ths.Size.Width, out var u);
+ 						return new MPos(u, v);
+ 					}
+ 
+@@ -1584,7 +1587,7 @@ int CheckValue3By3(CPos cpos)
+ 					int AddResource(CPos cpos)
+ 					{
+ 						var mpos = cpos.ToMPos(gridType);
+-						priorities[PriorityIndex(mpos)] = float.PositiveInfinity;
++						priorities[PriorityIndex(mpos)] = int.MaxValue;
+ 
+ 						// Generally shouldn't happen, but perhaps a rotation/mirror related inaccuracy.
+ 						if (map.Resources[mpos].Type != 0)
+@@ -1602,12 +1605,12 @@ int AddResource(CPos cpos)
+ 					while (remaining > 0)
+ 					{
+ 						var n = priorities.GetMinIndex();
+-						if (priorities[n] == float.PositiveInfinity)
++						if (priorities[n] == int.MaxValue)
+ 							break;
+ 
+ 						var chosenMPos = PriorityMPos(n);
+ 						var chosenCPos = chosenMPos.ToCPos(gridType);
+-						foreach (var cpos in Symmetry.RotateAndMirrorCPos(chosenCPos, plan, param.Rotations, param.Mirror))
++						foreach (var cpos in Symmetry.RotateAndMirrorCPos(chosenCPos, plan1024ths, param.Rotations, param.Mirror))
+ 							if (map.Resources.Contains(cpos))
+ 								remaining -= AddResource(cpos);
+ 					}
+@@ -1657,5 +1660,13 @@ int AddResource(CPos cpos)
+ 
+ 			return output;
+ 		}
++
++		static int ClumpinessAmplitude(int wavelength, int clumpiness)
++		{
++			var amplitude = wavelength;
++			for (var i = 0; i < clumpiness; i++)
++				amplitude = Exts.ISqrt(amplitude);
++			return amplitude;
++		}
+ 	}
+ }
+diff --git a/mods/cnc/rules/map-generators.yaml b/mods/cnc/rules/map-generators.yaml
+index 7b2ca8ace332..ac9403eceb7f 100644
+--- a/mods/cnc/rules/map-generators.yaml
++++ b/mods/cnc/rules/map-generators.yaml
+@@ -6,40 +6,40 @@
+ 			Option@hidden_defaults:
+ 				Choice@hidden_defaults:
+ 					Settings:
+-						TerrainFeatureSize: 20.0
+-						ForestFeatureSize: 20.0
+-						ResourceFeatureSize: 20.0
+-						Water: 0.0
+-						Mountains: 0.1
+-						Forests: 0.025
++						TerrainFeatureSize: 20480
++						ForestFeatureSize: 20480
++						ResourceFeatureSize: 20480
++						Water: 0
++						Mountains: 100
++						Forests: 25
+ 						ForestCutout: 2
+ 						MaximumCutoutSpacing: 12
+ 						TerrainSmoothing: 4
+-						SmoothingThreshold: 0.833333
++						SmoothingThreshold: 833
+ 						MinimumLandSeaThickness: 5
+ 						MinimumMountainThickness: 5
+ 						MaximumAltitude: 8
+ 						RoughnessRadius: 5
+-						Roughness: 0.5
++						Roughness: 500
+ 						MinimumTerrainContourSpacing: 6
+ 						MinimumCliffLength: 10
+-						ForestClumpiness: 0.5
++						ForestClumpiness: 1
+ 						DenyWalledAreas: True
+ 						EnforceSymmetry: 0
+ 						Roads: True
+ 						RoadSpacing: 5
+ 						RoadShrink: 0
+ 						CreateEntities: True
+-						CentralSpawnReservationFraction: 0.25
++						CentralSpawnReservationFraction: 250
+ 						ResourceSpawnReservation: 8
+ 						SpawnRegionSize: 12
+ 						SpawnBuildSize: 8
+ 						SpawnResourceSpawns: 3
+ 						SpawnReservation: 20
+-						SpawnResourceBias: 1.05
++						SpawnResourceBias: 1050
+ 						ResourcesPerPlayer: 50000
+-						OreUniformity: 0.5
+-						OreClumpiness: 0.5
++						OreUniformity: 500
++						OreClumpiness: 1
+ 						MaximumExpansionResourceSpawns: 5
+ 						MaximumResourceSpawnsPerExpansion: 2
+ 						MinimumExpansionSize: 2
+@@ -92,18 +92,18 @@
+ 					Label: label-cnc-map-generator-choice-terrain-type-lakes
+ 					Tileset: DESERT
+ 					Settings:
+-						Water: 0.2
++						Water: 200
+ 				Choice@Puddles:
+ 					Label: label-cnc-map-generator-choice-terrain-type-puddles
+ 					Tileset: DESERT
+ 					Settings:
+-						Water: 0.1
++						Water: 100
+ 				Choice@Gardens:
+ 					Label: label-cnc-map-generator-choice-terrain-type-gardens
+ 					Tileset: DESERT
+ 					Settings:
+-						Water: 0.05
+-						Forests: 0.3
++						Water: 50
++						Forests: 300
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+ 						RoadSpacing: 3
+@@ -111,17 +111,17 @@
+ 				Choice@Plains:
+ 					Label: label-cnc-map-generator-choice-terrain-type-plains
+ 					Settings:
+-						Water: 0.0
++						Water: 0
+ 				Choice@Parks:
+ 					Label: label-cnc-map-generator-choice-terrain-type-parks
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.1
++						Water: 0
++						Forests: 100
+ 				Choice@Woodlands:
+ 					Label: label-cnc-map-generator-choice-terrain-type-woodlands
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.4
++						Water: 0
++						Forests: 400
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+ 						RoadSpacing: 3
+@@ -129,36 +129,36 @@
+ 				Choice@Overgrown:
+ 					Label: label-cnc-map-generator-choice-terrain-type-overgrown
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.5
++						Water: 0
++						Forests: 500
+ 						EnforceSymmetry: 2
+-						Mountains: 0.5
+-						Roughness: 0.25
++						Mountains: 500
++						Roughness: 250
+ 				Choice@Rocky:
+ 					Label: label-cnc-map-generator-choice-terrain-type-rocky
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.3
++						Water: 0
++						Forests: 300
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+-						Mountains: 0.5
+-						Roughness: 0.25
++						Mountains: 500
++						Roughness: 250
+ 						RoadSpacing: 3
+ 						RoadShrink: 4
+ 				Choice@Mountains:
+ 					Label: label-cnc-map-generator-choice-terrain-type-mountains
+ 					Settings:
+-						Water: 0.0
+-						Mountains: 1.0
+-						Roughness: 0.60
++						Water: 0
++						Mountains: 1000
++						Roughness: 600
+ 						MinimumTerrainContourSpacing: 5
+ 				Choice@MountainLakes:
+ 					Label: label-cnc-map-generator-choice-terrain-type-mountain-lakes
+ 					Tileset: DESERT
+ 					Settings:
+-						Water: 0.2
+-						Mountains: 1.0
+-						Roughness: 0.85
++						Water: 200
++						Mountains: 1000
++						Roughness: 850
+ 						MinimumTerrainContourSpacing: 5
+ 			Option@Rotations:
+ 				Label: label-cnc-map-generator-option-rotations
+@@ -230,8 +230,8 @@
+ 						SpawnResourceSpawns: 1
+ 						ResourcesPerPlayer: 25000
+ 						ResourceSpawnWeights:
+-							split2: 1.0
+-							split3: 1.0
++							split2: 1
++							split3: 1
+ 						MaximumExpansionResourceSpawns: 2
+ 						MaximumResourceSpawnsPerExpansion: 1
+ 				Choice@Medium:
+@@ -240,9 +240,9 @@
+ 						SpawnResourceSpawns: 2
+ 						ResourcesPerPlayer: 50000
+ 						ResourceSpawnWeights:
+-							split2: 0.95
+-							split3: 0.95
+-							splitblue: 0.10
++							split2: 95
++							split3: 95
++							splitblue: 10
+ 						MaximumExpansionResourceSpawns: 3
+ 						MaximumResourceSpawnsPerExpansion: 1
+ 				Choice@High:
+@@ -251,9 +251,9 @@
+ 						SpawnResourceSpawns: 3
+ 						ResourcesPerPlayer: 75000
+ 						ResourceSpawnWeights:
+-							split2: 0.9
+-							split3: 0.9
+-							splitblue: 0.2
++							split2: 9
++							split3: 9
++							splitblue: 2
+ 						MaximumExpansionResourceSpawns: 5
+ 						MaximumResourceSpawnsPerExpansion: 2
+ 				Choice@VeryHigh:
+@@ -262,9 +262,9 @@
+ 						SpawnResourceSpawns: 4
+ 						ResourcesPerPlayer: 100000
+ 						ResourceSpawnWeights:
+-							split2: 0.8
+-							split3: 0.8
+-							splitblue: 0.4
++							split2: 8
++							split3: 8
++							splitblue: 4
+ 						MaximumExpansionResourceSpawns: 8
+ 						MaximumResourceSpawnsPerExpansion: 2
+ 				Choice@Full:
+@@ -324,38 +324,38 @@
+ 				Choice@Players:
+ 					Label: label-cnc-map-generator-choice-density-players
+ 					Settings:
+-						AreaEntityBonus: 0.0
+-						PlayerCountEntityBonus: 1.0
++						AreaEntityBonus: 0
++						PlayerCountEntityBonus: 1000000
+ 				Choice@AreaAndPlayers:
+ 					Label: label-cnc-map-generator-choice-density-area-and-players
+ 					Settings:
+-						AreaEntityBonus: 0.0002
+-						PlayerCountEntityBonus: 0.5
++						AreaEntityBonus: 200
++						PlayerCountEntityBonus: 500000
+ 				Choice@AreaVeryLow:
+ 					Label: label-cnc-map-generator-choice-density-area-very-low
+ 					Settings:
+-						AreaEntityBonus: 0.0001
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 100
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaLow:
+ 					Label: label-cnc-map-generator-choice-density-area-low
+ 					Settings:
+-						AreaEntityBonus: 0.0002
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 200
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaMedium:
+ 					Label: label-cnc-map-generator-choice-density-area-medium
+ 					Settings:
+-						AreaEntityBonus: 0.0004
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 400
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaHigh:
+ 					Label: label-cnc-map-generator-choice-density-area-high
+ 					Settings:
+-						AreaEntityBonus: 0.0006
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 600
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaVeryHigh:
+ 					Label: label-cnc-map-generator-choice-density-area-very-high
+ 					Settings:
+-						AreaEntityBonus: 0.0008
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 800
++						PlayerCountEntityBonus: 0
+ 			Option@DenyWalledArea:
+ 				Label: label-cnc-map-generator-option-deny-walled-areas
+ 				Checkbox: DenyWalledAreas
+diff --git a/mods/cnc/tilesets/desert.yaml b/mods/cnc/tilesets/desert.yaml
+index 9fe7d9c6a012..8c3175b40d06 100644
+--- a/mods/cnc/tilesets/desert.yaml
++++ b/mods/cnc/tilesets/desert.yaml
+@@ -3074,16 +3074,16 @@ MultiBrushCollections:
+ 			Actor: t18
+ 		MultiBrush@t04.husk:
+ 			Actor: t04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09.husk:
+ 			Actor: t09.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t18.husk:
+ 			Actor: t18.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@82:
+ 			Template: 82
+@@ -3099,34 +3099,34 @@ MultiBrushCollections:
+ 			Template: 217
+ 		MultiBrush@57:
+ 			Template: 57
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@58:
+ 			Template: 58
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@59:
+ 			Template: 59
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@60:
+ 			Template: 60
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@61:
+ 			Template: 61
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@62:
+ 			Template: 62
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@63:
+ 			Template: 63
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@64:
+ 			Template: 64
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@65:
+ 			Template: 65
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@66:
+ 			Template: 66
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@67:
+ 			Template: 67
+ 		MultiBrush@68:
+@@ -3140,42 +3140,42 @@ MultiBrushCollections:
+ 		MultiBrush@t04:
+ 			Actor: t04
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09:
+ 			Actor: t09
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t18:
+ 			Actor: t18
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t04.husk:
+ 			Actor: t04.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09.husk:
+ 			Actor: t09.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t18.husk:
+ 			Actor: t18.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@rock1:
+ 			Actor: rock1
+ 		MultiBrush@rock2:
+ 			Actor: rock2
+ 		MultiBrush@rock3:
+ 			Actor: rock3
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@rock4:
+ 			Actor: rock4
+ 		MultiBrush@rock5:
+@@ -3187,7 +3187,7 @@ MultiBrushCollections:
+ 	Water:
+ 		MultiBrush@1:
+ 			Template: 1
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@76:
+ 			Template: 76
+ 		MultiBrush@77:
+diff --git a/mods/cnc/tilesets/jungle.yaml b/mods/cnc/tilesets/jungle.yaml
+index e6d9fd644a61..3587d70d1590 100644
+--- a/mods/cnc/tilesets/jungle.yaml
++++ b/mods/cnc/tilesets/jungle.yaml
+@@ -2475,58 +2475,58 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@67:
+ 			Template: 67
+@@ -2534,10 +2534,10 @@ MultiBrushCollections:
+ 			Template: 68
+ 		MultiBrush@69:
+ 			Template: 69
+-			Weight: 0.02
++			Weight: 20
+ 		MultiBrush@70:
+ 			Template: 70
+-			Weight: 0.01
++			Weight: 10
+ 		MultiBrush@79:
+ 			Template: 79
+ 		MultiBrush@80:
+@@ -2550,79 +2550,79 @@ MultiBrushCollections:
+ 			Template: 84
+ 		MultiBrush@188:
+ 			Template: 188
+-			Weight: 0.01
++			Weight: 10
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 	Water:
+ 		MultiBrush@1:
+ 			Template: 1
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@2:
+ 			Template: 2
+ 		MultiBrush@5:
+ 			Template: 5
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@6:
+ 			Template: 6
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@76:
+ 			Template: 76
+ 		MultiBrush@77:
+diff --git a/mods/cnc/tilesets/snow.yaml b/mods/cnc/tilesets/snow.yaml
+index 714e21254329..75c3cef7ca5d 100644
+--- a/mods/cnc/tilesets/snow.yaml
++++ b/mods/cnc/tilesets/snow.yaml
+@@ -2474,64 +2474,64 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc04.husk:
+ 			Actor: tc04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc05.husk:
+ 			Actor: tc05.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@67:
+ 			Template: 67
+@@ -2539,10 +2539,10 @@ MultiBrushCollections:
+ 			Template: 68
+ 		MultiBrush@69:
+ 			Template: 69
+-			Weight: 0.02
++			Weight: 20
+ 		MultiBrush@70:
+ 			Template: 70
+-			Weight: 0.01
++			Weight: 10
+ 		MultiBrush@79:
+ 			Template: 79
+ 		MultiBrush@80:
+@@ -2556,75 +2556,75 @@ MultiBrushCollections:
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 	Water:
+ 		MultiBrush@1:
+ 			Template: 1
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@2:
+ 			Template: 2
+ 		MultiBrush@5:
+ 			Template: 5
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@6:
+ 			Template: 6
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@76:
+ 			Template: 76
+ 		MultiBrush@77:
+diff --git a/mods/cnc/tilesets/temperat.yaml b/mods/cnc/tilesets/temperat.yaml
+index bafe5867de8a..aeca913e4f44 100644
+--- a/mods/cnc/tilesets/temperat.yaml
++++ b/mods/cnc/tilesets/temperat.yaml
+@@ -2475,64 +2475,64 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc04.husk:
+ 			Actor: tc04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc05.husk:
+ 			Actor: tc05.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@67:
+ 			Template: 67
+@@ -2542,7 +2542,7 @@ MultiBrushCollections:
+ 			Template: 69
+ 		MultiBrush@70:
+ 			Template: 70
+-			Weight: 0.01
++			Weight: 10
+ 		MultiBrush@79:
+ 			Template: 79
+ 		MultiBrush@80:
+@@ -2555,79 +2555,79 @@ MultiBrushCollections:
+ 			Template: 84
+ 		MultiBrush@188:
+ 			Template: 188
+-			Weight: 0.01
++			Weight: 10
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 	Water:
+ 		MultiBrush@1:
+ 			Template: 1
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@2:
+ 			Template: 2
+ 		MultiBrush@5:
+ 			Template: 5
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@6:
+ 			Template: 6
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@76:
+ 			Template: 76
+ 		MultiBrush@77:
+diff --git a/mods/cnc/tilesets/winter.yaml b/mods/cnc/tilesets/winter.yaml
+index 3bbdb253bdb1..0b07f959e3d6 100644
+--- a/mods/cnc/tilesets/winter.yaml
++++ b/mods/cnc/tilesets/winter.yaml
+@@ -2510,64 +2510,64 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc04.husk:
+ 			Actor: tc04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc05.husk:
+ 			Actor: tc05.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@79:
+ 			Template: 79
+@@ -2582,66 +2582,66 @@ MultiBrushCollections:
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.2
++			Weight: 200
+ 	Snow:
+ 		MultiBrush@Nothing:
+-			Weight: 100
++			Weight: 100000
+ 		MultiBrush@81:
+ 			Template: 81
+ 		MultiBrush@181:
+@@ -2657,15 +2657,15 @@ MultiBrushCollections:
+ 	Water:
+ 		MultiBrush@1:
+ 			Template: 1
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@2:
+ 			Template: 2
+ 		MultiBrush@5:
+ 			Template: 5
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@6:
+ 			Template: 6
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@76:
+ 			Template: 76
+ 		MultiBrush@77:
+diff --git a/mods/ra/rules/map-generators.yaml b/mods/ra/rules/map-generators.yaml
+index b940cc0e1ada..1b0b16d4d966 100644
+--- a/mods/ra/rules/map-generators.yaml
++++ b/mods/ra/rules/map-generators.yaml
+@@ -6,40 +6,40 @@
+ 			Option@hidden_defaults:
+ 				Choice@hidden_defaults:
+ 					Settings:
+-						TerrainFeatureSize: 20.0
+-						ForestFeatureSize: 20.0
+-						ResourceFeatureSize: 20.0
+-						Water: 0.2
+-						Mountains: 0.1
+-						Forests: 0.025
++						TerrainFeatureSize: 20480
++						ForestFeatureSize: 20480
++						ResourceFeatureSize: 20480
++						Water: 200
++						Mountains: 100
++						Forests: 25
+ 						ForestCutout: 2
+ 						MaximumCutoutSpacing: 12
+ 						TerrainSmoothing: 4
+-						SmoothingThreshold: 0.833333
++						SmoothingThreshold: 833
+ 						MinimumLandSeaThickness: 5
+ 						MinimumMountainThickness: 5
+ 						MaximumAltitude: 8
+ 						RoughnessRadius: 5
+-						Roughness: 0.5
++						Roughness: 500
+ 						MinimumTerrainContourSpacing: 6
+ 						MinimumCliffLength: 10
+-						ForestClumpiness: 0.5
++						ForestClumpiness: 1
+ 						DenyWalledAreas: True
+ 						EnforceSymmetry: 0
+ 						Roads: True
+ 						RoadSpacing: 5
+ 						RoadShrink: 0
+ 						CreateEntities: True
+-						CentralSpawnReservationFraction: 0.25
++						CentralSpawnReservationFraction: 250
+ 						ResourceSpawnReservation: 8
+ 						SpawnRegionSize: 12
+ 						SpawnBuildSize: 8
+ 						SpawnResourceSpawns: 3
+ 						SpawnReservation: 20
+-						SpawnResourceBias: 1.15
++						SpawnResourceBias: 1150
+ 						ResourcesPerPlayer: 50000
+-						OreUniformity: 0.25
+-						OreClumpiness: 0.25
++						OreUniformity: 250
++						OreClumpiness: 2
+ 						MaximumExpansionResourceSpawns: 5
+ 						MaximumResourceSpawnsPerExpansion: 2
+ 						MinimumExpansionSize: 2
+@@ -93,12 +93,12 @@
+ 				Choice@Puddles:
+ 					Label: label-ra-map-generator-choice-terrain-type-puddles
+ 					Settings:
+-						Water: 0.1
++						Water: 100
+ 				Choice@Gardens:
+ 					Label: label-ra-map-generator-choice-terrain-type-gardens
+ 					Settings:
+-						Water: 0.05
+-						Forests: 0.3
++						Water: 50
++						Forests: 300
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+ 						RoadSpacing: 3
+@@ -106,17 +106,17 @@
+ 				Choice@Plains:
+ 					Label: label-ra-map-generator-choice-terrain-type-plains
+ 					Settings:
+-						Water: 0.0
++						Water: 0
+ 				Choice@Parks:
+ 					Label: label-ra-map-generator-choice-terrain-type-parks
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.1
++						Water: 0
++						Forests: 100
+ 				Choice@Woodlands:
+ 					Label: label-ra-map-generator-choice-terrain-type-woodlands
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.4
++						Water: 0
++						Forests: 400
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+ 						RoadSpacing: 3
+@@ -124,62 +124,62 @@
+ 				Choice@Overgrown:
+ 					Label: label-ra-map-generator-choice-terrain-type-overgrown
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.5
++						Water: 0
++						Forests: 500
+ 						EnforceSymmetry: 2
+-						Mountains: 0.5
+-						Roughness: 0.25
++						Mountains: 500
++						Roughness: 250
+ 				Choice@Rocky:
+ 					Label: label-ra-map-generator-choice-terrain-type-rocky
+ 					Settings:
+-						Water: 0.0
+-						Forests: 0.3
++						Water: 0
++						Forests: 300
+ 						ForestCutout: 3
+ 						EnforceSymmetry: 2
+-						Mountains: 0.5
+-						Roughness: 0.25
++						Mountains: 500
++						Roughness: 250
+ 						RoadSpacing: 3
+ 						RoadShrink: 4
+ 				Choice@Mountains:
+ 					Label: label-ra-map-generator-choice-terrain-type-mountains
+ 					Settings:
+-						Water: 0.0
+-						Mountains: 1.0
+-						Roughness: 0.60
++						Water: 0
++						Mountains: 1000
++						Roughness: 600
+ 						MinimumTerrainContourSpacing: 5
+ 				Choice@MountainLakes:
+ 					Label: label-ra-map-generator-choice-terrain-type-mountain-lakes
+ 					Settings:
+-						Water: 0.2
+-						Mountains: 1.0
+-						Roughness: 0.85
++						Water: 200
++						Mountains: 1000
++						Roughness: 850
+ 						MinimumTerrainContourSpacing: 5
+ 				Choice@Oceanic:
+ 					Label: label-ra-map-generator-choice-terrain-type-oceanic
+ 					Settings:
+-						Water: 0.8
+-						Forests: 0.0
++						Water: 800
++						Forests: 0
+ 				Choice@LargeIslands:
+ 					Label: label-ra-map-generator-choice-terrain-type-large-islands
+ 					Settings:
+-						Water: 0.75
+-						TerrainFeatureSize: 50.0
+-						Forests: 0.0
++						Water: 750
++						TerrainFeatureSize: 51200
++						Forests: 0
+ 				Choice@Continents:
+ 					Label: label-ra-map-generator-choice-terrain-type-continents
+ 					Settings:
+-						Water: 0.5
+-						TerrainFeatureSize: 100.0
++						Water: 500
++						TerrainFeatureSize: 102400
+ 				Choice@Wetlands:
+ 					Label: label-ra-map-generator-choice-terrain-type-wetlands
+ 					Settings:
+-						Water: 0.5
++						Water: 500
+ 				Choice@NarrowWetlands:
+ 					Label: label-ra-map-generator-choice-terrain-type-narrow-wetlands
+ 					Settings:
+-						Water: 0.5
+-						TerrainFeatureSize: 5.0
+-						Forests: 0.0
++						Water: 500
++						TerrainFeatureSize: 5120
++						Forests: 0
+ 						SpawnBuildSize: 6
+ 			Option@Rotations:
+ 				Label: label-ra-map-generator-option-rotations
+@@ -250,7 +250,7 @@
+ 						SpawnResourceSpawns: 2
+ 						ResourcesPerPlayer: 25000
+ 						ResourceSpawnWeights:
+-							mine: 1.0
++							mine: 1
+ 						MaximumExpansionResourceSpawns: 3
+ 						MaximumResourceSpawnsPerExpansion: 1
+ 				Choice@Medium:
+@@ -259,8 +259,8 @@
+ 						SpawnResourceSpawns: 3
+ 						ResourcesPerPlayer: 50000
+ 						ResourceSpawnWeights:
+-							mine: 0.95
+-							gmine: 0.05
++							mine: 95
++							gmine: 5
+ 						MaximumExpansionResourceSpawns: 5
+ 						MaximumResourceSpawnsPerExpansion: 2
+ 				Choice@High:
+@@ -269,8 +269,8 @@
+ 						SpawnResourceSpawns: 3
+ 						ResourcesPerPlayer: 75000
+ 						ResourceSpawnWeights:
+-							mine: 0.9
+-							gmine: 0.1
++							mine: 9
++							gmine: 1
+ 						MaximumExpansionResourceSpawns: 8
+ 						MaximumResourceSpawnsPerExpansion: 3
+ 				Choice@VeryHigh:
+@@ -279,8 +279,8 @@
+ 						SpawnResourceSpawns: 4
+ 						ResourcesPerPlayer: 100000
+ 						ResourceSpawnWeights:
+-							mine: 0.8
+-							gmine: 0.2
++							mine: 8
++							gmine: 2
+ 						MaximumExpansionResourceSpawns: 10
+ 						MaximumResourceSpawnsPerExpansion: 3
+ 				Choice@Full:
+@@ -341,38 +341,38 @@
+ 				Choice@Players:
+ 					Label: label-ra-map-generator-choice-density-players
+ 					Settings:
+-						AreaEntityBonus: 0.0
+-						PlayerCountEntityBonus: 1.0
++						AreaEntityBonus: 0
++						PlayerCountEntityBonus: 1000000
+ 				Choice@AreaAndPlayers:
+ 					Label: label-ra-map-generator-choice-density-area-and-players
+ 					Settings:
+-						AreaEntityBonus: 0.0002
+-						PlayerCountEntityBonus: 0.5
++						AreaEntityBonus: 200
++						PlayerCountEntityBonus: 500000
+ 				Choice@AreaVeryLow:
+ 					Label: label-ra-map-generator-choice-density-area-very-low
+ 					Settings:
+-						AreaEntityBonus: 0.0001
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 100
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaLow:
+ 					Label: label-ra-map-generator-choice-density-area-low
+ 					Settings:
+-						AreaEntityBonus: 0.0002
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 200
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaMedium:
+ 					Label: label-ra-map-generator-choice-density-area-medium
+ 					Settings:
+-						AreaEntityBonus: 0.0004
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 400
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaHigh:
+ 					Label: label-ra-map-generator-choice-density-area-high
+ 					Settings:
+-						AreaEntityBonus: 0.0006
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 600
++						PlayerCountEntityBonus: 0
+ 				Choice@AreaVeryHigh:
+ 					Label: label-ra-map-generator-choice-density-area-very-high
+ 					Settings:
+-						AreaEntityBonus: 0.0008
+-						PlayerCountEntityBonus: 0.0
++						AreaEntityBonus: 800
++						PlayerCountEntityBonus: 0
+ 			Option@DenyWalledArea:
+ 				Label: label-ra-map-generator-option-deny-walled-areas
+ 				Checkbox: DenyWalledAreas
+diff --git a/mods/ra/tilesets/desert.yaml b/mods/ra/tilesets/desert.yaml
+index e8c925f876ad..10053bafbb27 100644
+--- a/mods/ra/tilesets/desert.yaml
++++ b/mods/ra/tilesets/desert.yaml
+@@ -4071,16 +4071,16 @@ MultiBrushCollections:
+ 			Actor: tc01
+ 		MultiBrush@t04.husk:
+ 			Actor: t04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09.husk:
+ 			Actor: t09.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@2:
+ 			Template: 2
+@@ -4096,34 +4096,34 @@ MultiBrushCollections:
+ 			Template: 7
+ 		MultiBrush@14:
+ 			Template: 14
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@15:
+ 			Template: 15
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@16:
+ 			Template: 16
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@17:
+ 			Template: 17
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@18:
+ 			Template: 18
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@19:
+ 			Template: 19
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@20:
+ 			Template: 20
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@21:
+ 			Template: 21
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@22:
+ 			Template: 22
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@23:
+ 			Template: 23
+-			Weight: 0.5
++			Weight: 500
+ 		MultiBrush@35:
+ 			Template: 35
+ 		MultiBrush@36:
+@@ -4137,32 +4137,32 @@ MultiBrushCollections:
+ 		MultiBrush@t04:
+ 			Actor: t04
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09:
+ 			Actor: t09
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01:
+ 			Actor: tc01
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t04.husk:
+ 			Actor: t04.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t09.husk:
+ 			Actor: t09.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+diff --git a/mods/ra/tilesets/snow.yaml b/mods/ra/tilesets/snow.yaml
+index ed958f66313a..894b72145af9 100644
+--- a/mods/ra/tilesets/snow.yaml
++++ b/mods/ra/tilesets/snow.yaml
+@@ -4192,64 +4192,64 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc04.husk:
+ 			Actor: tc04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc05.husk:
+ 			Actor: tc05.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@97:
+ 			Template: 97
+@@ -4283,10 +4283,10 @@ MultiBrushCollections:
+ 			Template: 104
+ 		MultiBrush@105:
+ 			Template: 105
+-			Weight: 0.05
++			Weight: 50
+ 		MultiBrush@106:
+ 			Template: 106
+-			Weight: 0.05
++			Weight: 50
+ 		MultiBrush@109:
+ 			Template: 109
+ 		MultiBrush@110:
+@@ -4294,60 +4294,60 @@ MultiBrushCollections:
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+diff --git a/mods/ra/tilesets/temperat.yaml b/mods/ra/tilesets/temperat.yaml
+index 4fb927aa0a46..9c53c0b0b3dd 100644
+--- a/mods/ra/tilesets/temperat.yaml
++++ b/mods/ra/tilesets/temperat.yaml
+@@ -4652,64 +4652,64 @@ MultiBrushCollections:
+ 			Actor: tc05
+ 		MultiBrush@t01.husk:
+ 			Actor: t01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02.husk:
+ 			Actor: t02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03.husk:
+ 			Actor: t03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05.husk:
+ 			Actor: t05.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06.husk:
+ 			Actor: t06.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07.husk:
+ 			Actor: t07.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08.husk:
+ 			Actor: t08.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10.husk:
+ 			Actor: t10.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11.husk:
+ 			Actor: t11.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12.husk:
+ 			Actor: t12.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13.husk:
+ 			Actor: t13.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14.husk:
+ 			Actor: t14.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15.husk:
+ 			Actor: t15.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16.husk:
+ 			Actor: t16.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17.husk:
+ 			Actor: t17.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc01.husk:
+ 			Actor: tc01.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc02.husk:
+ 			Actor: tc02.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc03.husk:
+ 			Actor: tc03.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc04.husk:
+ 			Actor: tc04.husk
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@tc05.husk:
+ 			Actor: tc05.husk
+-			Weight: 0.1
++			Weight: 100
+ 	Obstructions:
+ 		MultiBrush@97:
+ 			Template: 97
+@@ -4743,10 +4743,10 @@ MultiBrushCollections:
+ 			Template: 104
+ 		MultiBrush@105:
+ 			Template: 105
+-			Weight: 0.05
++			Weight: 50
+ 		MultiBrush@106:
+ 			Template: 106
+-			Weight: 0.05
++			Weight: 50
+ 		MultiBrush@109:
+ 			Template: 109
+ 		MultiBrush@110:
+@@ -4754,87 +4754,87 @@ MultiBrushCollections:
+ 		MultiBrush@t01:
+ 			Actor: t01
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t02:
+ 			Actor: t02
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t03:
+ 			Actor: t03
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t05:
+ 			Actor: t05
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t06:
+ 			Actor: t06
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t07:
+ 			Actor: t07
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t08:
+ 			Actor: t08
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t10:
+ 			Actor: t10
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t11:
+ 			Actor: t11
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t12:
+ 			Actor: t12
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t13:
+ 			Actor: t13
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t14:
+ 			Actor: t14
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t15:
+ 			Actor: t15
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t16:
+ 			Actor: t16
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@t17:
+ 			Actor: t17
+ 			BackingTile: 255,0
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@580:
+ 			Template: 580
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@581:
+ 			Template: 581
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@582:
+ 			Template: 582
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@583:
+ 			Template: 583
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@584:
+ 			Template: 584
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@585:
+ 			Template: 585
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@586:
+ 			Template: 586
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@587:
+ 			Template: 587
+-			Weight: 0.1
++			Weight: 100
+ 		MultiBrush@588:
+ 			Template: 588
+-			Weight: 0.1
++			Weight: 100

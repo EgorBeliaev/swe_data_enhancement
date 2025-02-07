@@ -1,0 +1,210 @@
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
+index 620c2a0b187..cff4e5576ca 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
+@@ -15,22 +15,32 @@
+ 
+ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests;
+ 
+-public class OtlpHttpTraceExportClientTests
++public sealed class OtlpHttpTraceExportClientTests : IDisposable
+ {
+     private static readonly SdkLimitOptions DefaultSdkLimitOptions = new();
+ 
++    private readonly ActivityListener activityListener;
++
+     static OtlpHttpTraceExportClientTests()
+     {
+         Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+         Activity.ForceDefaultIdFormat = true;
++    }
+ 
+-        var listener = new ActivityListener
++    public OtlpHttpTraceExportClientTests()
++    {
++        this.activityListener = new ActivityListener
+         {
+             ShouldListenTo = _ => true,
+-            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
++            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
+         };
+ 
+-        ActivitySource.AddActivityListener(listener);
++        ActivitySource.AddActivityListener(this.activityListener);
++    }
++
++    public void Dispose()
++    {
++        this.activityListener.Dispose();
+     }
+ 
+     [Fact]
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs
+index a4aed5f155c..1896ad5e8f9 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs
+@@ -11,27 +11,27 @@
+ 
+ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests.Implementation.Serializer;
+ 
+-public class OtlpArrayTagWriterTests : IDisposable
++public sealed class OtlpArrayTagWriterTests : IDisposable
+ {
+     private readonly ProtobufOtlpTagWriter.OtlpArrayTagWriter arrayTagWriter;
++    private readonly ActivityListener activityListener;
+ 
+     static OtlpArrayTagWriterTests()
+     {
+         Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+         Activity.ForceDefaultIdFormat = true;
+-
+-        var listener = new ActivityListener
+-        {
+-            ShouldListenTo = _ => true,
+-            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
+-        };
+-
+-        ActivitySource.AddActivityListener(listener);
+     }
+ 
+     public OtlpArrayTagWriterTests()
+     {
+         this.arrayTagWriter = new ProtobufOtlpTagWriter.OtlpArrayTagWriter();
++        this.activityListener = new ActivityListener
++        {
++            ShouldListenTo = _ => true,
++            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
++        };
++
++        ActivitySource.AddActivityListener(this.activityListener);
+     }
+ 
+     [Fact]
+@@ -265,6 +265,7 @@ public void Dispose()
+     {
+         // Clean up the thread buffer after each test
+         ProtobufOtlpTagWriter.OtlpArrayTagWriter.ThreadBuffer = null;
++        this.activityListener.Dispose();
+     }
+ 
+     private static OtlpTrace.Span? ToOtlpSpan(SdkLimitOptions sdkOptions, Activity activity)
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+index e96b5d43f44..4a2b4103322 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+@@ -20,24 +20,35 @@
+ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests;
+ 
+ [Collection("xUnitCollectionPreventingTestsThatDependOnSdkConfigurationFromRunningInParallel")]
+-public class OtlpTraceExporterTests
++public sealed class OtlpTraceExporterTests : IDisposable
+ {
+     private static readonly SdkLimitOptions DefaultSdkLimitOptions = new();
+-
+     private static readonly ExperimentalOptions DefaultExperimentalOptions = new();
+ 
++    private readonly ActivityListener activityListener;
++
+     static OtlpTraceExporterTests()
+     {
+         Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+         Activity.ForceDefaultIdFormat = true;
++    }
+ 
+-        var listener = new ActivityListener
++    public OtlpTraceExporterTests()
++    {
++        this.activityListener = new ActivityListener
+         {
+             ShouldListenTo = _ => true,
+-            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
++            Sample = (ref ActivityCreationOptions<ActivityContext> options) => options.Parent.TraceFlags.HasFlag(ActivityTraceFlags.Recorded)
++                ? ActivitySamplingResult.AllDataAndRecorded
++                : ActivitySamplingResult.AllData,
+         };
+ 
+-        ActivitySource.AddActivityListener(listener);
++        ActivitySource.AddActivityListener(this.activityListener);
++    }
++
++    public void Dispose()
++    {
++        this.activityListener.Dispose();
+     }
+ 
+     [Fact]
+diff --git a/test/OpenTelemetry.Exporter.Zipkin.Tests/ZipkinExporterTests.cs b/test/OpenTelemetry.Exporter.Zipkin.Tests/ZipkinExporterTests.cs
+index 97b90a5ec68..66969566404 100644
+--- a/test/OpenTelemetry.Exporter.Zipkin.Tests/ZipkinExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.Zipkin.Tests/ZipkinExporterTests.cs
+@@ -19,7 +19,7 @@
+ 
+ namespace OpenTelemetry.Exporter.Zipkin.Tests;
+ 
+-public class ZipkinExporterTests : IDisposable
++public sealed class ZipkinExporterTests : IDisposable
+ {
+     private const string TraceId = "e8ea7e9ac72de94e91fabc613f9686b2";
+     private static readonly ConcurrentDictionary<Guid, string> Responses = new();
+@@ -32,14 +32,6 @@ static ZipkinExporterTests()
+     {
+         Activity.DefaultIdFormat = ActivityIdFormat.W3C;
+         Activity.ForceDefaultIdFormat = true;
+-
+-        var listener = new ActivityListener
+-        {
+-            ShouldListenTo = _ => true,
+-            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
+-        };
+-
+-        ActivitySource.AddActivityListener(listener);
+     }
+ 
+     public ZipkinExporterTests()
+@@ -68,7 +60,6 @@ static void ProcessServerRequest(HttpListenerContext context)
+     public void Dispose()
+     {
+         this.testServer.Dispose();
+-        GC.SuppressFinalize(this);
+     }
+ 
+     [Fact]
+@@ -455,6 +446,16 @@ internal static Activity CreateTestActivity(
+        string? statusDescription = null,
+        DateTime? dateTime = null)
+     {
++        using var activityListener = new ActivityListener
++        {
++            ShouldListenTo = _ => true,
++            Sample = (ref ActivityCreationOptions<ActivityContext> options) => options.Parent.TraceFlags.HasFlag(ActivityTraceFlags.Recorded)
++                ? ActivitySamplingResult.AllDataAndRecorded
++                : ActivitySamplingResult.AllData,
++        };
++
++        ActivitySource.AddActivityListener(activityListener);
++
+         var startTimestamp = DateTime.UtcNow;
+         var endTimestamp = startTimestamp.AddSeconds(60);
+         var eventTimestamp = DateTime.UtcNow;
+@@ -532,6 +533,8 @@ internal static Activity CreateTestActivity(
+             links,
+             startTime: startTimestamp)!;
+ 
++        Assert.NotNull(activity);
++
+         if (addEvents)
+         {
+             foreach (var evnt in events)
+diff --git a/test/OpenTelemetry.Shims.OpenTracing.Tests/ListenAndSampleAllActivitySources.cs b/test/OpenTelemetry.Shims.OpenTracing.Tests/ListenAndSampleAllActivitySources.cs
+index eccc55b95eb..9cc17e9e59f 100644
+--- a/test/OpenTelemetry.Shims.OpenTracing.Tests/ListenAndSampleAllActivitySources.cs
++++ b/test/OpenTelemetry.Shims.OpenTracing.Tests/ListenAndSampleAllActivitySources.cs
+@@ -21,7 +21,7 @@ public Fixture()
+             this.listener = new ActivityListener
+             {
+                 ShouldListenTo = _ => true,
+-                Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
++                Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllDataAndRecorded,
+             };
+ 
+             ActivitySource.AddActivityListener(this.listener);

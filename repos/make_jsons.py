@@ -212,7 +212,8 @@ def process_repo(repo_url, repo_name, prefix=""):
                 print(f"Error for PR {pr_number}\n\n")
 
 # Explore subfolders in the "java" directory
-java_directory = '../java'
+lang = 'csharp'
+java_directory = f'../{lang}'
 subfolders = [name for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
 
 for subfolder in subfolders:
@@ -229,4 +230,4 @@ for subfolder in subfolders:
                 # Form the second argument
                 repo_name = f"{java_directory}/{subfolder}"
                 # Call process_repo with the extracted URL and constructed repo_name
-                process_repo(repo_url, repo_name, prefix=f"java/{subfolder}")
+                process_repo(repo_url, repo_name, prefix=f"{lang}/{subfolder}")

@@ -1,0 +1,456 @@
+diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+index a753eae5..47e0a059 100644
+--- a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
++++ b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+@@ -69,6 +69,10 @@ public partial class PathingPartyConfig : ObservableObject
+     [ObservableProperty]
+     private bool _soloTaskUseFightEnabled = false;
+     
++    //不在某时执行
++    [ObservableProperty] 
++    private string _skipDuring = "";
++    
+     // 使用小道具的间隔时间
+     [ObservableProperty]
+     private int _useGadgetIntervalMs = 0;
+diff --git a/BetterGenshinImpact/GameTask/LogParse/LogParse.cs b/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
+index 83ef540e..d5b4b058 100644
+--- a/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
++++ b/BetterGenshinImpact/GameTask/LogParse/LogParse.cs
+@@ -102,6 +102,33 @@ public static List<ConfigGroupEntity> Parse(List<(string, string)> logLines)
+ 
+                     if (configTask != null)
+                     {
++
++                        //前往七天神像复活
++                        if (logstr.EndsWith("前往七天神像复活"))
++                        {
++                            configTask.Fault.ReviveCount++;
++                        }
++                        //传送失败，重试 n 次
++                        result = parseBgiLine($@"传送失败，重试 (\d+) 次", logstr);
++                        if (result.Item1)
++                        {
++                            configTask.Fault.TeleportFailCount = int.Parse(result.Item2[1]);
++               
++                        }
++                        //战斗超时结束
++                        if (logstr == "战斗超时结束")
++                        {
++                            configTask.Fault.BattleTimeoutCount ++;
++                        }                
++                        
++                        //重试一次路线或放弃此路线！
++                        if (logstr.EndsWith("重试一次路线或放弃此路线！"))
++                        {
++                            configTask.Fault.RetryCount++;
++                        }
++                       
++                        
++                        
+                         if (logstr.StartsWith("→ 脚本执行结束: \"" + configTask.Name + "\""))
+                         {
+                             configTask.EndDate = parsePreDataTime(logLines, i - 1, logrq);
+@@ -182,6 +209,8 @@ public class ConfigGroupEntity
+             //配置人物列表xxx.json
+             public List<ConfigTask> ConfigTaskList { get; } = new();
+ 
++
++
+             public class ConfigTask
+             {
+                 public string Name { get; set; }
+@@ -204,6 +233,21 @@ public void addPick(string val)
+ 
+                     Picks[val] = Picks[val] + 1;
+                 }
++                public FaultScenario Fault { get; set; } = new();
++            
++                public class FaultScenario
++                {
++                    //复活次数
++                    public int ReviveCount { get; set; } = 0;
++                    //传送失败次数
++                    public int TeleportFailCount { get; set; } = 0;
++                    //重试次数
++                    public int RetryCount { get; set; } = 0;
++                    //战斗超时
++                    public int BattleTimeoutCount { get; set; } = 0;
++                
++                }
++                
+             }
+         }
+ 
+@@ -307,7 +351,42 @@ static DateTime GetCustomDay(string timeStr)
+             return customDayStart;
+         }
+ 
+-        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups, GameInfo gameInfo)
++        public static string FormatNumberWithStyle(int a, int b=3)
++        {
++            if (a== 0)
++            {
++                return "";
++            }
++            // Determine the style based on the condition
++            string colorStyle = a >= b ? "color:red;" : string.Empty;
++
++            // Return the formatted HTML string
++            return $"<span style=\"font-weight:bold;{colorStyle}\">{a}</span>";
++        }
++        public static string GetNumberOrEmptyString(int number)
++        {
++            // 如果数字为0，返回空字符串，否则返回数字的字符串形式
++            return number == 0 ? string.Empty : number.ToString();
++        }
++        public static string SubtractFiveSeconds(string inputTime,int seconds)
++        {
++            try
++            {
++                // 将输入的字符串解析为 DateTime
++                DateTime parsedTime = DateTime.ParseExact(inputTime, "yyyy-MM-dd HH:mm:ss", null);
++            
++                // 减去 5 秒
++                DateTime resultTime = parsedTime.AddSeconds(-seconds);
++            
++                // 转换回指定格式的字符串并返回
++                return resultTime.ToString("yyyy-MM-dd HH:mm:ss");
++            }
++            catch (FormatException)
++            {
++                return "Invalid input time format. Please use 'yyyy-MM-dd HH:mm:ss'.";
++            }
++        }
++        public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> configGroups, GameInfo gameInfo,LogParseConfig.ScriptGroupLogParseConfig scriptGroupLogParseConfig)
+         {
+             (string name, Func<ConfigTask, string> value)[] colConfigs =
+             [
+@@ -316,20 +395,28 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+                 (name: "结束日期", value: task => task.EndDate?.ToString("yyyy-MM-dd HH:mm:ss") ?? ""),
+                 (name: "耗时", value: task => ConvertSecondsToTime((task.EndDate - task.StartDate)?.TotalSeconds ?? 0))
+             ];
+-            
+-            
++            List<(string name, Func<ConfigTask, string> value)> colConfigList = new();
++            colConfigList.AddRange(colConfigs);
++            if (scriptGroupLogParseConfig.FaultStatsSwitch)
++            {
++                colConfigList.Add((name: "复活次数", value: task => FormatNumberWithStyle(task.Fault.ReviveCount)));
++                colConfigList.Add((name: "重试次数", value: task => FormatNumberWithStyle(task.Fault.RetryCount)));
++                colConfigList.Add((name: "战斗超时次数", value: task => FormatNumberWithStyle(task.Fault.BattleTimeoutCount)));
++                colConfigList.Add((name: "传送失败次数", value: task => FormatNumberWithStyle(task.Fault.TeleportFailCount)));
++            }
++
+             
+             (string name, Func<MoraStatistics, string> value)[] msColConfigs =
+             [
+-                (name: "日期", value: ms => ms.Name), (name: "小怪", value: ms => ms.SmallMonsterStatistics.ToString()),
++                (name: "日期", value: ms => ms.Name), (name: "小怪", value: ms => GetNumberOrEmptyString(ms.SmallMonsterStatistics)),
+                 (name: "最后小怪日期", value: ms => ms.LastSmallTime),
+-                (name: "精英", value: ms => ms.EliteGameStatistics.ToString()),
++                (name: "精英", value: ms => GetNumberOrEmptyString(ms.EliteGameStatistics)),
+                 (name: "精英详细", value: ms => ms.EliteDetails), (name: "最后精英日期", value: ms => ms.LastEliteTime),
+                 (name: "总计锄地摩拉", value: ms => ms.TotalMoraKillingMonstersMora.ToString()),
+                 (name: "突发事件获取摩拉", value: ms => ms.EmergencyBonus)
+             ];
+             //锄地部分新曾字段
+-            (string name, Func<MoraStatistics, string> value)[] col2Configs=[..msColConfigs.ToList().Where(item=>item.name!="日期" && item.name!="最后小怪日期" && item.name!="最后精英日期"),
++            (string name, Func<MoraStatistics, string> value)[] col2Configs=[..msColConfigs.ToList().Where(item=>item.name!="日期" && item.name!="最后小怪日期" && item.name!="最后精英日期" && item.name!="突发事件获取摩拉"),
+                 (name: "摩拉（每秒）", value: ms => (ms.TotalMoraKillingMonstersMora/(ms.StatisticsEnd-ms.StatisticsStart)?.TotalSeconds ?? 0).ToString("F2")),
+             ];
+                 
+@@ -340,11 +427,19 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+             List<ActionItem> actionItems = new();
+             if (gameInfo != null)
+             {
+-
+                 actionItems = TravelsDiaryDetailManager.loadAllActionItems(gameInfo, configGroups);
++                int hoeingDelay;
++                if (int.TryParse(scriptGroupLogParseConfig.HoeingDelay, out hoeingDelay))
++                {
++                    foreach (var actionItem in actionItems)
++                    {
++                        actionItem.Time = SubtractFiveSeconds(actionItem.Time,hoeingDelay);
++                    }
++                }
++                
+             }
+ 
+-            return GenerHtmlByConfigGroupEntity(configGroups, "日志分析", colConfigs,col2Configs, actionItems, msColConfigs);
++            return GenerHtmlByConfigGroupEntity(configGroups, "日志分析", colConfigList.ToArray(),col2Configs, actionItems, msColConfigs);
+         }
+         public static string ConcatenateStrings(string a, string b)
+         {
+@@ -373,6 +468,8 @@ public static string GenerHtmlByConfigGroupEntity(List<ConfigGroupEntity> config
+             html.AppendLine("        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }");
+             html.AppendLine("        th, td { border: 1px solid black; padding: 8px; text-align: left; }");
+             html.AppendLine("        th { background-color: #f2f2f2; }");
++            html.AppendLine("    tr:nth-child(odd) {   background-color: #eaeaea; /* 奇数行颜色 */    }");
++            html.AppendLine("    tr:nth-child(even) { background-color: #f9f9f9; /* 偶数行颜色 */}");
+             html.AppendLine("    </style>");
+             html.AppendLine("</head>");
+             html.AppendLine("<body>");
+diff --git a/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs b/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs
+index 7588ab5d..688a01ff 100644
+--- a/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs
++++ b/BetterGenshinImpact/GameTask/LogParse/LogParseConfig.cs
+@@ -14,5 +14,7 @@ public partial class ScriptGroupLogParseConfig() : ObservableObject
+         [ObservableProperty] private string _rangeValue = "CurrentConfig";
+         [ObservableProperty] private string _dayRangeValue = "7";
+         [ObservableProperty] private bool _hoeingStatsSwitch = false;
++        [ObservableProperty] private bool _faultStatsSwitch = false;
++        [ObservableProperty] private string _hoeingDelay= "0";
+     }
+ }
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs b/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs
+index ae62e5ea..843039bd 100644
+--- a/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs
++++ b/BetterGenshinImpact/GameTask/LogParse/MoraStatistics.cs
+@@ -31,7 +31,12 @@ public string EmergencyBonus
+             {
+                 var ls = this.ActionItems.Where(item => item.ActionId == 28).ToList();
+                 var count = ls.Count();
+-                return ls.Sum(item=>item.Num)+((count==0 || count>=10)?"":$"({count}/10)");
++                if (count == 0)
++                {
++                    return "";
++                }
++
++                return ls.Sum(item=>item.Num)+(count>=10?"":$"({count}/10)");
+             }
+         }
+         
+diff --git a/BetterGenshinImpact/Service/ScriptService.cs b/BetterGenshinImpact/Service/ScriptService.cs
+index 69b1ca29..f3e9b10a 100644
+--- a/BetterGenshinImpact/Service/ScriptService.cs
++++ b/BetterGenshinImpact/Service/ScriptService.cs
+@@ -21,7 +21,24 @@ namespace BetterGenshinImpact.Service;
+ public partial class ScriptService : IScriptService
+ {
+     private readonly ILogger<ScriptService> _logger = App.GetLogger<ScriptService>();
++    private static bool IsCurrentHourEqual(string input)
++    {
++        // 尝试将输入字符串转换为整数
++        if (int.TryParse(input, out int hour))
++        {
++            // 验证小时是否在合法范围内（0-23）
++            if (hour >= 0 && hour <= 23)
++            {
++                // 获取当前小时数
++                int currentHour = DateTime.Now.Hour;
++                // 判断是否相等
++                return currentHour == hour;
++            }
++        }
+ 
++        // 如果输入非数字或不合法，返回 false
++        return false;
++    }
+     public async Task RunMulti(IEnumerable<ScriptGroupProject> projectList, string? groupName = null)
+     {
+         groupName ??= "默认";
+@@ -59,6 +76,13 @@ public async Task RunMulti(IEnumerable<ScriptGroupProject> projectList, string?
+ 
+                 foreach (var project in list)
+                 {
++                    
++                    if (project.GroupInfo.Config.PathingConfig.Enabled && IsCurrentHourEqual(project.GroupInfo.Config.PathingConfig.SkipDuring))
++                    {
++                        _logger.LogInformation($"{project.Name}任务已到禁止执行时段，将跳过！");
++                        continue;
++                    }
++                    
+                     if (project.Status != "Enabled")
+                     {
+                         _logger.LogInformation("脚本 {Name} 状态为禁用，跳过执行", project.Name);
+@@ -85,6 +109,14 @@ public async Task RunMulti(IEnumerable<ScriptGroupProject> projectList, string?
+                             stopwatch.Reset();
+                             stopwatch.Start();
+                             await ExecuteProject(project);
++                            
++                            //多次执行时及时中断
++                            if (project.GroupInfo.Config.PathingConfig.Enabled && IsCurrentHourEqual(project.GroupInfo.Config.PathingConfig.SkipDuring))
++                            {
++                                _logger.LogInformation($"{project.Name}任务已到禁止执行时段，将跳过！");
++                                break;
++                            }
++                            
+                         }
+                         catch (NormalEndException e)
+                         {
+@@ -175,6 +207,7 @@ private List<ScriptProject> ExtractJsProjects(List<ScriptGroupProject> list)
+ 
+     private async Task ExecuteProject(ScriptGroupProject project)
+     {
++       
+         if (project.Type == "Javascript")
+         {
+             if (project.Project == null)
+diff --git a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+index 21912df1..1c5b8769 100644
+--- a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
++++ b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+@@ -217,6 +217,7 @@
+                                 <MenuItem Header="日志分析" Command="{Binding OpenLogParseCommand}" />
+                                 <MenuItem Header="打开脚本仓库" Command="{Binding OpenLocalScriptRepoCommand}" />
+                                 <MenuItem Header="根据文件夹更新" Command="{Binding UpdateTasksCommand}" />
++                                <MenuItem Header="任务倒序排列" Command="{Binding ReverseTaskOrderCommand}" />
+                             </ContextMenu>
+                         </ui:DropDownButton.Flyout>
+                     </ui:DropDownButton>
+diff --git a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
+index 970e8715..fe9cf668 100644
+--- a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
++++ b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
+@@ -282,6 +282,32 @@
+                                          IsChecked="{Binding PathingConfig.SoloTaskUseFightEnabled, Mode=TwoWay}" />
+ 
+                     </Grid>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="不在某时执行"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="当执行完一个路线后，如果时间为当前配置的时间（范围：0-23），则此路径追踪任务后续都将都跳过，适用于连续执行的兜底任务，例如想通宵挂机，并且在4点后，开始执行新的任务。"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBox Grid.Row="0"
++                                    Grid.RowSpan="2"
++                                    Grid.Column="1"
++                                    MinWidth="100"
++                                    Text="{Binding PathingConfig.SkipDuring, Mode=TwoWay}"
++                                    TextWrapping="NoWrap" />
++                    </Grid>
+                 </StackPanel>
+             </ui:CardExpander>
+             <ui:CardExpander Margin="0,0,0,12"
+diff --git a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+index 1d8b0387..83979c9f 100644
+--- a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
++++ b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+@@ -11,6 +11,7 @@
+ using System.Threading.Tasks;
+ using System.Windows;
+ using System.Windows.Controls;
++using System.Windows.Controls.Primitives;
+ using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.Core.Script;
+ using BetterGenshinImpact.Core.Script.Group;
+@@ -174,6 +175,16 @@ private async Task OpenLogParse()
+         dayRangeComboBox.SelectedValuePath = "Value"; // 绑定的值
+         dayRangeComboBox.SelectedIndex = 0;
+         stackPanel.Children.Add(dayRangeComboBox);
++        
++        // 开关控件：ToggleButton 或 CheckBox
++        CheckBox faultStatsSwitch = new CheckBox
++        {
++            Content = "异常情况统计",
++            VerticalAlignment = VerticalAlignment.Center
++        };
++        stackPanel.Children.Add(faultStatsSwitch);       
++
++        
+ 
+ 
+         // 开关控件：ToggleButton 或 CheckBox
+@@ -212,9 +223,39 @@ private async Task OpenLogParse()
+ 
+         secondRow.Children.Add(questionButton);
+ 
++        StackPanel threeRow = new StackPanel
++        {
++            Orientation = Orientation.Horizontal,
++            Margin = new Thickness(0, 0, 0, 10)
++        };
++        
++        // 创建一个 TextBlock
++        TextBlock hoeingDelayBlock = new TextBlock
++        {
++            Text = "锄地延时(秒)：",
++            VerticalAlignment = VerticalAlignment.Center,
++            FontSize = 16,
++            Margin = new Thickness(0, 0, 10, 0)
++        };
++
++        
++        TextBox hoeingDelayTextBox = new TextBox
++        {
++            Width = 100,
++            FontSize = 16,
++            VerticalContentAlignment = VerticalAlignment.Center
++        };
++  
++        threeRow.Children.Add(hoeingDelayBlock);
++        threeRow.Children.Add(hoeingDelayTextBox);
++        
++        
++        
++        
++        
+         // 将第二行添加到 StackPanel
+         stackPanel.Children.Add(secondRow);
+-
++        stackPanel.Children.Add(threeRow);
+         //PrimaryButtonText
+         var uiMessageBox = new Wpf.Ui.Controls.MessageBox
+         {
+@@ -245,7 +286,8 @@ private async Task OpenLogParse()
+         dayRangeComboBox.SelectedValue = sgpc.DayRangeValue;
+         cookieTextBox.Text = config.Cookie;
+         hoeingStatsSwitch.IsChecked = sgpc.HoeingStatsSwitch;
+-        
++        faultStatsSwitch.IsChecked = sgpc.FaultStatsSwitch;
++        hoeingDelayTextBox.Text = sgpc.HoeingDelay;
+         
+         MessageBoxResult result = await uiMessageBox.ShowDialogAsync();
+ 
+@@ -259,6 +301,9 @@ private async Task OpenLogParse()
+             sgpc.DayRangeValue=dayRangeValue;
+             sgpc.RangeValue = rangeValue;
+             sgpc.HoeingStatsSwitch = hoeingStatsSwitch.IsChecked ?? false;
++            sgpc.FaultStatsSwitch = faultStatsSwitch.IsChecked ?? false;
++            sgpc.HoeingDelay = hoeingDelayTextBox.Text;
++
+             config.Cookie = cookieValue;
+             config.ScriptGroupLogDictionary[_selectedScriptGroup.Name]=sgpc;
+             
+@@ -343,7 +388,7 @@ private async Task OpenLogParse()
+                 configGroupEntities.Reverse();
+                 //realGameInfo
+                 //小怪摩拉统计
+-                win.NavigateToHtml(LogParse.LogParse.GenerHtmlByConfigGroupEntity(configGroupEntities,hoeingStats ? realGameInfo : null));
++                win.NavigateToHtml(LogParse.LogParse.GenerHtmlByConfigGroupEntity(configGroupEntities,hoeingStats ? realGameInfo : null,sgpc));
+                 win.ShowDialog();
+             }
+ 
+@@ -416,7 +461,16 @@ private async Task UpdateTasks()
+             WriteScriptGroup(SelectedScriptGroup);
+         
+     }
+-    
++
++    [RelayCommand]
++    private void ReverseTaskOrder()
++    {
++        List<ScriptGroupProject> projects = new();
++        projects.AddRange(SelectedScriptGroup?.Projects.Reverse());
++        SelectedScriptGroup.Projects.Clear();
++        projects.ForEach(item=>SelectedScriptGroup.Projects.Add(item));
++        WriteScriptGroup(SelectedScriptGroup);
++    }
+ 
+     [RelayCommand]
+     public void OnCopyScriptGroup(ScriptGroup? item)

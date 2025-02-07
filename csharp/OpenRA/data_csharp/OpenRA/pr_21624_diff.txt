@@ -1,0 +1,104 @@
+diff --git a/OpenRA.Game/Graphics/Viewport.cs b/OpenRA.Game/Graphics/Viewport.cs
+index 32f993704bdd..a916cf016da6 100644
+--- a/OpenRA.Game/Graphics/Viewport.cs
++++ b/OpenRA.Game/Graphics/Viewport.cs
+@@ -69,6 +69,8 @@ public class Viewport
+ 		bool unlockMinZoom;
+ 		float unlockedMinZoomScale;
+ 		float unlockedMinZoom = 1f;
++		float defaultScale;
++		bool overrideUserScale;
+ 
+ 		public float Zoom
+ 		{
+@@ -86,6 +88,13 @@ private set
+ 		public float MinZoom { get; private set; } = 1f;
+ 		public float MaxZoom { get; private set; } = 2f;
+ 
++		public void OverrideDefaultHeight(float height)
++		{
++			defaultScale = viewportSizes.DefaultScale * Game.Renderer.NativeResolution.Height / height;
++			overrideUserScale = true;
++			UpdateViewportZooms(false);
++		}
++
+ 		public void AdjustZoom(float dz)
+ 		{
+ 			// Exponential ensures that equal positive and negative steps have the same effect
+@@ -140,6 +149,7 @@ public Viewport(WorldRenderer wr, Map map)
+ 			var grid = Game.ModData.Manifest.Get<MapGrid>();
+ 			viewportSizes = Game.ModData.Manifest.Get<WorldViewportSizes>();
+ 			graphicSettings = Game.Settings.Graphics;
++			defaultScale = viewportSizes.DefaultScale;
+ 
+ 			// Calculate map bounds in world-px
+ 			if (wr.World.Type == WorldType.Editor)
+@@ -207,17 +217,17 @@ void UpdateViewportZooms(bool resetCurrentZoom = true)
+ 			lastViewportDistance = graphicSettings.ViewportDistance;
+ 
+ 			var vd = graphicSettings.ViewportDistance;
+-			if (viewportSizes.AllowNativeZoom && vd == WorldViewport.Native)
+-				MinZoom = viewportSizes.DefaultScale;
++			if (overrideUserScale || (viewportSizes.AllowNativeZoom && vd == WorldViewport.Native))
++				MinZoom = defaultScale;
+ 			else
+ 			{
+ 				var range = viewportSizes.GetSizeRange(vd);
+-				MinZoom = CalculateMinimumZoom(range.X, range.Y) * viewportSizes.DefaultScale;
++				MinZoom = CalculateMinimumZoom(range.X, range.Y) * defaultScale;
+ 			}
+ 
+ 			MaxZoom = Math.Min(
+ 				MinZoom * viewportSizes.MaxZoomScale,
+-				Game.Renderer.NativeResolution.Height * viewportSizes.DefaultScale / viewportSizes.MaxZoomWindowHeight);
++				Game.Renderer.NativeResolution.Height * defaultScale / viewportSizes.MaxZoomWindowHeight);
+ 
+ 			if (unlockMinZoom)
+ 			{
+diff --git a/OpenRA.Mods.Common/Traits/World/MapOptions.cs b/OpenRA.Mods.Common/Traits/World/MapOptions.cs
+index 629ef10f3506..4a7abed335b8 100644
+--- a/OpenRA.Mods.Common/Traits/World/MapOptions.cs
++++ b/OpenRA.Mods.Common/Traits/World/MapOptions.cs
+@@ -11,6 +11,7 @@
+ 
+ using System.Collections.Generic;
+ using System.Linq;
++using OpenRA.Graphics;
+ using OpenRA.Traits;
+ 
+ namespace OpenRA.Mods.Common.Traits
+@@ -79,6 +80,9 @@ public class MapOptionsInfo : TraitInfo, ILobbyOptions, IRulesetLoaded
+ 		[Desc("Display order for the game speed option in the lobby.")]
+ 		public readonly int GameSpeedDropdownDisplayOrder = 0;
+ 
++		[Desc("If defined, overrides the viewport height for all players to this many world units.")]
++		public readonly WDist? ViewportHeight = null;
++
+ 		IEnumerable<LobbyOption> ILobbyOptions.LobbyOptions(MapPreview map)
+ 		{
+ 			yield return new LobbyBooleanOption(map, "shortgame",
+@@ -113,7 +117,7 @@ void IRulesetLoaded<ActorInfo>.RulesetLoaded(Ruleset rules, ActorInfo info)
+ 		public override object Create(ActorInitializer init) { return new MapOptions(this); }
+ 	}
+ 
+-	public class MapOptions : INotifyCreated
++	public class MapOptions : INotifyCreated, IWorldLoaded
+ 	{
+ 		readonly MapOptionsInfo info;
+ 
+@@ -133,5 +137,15 @@ void INotifyCreated.Created(Actor self)
+ 			TechLevel = self.World.LobbyInfo.GlobalSettings
+ 				.OptionOrDefault("techlevel", info.TechLevel);
+ 		}
++
++		void IWorldLoaded.WorldLoaded(World w, WorldRenderer wr)
++		{
++			if (info.ViewportHeight.HasValue)
++			{
++				// WPos to world pixels
++				var height = info.ViewportHeight.Value.Length * w.Map.Grid.TileSize.Height / w.Map.Grid.TileScale;
++				wr.Viewport.OverrideDefaultHeight(height);
++			}
++		}
+ 	}
+ }

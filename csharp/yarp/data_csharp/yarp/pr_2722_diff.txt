@@ -1,0 +1,72 @@
+diff --git a/src/ReverseProxy/Forwarder/HttpForwarder.cs b/src/ReverseProxy/Forwarder/HttpForwarder.cs
+index 597e47d5b..2187ac0a8 100644
+--- a/src/ReverseProxy/Forwarder/HttpForwarder.cs
++++ b/src/ReverseProxy/Forwarder/HttpForwarder.cs
+@@ -430,6 +430,11 @@ public async ValueTask<ForwarderError> SendAsync(
+         // :: Step 3: Copy request headers Client --► Proxy --► Destination
+         await transformer.TransformRequestAsync(context, destinationRequest, destinationPrefix, activityToken.Token);
+ 
++        if (!ReferenceEquals(requestContent, destinationRequest.Content) && destinationRequest.Content is not EmptyHttpContent)
++        {
++            throw new InvalidOperationException("Replacing the YARP outgoing request HttpContent is not supported. You should configure the HttpContext.Request instead.");
++        }
++
+         // The transformer generated a response, do not forward.
+         if (RequestUtilities.IsResponseSet(context.Response))
+         {
+@@ -450,7 +455,6 @@ public async ValueTask<ForwarderError> SendAsync(
+             context.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
+         }
+ 
+-        // TODO: What if they replace the HttpContent object? That would mess with our tracking and error handling.
+         return (destinationRequest, requestContent, tryDowngradingH2WsOnFailure);
+     }
+ 
+diff --git a/test/ReverseProxy.Tests/Forwarder/HttpForwarderTests.cs b/test/ReverseProxy.Tests/Forwarder/HttpForwarderTests.cs
+index fe36680fc..4b01733dc 100644
+--- a/test/ReverseProxy.Tests/Forwarder/HttpForwarderTests.cs
++++ b/test/ReverseProxy.Tests/Forwarder/HttpForwarderTests.cs
+@@ -498,6 +498,43 @@ public async Task TransformRequestAsync_WritesToResponse_ShortCircuits()
+         events.AssertContainProxyStages(Array.Empty<ForwarderStage>());
+     }
+ 
++    [Theory]
++    [InlineData(true)]
++    [InlineData(false)]
++    public async Task TransformRequestAsync_ModifiesRequestContent_Throws(bool originalHasBody)
++    {
++        var events = TestEventListener.Collect();
++        TestLogger.Collect();
++
++        var httpContext = new DefaultHttpContext();
++        httpContext.Request.Method = "POST";
++        httpContext.Features.Set<IHttpRequestBodyDetectionFeature>(new TestBodyDetector { CanHaveBody = originalHasBody });
++
++        var destinationPrefix = "https://localhost/foo";
++
++        var transforms = new DelegateHttpTransforms()
++        {
++            CopyRequestHeaders = true,
++            OnRequest = (context, request, destination) =>
++            {
++                request.Content = new StringContent("modified content");
++                return Task.CompletedTask;
++            }
++        };
++
++        var sut = CreateProxy();
++        var client = MockHttpHandler.CreateClient(
++            (HttpRequestMessage request, CancellationToken cancellationToken) =>
++            {
++                throw new NotImplementedException();
++            });
++
++        var proxyError = await sut.SendAsync(httpContext, destinationPrefix, client, ForwarderRequestConfig.Empty, transforms);
++
++        AssertErrorInfo<InvalidOperationException>(ForwarderError.RequestCreation, StatusCodes.Status502BadGateway, proxyError, httpContext, destinationPrefix);
++        Assert.Empty(events.GetProxyStages());
++    }
++
+     // Tests proxying an upgradeable request.
+     [Theory]
+     [InlineData("WebSocket")]

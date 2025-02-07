@@ -1,0 +1,871 @@
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/OpenTelemetryProtocolExporterEventSource.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/OpenTelemetryProtocolExporterEventSource.cs
+index ac3db61f61e..3596b79fa28 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/OpenTelemetryProtocolExporterEventSource.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/OpenTelemetryProtocolExporterEventSource.cs
+@@ -220,6 +220,12 @@ public void GrpcRetryDelayParsingFailed(string grpcStatusDetailsHeader, string e
+         this.WriteEvent(24, grpcStatusDetailsHeader, exception);
+     }
+ 
++    [Event(25, Message = "The array tag buffer exceeded the maximum allowed size. The array tag value was replaced with 'TRUNCATED'", Level = EventLevel.Warning)]
++    public void ArrayBufferExceededMaxSize()
++    {
++        this.WriteEvent(25);
++    }
++
+     void IConfigurationExtensionsLogger.LogInvalidConfigurationValue(string key, string value)
+     {
+         this.InvalidConfigurationValue(key, value);
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpLogSerializer.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpLogSerializer.cs
+index 8330d7b2e34..4f29ce28fa4 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpLogSerializer.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpLogSerializer.cs
+@@ -20,7 +20,7 @@ internal static class ProtobufOtlpLogSerializer
+     [ThreadStatic]
+     private static SerializationState? threadSerializationState;
+ 
+-    internal static int WriteLogsData(byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, ExperimentalOptions experimentalOptions, Resources.Resource? resource, in Batch<LogRecord> logRecordBatch)
++    internal static int WriteLogsData(ref byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, ExperimentalOptions experimentalOptions, Resources.Resource? resource, in Batch<LogRecord> logRecordBatch)
+     {
+         writePosition = ProtobufSerializer.WriteTag(buffer, writePosition, ProtobufOtlpLogFieldNumberConstants.LogsData_Resource_Logs, ProtobufWireType.LEN);
+         int logsDataLengthPosition = writePosition;
+@@ -47,27 +47,27 @@ internal static int WriteLogsData(byte[] buffer, int writePosition, SdkLimitOpti
+             logRecords.Add(logRecord);
+         }
+ 
+-        writePosition = TryWriteResourceLogs(buffer, writePosition, sdkLimitOptions, experimentalOptions, resource, ScopeLogsList);
++        writePosition = TryWriteResourceLogs(ref buffer, writePosition, sdkLimitOptions, experimentalOptions, resource, ScopeLogsList);
+         ProtobufSerializer.WriteReservedLength(buffer, logsDataLengthPosition, writePosition - (logsDataLengthPosition + ReserveSizeForLength));
+         ReturnLogRecordListToPool();
+ 
+         return writePosition;
+     }
+ 
+-    internal static int TryWriteResourceLogs(byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, ExperimentalOptions experimentalOptions, Resources.Resource? resource, Dictionary<string, List<LogRecord>> scopeLogs)
++    internal static int TryWriteResourceLogs(ref byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, ExperimentalOptions experimentalOptions, Resources.Resource? resource, Dictionary<string, List<LogRecord>> scopeLogs)
+     {
+         try
+         {
+             writePosition = WriteResourceLogs(buffer, writePosition, sdkLimitOptions, experimentalOptions, resource, scopeLogs);
+         }
+-        catch (IndexOutOfRangeException)
++        catch (Exception ex) when (ex is IndexOutOfRangeException || ex is ArgumentException)
+         {
+             if (!ProtobufSerializer.IncreaseBufferSize(ref buffer, OtlpSignalType.Logs))
+             {
+                 throw;
+             }
+ 
+-            return TryWriteResourceLogs(buffer, writePosition, sdkLimitOptions, experimentalOptions, resource, scopeLogs);
++            return TryWriteResourceLogs(ref buffer, writePosition, sdkLimitOptions, experimentalOptions, resource, scopeLogs);
+         }
+ 
+         return writePosition;
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpMetricSerializer.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpMetricSerializer.cs
+index cb85aefe927..68d5c5fa115 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpMetricSerializer.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpMetricSerializer.cs
+@@ -17,7 +17,7 @@ internal static class ProtobufOtlpMetricSerializer
+ 
+     private delegate int WriteExemplarFunc(byte[] buffer, int writePosition, in Exemplar exemplar);
+ 
+-    internal static int WriteMetricsData(byte[] buffer, int writePosition, Resources.Resource? resource, in Batch<Metric> batch)
++    internal static int WriteMetricsData(ref byte[] buffer, int writePosition, Resources.Resource? resource, in Batch<Metric> batch)
+     {
+         writePosition = ProtobufSerializer.WriteTag(buffer, writePosition, ProtobufOtlpMetricFieldNumberConstants.MetricsData_Resource_Metrics, ProtobufWireType.LEN);
+         int mericsDataLengthPosition = writePosition;
+@@ -35,27 +35,27 @@ internal static int WriteMetricsData(byte[] buffer, int writePosition, Resources
+             metrics.Add(metric);
+         }
+ 
+-        writePosition = TryWriteResourceMetrics(buffer, writePosition, resource, ScopeMetricsList);
++        writePosition = TryWriteResourceMetrics(ref buffer, writePosition, resource, ScopeMetricsList);
+         ProtobufSerializer.WriteReservedLength(buffer, mericsDataLengthPosition, writePosition - (mericsDataLengthPosition + ReserveSizeForLength));
+         ReturnMetricListToPool();
+ 
+         return writePosition;
+     }
+ 
+-    internal static int TryWriteResourceMetrics(byte[] buffer, int writePosition, Resources.Resource? resource, Dictionary<string, List<Metric>> scopeMetrics)
++    internal static int TryWriteResourceMetrics(ref byte[] buffer, int writePosition, Resources.Resource? resource, Dictionary<string, List<Metric>> scopeMetrics)
+     {
+         try
+         {
+             writePosition = WriteResourceMetrics(buffer, writePosition, resource, scopeMetrics);
+         }
+-        catch (IndexOutOfRangeException)
++        catch (Exception ex) when (ex is IndexOutOfRangeException || ex is ArgumentException)
+         {
+             if (!ProtobufSerializer.IncreaseBufferSize(ref buffer, OtlpSignalType.Metrics))
+             {
+                 throw;
+             }
+ 
+-            return TryWriteResourceMetrics(buffer, writePosition, resource, scopeMetrics);
++            return TryWriteResourceMetrics(ref buffer, writePosition, resource, scopeMetrics);
+         }
+ 
+         return writePosition;
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTagWriter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTagWriter.cs
+index 14643dc6676..1002f90e7c7 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTagWriter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTagWriter.cs
+@@ -1,6 +1,7 @@
+ // Copyright The OpenTelemetry Authors
+ // SPDX-License-Identifier: Apache-2.0
+ 
++using System.Diagnostics;
+ using OpenTelemetry.Internal;
+ 
+ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Serializer;
+@@ -61,7 +62,6 @@ protected override void WriteStringTag(ref OtlpTagWriterState state, string key,
+ 
+     protected override void WriteArrayTag(ref OtlpTagWriterState state, string key, ref OtlpTagWriterArrayState value)
+     {
+-        // TODO: Expand OtlpTagWriterArrayState.Buffer on IndexOutOfRangeException.
+         // Write KeyValue tag
+         state.WritePosition = ProtobufSerializer.WriteStringWithTag(state.Buffer, state.WritePosition, ProtobufOtlpCommonFieldNumberConstants.KeyValue_Key, key);
+ 
+@@ -95,18 +95,19 @@ internal struct OtlpTagWriterArrayState
+         public int WritePosition;
+     }
+ 
+-    private sealed class OtlpArrayTagWriter : ArrayTagWriter<OtlpTagWriterArrayState>
++    internal sealed class OtlpArrayTagWriter : ArrayTagWriter<OtlpTagWriterArrayState>
+     {
+         [ThreadStatic]
+-        private static byte[]? threadBuffer;
++        internal static byte[]? ThreadBuffer;
++        private const int MaxBufferSize = 2 * 1024 * 1024;
+ 
+         public override OtlpTagWriterArrayState BeginWriteArray()
+         {
+-            threadBuffer ??= new byte[2048];
++            ThreadBuffer ??= new byte[2048];
+ 
+             return new OtlpTagWriterArrayState
+             {
+-                Buffer = threadBuffer,
++                Buffer = ThreadBuffer,
+                 WritePosition = 0,
+             };
+         }
+@@ -149,5 +150,29 @@ public override void WriteStringValue(ref OtlpTagWriterArrayState state, ReadOnl
+         public override void EndWriteArray(ref OtlpTagWriterArrayState state)
+         {
+         }
++
++        public override bool TryResize()
++        {
++            var buffer = ThreadBuffer;
++
++            Debug.Assert(buffer != null, "buffer was null");
++
++            if (buffer!.Length >= MaxBufferSize)
++            {
++                OpenTelemetryProtocolExporterEventSource.Log.ArrayBufferExceededMaxSize();
++                return false;
++            }
++
++            try
++            {
++                ThreadBuffer = new byte[buffer.Length * 2];
++                return true;
++            }
++            catch (OutOfMemoryException)
++            {
++                OpenTelemetryProtocolExporterEventSource.Log.BufferResizeFailedDueToMemory(nameof(OtlpArrayTagWriter));
++                return false;
++            }
++        }
+     }
+ }
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
+index b50acbe7c89..91201113897 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
+@@ -18,7 +18,7 @@ internal static class ProtobufOtlpTraceSerializer
+     private static readonly Stack<List<Activity>> ActivityListPool = [];
+     private static readonly Dictionary<string, List<Activity>> ScopeTracesList = [];
+ 
+-    internal static int WriteTraceData(byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, Resources.Resource? resource, in Batch<Activity> batch)
++    internal static int WriteTraceData(ref byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, Resources.Resource? resource, in Batch<Activity> batch)
+     {
+         writePosition = ProtobufSerializer.WriteTag(buffer, writePosition, ProtobufOtlpTraceFieldNumberConstants.TracesData_Resource_Spans, ProtobufWireType.LEN);
+         int resourceSpansScopeSpansLengthPosition = writePosition;
+@@ -36,20 +36,20 @@ internal static int WriteTraceData(byte[] buffer, int writePosition, SdkLimitOpt
+             activities.Add(activity);
+         }
+ 
+-        writePosition = TryWriteResourceSpans(buffer, writePosition, sdkLimitOptions, resource);
++        writePosition = TryWriteResourceSpans(ref buffer, writePosition, sdkLimitOptions, resource);
+         ReturnActivityListToPool();
+         ProtobufSerializer.WriteReservedLength(buffer, resourceSpansScopeSpansLengthPosition, writePosition - (resourceSpansScopeSpansLengthPosition + ReserveSizeForLength));
+ 
+         return writePosition;
+     }
+ 
+-    internal static int TryWriteResourceSpans(byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, Resources.Resource? resource)
++    internal static int TryWriteResourceSpans(ref byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, Resources.Resource? resource)
+     {
+         try
+         {
+             writePosition = WriteResourceSpans(buffer, writePosition, sdkLimitOptions, resource);
+         }
+-        catch (IndexOutOfRangeException)
++        catch (Exception ex) when (ex is IndexOutOfRangeException || ex is ArgumentException)
+         {
+             // Attempt to increase the buffer size
+             if (!ProtobufSerializer.IncreaseBufferSize(ref buffer, OtlpSignalType.Traces))
+@@ -61,7 +61,7 @@ internal static int TryWriteResourceSpans(byte[] buffer, int writePosition, SdkL
+             // The recursion depth is limited to a maximum of 7 calls, as the buffer size starts at ~732 KB
+             // and doubles until it reaches the maximum size of 100 MB. This ensures the recursion remains safe
+             // and avoids stack overflow.
+-            return TryWriteResourceSpans(buffer, writePosition, sdkLimitOptions, resource);
++            return TryWriteResourceSpans(ref buffer, writePosition, sdkLimitOptions, resource);
+         }
+ 
+         return writePosition;
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufSerializer.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufSerializer.cs
+index 8597524d52a..b4f3ad7131c 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufSerializer.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufSerializer.cs
+@@ -321,6 +321,13 @@ internal static int WriteStringWithTag(byte[] buffer, int writePosition, int fie
+         writePosition = WriteLength(buffer, writePosition, numberOfUtf8CharsInString);
+ 
+ #if NETFRAMEWORK || NETSTANDARD2_0
++        if (buffer.Length - writePosition < numberOfUtf8CharsInString)
++        {
++            // Note: Validate there is enough space in the buffer to hold the
++            // string otherwise throw to trigger a resize of the buffer.
++            throw new IndexOutOfRangeException();
++        }
++
+         unsafe
+         {
+             fixed (char* strPtr = &GetNonNullPinnableReference(value))
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
+index d78faaa84ba..2ac41e5aca1 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpLogExporter.cs
+@@ -72,7 +72,7 @@ public override ExportResult Export(in Batch<LogRecord> logRecordBatch)
+ 
+         try
+         {
+-            int writePosition = ProtobufOtlpLogSerializer.WriteLogsData(this.buffer, this.startWritePosition, this.sdkLimitOptions, this.experimentalOptions, this.Resource, logRecordBatch);
++            int writePosition = ProtobufOtlpLogSerializer.WriteLogsData(ref this.buffer, this.startWritePosition, this.sdkLimitOptions, this.experimentalOptions, this.Resource, logRecordBatch);
+ 
+             if (this.startWritePosition == GrpcStartWritePosition)
+             {
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
+index 26beee90bef..88bafa3007c 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpMetricExporter.cs
+@@ -65,7 +65,7 @@ public override ExportResult Export(in Batch<Metric> metrics)
+ 
+         try
+         {
+-            int writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(this.buffer, this.startWritePosition, this.Resource, metrics);
++            int writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(ref this.buffer, this.startWritePosition, this.Resource, metrics);
+ 
+             if (this.startWritePosition == GrpcStartWritePosition)
+             {
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
+index 2a9aa274241..5a1f2f19d24 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporter.cs
+@@ -68,7 +68,7 @@ public override ExportResult Export(in Batch<Activity> activityBatch)
+ 
+         try
+         {
+-            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(this.buffer, this.startWritePosition, this.sdkLimitOptions, this.Resource, activityBatch);
++            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref this.buffer, this.startWritePosition, this.sdkLimitOptions, this.Resource, activityBatch);
+ 
+             if (this.startWritePosition == GrpcStartWritePosition)
+             {
+diff --git a/src/Shared/TagWriter/ArrayTagWriter.cs b/src/Shared/TagWriter/ArrayTagWriter.cs
+index c8859acbb2f..92cf3a317e2 100644
+--- a/src/Shared/TagWriter/ArrayTagWriter.cs
++++ b/src/Shared/TagWriter/ArrayTagWriter.cs
+@@ -19,4 +19,6 @@ internal abstract class ArrayTagWriter<TArrayState>
+     public abstract void WriteStringValue(ref TArrayState state, ReadOnlySpan<char> value);
+ 
+     public abstract void EndWriteArray(ref TArrayState state);
++
++    public virtual bool TryResize() => false;
+ }
+diff --git a/src/Shared/TagWriter/TagWriter.cs b/src/Shared/TagWriter/TagWriter.cs
+index 941fa6d6f01..fdd83a76bfd 100644
+--- a/src/Shared/TagWriter/TagWriter.cs
++++ b/src/Shared/TagWriter/TagWriter.cs
+@@ -71,6 +71,10 @@ public bool TryWriteTag(
+                 {
+                     this.WriteArrayTagInternal(ref state, key, array, tagValueMaxLength);
+                 }
++                catch (Exception ex) when (ex is IndexOutOfRangeException || ex is ArgumentException)
++                {
++                    throw;
++                }
+                 catch
+                 {
+                     // If an exception is thrown when calling ToString
+@@ -152,27 +156,49 @@ private void WriteArrayTagInternal(ref TTagState state, string key, Array array,
+     {
+         var arrayState = this.arrayWriter.BeginWriteArray();
+ 
+-        // This switch ensures the values of the resultant array-valued tag are of the same type.
+-        switch (array)
++        try
+         {
+-            case char[] charArray: this.WriteStructToArray(ref arrayState, charArray); break;
+-            case string?[] stringArray: this.WriteStringsToArray(ref arrayState, stringArray, tagValueMaxLength); break;
+-            case bool[] boolArray: this.WriteStructToArray(ref arrayState, boolArray); break;
+-            case byte[] byteArray: this.WriteToArrayCovariant(ref arrayState, byteArray); break;
+-            case short[] shortArray: this.WriteToArrayCovariant(ref arrayState, shortArray); break;
++            // This switch ensures the values of the resultant array-valued tag are of the same type.
++            switch (array)
++            {
++                case char[] charArray: this.WriteStructToArray(ref arrayState, charArray); break;
++                case string?[] stringArray: this.WriteStringsToArray(ref arrayState, stringArray, tagValueMaxLength); break;
++                case bool[] boolArray: this.WriteStructToArray(ref arrayState, boolArray); break;
++                case byte[] byteArray: this.WriteToArrayCovariant(ref arrayState, byteArray); break;
++                case short[] shortArray: this.WriteToArrayCovariant(ref arrayState, shortArray); break;
+ #if NETFRAMEWORK
+-            case int[]: this.WriteArrayTagIntNetFramework(ref arrayState, array, tagValueMaxLength); break;
+-            case long[]: this.WriteArrayTagLongNetFramework(ref arrayState, array, tagValueMaxLength); break;
++                case int[]: this.WriteArrayTagIntNetFramework(ref arrayState, array, tagValueMaxLength); break;
++                case long[]: this.WriteArrayTagLongNetFramework(ref arrayState, array, tagValueMaxLength); break;
+ #else
+-            case int[] intArray: this.WriteToArrayCovariant(ref arrayState, intArray); break;
+-            case long[] longArray: this.WriteToArrayCovariant(ref arrayState, longArray); break;
++                case int[] intArray: this.WriteToArrayCovariant(ref arrayState, intArray); break;
++                case long[] longArray: this.WriteToArrayCovariant(ref arrayState, longArray); break;
+ #endif
+-            case float[] floatArray: this.WriteStructToArray(ref arrayState, floatArray); break;
+-            case double[] doubleArray: this.WriteStructToArray(ref arrayState, doubleArray); break;
+-            default: this.WriteToArrayTypeChecked(ref arrayState, array, tagValueMaxLength); break;
++                case float[] floatArray: this.WriteStructToArray(ref arrayState, floatArray); break;
++                case double[] doubleArray: this.WriteStructToArray(ref arrayState, doubleArray); break;
++                default: this.WriteToArrayTypeChecked(ref arrayState, array, tagValueMaxLength); break;
++            }
++
++            this.arrayWriter.EndWriteArray(ref arrayState);
+         }
++        catch (Exception ex) when (ex is IndexOutOfRangeException || ex is ArgumentException)
++        {
++            // If the array writer cannot be resized, TryResize should log a message to the event source, return false.
++            if (this.arrayWriter.TryResize())
++            {
++                this.WriteArrayTagInternal(ref state, key, array, tagValueMaxLength);
++                return;
++            }
++
++            // Drop the array value and set "TRUNCATED" as value for easier isolation.
++            // This is a best effort to avoid dropping the entire tag.
++            this.WriteStringTag(
++                ref state,
++                key,
++                "TRUNCATED".AsSpan());
+ 
+-        this.arrayWriter.EndWriteArray(ref arrayState);
++            this.LogUnsupportedTagTypeAndReturnFalse(key, array!.GetType().ToString());
++            return;
++        }
+ 
+         this.WriteArrayTag(ref state, key, ref arrayState);
+     }
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
+index e9a4ba80c76..cf5833e376d 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/ExportClient/OtlpHttpTraceExportClientTests.cs
+@@ -181,7 +181,7 @@ void RunTest(Batch<Activity> batch)
+     private static (byte[] Buffer, int ContentLength) CreateTraceExportRequest(SdkLimitOptions sdkOptions, in Batch<Activity> batch, Resource resource)
+     {
+         var buffer = new byte[4096];
+-        var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(buffer, 0, sdkOptions, resource, batch);
++        var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref buffer, 0, sdkOptions, resource, batch);
+         return (buffer, writePosition);
+     }
+ }
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs
+new file mode 100644
+index 00000000000..a4aed5f155c
+--- /dev/null
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/Implementation/Serializer/OtlpArrayTagWriterTests.cs
+@@ -0,0 +1,287 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++using System.Diagnostics;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Serializer;
++using OpenTelemetry.Resources;
++using Xunit;
++using OtlpCollector = OpenTelemetry.Proto.Collector.Trace.V1;
++using OtlpTrace = OpenTelemetry.Proto.Trace.V1;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests.Implementation.Serializer;
++
++public class OtlpArrayTagWriterTests : IDisposable
++{
++    private readonly ProtobufOtlpTagWriter.OtlpArrayTagWriter arrayTagWriter;
++
++    static OtlpArrayTagWriterTests()
++    {
++        Activity.DefaultIdFormat = ActivityIdFormat.W3C;
++        Activity.ForceDefaultIdFormat = true;
++
++        var listener = new ActivityListener
++        {
++            ShouldListenTo = _ => true,
++            Sample = (ref ActivityCreationOptions<ActivityContext> options) => ActivitySamplingResult.AllData,
++        };
++
++        ActivitySource.AddActivityListener(listener);
++    }
++
++    public OtlpArrayTagWriterTests()
++    {
++        this.arrayTagWriter = new ProtobufOtlpTagWriter.OtlpArrayTagWriter();
++    }
++
++    [Fact]
++    public void BeginWriteArray_InitializesArrayState()
++    {
++        // Act
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Assert
++        Assert.NotNull(arrayState.Buffer);
++        Assert.Equal(0, arrayState.WritePosition);
++        Assert.True(arrayState.Buffer.Length == 2048);
++    }
++
++    [Fact]
++    public void WriteNullValue_AddsNullValueToBuffer()
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Act
++        this.arrayTagWriter.WriteNullValue(ref arrayState);
++
++        // Assert
++        // Check that the buffer contains the correct tag and length for a null value
++        Assert.True(arrayState.WritePosition > 0);
++    }
++
++    [Theory]
++    [InlineData(0L)]
++    [InlineData(long.MaxValue)]
++    [InlineData(long.MinValue)]
++    public void WriteIntegralValue_WritesIntegralValueToBuffer(long value)
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Act
++        this.arrayTagWriter.WriteIntegralValue(ref arrayState, value);
++
++        // Assert
++        Assert.True(arrayState.WritePosition > 0);
++    }
++
++    [Theory]
++    [InlineData(0.0)]
++    [InlineData(double.MaxValue)]
++    [InlineData(double.MinValue)]
++    public void WriteFloatingPointValue_WritesFloatingPointValueToBuffer(double value)
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Act
++        this.arrayTagWriter.WriteFloatingPointValue(ref arrayState, value);
++
++        // Assert
++        Assert.True(arrayState.WritePosition > 0);
++    }
++
++    [Theory]
++    [InlineData(true)]
++    [InlineData(false)]
++    public void WriteBooleanValue_WritesBooleanValueToBuffer(bool value)
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Act
++        this.arrayTagWriter.WriteBooleanValue(ref arrayState, value);
++
++        // Assert
++        Assert.True(arrayState.WritePosition > 0);
++    }
++
++    [Theory]
++    [InlineData("")]
++    [InlineData("test")]
++    public void WriteStringValue_WritesStringValueToBuffer(string value)
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++
++        // Act
++        this.arrayTagWriter.WriteStringValue(ref arrayState, value.AsSpan());
++
++        // Assert
++        Assert.True(arrayState.WritePosition > 0);
++    }
++
++    [Fact]
++    public void TryResize_SucceedsInitially()
++    {
++        // Act
++        this.arrayTagWriter.BeginWriteArray();
++        bool result = this.arrayTagWriter.TryResize();
++
++        // Assert
++        Assert.True(result);
++    }
++
++    [Fact]
++    public void TryResize_RepeatedResizingStopsAtMaxBufferSize()
++    {
++        // Arrange
++        var arrayState = this.arrayTagWriter.BeginWriteArray();
++        bool resizeResult = true;
++
++        // Act: Repeatedly attempt to resize until reaching maximum buffer size
++        while (resizeResult)
++        {
++            resizeResult = this.arrayTagWriter.TryResize();
++        }
++
++        // Assert
++        Assert.False(resizeResult, "Buffer should not resize beyond the maximum allowed size.");
++    }
++
++    [Fact]
++    public void SerializeLargeArrayExceeding2MB_TruncatesInOtlpSpan()
++    {
++        // Create a large array exceeding 2 MB
++        var largeArray = new string[512 * 1024];
++        for (int i = 0; i < largeArray.Length; i++)
++        {
++            largeArray[i] = "1234";
++        }
++
++        var lessthat1MBArray = new string[256 * 4];
++        for (int i = 0; i < lessthat1MBArray.Length; i++)
++        {
++            lessthat1MBArray[i] = "1234";
++        }
++
++        var tags = new ActivityTagsCollection
++        {
++            new("lessthat1MBArray", lessthat1MBArray),
++            new("StringArray", new string?[] { "12345" }),
++            new("LargeArray", largeArray),
++        };
++
++        using var activitySource = new ActivitySource(nameof(this.SerializeLargeArrayExceeding2MB_TruncatesInOtlpSpan));
++        using var activity = activitySource.StartActivity("activity", ActivityKind.Server, default(ActivityContext), tags);
++
++        Assert.NotNull(activity);
++
++        var otlpSpan = ToOtlpSpanWithExtendedBuffer(new SdkLimitOptions(), activity);
++
++        Assert.NotNull(otlpSpan);
++        Assert.True(otlpSpan.Attributes.Count == 3);
++        var keyValue = otlpSpan.Attributes.FirstOrDefault(kvp => kvp.Key == "StringArray");
++        Assert.NotNull(keyValue);
++        Assert.Equal("12345", keyValue.Value.ArrayValue.Values[0].StringValue);
++
++        // The string is too large, hence not evaluating the content.
++        keyValue = otlpSpan.Attributes.FirstOrDefault(kvp => kvp.Key == "lessthat1MBArray");
++        Assert.NotNull(keyValue);
++
++        keyValue = otlpSpan.Attributes.FirstOrDefault(kvp => kvp.Key == "LargeArray");
++        Assert.NotNull(keyValue);
++        Assert.Equal("TRUNCATED", keyValue.Value.StringValue);
++    }
++
++    [Fact]
++    public void LargeArray_WithSmallBaseBuffer_ThrowsExceptionOnWriteSpan()
++    {
++        var lessthat1MBArray = new string[256 * 256];
++        for (int i = 0; i < lessthat1MBArray.Length; i++)
++        {
++            lessthat1MBArray[i] = "1234";
++        }
++
++        var tags = new ActivityTagsCollection
++        {
++            new("lessthat1MBArray", lessthat1MBArray),
++        };
++
++        using var activitySource = new ActivitySource(nameof(this.LargeArray_WithSmallBaseBuffer_ThrowsExceptionOnWriteSpan));
++        using var activity = activitySource.StartActivity("root", ActivityKind.Server, default(ActivityContext), tags);
++
++        Assert.NotNull(activity);
++        Assert.Throws<ArgumentException>(() => ToOtlpSpan(new SdkLimitOptions(), activity));
++    }
++
++    [Fact]
++    public void LargeArray_WithSmallBaseBuffer_ExpandsOnTraceData()
++    {
++        var lessthat1MBArray = new string[256 * 256];
++        for (int i = 0; i < lessthat1MBArray.Length; i++)
++        {
++            lessthat1MBArray[i] = "1234";
++        }
++
++        var tags = new ActivityTagsCollection
++        {
++            new("lessthat1MBArray", lessthat1MBArray),
++        };
++
++        using var activitySource = new ActivitySource(nameof(this.LargeArray_WithSmallBaseBuffer_ExpandsOnTraceData));
++        using var activity = activitySource.StartActivity("root", ActivityKind.Server, default(ActivityContext), tags);
++
++        Assert.NotNull(activity);
++        var batch = new Batch<Activity>([activity], 1);
++        RunTest(new(), batch);
++
++        void RunTest(SdkLimitOptions sdkOptions, Batch<Activity> batch)
++        {
++            var buffer = new byte[4096];
++            var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref buffer, 0, sdkOptions, ResourceBuilder.CreateEmpty().Build(), batch);
++            using var stream = new MemoryStream(buffer, 0, writePosition);
++            var tracesData = OtlpTrace.TracesData.Parser.ParseFrom(stream);
++            var request = new OtlpCollector.ExportTraceServiceRequest();
++            request.ResourceSpans.Add(tracesData.ResourceSpans);
++
++            // Buffer should be expanded to accommodate the large array.
++            Assert.True(buffer.Length > 4096);
++
++            Assert.Single(request.ResourceSpans);
++            var scopeSpans = request.ResourceSpans.First().ScopeSpans;
++            Assert.Single(scopeSpans);
++            var otlpSpan = scopeSpans.First().Spans.First();
++            Assert.NotNull(otlpSpan);
++
++            // The string is too large, hence not evaluating the content.
++            var keyValue = otlpSpan.Attributes.FirstOrDefault(kvp => kvp.Key == "lessthat1MBArray");
++            Assert.NotNull(keyValue);
++        }
++    }
++
++    public void Dispose()
++    {
++        // Clean up the thread buffer after each test
++        ProtobufOtlpTagWriter.OtlpArrayTagWriter.ThreadBuffer = null;
++    }
++
++    private static OtlpTrace.Span? ToOtlpSpan(SdkLimitOptions sdkOptions, Activity activity)
++    {
++        var buffer = new byte[4096];
++        var writePosition = ProtobufOtlpTraceSerializer.WriteSpan(buffer, 0, sdkOptions, activity);
++        using var stream = new MemoryStream(buffer, 0, writePosition);
++        var scopeSpans = OtlpTrace.ScopeSpans.Parser.ParseFrom(stream);
++        return scopeSpans.Spans.FirstOrDefault();
++    }
++
++    private static OtlpTrace.Span? ToOtlpSpanWithExtendedBuffer(SdkLimitOptions sdkOptions, Activity activity)
++    {
++        var buffer = new byte[4194304];
++        var writePosition = ProtobufOtlpTraceSerializer.WriteSpan(buffer, 0, sdkOptions, activity);
++        using var stream = new MemoryStream(buffer, 0, writePosition);
++        var scopeSpans = OtlpTrace.ScopeSpans.Parser.ParseFrom(stream);
++        return scopeSpans.Spans.FirstOrDefault();
++    }
++}
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpLogExporterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpLogExporterTests.cs
+index 95acb36da9b..9d14aafefe4 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpLogExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpLogExporterTests.cs
+@@ -1459,6 +1459,44 @@ public void LogRecordLoggerNameIsExportedWhenUsingBridgeApi(string? loggerName,
+         Assert.Equal(expectedScopeName, request.ResourceLogs[0].ScopeLogs[0].Scope?.Name);
+     }
+ 
++    [Fact]
++    public void LogSerialization_ExpandsBufferForLogsAndSerializes()
++    {
++        LogRecordAttributeList attributes = default;
++        attributes.Add("name", "tomato");
++        attributes.Add("price", 2.99);
++        attributes.Add("{OriginalFormat}", "Hello from {name} {price}.");
++
++        var logRecords = new List<LogRecord>();
++
++        using (var loggerProvider = Sdk.CreateLoggerProviderBuilder()
++                   .AddInMemoryExporter(logRecords)
++                   .Build())
++        {
++            var logger = loggerProvider.GetLogger("MyLogger");
++
++            logger.EmitLog(new LogRecordData());
++        }
++
++        Assert.Single(logRecords);
++
++        var batch = new Batch<LogRecord>(new[] { logRecords[0] }, 1);
++
++        var buffer = new byte[50];
++        var writePosition = ProtobufOtlpLogSerializer.WriteLogsData(ref buffer, 0, DefaultSdkLimitOptions, new(), ResourceBuilder.CreateEmpty().Build(), batch);
++        using var stream = new MemoryStream(buffer, 0, writePosition);
++        var logsData = OtlpLogs.LogsData.Parser.ParseFrom(stream);
++        var request = new OtlpCollector.ExportLogsServiceRequest();
++        request.ResourceLogs.Add(logsData.ResourceLogs);
++
++        Assert.True(buffer.Length > 50);
++        Assert.NotNull(request);
++        Assert.Single(request.ResourceLogs);
++        Assert.Single(request.ResourceLogs[0].ScopeLogs);
++
++        Assert.Equal("MyLogger", request.ResourceLogs[0].ScopeLogs[0].Scope?.Name);
++    }
++
+     private static void RunVerifyEnvironmentVariablesTakenFromIConfigurationTest(
+         string? optionsName,
+         Func<Action<IServiceCollection>, (IDisposable Container, ILoggerFactory LoggerFactory)> createLoggerFactoryFunc)
+@@ -1599,7 +1637,7 @@ private static void ConfigureOtlpExporter(
+     private static OtlpCollector.ExportLogsServiceRequest CreateLogsExportRequest(SdkLimitOptions sdkOptions, ExperimentalOptions experimentalOptions, in Batch<LogRecord> batch, Resource resource)
+     {
+         var buffer = new byte[4096];
+-        var writePosition = ProtobufOtlpLogSerializer.WriteLogsData(buffer, 0, sdkOptions, experimentalOptions, resource, batch);
++        var writePosition = ProtobufOtlpLogSerializer.WriteLogsData(ref buffer, 0, sdkOptions, experimentalOptions, resource, batch);
+         using var stream = new MemoryStream(buffer, 0, writePosition);
+         var logsData = OtlpLogs.LogsData.Parser.ParseFrom(stream);
+         var request = new OtlpCollector.ExportLogsServiceRequest();
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpMetricsExporterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpMetricsExporterTests.cs
+index d90d3934ad7..40c075c44a3 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpMetricsExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpMetricsExporterTests.cs
+@@ -906,6 +906,58 @@ void AssertExemplars<T>(T value, OtlpMetrics.Metric metric)
+         }
+     }
+ 
++    [Fact]
++    public void MetricsSerialization_ExpandsBufferForMetricsAndSerializes()
++    {
++        var metrics = new List<Metric>();
++
++        var meterTags = new KeyValuePair<string, object?>[]
++        {
++            new("key1", "value1"),
++            new("key2", "value2"),
++        };
++
++        using var meter = new Meter(name: $"{Utils.GetCurrentMethodName()}", version: "0.0.1", tags: meterTags);
++        using var provider = Sdk.CreateMeterProviderBuilder()
++            .AddMeter(meter.Name)
++            .AddInMemoryExporter(metrics)
++            .Build();
++
++        var counter = meter.CreateCounter<int>("counter");
++        counter.Add(100);
++
++        provider.ForceFlush();
++
++        var batch = new Batch<Metric>(metrics.ToArray(), metrics.Count);
++
++        var buffer = new byte[50];
++        var writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(ref buffer, 0, ResourceBuilder.CreateEmpty().Build(), in batch);
++        using var stream = new MemoryStream(buffer, 0, writePosition);
++
++        var metricsData = OtlpMetrics.MetricsData.Parser.ParseFrom(stream);
++
++        var request = new OtlpCollector.ExportMetricsServiceRequest();
++        request.ResourceMetrics.Add(metricsData.ResourceMetrics);
++
++        Assert.True(buffer.Length > 50);
++
++        Assert.Single(request.ResourceMetrics);
++        var resourceMetric = request.ResourceMetrics.First();
++        var otlpResource = resourceMetric.Resource;
++
++        Assert.Contains(otlpResource.Attributes, (kvp) => kvp.Key == ResourceSemanticConventions.AttributeServiceName && kvp.Value.ToString().Contains("unknown_service:"));
++
++        Assert.Single(resourceMetric.ScopeMetrics);
++        var instrumentationLibraryMetrics = resourceMetric.ScopeMetrics.First();
++        Assert.Equal(string.Empty, instrumentationLibraryMetrics.SchemaUrl);
++        Assert.Equal(meter.Name, instrumentationLibraryMetrics.Scope.Name);
++        Assert.Equal("0.0.1", instrumentationLibraryMetrics.Scope.Version);
++
++        Assert.Equal(2, instrumentationLibraryMetrics.Scope.Attributes.Count);
++        Assert.Contains(instrumentationLibraryMetrics.Scope.Attributes, (kvp) => kvp.Key == "key1" && kvp.Value.StringValue == "value1");
++        Assert.Contains(instrumentationLibraryMetrics.Scope.Attributes, (kvp) => kvp.Key == "key2" && kvp.Value.StringValue == "value2");
++    }
++
+     public void Dispose()
+     {
+         OtlpSpecConfigDefinitionTests.ClearEnvVars();
+@@ -939,7 +991,7 @@ private static void VerifyExemplars<T>(long? longValue, double? doubleValue, boo
+     private static OtlpCollector.ExportMetricsServiceRequest CreateMetricExportRequest(in Batch<Metric> batch, Resource resource)
+     {
+         var buffer = new byte[4096];
+-        var writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(buffer, 0, resource, in batch);
++        var writePosition = ProtobufOtlpMetricSerializer.WriteMetricsData(ref buffer, 0, resource, in batch);
+         using var stream = new MemoryStream(buffer, 0, writePosition);
+ 
+         var metricsData = OtlpMetrics.MetricsData.Parser.ParseFrom(stream);
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+index 94b97ca1702..ab3a1c0d3e2 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+@@ -590,6 +590,46 @@ public void ToOtlpSpanNativeActivityStatusTest(ActivityStatusCode expectedStatus
+         }
+     }
+ 
++    [Fact]
++    public void TracesSerialization_ExpandsBufferForTracesAndSerializes()
++    {
++        var tags = new ActivityTagsCollection
++        {
++            new("Tagkey", "Tagvalue"),
++        };
++
++        using var activitySource = new ActivitySource(nameof(this.TracesSerialization_ExpandsBufferForTracesAndSerializes));
++        using var activity = activitySource.StartActivity("root", ActivityKind.Server, default(ActivityContext), tags);
++
++        Assert.NotNull(activity);
++        var batch = new Batch<Activity>([activity], 1);
++        RunTest(new(), batch);
++
++        void RunTest(SdkLimitOptions sdkOptions, Batch<Activity> batch)
++        {
++            var buffer = new byte[50];
++            var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref buffer, 0, sdkOptions, ResourceBuilder.CreateEmpty().Build(), batch);
++            using var stream = new MemoryStream(buffer, 0, writePosition);
++            var tracesData = OtlpTrace.TracesData.Parser.ParseFrom(stream);
++            var request = new OtlpCollector.ExportTraceServiceRequest();
++            request.ResourceSpans.Add(tracesData.ResourceSpans);
++
++            // Buffer should be expanded to accommodate the large array.
++            Assert.True(buffer.Length > 50);
++
++            Assert.Single(request.ResourceSpans);
++            var scopeSpans = request.ResourceSpans.First().ScopeSpans;
++            Assert.Single(scopeSpans);
++            var otlpSpan = scopeSpans.First().Spans.First();
++            Assert.NotNull(otlpSpan);
++
++            // The string is too large, hence not evaluating the content.
++            var keyValue = otlpSpan.Attributes.FirstOrDefault(kvp => kvp.Key == "Tagkey");
++            Assert.NotNull(keyValue);
++            Assert.Equal("Tagvalue", keyValue.Value.StringValue);
++        }
++    }
++
+     [Theory]
+     [InlineData(StatusCode.Unset, "Unset", "Description will be ignored if status is Unset.")]
+     [InlineData(StatusCode.Ok, "Ok", "Description must only be used with the Error StatusCode.")]
+@@ -970,7 +1010,7 @@ public void SpanLinkFlagsTest(bool isRecorded, bool isRemote)
+     private static OtlpCollector.ExportTraceServiceRequest CreateTraceExportRequest(SdkLimitOptions sdkOptions, in Batch<Activity> batch, Resource resource)
+     {
+         var buffer = new byte[4096];
+-        var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(buffer, 0, sdkOptions, resource, batch);
++        var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(ref buffer, 0, sdkOptions, resource, batch);
+         using var stream = new MemoryStream(buffer, 0, writePosition);
+         var tracesData = OtlpTrace.TracesData.Parser.ParseFrom(stream);
+         var request = new OtlpCollector.ExportTraceServiceRequest();

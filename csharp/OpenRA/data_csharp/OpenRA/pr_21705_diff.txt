@@ -1,0 +1,518 @@
+diff --git a/OpenRA.Mods.Common/MapGenerator/Matrix.cs b/OpenRA.Mods.Common/MapGenerator/Matrix.cs
+index f1bd13640d3f..168417cd3ea9 100644
+--- a/OpenRA.Mods.Common/MapGenerator/Matrix.cs
++++ b/OpenRA.Mods.Common/MapGenerator/Matrix.cs
+@@ -105,6 +105,16 @@ public bool ContainsXY(int x, int y)
+ 			return x >= 0 && x < Size.X && y >= 0 && y < Size.Y;
+ 		}
+ 
++		public bool IsEdge(int x, int y)
++		{
++			return x == 0 || x == Size.X - 1 || y == 0 || y == Size.Y - 1;
++		}
++
++		public bool IsEdge(int2 xy)
++		{
++			return IsEdge(xy.X, xy.Y);
++		}
++
+ 		/// <summary>Clamp xy to be the closest index within the matrix.</summary>
+ 		public int2 ClampXY(int2 xy)
+ 		{
+diff --git a/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs b/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
+index dea3f3e029ec..16315dfad9b3 100644
+--- a/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
++++ b/OpenRA.Mods.Common/MapGenerator/MatrixUtils.cs
+@@ -1203,6 +1203,30 @@ void SetThinness(int x, int y, int v)
+ 			return changes;
+ 		}
+ 
++		/// <summary>Remove links from a direction map that are not reciprocated.</summary>
++		public static void RemoveStubsFromDirectionMapInPlace(Matrix<byte> matrix)
++		{
++			var output = matrix.Clone();
++			for (var cy = 0; cy < matrix.Size.Y; cy++)
++				for (var cx = 0; cx < matrix.Size.X; cx++)
++				{
++					var fromPos = new int2(cx, cy);
++					var fromDm = matrix[fromPos];
++					foreach (var (offset, d) in Direction.Spread8D)
++					{
++						if ((fromDm & (1 << d)) == 0)
++							continue;
++
++						var dr = Direction.Reverse(d);
++						var toPos = new int2(cx + offset.X, cy + offset.Y);
++						if (matrix.ContainsXY(toPos) && (matrix[toPos] & (1 << dr)) != 0)
++							continue;
++
++						matrix[fromPos] = (byte)(output[fromPos] & ~(1 << d));
++					}
++				}
++		}
++
+ 		static Matrix<byte> RemoveJunctionsFromDirectionMap(Matrix<byte> input)
+ 		{
+ 			var output = input.Clone();
+@@ -1224,67 +1248,116 @@ static Matrix<byte> RemoveJunctionsFromDirectionMap(Matrix<byte> input)
+ 					}
+ 				}
+ 
+-			for (var x = 0; x < input.Size.X; x++)
+-			{
+-				output[x, 0] = (byte)(output[x, 0] & ~(Direction.MLU | Direction.MU | Direction.MRU));
+-				output[x, input.Size.Y - 1] = (byte)(output[x, input.Size.Y - 1] & ~(Direction.MRD | Direction.MD | Direction.MLD));
+-			}
+-
+-			for (var y = 0; y < input.Size.Y; y++)
+-			{
+-				output[0, y] = (byte)(output[0, y] & ~(Direction.MLD | Direction.ML | Direction.MLU));
+-				output[input.Size.X - 1, y] &= (byte)(output[input.Size.X - 1, y] & ~(Direction.MRU | Direction.MR | Direction.MRD));
+-			}
+-
+ 			return output;
+ 		}
+ 
+ 		/// <summary>
+-		/// Traces a matrix of directions into a set of point sequences.
+-		/// Any junctions in the input direction map are dropped.
++		/// Traces a matrix of directions into a set of point sequences. Each point sequence is
++		/// traced up to but excluding junction points. Paths are traced in both directions. The
++		/// paths in the direction map must be bidrectional and contain no stubs.
+ 		/// </summary>
+ 		public static int2[][] DirectionMapToPaths(Matrix<byte> input)
+ 		{
+-			input = RemoveJunctionsFromDirectionMap(input);
++			var links = RemoveJunctionsFromDirectionMap(input);
+ 
+-			// Loops not handled, but these would be extremely rare anyway.
++			// Find non-loops, starting at terminals.
+ 			var pointArrays = new List<int2[]>();
+-			for (var sy = 0; sy < input.Size.Y; sy++)
+-				for (var sx = 0; sx < input.Size.X; sx++)
+-				{
+-					var sdm = input[sx, sy];
+-					if (Direction.FromMask(sdm) != Direction.None)
+-					{
+-						var points = new List<int2>();
+-						var xy = new int2(sx, sy);
+-						var reverseDm = 0;
+ 
+-						bool AddPoint()
+-						{
+-							points.Add(xy);
+-							var dm = input[xy] & ~reverseDm;
+-							foreach (var (offset, d) in Direction.Spread8D)
+-								if ((dm & (1 << d)) != 0)
+-								{
+-									xy += offset;
+-									if (!input.ContainsXY(xy))
+-										throw new ArgumentException("input should not link out of bounds");
+-									reverseDm = 1 << Direction.Reverse(d);
+-									return true;
+-								}
++			void TracePoints(int2 xy, int reverseDm)
++			{
++				var points = new List<int2>();
+ 
+-							return false;
++				bool AddPoint()
++				{
++					points.Add(xy);
++					var dm = links[xy] & ~reverseDm;
++					links[xy] = 0;
++					foreach (var (offset, d) in Direction.Spread8D)
++						if ((dm & (1 << d)) != 0)
++						{
++							xy += offset;
++							reverseDm = 1 << Direction.Reverse(d);
++							return true;
+ 						}
+ 
+-						while (AddPoint()) { }
++					return false;
++				}
++
++				while (AddPoint()) { }
++
++				pointArrays.Add(points.ToArray());
++				pointArrays.Add(points.Reverse<int2>().ToArray());
++			}
++
++			for (var sy = 0; sy < links.Size.Y; sy++)
++				for (var sx = 0; sx < links.Size.X; sx++)
++					if (Direction.FromMask(links[sx, sy]) != Direction.None)
++						TracePoints(new int2(sx, sy), 0);
+ 
+-						pointArrays.Add(points.ToArray());
++			// All non-loops have been removed, leaving only loops left.
++			for (var sy = 0; sy < links.Size.Y; sy++)
++				for (var sx = 0; sx < links.Size.X; sx++)
++					if (links[sx, sy] != 0)
++					{
++						// Choose direction with most-significant bit
++						var reverseDm = links[sx, sy] & (links[sx, sy] - 1);
++						TracePoints(new int2(sx, sy), reverseDm);
+ 					}
+-				}
+ 
+ 			return pointArrays.ToArray();
+ 		}
+ 
++		/// <summary>
++		/// Wrapper around DirectionMapToPaths which iteratively prunes stubs and short paths until
++		/// all paths are at least a minimumLength. Paths shorter than mimimumJunctionSeparation
++		/// sever their neighboring junctions instead of fusing them together.
++		/// </summary>
++		public static int2[][] DirectionMapToPathsWithPruning(
++			Matrix<byte> input,
++			int minimumLength,
++			int minimumJunctionSeparation,
++			bool preserveEdgePaths)
++		{
++			var links = input.Clone();
++			int2[][] pointArrays;
++
++			// Iteratively remove paths which are too short and merge remaining ones.
++			while (true)
++			{
++				RemoveStubsFromDirectionMapInPlace(links);
++				pointArrays = DirectionMapToPaths(links);
++
++				var removeablePointArrays = pointArrays;
++				if (preserveEdgePaths)
++					removeablePointArrays = pointArrays
++					.Where(a => !(links.IsEdge(a[0]) || links.IsEdge(a[^1])))
++					.ToArray();
++
++				if (removeablePointArrays.Length == 0)
++					return pointArrays;
++
++				var shortest = removeablePointArrays.Min(a => a.Length);
++
++				if (shortest >= minimumLength)
++					return pointArrays;
++
++				var toDelete = new List<int2>();
++				foreach (var pointArray in removeablePointArrays)
++					if (pointArray.Length == shortest)
++						foreach (var point in pointArray)
++						{
++							toDelete.Add(point);
++							if (pointArray.Length < minimumJunctionSeparation)
++								foreach (var (offset, d) in Direction.Spread8D)
++									if ((links[point] & (1 << d)) != 0)
++										toDelete.Add(point + offset);
++						}
++
++				foreach (var point in toDelete)
++					links[point] = 0;
++			}
++		}
++
+ 		/// <summary>
+ 		/// <para>
+ 		/// Given a set of point sequences and a stencil mask that defines permitted point positions,
+diff --git a/OpenRA.Mods.Common/MapGenerator/TilingPath.cs b/OpenRA.Mods.Common/MapGenerator/TilingPath.cs
+index 4658ee1546c3..153d596280fe 100644
+--- a/OpenRA.Mods.Common/MapGenerator/TilingPath.cs
++++ b/OpenRA.Mods.Common/MapGenerator/TilingPath.cs
+@@ -395,6 +395,9 @@ public CPos[] Tile(MersenneTwister random)
+ 					? forwardProgressLimit
+ 					: int.MinValue;
+ 
++			// Find the progress difference of two progress values. For loops high progress values
++			// wrap around to low ones. (Think of loops' progress like a 24 hour clock,
++			// where 22 -> 2 is a difference of 4, and 2 -> 22 is a difference of -4).
+ 			int Progress(int from, int to)
+ 			{
+ 				if (IsLoop)
+@@ -425,11 +428,24 @@ int Progress(int from, int to)
+ 
+ 				(int Low, int High) FindLowAndHigh(List<int> values)
+ 				{
+-					Debug.Assert(values.Count > 0, "No values");
++					if (values.Count == 0)
++						return (InvalidProgress, InvalidProgress);
++
+ 					if (values.Count == 1)
+ 						return (values[0], values[0]);
++
+ 					if (IsLoop)
+ 					{
++						// For loops, with a list of 2+ sorted progress values, there are 2 cases:
++						// - The values are spatially grouped, such that the values are contained
++						//   in under a half of the progress range, and the largest gap between
++						//   values is more than half of the progress range. This means that going
++						//   from before the gap to after it is an overall negative progress
++						//   change. (It must be the only negative progress change one as there can
++						//   only be one gap that is over half of the progress range.) In this
++						//   case, there is an obvious start and end to the group, with an overall
++						//   positive progress change.
++						// - The values are dispersed such that there is no obvious start or end.
+ 						if (Progress(values[^1], values[0]) < 0)
+ 							return (values[0], values[^1]);
+ 						for (var i = 0; i < values.Count - 1; i++)
+@@ -459,9 +475,8 @@ int Progress(int from, int to)
+ 
+ 					lows.Clear();
+ 					highs.Clear();
+-					for (var i = 0; i < 8; i++)
++					foreach (var offset in Direction.Spread8)
+ 					{
+-						var offset = Direction.Spread8[i];
+ 						var neighbor = xy + offset;
+ 						if (!deviations.ContainsXY(neighbor) ||
+ 							deviations[neighbor] >= deviation ||
+@@ -839,12 +854,19 @@ public TilingPath InertiallyExtend(int extensionLength, int inertialRange)
+ 		/// <summary>
+ 		/// Extend the start and end of a path by extensionLength points. The directions of the
+ 		/// extensions are based on the overall direction of the outermost inertialRange points.
++		/// Loops are left unmodified.
+ 		/// </summary>
+ 		public static CPos[] InertiallyExtendPathPoints(CPos[] points, int extensionLength, int inertialRange)
+ 		{
+ 			if (points == null)
+ 				return null;
+ 
++			if (points[0] == points[^1])
++			{
++				// Is a loop.
++				return points;
++			}
++
+ 			if (inertialRange > points.Length - 1)
+ 				inertialRange = points.Length - 1;
+ 			var sd = Direction.FromCVecNonDiagonal(points[inertialRange] - points[0]);
+@@ -1107,6 +1129,9 @@ public TilingPath ChirallyNormalize(Func<CPos, WVec> measureFromCenter)
+ 		/// Normalized but opposing paths rotate around the center in the same direction.
+ 		/// </para>
+ 		/// <para>
++		/// Loops are normalized to rotate in a consistent direction, regardless of position.
++		/// </para>
++		/// <para>
+ 		/// The measureFromCenter function must convert CVec positions to WVec offsets from the map
+ 		/// center.
+ 		/// </para>
+@@ -1122,33 +1147,55 @@ public static CPos[] ChirallyNormalizePathPoints(CPos[] points, Func<CPos, WVec>
+ 
+ 			if (start == end)
+ 			{
+-				// Is loop
+-				start = points[1];
+-				end = points[^2];
+-			}
++				// Is a loop.
++				// Find the top-left-most corner point (on the convex hull) and
++				// sample which way the points are bending.
++				var topLeftIndex = 0;
++				var topLeftPoint = points[0];
++				for (var i = 1; i < points.Length; i++)
++				{
++					var point = points[i];
++					if (point.Y < topLeftPoint.Y || (point.Y == topLeftPoint.Y && point.X < topLeftPoint.X))
++					{
++						topLeftIndex = i;
++						topLeftPoint = point;
++					}
++				}
+ 
+-			bool ShouldReverse(CPos start, CPos end)
+-			{
+-				var v1 = measureFromCenter(start);
+-				var v2 = measureFromCenter(end);
+-
+-				// Rotation around center?
+-				var crossProd = v1.X * v2.Y - v2.X * v1.Y;
+-				if (crossProd != 0)
+-					return crossProd < 0;
+-
+-				// Distance from center?
+-				var r1 = v1.X * v1.X + v1.Y * v1.Y;
+-				var r2 = v2.X * v2.X + v2.Y * v2.Y;
+-				if (r1 != r2)
+-					return r1 < r2;
+-
+-				// Absolute angle
+-				return v1.Y == v2.Y ? v1.X > v2.X : v1.Y > v2.Y;
++				var inOffset = points[topLeftIndex] - points[(topLeftIndex + points.Length - 1) % points.Length];
++				var outOffset = points[(topLeftIndex + points.Length + 1) % points.Length] - points[topLeftIndex];
++				var crossProd = inOffset.X * outOffset.Y - inOffset.Y * outOffset.X;
++
++				// crossProd should never be 0 for a valid input.
++				if (crossProd < 0)
++					Array.Reverse(normalized);
+ 			}
++			else
++			{
++				// Is not a loop.
++				bool ShouldReverse(CPos start, CPos end)
++				{
++					var v1 = measureFromCenter(start);
++					var v2 = measureFromCenter(end);
++
++					// Rotation around center?
++					var crossProd = v1.X * v2.Y - v2.X * v1.Y;
++					if (crossProd != 0)
++						return crossProd < 0;
++
++					// Distance from center?
++					var r1 = v1.X * v1.X + v1.Y * v1.Y;
++					var r2 = v2.X * v2.X + v2.Y * v2.Y;
++					if (r1 != r2)
++						return r1 < r2;
++
++					// Absolute angle
++					return v1.Y == v2.Y ? v1.X > v2.X : v1.Y > v2.Y;
++				}
+ 
+-			if (ShouldReverse(start, end))
+-				Array.Reverse(normalized);
++				if (ShouldReverse(start, end))
++					Array.Reverse(normalized);
++			}
+ 
+ 			return normalized;
+ 		}
+@@ -1191,5 +1238,42 @@ public static CPos[][] RetainDisjointPaths(IEnumerable<CPos[]> inputs)
+ 
+ 			return outputs.ToArray();
+ 		}
++
++		/// <summary>Nullify the path's points if they aren't suitable for tiling.</summary>
++		public TilingPath RetainIfValid()
++		{
++			if (!ValidatePathPoints(Points))
++				Points = null;
++
++			return this;
++		}
++
++		public static bool ValidatePathPoints(CPos[] points)
++		{
++			if (points == null || points.Length == 0)
++				return false;
++
++			var isLoop = points[0] == points[^1];
++
++			if (points.Length < (isLoop ? 3 : 2))
++				return false;
++
++			// Duplicate points check
++			if (points.Distinct().Count() != points.Length - (isLoop ? 1 : 0))
++				return false;
++
++			// All steps must be (non-diagonal) unit offsets.
++			var lastPoint = points[0];
++			for (var i = 1; i < points.Length; i++)
++			{
++				var offset = lastPoint - points[i];
++				if (Direction.ToCVec(Direction.FromCVecNonDiagonal(offset)) != offset)
++					return false;
++
++				lastPoint = points[i];
++			}
++
++			return true;
++		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+index f9d237e82f50..4b47af9d6e91 100644
+--- a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
++++ b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+@@ -1037,7 +1037,12 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 			{
+ 				var space = new CellLayer<bool>(map);
+ 				foreach (var mpos in map.AllCells.MapCoords)
+-					space[mpos] = playableArea[mpos] && param.ClearTerrain.Contains(tileset.GetTerrainIndex(map.Tiles[mpos]));
++					space[mpos] = param.ClearTerrain.Contains(tileset.GetTerrainIndex(map.Tiles[mpos]));
++
++				foreach (var actorPlan in actorPlans)
++					foreach (var (cpos, _) in actorPlan.Footprint())
++						if (space.Contains(cpos))
++							space[cpos] = false;
+ 
+ 				// Improve symmetry.
+ 				{
+@@ -1052,7 +1057,14 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					space = newSpace;
+ 				}
+ 
+-				var matrixSpace = CellLayerUtils.ToMatrix(space, false);
++				// TODO: Move to configuration
++				const int RoadStraightenShrink = 4;
++				const int RoadStraightenGrow = 2;
++				const int RoadMinimumShrinkLength = 12;
++				const int RoadInertialRange = 8;
++				var roadTotalShrink = RoadStraightenShrink + param.RoadShrink;
++
++				var matrixSpace = CellLayerUtils.ToMatrix(space, true);
+ 				var kernel = new Matrix<bool>(param.RoadSpacing * 2 + 1, param.RoadSpacing * 2 + 1);
+ 				MatrixUtils.OverCircle(
+ 					matrix: kernel,
+@@ -1065,30 +1077,50 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					kernel,
+ 					new int2(param.RoadSpacing, param.RoadSpacing),
+ 					false);
+-				var deflated = MatrixUtils.DeflateSpace(dilated, false);
+-				var matrixPointArrays = MatrixUtils.DirectionMapToPaths(deflated);
++				var deflated = MatrixUtils.DeflateSpace(dilated, true);
++				var matrixPointArrays = MatrixUtils.DirectionMapToPathsWithPruning(
++					input: deflated,
++					minimumLength: 20 + 2 * param.RoadShrink,
++					minimumJunctionSeparation: 6,
++					preserveEdgePaths: true);
+ 				var pointArrays = CellLayerUtils.FromMatrixPoints(matrixPointArrays, space);
+ 				pointArrays = TilingPath.RetainDisjointPaths(pointArrays);
+ 
+-				var roadPermittedTemplates =
++				var nonLoopedRoadPermittedTemplates =
+ 					TilingPath.PermittedSegments.FromInnerAndTerminalTypes(
+ 						tileset, param.RoadSegmentTypes, param.ClearSegmentTypes);
++				var loopedRoadPermittedTemplates =
++					TilingPath.PermittedSegments.FromType(
++						tileset, param.RoadSegmentTypes);
+ 
+ 				foreach (var pointArray in pointArrays)
+ 				{
+-					// Currently, never looped.
+-					var path = new TilingPath(
+-						map,
+-						pointArray,
+-						param.RoadSpacing - 1,
+-						param.ClearSegmentTypes[0],
+-						param.ClearSegmentTypes[0],
+-						roadPermittedTemplates);
++					var isLoop = pointArray[0] == pointArray[^1];
++					TilingPath path;
++					if (isLoop)
++						path = new TilingPath(
++							map,
++							pointArray,
++							param.RoadSpacing - 1,
++							param.RoadSegmentTypes[0],
++							param.RoadSegmentTypes[0],
++							loopedRoadPermittedTemplates);
++					else
++						path = new TilingPath(
++							map,
++							pointArray,
++							param.RoadSpacing - 1,
++							param.ClearSegmentTypes[0],
++							param.ClearSegmentTypes[0],
++							nonLoopedRoadPermittedTemplates);
++
+ 					path
+ 						.ChirallyNormalize(cvec => CellLayerUtils.CornerToWPos(cvec, gridType) - wMapCenter)
+-						.Shrink(4 + param.RoadShrink, 12)
+-						.InertiallyExtend(2, 8)
+-						.ExtendEdge(4);
++						.ExtendEdge(2 * roadTotalShrink + RoadMinimumShrinkLength)
++						.Shrink(roadTotalShrink, RoadMinimumShrinkLength)
++						.InertiallyExtend(RoadStraightenGrow, RoadInertialRange)
++						.OptimizeLoop()
++						.RetainIfValid();
+ 
+ 					// Shrinking may have deleted the path.
+ 					if (path.Points == null)

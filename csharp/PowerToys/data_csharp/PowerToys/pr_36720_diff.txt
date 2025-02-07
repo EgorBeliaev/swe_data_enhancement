@@ -1,0 +1,373 @@
+diff --git a/src/common/SettingsAPI/FileWatcher.h b/src/common/SettingsAPI/FileWatcher.h
+index 073a33a0c81c..5ac2a55f0ef8 100644
+--- a/src/common/SettingsAPI/FileWatcher.h
++++ b/src/common/SettingsAPI/FileWatcher.h
+@@ -9,6 +9,9 @@
+ #include <string>
+ #include <functional>
+ 
++#include <wil/resource.h>
++#include <wil/filesystem.h>
++
+ class FileWatcher
+ {
+     std::wstring m_path;
+diff --git a/src/common/SettingsAPI/pch.h b/src/common/SettingsAPI/pch.h
+index 86f6eff28321..8644dfaaafc0 100644
+--- a/src/common/SettingsAPI/pch.h
++++ b/src/common/SettingsAPI/pch.h
+@@ -10,4 +10,3 @@
+ #include <fstream>
+ 
+ #include <common/logger/logger.h>
+-#include <wil/filesystem.h>
+diff --git a/src/common/notifications/NotificationUtil.cpp b/src/common/notifications/NotificationUtil.cpp
+new file mode 100644
+index 000000000000..082b11a23d5e
+--- /dev/null
++++ b/src/common/notifications/NotificationUtil.cpp
+@@ -0,0 +1,56 @@
++#include "pch.h"
++#include "NotificationUtil.h"
++
++#include <common/notifications/notifications.h>
++#include <common/notifications/dont_show_again.h>
++#include <common/utils/resources.h>
++#include <common/SettingsAPI/settings_helpers.h>
++
++// Non-Localizable strings
++namespace NonLocalizable
++{
++    const wchar_t RunAsAdminInfoPage[] = L"https://aka.ms/powertoysDetectedElevatedHelp";
++    const wchar_t ToastNotificationButtonUrl[] = L"powertoys://cant_drag_elevated_disable/";
++}
++
++namespace notifications
++{
++    NotificationUtil::NotificationUtil()
++    {
++        ReadSettings();
++        auto settingsFileName = PTSettingsHelper::get_powertoys_general_save_file_location();
++
++        m_settingsFileWatcher = std::make_unique<FileWatcher>(settingsFileName, [this]() {
++            ReadSettings();
++        });
++    }
++
++    NotificationUtil::~NotificationUtil()
++    {
++        m_settingsFileWatcher.reset();
++    }
++
++    void NotificationUtil::WarnIfElevationIsRequired(std::wstring title, std::wstring message, std::wstring button1, std::wstring button2)
++    {
++        if (m_warningsElevatedApps && !m_warningShown && !is_toast_disabled(ElevatedDontShowAgainRegistryPath, ElevatedDisableIntervalInDays))
++        {
++            std::vector<action_t> actions = {
++                link_button{ button1, NonLocalizable::RunAsAdminInfoPage },
++                link_button{ button2, NonLocalizable::ToastNotificationButtonUrl }
++            };
++
++            show_toast_with_activations(message,
++                                        title,
++                                        {},
++                                        std::move(actions));
++
++            m_warningShown = true;
++        }
++    }
++
++    void NotificationUtil::ReadSettings()
++    {
++        auto settings = PTSettingsHelper::load_general_settings();
++        m_warningsElevatedApps = settings.GetNamedBoolean(L"enable_warnings_elevated_apps", true);
++    }
++}
+diff --git a/src/common/notifications/NotificationUtil.h b/src/common/notifications/NotificationUtil.h
+index 8fcf3d91d8c3..736eabaf0c7d 100644
+--- a/src/common/notifications/NotificationUtil.h
++++ b/src/common/notifications/NotificationUtil.h
+@@ -1,40 +1,22 @@
+ #pragma once
+ 
+-#include <common/notifications/notifications.h>
+-#include <common/notifications/dont_show_again.h>
+-#include <common/utils/resources.h>
+-#include <common/SettingsAPI/settings_helpers.h>
+-
+-#include "Generated Files/resource.h"
++#include <common/SettingsAPI/FileWatcher.h>
+ 
+ namespace notifications
+ {
+-    // Non-Localizable strings
+-    namespace NonLocalizable
++    class NotificationUtil
+     {
+-        const wchar_t RunAsAdminInfoPage[] = L"https://aka.ms/powertoysDetectedElevatedHelp";
+-        const wchar_t ToastNotificationButtonUrl[] = L"powertoys://cant_drag_elevated_disable/";
+-    }
++    public:
++        NotificationUtil();
++        ~NotificationUtil();
+ 
+-    inline void WarnIfElevationIsRequired(std::wstring title, std::wstring message, std::wstring button1, std::wstring button2)
+-    {
+-        using namespace NonLocalizable;
++        void WarnIfElevationIsRequired(std::wstring title, std::wstring message, std::wstring button1, std::wstring button2);
+ 
+-        auto settings = PTSettingsHelper::load_general_settings();
+-        auto enableWarningsElevatedApps = settings.GetNamedBoolean(L"enable_warnings_elevated_apps", true);
++    private:
++        std::unique_ptr<FileWatcher> m_settingsFileWatcher;
++        bool m_warningsElevatedApps;
++        bool m_warningShown = false;
+ 
+-        static bool warning_shown = false;
+-        if (enableWarningsElevatedApps && !warning_shown && !is_toast_disabled(ElevatedDontShowAgainRegistryPath, ElevatedDisableIntervalInDays))
+-        {
+-            std::vector<action_t> actions = {
+-                link_button{ button1, RunAsAdminInfoPage },
+-                link_button{ button2, ToastNotificationButtonUrl }
+-            };
+-            show_toast_with_activations(message,
+-                                        title,
+-                                        {},
+-                                        std::move(actions));
+-            warning_shown = true;
+-        }
+-    }
+-}
+\ No newline at end of file
++        void ReadSettings();
++    };
++}
+diff --git a/src/common/notifications/notifications.vcxproj b/src/common/notifications/notifications.vcxproj
+index 8c6808cf6c9e..b55d67e7b344 100644
+--- a/src/common/notifications/notifications.vcxproj
++++ b/src/common/notifications/notifications.vcxproj
+@@ -27,13 +27,14 @@
+   </ItemDefinitionGroup>
+   <ItemGroup>
+     <ClInclude Include="notifications.h" />
+-    <ClInclude Include="NotificationUtil.h" />
+     <ClInclude Include="dont_show_again.h" />
++    <ClInclude Include="NotificationUtil.h" />
+     <ClInclude Include="pch.h" />
+   </ItemGroup>
+   <ItemGroup>
+     <ClCompile Include="dont_show_again.cpp" />
+     <ClCompile Include="notifications.cpp" />
++    <ClCompile Include="NotificationUtil.cpp" />
+     <ClCompile Include="pch.cpp">
+       <PrecompiledHeader Condition="'$(UsePrecompiledHeaders)' != 'false'">Create</PrecompiledHeader>
+     </ClCompile>
+diff --git a/src/modules/Workspaces/WorkspacesSnapshotTool/SnapshotUtils.cpp b/src/modules/Workspaces/WorkspacesSnapshotTool/SnapshotUtils.cpp
+index ddbf0f3cf780..daf9ed0f88d0 100644
+--- a/src/modules/Workspaces/WorkspacesSnapshotTool/SnapshotUtils.cpp
++++ b/src/modules/Workspaces/WorkspacesSnapshotTool/SnapshotUtils.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <common/utils/elevation.h>
+ #include <common/utils/process_path.h>
++#include <common/utils/resources.h>
+ #include <common/notifications/NotificationUtil.h>
+ 
+ #include <workspaces-common/WindowEnumerator.h>
+@@ -11,6 +12,8 @@
+ #include <WorkspacesLib/AppUtils.h>
+ #include <WorkspacesLib/PwaHelper.h>
+ 
++#include "Generated Files/resource.h"
++
+ #pragma comment(lib, "ntdll.lib")
+ 
+ namespace SnapshotUtils
+@@ -73,10 +76,12 @@ namespace SnapshotUtils
+                 // Notify the user that running as admin is required to process elevated windows.
+                 if (!is_process_elevated() && IsProcessElevated(pid))
+                 {
+-                    notifications::WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_PROJECTS),
+-                                                             GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED),
+-                                                             GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_LEARN_MORE),
+-                                                             GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
++                    auto notificationUtil = std::make_unique<notifications::NotificationUtil>();
++
++                    notificationUtil->WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_PROJECTS),
++                                                                GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED),
++                                                                GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_LEARN_MORE),
++                                                                GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
+                 }
+ 
+                 continue;
+diff --git a/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.cpp b/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.cpp
+index 491a0bdf4272..8287ee1cced8 100644
+--- a/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.cpp
++++ b/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.cpp
+@@ -9,7 +9,6 @@
+ #include <common/utils/process_path.h>
+ 
+ #include <common/utils/elevation.h>
+-#include <common/notifications/NotificationUtil.h>
+ #include <Generated Files/resource.h>
+ 
+ #include <interop/shared_constants.h>
+@@ -36,7 +35,8 @@ AlwaysOnTop::AlwaysOnTop(bool useLLKH, DWORD mainThreadId) :
+     SettingsObserver({SettingId::FrameEnabled, SettingId::Hotkey, SettingId::ExcludeApps}),
+     m_hinstance(reinterpret_cast<HINSTANCE>(&__ImageBase)),
+     m_useCentralizedLLKH(useLLKH),
+-    m_mainThreadId(mainThreadId)
++    m_mainThreadId(mainThreadId),
++    m_notificationUtil(std::make_unique<notifications::NotificationUtil>())
+ {
+     s_instance = this;
+     DPIAware::EnableDPIAwarenessForThisProcess();
+@@ -64,6 +64,7 @@ AlwaysOnTop::AlwaysOnTop(bool useLLKH, DWORD mainThreadId) :
+ AlwaysOnTop::~AlwaysOnTop()
+ {
+     m_running = false;
++    m_notificationUtil.reset();
+ 
+     if (m_hPinEvent)
+     {
+@@ -509,7 +510,10 @@ void AlwaysOnTop::HandleWinHookEvent(WinHookEvent* data) noexcept
+     {
+         if (!is_process_elevated() && IsProcessOfWindowElevated(data->hwnd))
+         {
+-            notifications::WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_ALWAYSONTOP), GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED), GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_LEARN_MORE), GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
++            m_notificationUtil->WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_ALWAYSONTOP),
++                                                          GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED),
++                                                          GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_LEARN_MORE),
++                                                          GET_RESOURCE_STRING(IDS_SYSTEM_FOREGROUND_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
+         }
+         RefreshBorders();
+     }
+diff --git a/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.h b/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.h
+index da14d508b2c1..0505c837a282 100644
+--- a/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.h
++++ b/src/modules/alwaysontop/AlwaysOnTop/AlwaysOnTop.h
+@@ -9,6 +9,7 @@
+ #include <WindowBorder.h>
+ 
+ #include <common/hooks/WinHookEvent.h>
++#include <common/notifications/NotificationUtil.h>
+ 
+ class AlwaysOnTop : public SettingsObserver
+ {
+@@ -53,6 +54,7 @@ class AlwaysOnTop : public SettingsObserver
+     std::thread m_thread;
+     const bool m_useCentralizedLLKH;
+     bool m_running = true;
++    std::unique_ptr<notifications::NotificationUtil> m_notificationUtil;
+ 
+     LRESULT WndProc(HWND, UINT, WPARAM, LPARAM) noexcept;
+     void HandleWinHookEvent(WinHookEvent* data) noexcept;
+diff --git a/src/modules/fancyzones/FancyZonesLib/FancyZones.cpp b/src/modules/fancyzones/FancyZonesLib/FancyZones.cpp
+index d0839f2844d8..1956c57a97fb 100644
+--- a/src/modules/fancyzones/FancyZonesLib/FancyZones.cpp
++++ b/src/modules/fancyzones/FancyZonesLib/FancyZones.cpp
+@@ -7,6 +7,7 @@
+ #include <common/utils/EventWaiter.h>
+ #include <common/utils/winapi_error.h>
+ #include <common/SettingsAPI/FileWatcher.h>
++#include <common/notifications/NotificationUtil.h>
+ 
+ #include <FancyZonesLib/DraggingState.h>
+ #include <FancyZonesLib/EditorParameters.h>
+@@ -185,6 +186,8 @@ struct FancyZones : public winrt::implements<FancyZones, IFancyZones, IFancyZone
+ 
+     EventWaiter m_toggleEditorEventWaiter;
+ 
++    std::unique_ptr<notifications::NotificationUtil> m_notificationUtil;
++
+     // If non-recoverable error occurs, trigger disabling of entire FancyZones.
+     static std::function<void()> disableModuleCallback;
+ 
+@@ -266,6 +269,8 @@ FancyZones::Run() noexcept
+         }
+     });
+ 
++    m_notificationUtil = std::make_unique<notifications::NotificationUtil>();
++
+     SyncVirtualDesktops();
+ 
+     // id format of applied-layouts and app-zone-history was changed in 0.60
+@@ -288,6 +293,8 @@ FancyZones::Destroy() noexcept
+         m_window = nullptr;
+     }
+ 
++    m_notificationUtil.reset();
++
+     CoUninitialize();
+ }
+ 
+@@ -302,7 +309,7 @@ FancyZones::VirtualDesktopChanged() noexcept
+ 
+ void FancyZones::MoveSizeStart(HWND window, HMONITOR monitor)
+ {
+-    m_windowMouseSnapper = WindowMouseSnap::Create(window, m_workAreaConfiguration.GetAllWorkAreas());
++    m_windowMouseSnapper = WindowMouseSnap::Create(window, m_workAreaConfiguration.GetAllWorkAreas(), m_notificationUtil.get());
+     if (m_windowMouseSnapper)
+     {
+         if (FancyZonesSettings::settings().spanZonesAcrossMonitors)
+diff --git a/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.cpp b/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.cpp
+index e127371347fb..eb2a431313e5 100644
+--- a/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.cpp
++++ b/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.cpp
+@@ -11,7 +11,7 @@
+ #include <FancyZonesLib/trace.h>
+ 
+ #include <common/utils/elevation.h>
+-#include <common/notifications/NotificationUtil.h>
++#include <common/utils/resources.h>
+ 
+ WindowMouseSnap::WindowMouseSnap(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas) :
+     m_window(window),
+@@ -27,7 +27,7 @@ WindowMouseSnap::~WindowMouseSnap()
+     ResetWindowTransparency();
+ }
+ 
+-std::unique_ptr<WindowMouseSnap> WindowMouseSnap::Create(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas)
++std::unique_ptr<WindowMouseSnap> WindowMouseSnap::Create(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas, notifications::NotificationUtil* notificationUtil)
+ {
+     if (FancyZonesWindowUtils::IsCursorTypeIndicatingSizeEvent() || !FancyZonesWindowProcessing::IsProcessableManually(window))
+     {
+@@ -36,8 +36,15 @@ std::unique_ptr<WindowMouseSnap> WindowMouseSnap::Create(HWND window, const std:
+ 
+     if (!is_process_elevated() && IsProcessOfWindowElevated(window))
+     {
+-        // Notifies user if unable to drag elevated window
+-        notifications::WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_FANCYZONES), GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED), GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED_LEARN_MORE), GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
++        if (notificationUtil != nullptr)
++        {
++            // Notifies user if unable to drag elevated window
++            notificationUtil->WarnIfElevationIsRequired(GET_RESOURCE_STRING(IDS_FANCYZONES),
++                                                        GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED),
++                                                        GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED_LEARN_MORE),
++                                                        GET_RESOURCE_STRING(IDS_CANT_DRAG_ELEVATED_DIALOG_DONT_SHOW_AGAIN));
++        }
++
+         return nullptr;
+     }
+ 
+diff --git a/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.h b/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.h
+index cf8f2615ac2a..e7e5365b19d9 100644
+--- a/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.h
++++ b/src/modules/fancyzones/FancyZonesLib/WindowMouseSnap.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <FancyZonesLib/HighlightedZones.h>
++#include <common/notifications/NotificationUtil.h>
+ 
+ class WorkArea;
+ 
+@@ -9,7 +10,7 @@ class WindowMouseSnap
+     WindowMouseSnap(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas);
+ 
+ public:
+-    static std::unique_ptr<WindowMouseSnap> Create(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas);
++    static std::unique_ptr<WindowMouseSnap> Create(HWND window, const std::unordered_map<HMONITOR, std::unique_ptr<WorkArea>>& activeWorkAreas, notifications::NotificationUtil* notificationUtil);
+     ~WindowMouseSnap();
+ 
+     bool MoveSizeStart(HMONITOR monitor, bool isSnapping);

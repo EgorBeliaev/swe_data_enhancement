@@ -1,0 +1,177 @@
+diff --git a/website/client/src/components/settings/site.vue b/website/client/src/components/settings/site.vue
+index f05282cd01d..60c137e67cf 100644
+--- a/website/client/src/components/settings/site.vue
++++ b/website/client/src/components/settings/site.vue
+@@ -144,22 +144,6 @@
+             >{{ $t('startAdvCollapsed') }}</span>
+           </label>
+         </div>
+-        <div class="checkbox">
+-          <label>
+-            <input
+-              v-model="user.preferences.dailyDueDefaultView"
+-              type="checkbox"
+-              class="mr-2"
+-              @change="set('dailyDueDefaultView')"
+-            >
+-            <span
+-              class="hint"
+-              popover-trigger="mouseenter"
+-              popover-placement="right"
+-              :popover="$t('dailyDueDefaultViewPop')"
+-            >{{ $t('dailyDueDefaultView') }}</span>
+-          </label>
+-        </div>
+         <div
+           v-if="party.memberCount === 1"
+           class="checkbox"
+diff --git a/website/client/src/components/tasks/column.vue b/website/client/src/components/tasks/column.vue
+index 3cae7ba8ed7..50db8b8fddc 100644
+--- a/website/client/src/components/tasks/column.vue
++++ b/website/client/src/components/tasks/column.vue
+@@ -520,7 +520,12 @@ export default {
+     // Get Category Filter Labels
+     this.typeFilters = getFilterLabels(this.type, this.challenge);
+     // Set default filter for task column
+-    this.activateFilter(this.type);
++
++    if (this.challenge) {
++      this.activateFilter(this.type);
++    } else {
++      this.activateFilter(this.type, this.user.preferences.tasks.activeFilter[this.type], true);
++    }
+   },
+   mounted () {
+     this.setColumnBackgroundVisibility();
+@@ -656,7 +661,7 @@ export default {
+     taskSummary (task) {
+       this.$emit('taskSummary', task);
+     },
+-    activateFilter (type, filter = '') {
++    activateFilter (type, filter = '', skipSave = false) {
+       // Needs a separate API call as this data may not reside in store
+       if (type === 'todo' && filter === 'complete2') {
+         if (this.group && this.group._id) {
+@@ -672,14 +677,16 @@ export default {
+       // as default filter for daily
+       // and set the filter as 'due' only when the component first
+       // loads and not on subsequent reloads.
+-      if (
+-        type === 'daily' && filter === '' && !this.challenge
+-        && this.user.preferences.dailyDueDefaultView
+-      ) {
++      if (type === 'daily' && filter === '' && !this.challenge) {
+         filter = 'due'; // eslint-disable-line no-param-reassign
+       }
+ 
+       this.activeFilter = getActiveFilter(type, filter, this.challenge);
++
++      if (!skipSave && !this.challenge) {
++        const propertyToUpdate = `preferences.tasks.activeFilter.${type}`;
++        this.$store.dispatch('user:set', { [propertyToUpdate]: filter });
++      }
+     },
+     setColumnBackgroundVisibility () {
+       this.$nextTick(() => {
+diff --git a/website/client/tests/unit/components/tasks/column.spec.js b/website/client/tests/unit/components/tasks/column.spec.js
+index 2fbea418ef1..a44bf4be4d9 100644
+--- a/website/client/tests/unit/components/tasks/column.spec.js
++++ b/website/client/tests/unit/components/tasks/column.spec.js
+@@ -21,6 +21,18 @@ describe('Task Column', () => {
+         getters: {
+           'tasks:getFilteredTaskList': () => [],
+         },
++
++        state: {
++          user: {
++            data: {
++              preferences: {
++                tasks: {
++                  activeFilter: {},
++                },
++              },
++            },
++          },
++        },
+       },
+       mocks,
+       stubs,
+@@ -76,7 +88,20 @@ describe('Task Column', () => {
+         'tasks:getFilteredTaskList': () => () => habits,
+       };
+ 
+-      const store = new Store({ getters });
++      const store = new Store({
++        getters,
++        state: {
++          user: {
++            data: {
++              preferences: {
++                tasks: {
++                  activeFilter: {},
++                },
++              },
++            },
++          },
++        },
++      });
+ 
+       wrapper = makeWrapper({ store });
+     });
+diff --git a/website/client/tests/unit/components/tasks/task.spec.js b/website/client/tests/unit/components/tasks/task.spec.js
+index 9349d7ea2fd..bba52c2e41f 100644
+--- a/website/client/tests/unit/components/tasks/task.spec.js
++++ b/website/client/tests/unit/components/tasks/task.spec.js
+@@ -22,7 +22,13 @@ describe('Task', () => {
+         state: {
+           user: {
+             data: {
+-              preferences: {},
++              preferences: {
++                tasks: {
++                  activeFilter: {
++
++                  },
++                },
++              },
+               ...additionalUserData,
+             },
+           },
+diff --git a/website/common/locales/en/settings.json b/website/common/locales/en/settings.json
+index 3c93d6c000b..7dba6eca244 100644
+--- a/website/common/locales/en/settings.json
++++ b/website/common/locales/en/settings.json
+@@ -5,8 +5,6 @@
+     "helpWithTranslation": "Would you like to help with the translation of Habitica? Great! Then visit <a href=\"/groups/guild/7732f64c-33ee-4cce-873c-fc28f147a6f7\">the Aspiring Linguists Guild</a>!",
+     "stickyHeader": "Sticky header",
+     "newTaskEdit": "Open new tasks in edit mode",
+-    "dailyDueDefaultView": "Set Dailies default to 'due' tab",
+-    "dailyDueDefaultViewPop": "With this option set, the Dailies tasks will default to 'due' instead of 'all'",
+     "reverseChatOrder": "Show chat messages in reverse order",
+     "startAdvCollapsed": "Advanced Settings in tasks start collapsed",
+     "startAdvCollapsedPop": "With this option set, Advanced Settings will be hidden when you first open a task for editing.",
+diff --git a/website/server/models/user/schema.js b/website/server/models/user/schema.js
+index 7c9ab11a590..c93ed2e9d6e 100644
+--- a/website/server/models/user/schema.js
++++ b/website/server/models/user/schema.js
+@@ -532,6 +532,7 @@ export default new Schema({
+     stickyHeader: { $type: Boolean, default: true },
+     disableClasses: { $type: Boolean, default: false },
+     newTaskEdit: { $type: Boolean, default: false },
++    // not used anymore, now the current filter is saved in preferences.activeFilter
+     dailyDueDefaultView: { $type: Boolean, default: false },
+     advancedCollapsed: { $type: Boolean, default: false },
+     toolbarCollapsed: { $type: Boolean, default: false },
+@@ -592,6 +593,12 @@ export default new Schema({
+       mirrorGroupTasks: [
+         { $type: String, validate: [v => validator.isUUID(v), 'Invalid group UUID.'], ref: 'Group' },
+       ],
++      activeFilter: {
++        habit: { $type: String, default: 'all' },
++        daily: { $type: String, default: 'all' },
++        todo: { $type: String, default: 'remaining' },
++        reward: { $type: String, default: 'all' },
++      },
+     },
+     improvementCategories: {
+       $type: Array,

@@ -1,0 +1,1306 @@
+diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+index bcc82a30..90bfec37 100644
+--- a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
++++ b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+@@ -3,6 +3,7 @@
+ using System.Collections.Generic;
+ using System.Text.Json.Serialization;
+ using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.AutoFight;
+ 
+ namespace BetterGenshinImpact.Core.Config;
+ 
+@@ -67,7 +68,14 @@ public partial class PathingPartyConfig : ObservableObject
+     // 启用进入剧情自动脱离
+     [ObservableProperty]
+     private bool _autoSkipEnabled = true;
+-    
++
++    //启用自动战斗配置
++    [ObservableProperty]
++    private bool _autoFightEabled = false;
++
++    [ObservableProperty]
++    private AutoFightConfig _autoFightConfig = new();
++
+     public static PathingPartyConfig BuildDefault()
+     {
+         // 即便是不启用的情况下也设置默认值，减少后续使用的判断
+diff --git a/BetterGenshinImpact/Core/Script/Dependence/Dispatcher.cs b/BetterGenshinImpact/Core/Script/Dependence/Dispatcher.cs
+index 19764bc2..4bdfa8e3 100644
+--- a/BetterGenshinImpact/Core/Script/Dependence/Dispatcher.cs
++++ b/BetterGenshinImpact/Core/Script/Dependence/Dispatcher.cs
+@@ -82,11 +82,7 @@ public async Task RunTask(SoloTask soloTask)
+                     return;
+                 }
+                 var autoFightConfig = TaskContext.Instance().Config.AutoFightConfig;
+-                var param = new AutoFightParam(path1)
+-                {
+-                    FightFinishDetectEnabled = autoFightConfig.FightFinishDetectEnabled,
+-                    PickDropsAfterFightEnabled = autoFightConfig.PickDropsAfterFightEnabled
+-                };
++                var param = new AutoFightParam(path1, autoFightConfig);
+                 await new AutoFightTask(param).Start(CancellationContext.Instance.Cts.Token);
+                 break;
+ 
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightConfig.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightConfig.cs
+index 585cbc37..aab0ba68 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightConfig.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightConfig.cs
+@@ -27,4 +27,22 @@ public partial class AutoFightConfig : ObservableObject
+     /// </summary>
+     [ObservableProperty]
+     private bool _pickDropsAfterFightEnabled = true;
++
++    /// <summary>
++    /// 战斗超时，单位秒
++    /// </summary>
++    [ObservableProperty]
++    private int _timeout = 120;
++
++    /// <summary>
++    /// 判断战斗结束读条颜色，不同帧率可能下会有些不同，默认为95,235,255
++    /// </summary>
++    [ObservableProperty]
++    private string _battleEndProgressBarColor = "";
++
++    /// <summary>
++    /// 对于上方颜色地偏差值，即±某个值，例如 6或6,6,6，前者表示所有偏差值都一样，后者则可以分别设置
++    /// </summary>
++    [ObservableProperty]
++    private string _battleEndProgressBarColorTolerance = "";
+ }
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+index 47da06ed..ec801f0a 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+@@ -2,11 +2,37 @@
+ 
+ namespace BetterGenshinImpact.GameTask.AutoFight;
+ 
+-public class AutoFightParam(string path) : BaseTaskParam
++public class AutoFightParam : BaseTaskParam
+ {
+-    public string CombatStrategyPath { get; set; } = path;
++    public AutoFightParam(string path, AutoFightConfig autoFightConfig)
++    {
++        CombatStrategyPath = path;
++        Timeout = autoFightConfig.Timeout;
++        FightFinishDetectEnabled = autoFightConfig.FightFinishDetectEnabled;
++        PickDropsAfterFightEnabled = autoFightConfig.PickDropsAfterFightEnabled;
++
++        //下面参数固定，只取自动战斗里面的
++        autoFightConfig = TaskContext.Instance().Config.AutoFightConfig;
++        BattleEndProgressBarColor = autoFightConfig.BattleEndProgressBarColor;
++        BattleEndProgressBarColorTolerance = autoFightConfig.BattleEndProgressBarColorTolerance;
++    }
++
++    public AutoFightParam(string path)
++    {
++        CombatStrategyPath = path;
++    }
++
++    public string CombatStrategyPath { get; set; }
+ 
+     public bool FightFinishDetectEnabled { get; set; } = false;
+ 
+     public bool PickDropsAfterFightEnabled { get; set; } = false;
+-}
++
++    public int Timeout { get; set; } = 120;
++
++
++    public string BattleEndProgressBarColor = "";
++
++
++    public string BattleEndProgressBarColorTolerance = "";
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+index d2d1f954..441f2cdc 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+@@ -34,6 +34,8 @@ public class AutoFightTask : ISoloTask
+     private DateTime _lastFightFlagTime = DateTime.Now; // 战斗标志最近一次出现的时间
+ 
+     private readonly double _dpi = TaskContext.Instance().DpiScale;
++    private (int, int, int) _battleEndProgressBarColor;
++    private (int, int, int) _battleEndProgressBarColorTolerance;
+ 
+     public AutoFightTask(AutoFightParam taskParam)
+     {
+@@ -44,6 +46,42 @@ public AutoFightTask(AutoFightParam taskParam)
+         {
+             _predictor = BgiYoloV8PredictorFactory.GetPredictor(@"Assets\Model\World\bgi_world.onnx");
+         }
++
++        _battleEndProgressBarColor = ParseStringToTuple(taskParam.BattleEndProgressBarColor, (95, 235, 255));
++        _battleEndProgressBarColorTolerance = ParseSingleOrCommaSeparated(taskParam.BattleEndProgressBarColorTolerance, (6, 6, 6));
++    }
++
++    // 方法1：判断是否是单个数字
++    static bool IsSingleNumber(string input, out int result)
++    {
++        return int.TryParse(input, out result);
++    }
++
++    static (int, int, int) ParseSingleOrCommaSeparated(string input, (int, int, int) defaultValue)
++    {
++        // 如果是单个数字
++        if (IsSingleNumber(input, out var singleNumber))
++        {
++            return (singleNumber, singleNumber, singleNumber);
++        }
++
++        return ParseStringToTuple(input, defaultValue);
++    }
++
++    static (int, int, int) ParseStringToTuple(string input, (int, int, int) defaultValue)
++    {
++        // 尝试按逗号分割字符串
++        var parts = input.Split(',');
++        if (parts.Length == 3 &&
++            int.TryParse(parts[0], out var num1) &&
++            int.TryParse(parts[1], out var num2) &&
++            int.TryParse(parts[2], out var num3))
++        {
++            return (num1, num2, num3);
++        }
++
++        // 如果解析失败，返回默认值
++        return defaultValue;
+     }
+ 
+     public async Task Start(CancellationToken ct)
+@@ -64,7 +102,7 @@ public async Task Start(CancellationToken ct)
+         ct.Register(cts2.Cancel);
+ 
+         combatScenes.BeforeTask(cts2.Token);
+-        TimeSpan fightTimeout = TimeSpan.FromSeconds(120); // 默认战斗超时时间
++        TimeSpan fightTimeout = TimeSpan.FromSeconds(_taskParam.Timeout); // 默认战斗超时时间
+         Stopwatch stopwatch = Stopwatch.StartNew();
+ 
+         //战斗前检查，可做成配置
+@@ -78,13 +116,21 @@ public async Task Start(CancellationToken ct)
+             {
+                 while (!cts2.Token.IsCancellationRequested)
+                 {
++                    var timeoutFlag = false;
+                     // 通用化战斗策略
+                     foreach (var command in combatCommands)
+                     {
++                        if (stopwatch.Elapsed > fightTimeout)
++                        {
++                            Logger.LogInformation("战斗超时结束");
++                            timeoutFlag = true;
++                            break;
++                        }
++
+                         command.Execute(combatScenes);
+                     }
+ 
+-                    if (stopwatch.Elapsed > fightTimeout || _taskParam is { FightFinishDetectEnabled: true } && await CheckFightFinish())
++                    if (timeoutFlag || _taskParam is { FightFinishDetectEnabled: true } && await CheckFightFinish())
+                     {
+                         break;
+                     }
+@@ -148,6 +194,14 @@ private void LogScreenResolution()
+         }
+     }
+ 
++    static bool AreDifferencesWithinBounds((int, int, int) a, (int, int, int) b, (int, int, int) c)
++    {
++        // 计算每个位置的差值绝对值并进行比较
++        return Math.Abs(a.Item1 - b.Item1) < c.Item1 &&
++               Math.Abs(a.Item2 - b.Item2) < c.Item2 &&
++               Math.Abs(a.Item3 - b.Item3) < c.Item3;
++    }
++
+     private async Task<bool> CheckFightFinish()
+     {
+         //  YOLO 判断血条和怪物位置
+@@ -167,7 +221,7 @@ private async Task<bool> CheckFightFinish()
+         //if ((DateTime.Now - _lastFightFlagTime).TotalSeconds > randomNumber)
+         //{
+         // 旋转完毕后都没有检测到血条和怪物位置，则按L键确认战斗结束
+-        /** 
++        /**
+         Simulation.SendInput.Mouse.MiddleButtonClick();
+         await Delay(300, _ct);
+         for (var i = 0; i < 8; i++)
+@@ -181,29 +235,28 @@ private async Task<bool> CheckFightFinish()
+             }
+         }
+         **/
+-            //检查延时，根据队伍不同可以进行优化，可做成配置
+-            await Delay(1500, _ct);
+-            Logger.LogInformation("按了L");
+-            // 最终方案确认战斗结束
+-            Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_L);
+-            await Delay(450, _ct);
+-            var ra = CaptureToRectArea();
+-            var b3 = ra.SrcMat.At<Vec3b>(50, 790);
+-
+-            int tolerance = 6;
+-            if (Math.Abs(b3.Item0 - 95)< tolerance&& Math.Abs(b3.Item1 - 235) < tolerance&& Math.Abs(b3.Item2 - 255) < tolerance)
+-            {
+-                Logger.LogInformation("识别到战斗结束");
+-                Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_SPACE);
+-                return true;
+-            }
+-            else
+-            {
+-               Logger.LogInformation($"未识别到战斗结束{b3.Item0},{b3.Item1},{b3.Item2}");
+-                _lastFightFlagTime = DateTime.Now;
+-                return false;
+-            }
+-      //  }
++        //检查延时，根据队伍不同可以进行优化，可做成配置
++        await Delay(1500, _ct);
++        Logger.LogInformation("按L检查战斗是否结束");
++        // 最终方案确认战斗结束
++        Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_L);
++        await Delay(450, _ct);
++        var ra = CaptureToRectArea();
++        var b3 = ra.SrcMat.At<Vec3b>(50, 790);
++
++        if (AreDifferencesWithinBounds(_battleEndProgressBarColor, (b3.Item0, b3.Item1, b3.Item2), _battleEndProgressBarColorTolerance))
++        {
++            Logger.LogInformation("识别到战斗结束");
++            Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_SPACE);
++            return true;
++        }
++
++        Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_SPACE);
++        Logger.LogInformation($"未识别到战斗结束{b3.Item0},{b3.Item1},{b3.Item2}");
++        _lastFightFlagTime = DateTime.Now;
++        return false;
++
++        //  }
+ 
+         return false;
+     }
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+index 5296f2ff..7d40fc09 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+@@ -12,31 +12,45 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+ internal class AutoFightHandler : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+-        await StartFight(ct);
++        await StartFight(ct, config);
+     }
+ 
+-    private async Task StartFight(CancellationToken ct)
++    private async Task StartFight(CancellationToken ct, object? config = null)
+     {
+         TaskControl.Logger.LogInformation("执行 {Text}", "自动战斗");
+         // 爷们要战斗
+-        var taskParams = new AutoFightParam(GetFightStrategy())
++        AutoFightParam taskParams = null;
++        if (config != null && config is PathingPartyConfig patyConfig && patyConfig.AutoFightEabled)
+         {
+-            FightFinishDetectEnabled = true,
+-            PickDropsAfterFightEnabled = true
+-        };
++            //替换配置为路径追踪
++
++            taskParams = GetFightAutoFightParam(patyConfig.AutoFightConfig);
++        }
++        else
++        {
++            taskParams = new AutoFightParam(GetFightStrategy(), TaskContext.Instance().Config.AutoFightConfig);
++        }
++
+         var fightSoloTask = new AutoFightTask(taskParams);
+         await fightSoloTask.Start(ct);
+     }
+ 
+-    private string GetFightStrategy()
++    private AutoFightParam GetFightAutoFightParam(AutoFightConfig? config)
++    {
++        AutoFightParam autoFightParam = new AutoFightParam(GetFightStrategy(config), config);
++        return autoFightParam;
++    }
++
++    private string GetFightStrategy(AutoFightConfig config)
+     {
+-        var path = Global.Absolute(@"User\AutoFight\" + TaskContext.Instance().Config.AutoFightConfig.StrategyName + ".txt");
+-        if ("根据队伍自动选择".Equals(TaskContext.Instance().Config.AutoFightConfig.StrategyName))
++        var path = Global.Absolute(@"User\AutoFight\" + config.StrategyName + ".txt");
++        if ("根据队伍自动选择".Equals(config.StrategyName))
+         {
+             path = Global.Absolute(@"User\AutoFight\");
+         }
++
+         if (!File.Exists(path) && !Directory.Exists(path))
+         {
+             throw new Exception("战斗策略文件不存在");
+@@ -44,4 +58,9 @@ private string GetFightStrategy()
+ 
+         return path;
+     }
+-}
++
++    private string GetFightStrategy()
++    {
++        return GetFightStrategy(TaskContext.Instance().Config.AutoFightConfig);
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/CombatScriptHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/CombatScriptHandler.cs
+index d1b8da77..2546522a 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/CombatScriptHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/CombatScriptHandler.cs
+@@ -2,6 +2,7 @@
+ using System.Diagnostics;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using Microsoft.Extensions.Logging;
+ using static BetterGenshinImpact.GameTask.Common.TaskControl;
+@@ -10,7 +11,7 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+ public class CombatScriptHandler : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         if (waypointForTrack is { CombatScript: not null })
+         {
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalCollectHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalCollectHandler.cs
+index d4cf9e10..92caa0d7 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalCollectHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalCollectHandler.cs
+@@ -3,6 +3,7 @@
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoFight.Config;
+ using BetterGenshinImpact.GameTask.AutoGeniusInvokation.Model;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+@@ -16,7 +17,7 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ /// </summary>
+ public class ElementalCollectHandler(ElementalType elementalType) : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         var combatScenes = await RunnerContext.Instance.GetCombatScenes(ct);
+         if (combatScenes == null)
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalSkillHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalSkillHandler.cs
+index d2d111f4..1afd2e2e 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalSkillHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/ElementalSkillHandler.cs
+@@ -6,6 +6,7 @@
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using Vanara.PInvoke;
+ using static BetterGenshinImpact.GameTask.Common.TaskControl;
++using BetterGenshinImpact.Core.Config;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+@@ -15,7 +16,7 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ [Obsolete]
+ public class ElementalSkillHandler : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         Logger.LogInformation("执行 {Text}", "释放元素战技");
+         Simulation.SendInput.Keyboard.KeyPress(User32.VK.VK_E);
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/IActionHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/IActionHandler.cs
+index 7cd28d92..1d045121 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/IActionHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/IActionHandler.cs
+@@ -1,10 +1,11 @@
+ ﻿using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+ public interface IActionHandler
+ {
+-    Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack=null);
++    Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack=null, object? config = null);
+ }
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/MiningHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/MiningHandler.cs
+index db3695ea..9c4291fe 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/MiningHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/MiningHandler.cs
+@@ -2,6 +2,7 @@
+ using System.Diagnostics;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoFight.Model;
+ using BetterGenshinImpact.GameTask.AutoFight.Script;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+@@ -25,7 +26,7 @@ 坎蒂丝 e(hold)
+ 
+     private readonly ScanPickTask _scanPickTask = new();
+ 
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         var combatScenes = await RunnerContext.Instance.GetCombatScenes(ct);
+         if (combatScenes == null)
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/NahidaCollectHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/NahidaCollectHandler.cs
+index 10f3920d..569e4a20 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/NahidaCollectHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/NahidaCollectHandler.cs
+@@ -1,6 +1,7 @@
+ ﻿using System;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.Core.Simulator;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using BetterGenshinImpact.Helpers;
+@@ -17,7 +18,7 @@ public class NahidaCollectHandler : IActionHandler
+ {
+     private DateTime lastETime = DateTime.MinValue;
+ 
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         Logger.LogInformation("执行 {Nhd} 长按E转圈拾取", "纳西妲");
+ 
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/NormalAttackHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/NormalAttackHandler.cs
+index d3fe9747..c6d5a00e 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/NormalAttackHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/NormalAttackHandler.cs
+@@ -5,6 +5,7 @@
+ using System.Threading.Tasks;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using static BetterGenshinImpact.GameTask.Common.TaskControl;
++using BetterGenshinImpact.Core.Config;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+@@ -14,7 +15,7 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ [Obsolete]
+ public class NormalAttackHandler : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         Logger.LogInformation("执行 {Text}", "普通攻击");
+         Simulation.SendInput.Mouse.LeftButtonClick();
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/PickAroundHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/PickAroundHandler.cs
+index 553108e4..818883eb 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/PickAroundHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/PickAroundHandler.cs
+@@ -8,6 +8,7 @@
+ using BetterGenshinImpact.Helpers;
+ using Vanara.PInvoke;
+ using static BetterGenshinImpact.GameTask.Common.TaskControl;
++using BetterGenshinImpact.Core.Config;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+@@ -18,7 +19,7 @@ public class PickAroundHandler() : IActionHandler
+ {
+     private CancellationToken _ct;
+ 
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         this._ct = ct;
+         Logger.LogInformation("执行 {Text}", "小范围内自动拾取");
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/UpDownGrabLeaf.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/UpDownGrabLeaf.cs
+index b6d7c166..6c42cc22 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/UpDownGrabLeaf.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/UpDownGrabLeaf.cs
+@@ -1,6 +1,7 @@
+ ﻿using System.Diagnostics;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.Core.Simulator;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using Microsoft.Extensions.Logging;
+@@ -14,7 +15,7 @@ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ /// </summary>
+ public class UpDownGrabLeaf : IActionHandler
+ {
+-    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null)
++    public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
+         await Delay(500, ct);
+         Logger.LogInformation("开始上下晃动视角抓{Syy}", "四叶印");
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+index de03bc24..39bf5af3 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+@@ -841,7 +841,8 @@ private async Task AfterMoveToTarget(WaypointForTrack waypoint)
+             || waypoint.Action == ActionEnum.CombatScript.Code)
+         {
+             var handler = ActionFactory.GetAfterHandler(waypoint.Action);
+-            await handler.RunAsync(ct, waypoint);
++            //,PartyConfig
++            await handler.RunAsync(ct, waypoint, PartyConfig);
+             await Delay(1000, ct);
+         }
+     }
+diff --git a/BetterGenshinImpact/GameTask/Common/TaskControl.cs b/BetterGenshinImpact/GameTask/Common/TaskControl.cs
+index 5fedb870..2fb0fcef 100644
+--- a/BetterGenshinImpact/GameTask/Common/TaskControl.cs
++++ b/BetterGenshinImpact/GameTask/Common/TaskControl.cs
+@@ -7,7 +7,9 @@
+ using System.Drawing;
+ using System.Threading;
+ using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Simulator;
+ using BetterGenshinImpact.GameTask.AutoPathing.Suspend;
++using Vanara.PInvoke;
+ 
+ namespace BetterGenshinImpact.GameTask.Common;
+ 
+@@ -46,14 +48,34 @@ public static void Sleep(int millisecondsTimeout)
+         }, TimeSpan.FromSeconds(1), 100);
+         Thread.Sleep(millisecondsTimeout);
+     }
+-    
++    private static bool IsKeyPressed(User32.VK key)
++    {
++        // 获取按键状态
++        var state = User32.GetAsyncKeyState((int)key);
++
++        // 检查高位是否为 1（表示按键被按下）
++        return (state & 0x8000) != 0;
++    }
+     public static void TrySuspend()
+     {
+-        bool first = true;
++        var first = true;
++        //此处为了记录最开始的暂停状态
++        var isSuspend = RunnerContext.Instance.IsSuspend;
+         while (RunnerContext.Instance.IsSuspend)
+         {
+             if (first)
+             {
++                //使快捷键本身释放
++                Thread.Sleep(300);
++                foreach (User32.VK key in Enum.GetValues(typeof(User32.VK)))
++                {
++                    // 检查键是否被按下
++                    if (IsKeyPressed(key)) // 强制转换 VK 枚举为 int
++                    {
++                        Logger.LogWarning($"解除{key}的按下状态.");
++                        Simulation.SendInput.Keyboard.KeyUp(key);
++                    }
++                }
+                 Logger.LogWarning("快捷键触发暂停，等待解除");
+                 foreach (var item in RunnerContext.Instance.SuspendableDictionary)
+                 {
+@@ -65,8 +87,8 @@ public static void TrySuspend()
+ 
+             Thread.Sleep(1000);
+         }
+-
+-        if (RunnerContext.Instance.IsSuspend)
++        //从暂停中解除
++        if (isSuspend)
+         {
+             Logger.LogWarning("暂停已经解除");
+             foreach (var item in RunnerContext.Instance.SuspendableDictionary)
+diff --git a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+index ffbeaa0c..9d7e7cb9 100644
+--- a/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
++++ b/BetterGenshinImpact/View/Pages/ScriptControlPage.xaml
+@@ -207,7 +207,15 @@
+                         </ui:DropDownButton.Flyout>
+                     </ui:DropDownButton>
+                     <Separator Width="10" Opacity="0" />
+-
++                    <ui:DropDownButton Content="更多功能">
++                        <ui:DropDownButton.Flyout>
++                            <ContextMenu>
++                                <MenuItem Header="清空" Command="{Binding ClearTasksCommand}" />
++                                <!--<MenuItem Header="根据文件夹更新" Command="{Binding UpdateTasksCommand}" />-->
++                            </ContextMenu>
++                        </ui:DropDownButton.Flyout>
++                    </ui:DropDownButton>
++                    <Separator Width="10" Opacity="0" />
+                     <ui:Button Command="{Binding OpenScriptGroupSettingsCommand}"
+                                Content="设置"
+                                Icon="{ui:SymbolIcon Settings24}" />
+diff --git a/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml b/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
+index e5d81cda..75c2e4c4 100644
+--- a/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
++++ b/BetterGenshinImpact/View/Pages/TaskSettingsPage.xaml
+@@ -124,7 +124,7 @@
+                               Grid.Column="2"
+                               Width="180"
+                               Margin="0,0,36,0"
+-                              ItemsSource="{Binding StrategyList}"
++                              ItemsSource="{Binding AutoFightViewModel.StrategyList}"
+                               SelectedItem="{Binding Config.AutoGeniusInvokationConfig.StrategyName, Mode=TwoWay}">
+                         <b:Interaction.Triggers>
+                             <b:EventTrigger EventName="DropDownOpened">
+@@ -418,7 +418,7 @@
+                               Grid.Column="3"
+                               Width="180"
+                               Margin="0,0,36,0"
+-                              ItemsSource="{Binding CombatStrategyList}"
++                              ItemsSource="{Binding AutoFightViewModel.CombatStrategyList}"
+                               SelectedItem="{Binding Config.AutoFightConfig.StrategyName, Mode=TwoWay}">
+                         <b:Interaction.Triggers>
+                             <b:EventTrigger EventName="DropDownOpened">
+@@ -506,6 +506,81 @@
+                                      Margin="0,0,36,0"
+                                      IsChecked="{Binding Config.AutoFightConfig.PickDropsAfterFightEnabled, Mode=TwoWay}" />
+                 </Grid>
++                <Grid Margin="16">
++                    <Grid.RowDefinitions>
++                        <RowDefinition Height="Auto" />
++                        <RowDefinition Height="Auto" />
++                    </Grid.RowDefinitions>
++                    <Grid.ColumnDefinitions>
++                        <ColumnDefinition Width="*" />
++                        <ColumnDefinition Width="Auto" />
++                    </Grid.ColumnDefinitions>
++                    <ui:TextBlock Grid.Row="0"
++                                     Grid.Column="0"
++                                     FontTypography="Body"
++                                     Text="战斗超时（秒）"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBlock Grid.Row="1"
++                                     Grid.Column="0"
++                                     Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                     Text="当战斗超过一定时间后，自动停止战斗"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBox Grid.Row="0"
++                                   Grid.RowSpan="2"
++                                   Grid.Column="1"
++                                   MinWidth="120"
++                                   Text="{Binding Config.AutoFightConfig.Timeout}" />
++                </Grid>
++                <Grid Margin="16">
++                    <Grid.RowDefinitions>
++                        <RowDefinition Height="Auto" />
++                        <RowDefinition Height="Auto" />
++                    </Grid.RowDefinitions>
++                    <Grid.ColumnDefinitions>
++                        <ColumnDefinition Width="*" />
++                        <ColumnDefinition Width="Auto" />
++                    </Grid.ColumnDefinitions>
++                    <ui:TextBlock Grid.Row="0"
++                                     Grid.Column="0"
++                                     FontTypography="Body"
++                                     Text="战斗结束基准色"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBlock Grid.Row="1"
++                                     Grid.Column="0"
++                                     Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                     Text="判断战斗结束读条颜色，默认为95,235,255，一般无需修改"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBox Grid.Row="0"
++                                   Grid.RowSpan="2"
++                                   Grid.Column="1"
++                                   MinWidth="120"
++                                   Text="{Binding Config.AutoFightConfig.BattleEndProgressBarColor}" />
++                </Grid>
++                <Grid Margin="16">
++                    <Grid.RowDefinitions>
++                        <RowDefinition Height="Auto" />
++                        <RowDefinition Height="Auto" />
++                    </Grid.RowDefinitions>
++                    <Grid.ColumnDefinitions>
++                        <ColumnDefinition Width="*" />
++                        <ColumnDefinition Width="Auto" />
++                    </Grid.ColumnDefinitions>
++                    <ui:TextBlock Grid.Row="0"
++                                     Grid.Column="0"
++                                     FontTypography="Body"
++                                     Text="战斗结束基准色偏差值"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBlock Grid.Row="1"
++                                     Grid.Column="0"
++                                     Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                     Text="对于战斗结束基准色的偏差值，即±某个值（默认为6），例如 6或6,6,6，前者表示所有偏差值都一样，后者则可以分别设置"
++                                     TextWrapping="Wrap" />
++                    <ui:TextBox Grid.Row="0"
++                                   Grid.RowSpan="2"
++                                   Grid.Column="1"
++                                   MinWidth="120"
++                                   Text="{Binding Config.AutoFightConfig.BattleEndProgressBarColorTolerance}" />
++                </Grid>
+             </StackPanel>
+         </ui:CardExpander>
+ 
+@@ -590,7 +665,7 @@
+                               Grid.Column="3"
+                               Width="180"
+                               Margin="0,0,36,0"
+-                              ItemsSource="{Binding CombatStrategyList}"
++                              ItemsSource="{Binding AutoFightViewModel.CombatStrategyList}"
+                               SelectedItem="{Binding Config.AutoFightConfig.StrategyName, Mode=TwoWay}">
+                         <b:Interaction.Triggers>
+                             <b:EventTrigger EventName="DropDownOpened">
+diff --git a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
+index bab44230..5ec87923 100644
+--- a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
++++ b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml
+@@ -2,17 +2,18 @@
+              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+-             xmlns:group="clr-namespace:BetterGenshinImpact.Core.Script.Group"
++             xmlns:b="http://schemas.microsoft.com/xaml/behaviors"
++             xmlns:pages="clr-namespace:BetterGenshinImpact.ViewModel.Pages.View"
+              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+              xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+              Width="800"
+              ui:Design.Background="{DynamicResource ApplicationBackgroundBrush}"
+              ui:Design.Foreground="{DynamicResource TextFillColorPrimaryBrush}"
+-             d:DataContext="{d:DesignInstance Type=group:ScriptGroupConfig}"
++             d:DataContext="{d:DesignInstance Type=pages:ScriptGroupConfigViewModel}"
+              d:DesignHeight="850"
+              d:DesignWidth="800"
+              mc:Ignorable="d">
+-    <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto">
++    <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto" Height="800">
+         <StackPanel Margin="42,16,42,12">
+ 
+             <ui:CardExpander Margin="0,0,0,12"
+@@ -235,7 +236,197 @@
+ 
+                 </StackPanel>
+             </ui:CardExpander>
++            <ui:CardExpander Margin="0,0,0,12"
++                             ContentPadding="0"
++                             IsExpanded="True">
++                <ui:CardExpander.Icon>
++                    <ui:FontIcon Glyph="&#xf71d;" Style="{StaticResource FaFontIconStyle}" />
++                </ui:CardExpander.Icon>
++                <ui:CardExpander.Header>
++                    <Grid>
+ 
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="战斗配置"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      TextWrapping="Wrap">
++                            开启此项可制定战斗配置，关闭此项，则用于独立任务中的配置
++                        </ui:TextBlock>
++                        <ui:ToggleSwitch Grid.Row="0"
++                                         Grid.RowSpan="2"
++                                         Grid.Column="1"
++                                         Margin="0,0,24,0"
++                                         IsChecked="{Binding PathingConfig.AutoFightEabled, Mode=TwoWay}" />
++                        <!---->
++                    </Grid>
++                </ui:CardExpander.Header>
++                <StackPanel>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                            <ColumnDefinition Width="Auto" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="选择战斗策略"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="用于战斗"
++                                      TextWrapping="Wrap" />
++                        <ui:Button Grid.Row="0"
++                                   Grid.RowSpan="2"
++                                   Grid.Column="1"
++                                   Margin="0,0,12,0"
++                                   Content="脚本仓库"
++                                   Command="{Binding OpenLocalScriptRepoCommand}"
++                                   Icon="{ui:SymbolIcon Archive24}" />
++                        <ui:Button Grid.Row="0"
++                                   Grid.RowSpan="2"
++                                   Grid.Column="2"
++                                   Margin="0,0,12,0"
++                                   Command="{Binding OpenFightFolderCommand}"
++                                   Content="打开目录" />
++                        <ComboBox Grid.Row="0"
++                                  Grid.RowSpan="2"
++                                  Grid.Column="3"
++                                  Width="180"
++                                  Margin="0,0,36,0"
++                                  ItemsSource="{Binding AutoFightViewModel.CombatStrategyList}"
++                                  SelectedItem="{Binding PathingConfig.AutoFightConfig.StrategyName, Mode=TwoWay}">
++                            <b:Interaction.Triggers>
++                                <b:EventTrigger EventName="DropDownOpened">
++                                    <b:InvokeCommandAction Command="{Binding StrategyDropDownOpenedCommand}"
++                                                           CommandParameter="Combat" />
++                                </b:EventTrigger>
++                            </b:Interaction.Triggers>
++                        </ComboBox>
++                    </Grid>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="强制指定配队"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="队伍无法被识别时，请按顺序填写队伍内角色名称，逗号分割"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBox Grid.Row="0"
++                                    Grid.RowSpan="2"
++                                    Grid.Column="1"
++                                    MinWidth="180"
++                                    MaxWidth="800"
++                                    Margin="0,0,36,0"
++                                    Text="{Binding PathingConfig.AutoFightConfig.TeamNames, Mode=TwoWay}"
++                                    TextWrapping="Wrap" />
++                    </Grid>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="自动检测战斗结束"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="检测到战斗已经结束的情况下，停止自动战斗功能"
++                                      TextWrapping="Wrap" />
++                        <ui:ToggleSwitch Grid.Row="0"
++                                         Grid.RowSpan="2"
++                                         Grid.Column="1"
++                                         Margin="0,0,36,0"
++                                         IsChecked="{Binding PathingConfig.AutoFightConfig.FightFinishDetectEnabled, Mode=TwoWay}" />
++                    </Grid>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="战斗结束后自动拾取掉落物"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="在战斗结束检测启用的情况下才会生效"
++                                      TextWrapping="Wrap" />
++                        <ui:ToggleSwitch Grid.Row="0"
++                                         Grid.RowSpan="2"
++                                         Grid.Column="1"
++                                         Margin="0,0,36,0"
++                                         IsChecked="{Binding PathingConfig.AutoFightConfig.PickDropsAfterFightEnabled, Mode=TwoWay}" />
++                    </Grid>
++                    <Grid Margin="16">
++                        <Grid.RowDefinitions>
++                            <RowDefinition Height="Auto" />
++                            <RowDefinition Height="Auto" />
++                        </Grid.RowDefinitions>
++                        <Grid.ColumnDefinitions>
++                            <ColumnDefinition Width="*" />
++                            <ColumnDefinition Width="Auto" />
++                        </Grid.ColumnDefinitions>
++                        <ui:TextBlock Grid.Row="0"
++                                      Grid.Column="0"
++                                      FontTypography="Body"
++                                      Text="战斗超时（秒）"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBlock Grid.Row="1"
++                                      Grid.Column="0"
++                                      Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
++                                      Text="当战斗超过一定时间后，自动停止战斗"
++                                      TextWrapping="Wrap" />
++                        <ui:TextBox Grid.Row="0"
++                                    Grid.RowSpan="2"
++                                    Grid.Column="1"
++                                    MinWidth="120"
++                                    Text="{Binding PathingConfig.AutoFightConfig.Timeout}" />
++                    </Grid>
++                </StackPanel>
++            </ui:CardExpander>
+ 
+             <!--<ui:CardExpander Margin="0,0,0,12"
+                              ContentPadding="0"
+diff --git a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml.cs b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml.cs
+index 0c6709b6..d7d2b2f3 100644
+--- a/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml.cs
++++ b/BetterGenshinImpact/View/Pages/View/ScriptGroupConfigView.xaml.cs
+@@ -1,5 +1,6 @@
+ ﻿using System.Windows.Controls;
+ using BetterGenshinImpact.Core.Script.Group;
++using BetterGenshinImpact.ViewModel.Pages.View;
+ 
+ namespace BetterGenshinImpact.View.Pages.View
+ {
+@@ -8,10 +9,13 @@ namespace BetterGenshinImpact.View.Pages.View
+     /// </summary>
+     public partial class ScriptGroupConfigView : UserControl
+     {
+-        public ScriptGroupConfigView(ScriptGroupConfig config)
++        private ScriptGroupConfigViewModel ViewModel { get; }
++
++        public ScriptGroupConfigView(ScriptGroupConfigViewModel viewModel)
+         {
++            DataContext  = ViewModel = viewModel;
+             InitializeComponent();
+-            DataContext = config;
++            
+         }
+     }
+ }
+diff --git a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+index 39380780..b78d8c30 100644
+--- a/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
++++ b/BetterGenshinImpact/ViewModel/Pages/ScriptControlViewModel.cs
+@@ -32,6 +32,7 @@
+ using Newtonsoft.Json.Linq;
+ using static Vanara.PInvoke.User32;
+ using TextBox = Wpf.Ui.Controls.TextBox;
++using BetterGenshinImpact.ViewModel.Pages.View;
+ 
+ namespace BetterGenshinImpact.ViewModel.Pages;
+ 
+@@ -96,7 +97,19 @@ private void OnAddScriptGroup()
+             }
+         }
+     }
+-
++    [RelayCommand]
++    private void ClearTasks()
++    {
++        SelectedScriptGroup.Projects.Clear();
++        WriteScriptGroup(SelectedScriptGroup);
++    }
++    private void UpdateTasks()
++    {
++        //PromptDialog.Prompt
++       // SelectedScriptGroup.Projects.Clear();
++       // WriteScriptGroup(SelectedScriptGroup);
++    }
++    
+     [RelayCommand]
+     public void OnRenameScriptGroup(ScriptGroup? item)
+     {
+@@ -718,7 +731,7 @@ public void OnOpenScriptGroupSettings()
+         var dialogWindow = new Window
+         {
+             Title = "配置组设置",
+-            Content = new ScriptGroupConfigView(SelectedScriptGroup.Config),
++            Content = new ScriptGroupConfigView(new ScriptGroupConfigViewModel(TaskContext.Instance().Config, SelectedScriptGroup.Config)),
+             SizeToContent = SizeToContent.WidthAndHeight,
+             WindowStartupLocation = WindowStartupLocation.CenterOwner,
+         };
+diff --git a/BetterGenshinImpact/ViewModel/Pages/TaskSettingsPageViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/TaskSettingsPageViewModel.cs
+index 86c3a289..12f13672 100644
+--- a/BetterGenshinImpact/ViewModel/Pages/TaskSettingsPageViewModel.cs
++++ b/BetterGenshinImpact/ViewModel/Pages/TaskSettingsPageViewModel.cs
+@@ -25,6 +25,7 @@
+ using Wpf.Ui;
+ using Wpf.Ui.Controls;
+ using Wpf.Ui.Violeta.Controls;
++using BetterGenshinImpact.ViewModel.Pages.View;
+ 
+ namespace BetterGenshinImpact.ViewModel.Pages;
+ 
+@@ -38,8 +39,8 @@ public partial class TaskSettingsPageViewModel : ObservableObject, INavigationAw
+     private CancellationTokenSource? _cts;
+     private static readonly object _locker = new();
+ 
+-    [ObservableProperty]
+-    private string[] _strategyList;
++   // [ObservableProperty]
++   // private string[] _strategyList;
+ 
+     [ObservableProperty]
+     private bool _switchAutoGeniusInvokationEnabled;
+@@ -59,8 +60,8 @@ public partial class TaskSettingsPageViewModel : ObservableObject, INavigationAw
+     [ObservableProperty]
+     private string _switchAutoWoodButtonText = "启动";
+ 
+-    [ObservableProperty]
+-    private string[] _combatStrategyList;
++    //[ObservableProperty]
++    //private string[] _combatStrategyList;
+ 
+     [ObservableProperty]
+     private int _autoDomainRoundNum;
+@@ -92,17 +93,22 @@ public partial class TaskSettingsPageViewModel : ObservableObject, INavigationAw
+     [ObservableProperty]
+     private List<string> _artifactSalvageStarList = ["4", "3", "2", "1"];
+ 
++    [ObservableProperty]
++    private AutoFightViewModel? _autoFightViewModel;
++
+     public TaskSettingsPageViewModel(IConfigService configService, INavigationService navigationService, TaskTriggerDispatcher taskTriggerDispatcher)
+     {
+         Config = configService.Get();
+         _navigationService = navigationService;
+         _taskDispatcher = taskTriggerDispatcher;
+ 
+-        _strategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
++        //_strategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
+ 
+-        _combatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
++        //_combatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
+ 
+         _domainNameList = MapLazyAssets.Instance.DomainNameList;
++        _autoFightViewModel=new AutoFightViewModel(Config);
++
+     }
+ 
+     private string[] LoadCustomScript(string folder)
+@@ -142,16 +148,7 @@ private async Task OnStopSoloTask()
+     [RelayCommand]
+     private void OnStrategyDropDownOpened(string type)
+     {
+-        switch (type)
+-        {
+-            case "Combat":
+-                CombatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
+-                break;
+-
+-            case "GeniusInvocation":
+-                StrategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
+-                break;
+-        }
++        _autoFightViewModel.OnStrategyDropDownOpened(type);
+     }
+ 
+     public void OnNavigatedTo()
+@@ -232,11 +229,7 @@ public async Task OnSwitchAutoFight()
+             return;
+         }
+ 
+-        var param = new AutoFightParam(path)
+-        {
+-            FightFinishDetectEnabled = Config.AutoFightConfig.FightFinishDetectEnabled,
+-            PickDropsAfterFightEnabled = Config.AutoFightConfig.PickDropsAfterFightEnabled
+-        };
++        var param = new AutoFightParam(path, Config.AutoFightConfig);
+ 
+         SwitchAutoFightEnabled = true;
+         await new TaskRunner(DispatcherTimerOperationEnum.UseCacheImageWithTrigger)
+@@ -290,7 +283,7 @@ public async Task OnGoToAutoDomainUrlAsync()
+     [RelayCommand]
+     public void OnOpenFightFolder()
+     {
+-        Process.Start("explorer.exe", Global.Absolute(@"User\AutoFight\"));
++       _autoFightViewModel.OnOpenFightFolder();
+     }
+ 
+     [Obsolete]
+@@ -379,7 +372,6 @@ public async Task OnGoToAutoMusicGameUrlAsync()
+     [RelayCommand]
+     public void OnOpenLocalScriptRepo()
+     {
+-        Config.ScriptConfig.ScriptRepoHintDotVisible = false;
+-        ScriptRepoUpdater.Instance.OpenLocalRepoInWebView();
++        _autoFightViewModel.OnOpenLocalScriptRepo();
+     }
+ }
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/ViewModel/Pages/View/AutoFightViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/View/AutoFightViewModel.cs
+new file mode 100644
+index 00000000..428271f4
+--- /dev/null
++++ b/BetterGenshinImpact/ViewModel/Pages/View/AutoFightViewModel.cs
+@@ -0,0 +1,90 @@
++﻿using BetterGenshinImpact.Core.Config;
++using BetterGenshinImpact.Core.Script;
++using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.Common.Element.Assets;
++using BetterGenshinImpact.Model;
++using BetterGenshinImpact.Service.Interface;
++using CommunityToolkit.Mvvm.ComponentModel;
++using CommunityToolkit.Mvvm.Input;
++using System.ComponentModel;
++using System.Diagnostics;
++using System.IO;
++using Wpf.Ui;
++
++namespace BetterGenshinImpact.ViewModel.Pages.View;
++
++public partial class AutoFightViewModel : ObservableObject, IViewModel
++{
++    public AllConfig Config { get; set; }
++
++    public AutoFightViewModel()
++    {
++        Config = TaskContext.Instance().Config;
++        _strategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
++        _combatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
++    }
++
++    public AutoFightViewModel(AllConfig config)
++    {
++        Config = config;
++        _strategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
++        _combatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
++    }
++
++    [ObservableProperty]
++    private string[] _combatStrategyList;
++
++    [ObservableProperty]
++    private string[] _strategyList;
++
++    private string[] LoadCustomScript(string folder)
++    {
++        var files = Directory.GetFiles(folder, "*.*",
++            SearchOption.AllDirectories);
++
++        var strategyList = new string[files.Length];
++        for (var i = 0; i < files.Length; i++)
++        {
++            if (files[i].EndsWith(".txt"))
++            {
++                var strategyName = files[i].Replace(folder, "").Replace(".txt", "");
++                if (strategyName.StartsWith('\\'))
++                {
++                    strategyName = strategyName[1..];
++                }
++
++                strategyList[i] = strategyName;
++            }
++        }
++
++        return strategyList;
++    }
++
++    [RelayCommand]
++    public void OnStrategyDropDownOpened(string type)
++    {
++        switch (type)
++        {
++            case "Combat":
++                CombatStrategyList = ["根据队伍自动选择", .. LoadCustomScript(Global.Absolute(@"User\AutoFight"))];
++                break;
++
++            case "GeniusInvocation":
++                StrategyList = LoadCustomScript(Global.Absolute(@"User\AutoGeniusInvokation"));
++                break;
++        }
++    }
++
++    [RelayCommand]
++    public void OnOpenLocalScriptRepo()
++    {
++        Config.ScriptConfig.ScriptRepoHintDotVisible = false;
++        ScriptRepoUpdater.Instance.OpenLocalRepoInWebView();
++    }
++
++    [RelayCommand]
++    public void OnOpenFightFolder()
++    {
++        Process.Start("explorer.exe", Global.Absolute(@"User\AutoFight\"));
++    }
++}
+\ No newline at end of file
+diff --git a/BetterGenshinImpact/ViewModel/Pages/View/ScriptGroupConfigViewModel.cs b/BetterGenshinImpact/ViewModel/Pages/View/ScriptGroupConfigViewModel.cs
+new file mode 100644
+index 00000000..645f4065
+--- /dev/null
++++ b/BetterGenshinImpact/ViewModel/Pages/View/ScriptGroupConfigViewModel.cs
+@@ -0,0 +1,52 @@
++﻿using BetterGenshinImpact.Core.Config;
++using BetterGenshinImpact.Core.Script;
++using BetterGenshinImpact.Core.Script.Group;
++using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.Common.Element.Assets;
++using BetterGenshinImpact.Model;
++using BetterGenshinImpact.Service.Interface;
++using CommunityToolkit.Mvvm.ComponentModel;
++using CommunityToolkit.Mvvm.Input;
++using System.ComponentModel;
++using System.Diagnostics;
++using System.IO;
++using Wpf.Ui;
++
++namespace BetterGenshinImpact.ViewModel.Pages.View;
++
++public partial class ScriptGroupConfigViewModel : ObservableObject, IViewModel
++{
++
++    [ObservableProperty]
++    private AutoFightViewModel _autoFightViewModel;
++
++    [ObservableProperty]
++    private ScriptGroupConfig _scriptGroupConfig;
++    [ObservableProperty]
++    private PathingPartyConfig _pathingConfig;
++
++    public ScriptGroupConfigViewModel(AllConfig config, ScriptGroupConfig scriptGroupConfig)
++    {
++        ScriptGroupConfig = scriptGroupConfig;
++        PathingConfig = scriptGroupConfig.PathingConfig;
++        AutoFightViewModel = new AutoFightViewModel(config);
++
++
++    }
++    [RelayCommand]
++    private void OnStrategyDropDownOpened(string type)
++    {
++        AutoFightViewModel.OnStrategyDropDownOpened(type);
++    }
++    [RelayCommand]
++    public void OnOpenLocalScriptRepo()
++    {
++        AutoFightViewModel.OnOpenLocalScriptRepo();
++    }
++    [RelayCommand]
++    public void OnOpenFightFolder()
++    {
++
++        AutoFightViewModel.OnOpenFightFolder();
++    }
++}

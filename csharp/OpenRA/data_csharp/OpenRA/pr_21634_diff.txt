@@ -1,0 +1,112 @@
+diff --git a/OpenRA.Game/Graphics/SpriteRenderer.cs b/OpenRA.Game/Graphics/SpriteRenderer.cs
+index 3b07b3563937..1ec75cb97fa0 100644
+--- a/OpenRA.Game/Graphics/SpriteRenderer.cs
++++ b/OpenRA.Game/Graphics/SpriteRenderer.cs
+@@ -253,9 +253,9 @@ public void SetDepthPreview(bool enabled, float contrast, float offset)
+ 			shader.SetVec("DepthPreviewParams", contrast, offset);
+ 		}
+ 
+-		public void SetAntialiasingPixelsPerTexel(float pxPerTx)
++		public void EnablePixelArtScaling(bool enabled)
+ 		{
+-			shader.SetVec("AntialiasPixelsPerTexel", pxPerTx);
++			shader.SetBool("EnablePixelArtScaling", enabled);
+ 		}
+ 	}
+ }
+diff --git a/OpenRA.Game/Renderer.cs b/OpenRA.Game/Renderer.cs
+index 9c111b4e1c9a..8c29f58d8acf 100644
+--- a/OpenRA.Game/Renderer.cs
++++ b/OpenRA.Game/Renderer.cs
+@@ -294,10 +294,10 @@ public void BeginUI()
+ 					(int)(-screenSprite.Bounds.Height / scale) / worldSprite.Size.Y,
+ 					1f);
+ 
+-				SpriteRenderer.SetAntialiasingPixelsPerTexel(Window.SurfaceSize.Height * 1f / worldSprite.Bounds.Height);
++				SpriteRenderer.EnablePixelArtScaling(true);
+ 				RgbaSpriteRenderer.DrawSprite(worldSprite, float3.Zero, bufferScale);
+ 				Flush();
+-				SpriteRenderer.SetAntialiasingPixelsPerTexel(0);
++				SpriteRenderer.EnablePixelArtScaling(false);
+ 			}
+ 			else
+ 			{
+@@ -499,7 +499,7 @@ public void EnableAntialiasingFilter()
+ 				throw new InvalidOperationException($"EndFrame called with renderType = {renderType}, expected RenderType.UI.");
+ 
+ 			Flush();
+-			SpriteRenderer.SetAntialiasingPixelsPerTexel(Window.EffectiveWindowScale);
++			SpriteRenderer.EnablePixelArtScaling(true);
+ 		}
+ 
+ 		public void DisableAntialiasingFilter()
+@@ -508,7 +508,7 @@ public void DisableAntialiasingFilter()
+ 				throw new InvalidOperationException($"EndFrame called with renderType = {renderType}, expected RenderType.UI.");
+ 
+ 			Flush();
+-			SpriteRenderer.SetAntialiasingPixelsPerTexel(0);
++			SpriteRenderer.EnablePixelArtScaling(false);
+ 		}
+ 
+ 		public void GrabWindowMouseFocus()
+diff --git a/OpenRA.Platforms.Default/OpenGL.cs b/OpenRA.Platforms.Default/OpenGL.cs
+index 8b1e318a7d96..d431c2934a52 100644
+--- a/OpenRA.Platforms.Default/OpenGL.cs
++++ b/OpenRA.Platforms.Default/OpenGL.cs
+@@ -674,9 +674,10 @@ public static bool DetectGLFeatures()
+ 						break;
+ 				}
+ 
+-				// Core features are defined as the shared feature set of GL 3.2 and (GLES 3 + BGRA extension)
++				// Core features are defined as the shared feature set of GL 3.2 and (GLES 3 + derivatives, BGRA extensions)
+ 				var hasBGRA = SDL.SDL_GL_ExtensionSupported("GL_EXT_texture_format_BGRA8888") == SDL.SDL_bool.SDL_TRUE;
+-				if (Version.Contains(" ES") && hasBGRA && major >= 3)
++				var hasDerivatives = SDL.SDL_GL_ExtensionSupported("GL_OES_standard_derivatives") == SDL.SDL_bool.SDL_TRUE;
++				if (Version.Contains(" ES") && hasBGRA && hasDerivatives && major >= 3)
+ 				{
+ 					hasValidConfiguration = true;
+ 					Profile = GLProfile.Embedded;
+diff --git a/glsl/combined.frag b/glsl/combined.frag
+index cedc5d846cf1..5734caea2990 100644
+--- a/glsl/combined.frag
++++ b/glsl/combined.frag
+@@ -17,7 +17,7 @@ uniform sampler2D ColorShifts;
+ uniform bool EnableDepthPreview;
+ uniform vec2 DepthPreviewParams;
+ uniform float DepthTextureScale;
+-uniform float AntialiasPixelsPerTexel;
++uniform bool EnablePixelArtScaling;
+ 
+ in vec4 vTexCoord;
+ flat in float vTexPalette;
+@@ -158,24 +158,26 @@ void main()
+ 	bool isColor = vChannelType == 0u;
+ 
+ 	vec4 c;
+-	if (AntialiasPixelsPerTexel > 0.0)
++	if (EnablePixelArtScaling)
+ 	{
+ 		vec2 textureSize = vec2(Size(vChannelSampler));
+-		vec2 offset = fract(coords.st * textureSize);
++		vec2 vUv = coords.st * textureSize;
++		vec2 offset = fract(vUv);
++		vec2 pixelsPerTexel = vec2(1.0 / dFdx(vUv.x), 1.0 / dFdy(vUv.y));
+ 
+ 		// Offset the sampling point to simulate bilinear intepolation in window coordinates instead of texture coordinates
+ 		// https://csantosbh.wordpress.com/2014/01/25/manual-texture-filtering-for-pixelated-games-in-webgl/
+ 		// https://csantosbh.wordpress.com/2014/02/05/automatically-detecting-the-texture-filter-threshold-for-pixelated-magnifications/
+ 		// ik is defined as 1/k from the articles, set to 1/0.7 because it looks good
+ 		float ik = 1.43;
+-		vec2 interp = clamp(offset * ik * AntialiasPixelsPerTexel, 0.0, .5) + clamp((offset - 1.0) * ik * AntialiasPixelsPerTexel + .5, 0.0, .5);
++		vec2 interp = clamp(offset * ik * pixelsPerTexel, 0.0, .5) + clamp((offset - 1.0) * ik * pixelsPerTexel + .5, 0.0, .5);
+ 		coords = (floor(coords.st * textureSize) + interp) / textureSize;
+ 
+ 		if (isPaletted)
+ 			c = SamplePalettedBilinear(vChannelSampler, coords, textureSize);
+ 	}
+ 
+-	if (!(AntialiasPixelsPerTexel > 0.0 && isPaletted))
++	if (!(EnablePixelArtScaling && isPaletted))
+ 	{
+ 		vec4 x = Sample(vChannelSampler, coords);
+ 		vec2 p = vec2(dot(x, vChannelMask), vTexPalette);

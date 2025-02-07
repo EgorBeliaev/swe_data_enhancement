@@ -1,0 +1,64 @@
+diff --git a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/ExtendedCalculatorParserTests.cs b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/ExtendedCalculatorParserTests.cs
+index d62fbf668f15..b13072021b24 100644
+--- a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/ExtendedCalculatorParserTests.cs
++++ b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/ExtendedCalculatorParserTests.cs
+@@ -197,6 +197,8 @@ public void Interpret_DifferentCulture_WhenCalled(string input, decimal expected
+         [DataRow("randi(0.5)", true)]
+         [DataRow("rand()", true)]
+         [DataRow("rand(0.5)", false)]
++        [DataRow("0X78AD+0o123", true)]
++        [DataRow("0o9", false)]
+         public void InputValid_TestValid_WhenCalled(string input, bool valid)
+         {
+             // Act
+@@ -233,7 +235,8 @@ public void Interpret_MustReturnResult_WhenResultIsZero(string input)
+                new object[] { "abs(-2)", 2M },
+                new object[] { "abs(2)", 2M },
+                new object[] { "0+(1*2)/(0+1)", 2M }, // Validate that division by "(0+1)" is not interpret as division by zero.
+-               new object[] { "0+(1*2)/0.5", 4M }, // Validate that division by  number with decimal digits is not interpret as division by zero.
++               new object[] { "0+(1*2)/0.5", 4M }, // Validate that division by number with decimal digits is not interpret as division by zero.
++               new object[] { "0+(1*2)/0o004", 0.5M }, // Validate that division by an octal number with zeroes is not treated as division by zero.
+            };
+ 
+         [DataTestMethod]
+diff --git a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/QueryTests.cs b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/QueryTests.cs
+index cd94046473d2..d5b491005a26 100644
+--- a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/QueryTests.cs
++++ b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator.UnitTest/QueryTests.cs
+@@ -41,6 +41,8 @@ public void Initialize()
+         [DataRow("=5 / 0", "Expression contains division by zero")]
+         [DataRow("10+(8*9)/0+7", "Expression contains division by zero")]
+         [DataRow("10+(8*9)/0*7", "Expression contains division by zero")]
++        [DataRow("10+(8*9)/0x00", "Expression contains division by zero")]
++        [DataRow("10+(8*9)/0b0", "Expression contains division by zero")]
+         public void ErrorResultOnInvalidKeywordQuery(string typedString, string expectedResult)
+         {
+             Query expectedQuery = new(typedString, "=");
+diff --git a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateEngine.cs b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateEngine.cs
+index 3aef7ba25486..815a52d8b0b5 100644
+--- a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateEngine.cs
++++ b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateEngine.cs
+@@ -37,8 +37,8 @@ public CalculateResult Interpret(string input, CultureInfo cultureInfo, out stri
+             }
+ 
+             // check for division by zero
+-            // We check if the string contains a slash followed by space (optional) and zero. Whereas the zero must not be followed by a dot, comma, or 'x'/'X' as these indicate a number with decimal digits or a hexadecimal value respectively. The zero must also not be followed by other digits.
+-            if (new Regex("\\/\\s*0(?![,\\.0-9xX])").Match(input).Success)
++            // We check if the string contains a slash followed by space (optional) and zero. Whereas the zero must not be followed by a dot, comma, 'b', 'o' or 'x' as these indicate a number with decimal digits or a binary/octal/hexadecimal value respectively. The zero must also not be followed by other digits.
++            if (new Regex("\\/\\s*0(?!(?:[,\\.0-9]|[box]0*[1-9a-f]))", RegexOptions.IgnoreCase).Match(input).Success)
+             {
+                 error = Properties.Resources.wox_plugin_calculator_division_by_zero;
+                 return default;
+diff --git a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateHelper.cs b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateHelper.cs
+index 59bc414bda29..436591e3b333 100644
+--- a/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateHelper.cs
++++ b/src/modules/launcher/Plugins/Microsoft.PowerToys.Run.Plugin.Calculator/CalculateHelper.cs
+@@ -21,7 +21,7 @@ public static class CalculateHelper
+             @"pi|" +
+             @"==|~=|&&|\|\||" +
+             @"((-?(\d+(\.\d*)?)|-?(\.\d+))[Ee](-?\d+))|" + /* expression from CheckScientificNotation between parenthesis */
+-            @"e|[0-9]|0x[0-9a-fA-F]+|0b[01]+|[\+\-\*\/\^\., ""]|[\(\)\|\!\[\]]" +
++            @"e|[0-9]|0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|[\+\-\*\/\^\., ""]|[\(\)\|\!\[\]]" +
+             @")+$",
+             RegexOptions.Compiled);
+ 

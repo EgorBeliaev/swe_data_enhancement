@@ -1,0 +1,365 @@
+diff --git a/docs/index.md b/docs/index.md
+index 2e9313185d..bf9c12fd23 100644
+--- a/docs/index.md
++++ b/docs/index.md
+@@ -1063,7 +1063,7 @@ The option can be given multiple times. The option accepts a comma-delimited lis
+ 
+ `--extension` now supports multipart extensions (e.g., `spec.js`), leading dots (`.js`) and combinations thereof (`.spec.js`);
+ 
+-### `--file <file|directory|glob>`
++### `--file <file>`
+ 
+ > _WARNING: `--file` is incompatible with [parallel mode](#parallel-tests)._
+ 
+@@ -1298,7 +1298,7 @@ In parallel mode, Mocha does not guarantee the order in which test files will ru
+ 
+ Because of this, the following options, which depend on order, _cannot be used_ in parallel mode:
+ 
+-- [`--file`](#-file-filedirectoryglob)
++- [`--file`](#-file-file)
+ - [`--sort`](#-sort-s)
+ - [`--delay`](#delayed-root-suite)
+   {:.single-column}
+diff --git a/lib/cli/collect-files.js b/lib/cli/collect-files.js
+index cc04559443..73f5d2e95a 100644
+--- a/lib/cli/collect-files.js
++++ b/lib/cli/collect-files.js
+@@ -1,5 +1,6 @@
+ 'use strict';
+ 
++const fs = require('fs');
+ const path = require('path');
+ const ansi = require('ansi-colors');
+ const debug = require('debug')('mocha:cli:run:helpers');
+@@ -19,7 +20,7 @@ const {castArray} = require('../utils');
+ /**
+  * Smash together an array of test files in the correct order
+  * @param {FileCollectionOptions} [opts] - Options
+- * @returns {string[]} List of files to test
++ * @returns {FileCollectionResponse} An object containing a list of files to test and unmatched files.
+  * @private
+  */
+ module.exports = ({
+@@ -30,7 +31,7 @@ module.exports = ({
+   sort,
+   spec
+ } = {}) => {
+-  const unmatched = [];
++  const unmatchedSpecFiles = [];
+   const specFiles = spec.reduce((specFiles, arg) => {
+     try {
+       const moreSpecFiles = castArray(lookupFiles(arg, extension, recursive))
+@@ -44,7 +45,7 @@ module.exports = ({
+       return [...specFiles, ...moreSpecFiles];
+     } catch (err) {
+       if (err.code === NO_FILES_MATCH_PATTERN) {
+-        unmatched.push({message: err.message, pattern: err.pattern});
++        unmatchedSpecFiles.push({message: err.message, pattern: err.pattern});
+         return specFiles;
+       }
+ 
+@@ -52,6 +53,27 @@ module.exports = ({
+     }
+   }, []);
+ 
++  // check that each file passed in to --file exists
++
++  const unmatchedFiles = [];
++  fileArgs.forEach(file => {
++    const fileAbsolutePath = path.resolve(file);
++    try {
++      // Used instead of fs.existsSync to ensure that file-ending less files are still resolved correctly
++      require.resolve(fileAbsolutePath);
++    } catch (err) {
++      if (err.code === 'MODULE_NOT_FOUND') {
++        unmatchedFiles.push({
++          pattern: file,
++          absolutePath: fileAbsolutePath
++        });
++        return;
++      }
++
++      throw err;
++    }
++  });
++
+   // ensure we don't sort the stuff from fileArgs; order is important!
+   if (sort) {
+     specFiles.sort();
+@@ -67,19 +89,24 @@ module.exports = ({
+   if (!files.length) {
+     // give full message details when only 1 file is missing
+     const noneFoundMsg =
+-      unmatched.length === 1
+-        ? `Error: No test files found: ${JSON.stringify(unmatched[0].pattern)}` // stringify to print escaped characters raw
++      unmatchedSpecFiles.length === 1
++        ? `Error: No test files found: ${JSON.stringify(
++            unmatchedSpecFiles[0].pattern
++          )}` // stringify to print escaped characters raw
+         : 'Error: No test files found';
+     console.error(ansi.red(noneFoundMsg));
+     process.exit(1);
+   } else {
+     // print messages as a warning
+-    unmatched.forEach(warning => {
++    unmatchedSpecFiles.forEach(warning => {
+       console.warn(ansi.yellow(`Warning: ${warning.message}`));
+     });
+   }
+ 
+-  return files;
++  return {
++    files,
++    unmatchedFiles
++  };
+ };
+ 
+ /**
+@@ -93,3 +120,18 @@ module.exports = ({
+  * @property {boolean} recursive - Find files recursively
+  * @property {boolean} sort - Sort test files
+  */
++
++/**
++ * Diagnostic object containing unmatched files
++ * @typedef {Object} UnmatchedFile -
++ * @property {string} absolutePath - A list of unmatched files derived from the file arguments passed in.
++ * @property {string} pattern - A list of unmatched files derived from the file arguments passed in.
++ *
++ */
++
++/**
++ * Response object containing a list of files to test and unmatched files.
++ * @typedef {Object} FileCollectionResponse
++ * @property {string[]} files - A list of files to test
++ * @property {UnmatchedFile[]} unmatchedFiles - A list of unmatched files derived from the file arguments passed in.
++ */
+diff --git a/lib/cli/run-helpers.js b/lib/cli/run-helpers.js
+index 078ca7e434..0d01afbf11 100644
+--- a/lib/cli/run-helpers.js
++++ b/lib/cli/run-helpers.js
+@@ -9,6 +9,7 @@
+ 
+ const fs = require('fs');
+ const path = require('path');
++const ansi = require('ansi-colors');
+ const debug = require('debug')('mocha:cli:run:helpers');
+ const {watchRun, watchParallelRun} = require('./watch-run');
+ const collectFiles = require('./collect-files');
+@@ -16,6 +17,7 @@ const {format} = require('util');
+ const {createInvalidLegacyPluginError} = require('../errors');
+ const {requireOrImport} = require('../nodejs/esm-utils');
+ const PluginLoader = require('../plugin-loader');
++const {UnmatchedFile} = require('./collect-files');
+ 
+ /**
+  * Exits Mocha when tests + code under test has finished execution (default)
+@@ -106,6 +108,32 @@ exports.handleRequires = async (requires = [], {ignoredPlugins = []} = {}) => {
+   return plugins;
+ };
+ 
++/**
++ * Logs errors and exits the app if unmatched files exist
++ * @param {Mocha} mocha - Mocha instance
++ * @param {UnmatchedFile} unmatchedFiles - object containing unmatched file paths
++ * @returns {Promise<Runner>}
++ * @private
++ */
++const handleUnmatchedFiles = (mocha, unmatchedFiles) => {
++  if (unmatchedFiles.length === 0) {
++    return;
++  }
++
++  unmatchedFiles.forEach(({pattern, absolutePath}) => {
++    console.error(
++      ansi.yellow(
++        `Warning: Cannot find any files matching pattern "${pattern}" at the absolute path "${absolutePath}"`
++      )
++    );
++  });
++  console.log(
++    'No test file(s) found with the given pattern, exiting with code 1'
++  );
++
++  return mocha.run(exitMocha(1));
++};
++
+ /**
+  * Collect and load test files, then run mocha instance.
+  * @param {Mocha} mocha - Mocha instance
+@@ -117,9 +145,14 @@ exports.handleRequires = async (requires = [], {ignoredPlugins = []} = {}) => {
+  * @private
+  */
+ const singleRun = async (mocha, {exit}, fileCollectParams) => {
+-  const files = collectFiles(fileCollectParams);
+-  debug('single run with %d file(s)', files.length);
+-  mocha.files = files;
++  const fileCollectionObj = collectFiles(fileCollectParams);
++
++  if (fileCollectionObj.unmatchedFiles.length > 0) {
++    return handleUnmatchedFiles(mocha, fileCollectionObj.unmatchedFiles);
++  }
++
++  debug('single run with %d file(s)', fileCollectionObj.files.length);
++  mocha.files = fileCollectionObj.files;
+ 
+   // handles ESM modules
+   await mocha.loadFilesAsync();
+@@ -140,9 +173,17 @@ const singleRun = async (mocha, {exit}, fileCollectParams) => {
+  * @private
+  */
+ const parallelRun = async (mocha, options, fileCollectParams) => {
+-  const files = collectFiles(fileCollectParams);
+-  debug('executing %d test file(s) in parallel mode', files.length);
+-  mocha.files = files;
++  const fileCollectionObj = collectFiles(fileCollectParams);
++
++  if (fileCollectionObj.unmatchedFiles.length > 0) {
++    return handleUnmatchedFiles(mocha, fileCollectionObj.unmatchedFiles);
++  }
++
++  debug(
++    'executing %d test file(s) in parallel mode',
++    fileCollectionObj.files.length
++  );
++  mocha.files = fileCollectionObj.files;
+ 
+   // note that we DO NOT load any files here; this is handled by the worker
+   return mocha.run(options.exit ? exitMocha : exitMochaLater);
+diff --git a/lib/cli/watch-run.js b/lib/cli/watch-run.js
+index a77ed7a91a..6d5c6c26a7 100644
+--- a/lib/cli/watch-run.js
++++ b/lib/cli/watch-run.js
+@@ -58,7 +58,7 @@ exports.watchParallelRun = (
+       newMocha.suite.ctx = new Context();
+ 
+       // reset the list of files
+-      newMocha.files = collectFiles(fileCollectParams);
++      newMocha.files = collectFiles(fileCollectParams).files;
+ 
+       // because we've swapped out the root suite (see the `run` inner function
+       // in `createRerunner`), we need to call `mocha.ui()` again to set up the context/globals.
+@@ -120,7 +120,7 @@ exports.watchRun = (mocha, {watchFiles, watchIgnore}, fileCollectParams) => {
+       newMocha.suite.ctx = new Context();
+ 
+       // reset the list of files
+-      newMocha.files = collectFiles(fileCollectParams);
++      newMocha.files = collectFiles(fileCollectParams).files;
+ 
+       // because we've swapped out the root suite (see the `run` inner function
+       // in `createRerunner`), we need to call `mocha.ui()` again to set up the context/globals.
+diff --git a/test/integration/fixtures/collect-files.fixture.mjs b/test/integration/fixtures/collect-files.fixture.mjs
+new file mode 100644
+index 0000000000..199e9714ac
+--- /dev/null
++++ b/test/integration/fixtures/collect-files.fixture.mjs
+@@ -0,0 +1,7 @@
++var obj = {foo: 'bar'};
++
++describe('mjs', function () {
++  it('should work', function () {
++    expect(obj, 'to equal', {foo: 'bar'});
++  });
++});
+diff --git a/test/integration/options/file.spec.js b/test/integration/options/file.spec.js
+index 88815376f0..259ce4782e 100644
+--- a/test/integration/options/file.spec.js
++++ b/test/integration/options/file.spec.js
+@@ -1,9 +1,11 @@
+ 'use strict';
+ 
+ var path = require('path').posix;
+-var helpers = require('../helpers');
+-var runMochaJSON = helpers.runMochaJSON;
+-var resolvePath = helpers.resolveFixturePath;
++const {
++  runMochaJSON,
++  resolveFixturePath: resolvePath,
++  runMocha
++} = require('../helpers');
+ 
+ describe('--file', function () {
+   var args = [];
+@@ -64,4 +66,82 @@ describe('--file', function () {
+       done();
+     });
+   });
++
++  it('should run esm tests passed via file', function (done) {
++    const esmFile = 'collect-files.fixture.mjs';
++    const testArgs = ['--file', resolvePath(esmFile)];
++
++    runMochaJSON(esmFile, testArgs, function (err, res) {
++      if (err) {
++        return done(err);
++      }
++      expect(res, 'to have passed');
++      done();
++    });
++  });
++
++  it('should log a warning if a nonexistent file with an unknown extension is specified', function (done) {
++    const nonexistentTestFileArg = 'nonexistent.test.ts';
++    runMocha(
++      nonexistentTestFileArg,
++      ['--file'],
++      function (err, res) {
++        if (err) {
++          return done(err);
++        }
++
++        expect(
++          res.output,
++          'to contain',
++          `Warning: Cannot find any files matching pattern`
++        ).and('to contain', nonexistentTestFileArg);
++        done();
++      },
++      {stdio: 'pipe'}
++    );
++  });
++
++  it('should provide warning for nonexistent js file extensions', function (done) {
++    const nonexistentCjsArg = 'nonexistent.test.js';
++
++    runMocha(
++      nonexistentCjsArg,
++      ['--file'],
++      function (err, res) {
++        if (err) {
++          return done(err);
++        }
++
++        expect(
++          res.output,
++          'to contain',
++          `Warning: Cannot find any files matching pattern`
++        ).and('to contain', nonexistentCjsArg);
++        done();
++      },
++      {stdio: 'pipe'}
++    );
++  });
++
++  it('should provide warning for nonexistent esm file extensions', function (done) {
++    const nonexistentEsmArg = 'nonexistent.test.mjs';
++
++    runMocha(
++      nonexistentEsmArg,
++      ['--file'],
++      function (err, res) {
++        if (err) {
++          return done(err);
++        }
++
++        expect(
++          res.output,
++          'to contain',
++          `Warning: Cannot find any files matching pattern`
++        ).and('to contain', nonexistentEsmArg);
++        done();
++      },
++      {stdio: 'pipe'}
++    );
++  });
+ });

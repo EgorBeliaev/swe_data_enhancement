@@ -1,0 +1,272 @@
+diff --git a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Main.cs b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Main.cs
+index 577d0a19de58..43bafe1c1cec 100644
+--- a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Main.cs
++++ b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Main.cs
+@@ -7,16 +7,21 @@
+ using System.ComponentModel;
+ using System.Diagnostics;
+ using System.Linq;
++using System.Windows;
++using System.Windows.Input;
+ 
+ using Community.PowerToys.Run.Plugin.VSCodeWorkspaces.Properties;
+ using Community.PowerToys.Run.Plugin.VSCodeWorkspaces.RemoteMachinesHelper;
+ using Community.PowerToys.Run.Plugin.VSCodeWorkspaces.VSCodeHelper;
+ using Community.PowerToys.Run.Plugin.VSCodeWorkspaces.WorkspacesHelper;
++
++using Wox.Infrastructure;
+ using Wox.Plugin;
++using Wox.Plugin.Logger;
+ 
+ namespace Community.PowerToys.Run.Plugin.VSCodeWorkspaces
+ {
+-    public class Main : IPlugin, IPluginI18n
++    public class Main : IPlugin, IPluginI18n, IContextMenu
+     {
+         private PluginInitContext _context;
+ 
+@@ -76,11 +81,9 @@ public List<Result> Query(Query query)
+ 
+                                 hide = true;
+                             }
+-                            catch (Win32Exception)
++                            catch (Win32Exception ex)
+                             {
+-                                var name = $"Plugin: {_context.CurrentPluginMetadata.Name}";
+-                                var msg = "Can't Open this file";
+-                                _context.API.ShowMsg(name, msg, string.Empty);
++                                HandleError("Can't Open this file", ex, showMsg: true);
+                                 hide = false;
+                             }
+ 
+@@ -124,11 +127,9 @@ public List<Result> Query(Query query)
+ 
+                                 hide = true;
+                             }
+-                            catch (Win32Exception)
++                            catch (Win32Exception ex)
+                             {
+-                                var name = $"Plugin: {_context.CurrentPluginMetadata.Name}";
+-                                var msg = "Can't Open this file";
+-                                _context.API.ShowMsg(name, msg, string.Empty);
++                                HandleError("Can't Open this file", ex, showMsg: true);
+                                 hide = false;
+                             }
+ 
+@@ -142,23 +143,23 @@ public List<Result> Query(Query query)
+             results = results.Where(a => a.Title.Contains(query.Search, StringComparison.InvariantCultureIgnoreCase)).ToList();
+ 
+             results.ForEach(x =>
+-                    {
+-                        if (x.Score == 0)
+-                        {
+-                            x.Score = 100;
+-                        }
++            {
++                if (x.Score == 0)
++                {
++                    x.Score = 100;
++                }
+ 
+-                        // intersect the title with the query
+-                        var intersection = Convert.ToInt32(x.Title.ToLowerInvariant().Intersect(query.Search.ToLowerInvariant()).Count() * query.Search.Length);
+-                        var differenceWithQuery = Convert.ToInt32((x.Title.Length - intersection) * query.Search.Length * 0.7);
+-                        x.Score = x.Score - differenceWithQuery + intersection;
++                // intersect the title with the query
++                var intersection = Convert.ToInt32(x.Title.ToLowerInvariant().Intersect(query.Search.ToLowerInvariant()).Count() * query.Search.Length);
++                var differenceWithQuery = Convert.ToInt32((x.Title.Length - intersection) * query.Search.Length * 0.7);
++                x.Score = x.Score - differenceWithQuery + intersection;
+ 
+-                        // if is a remote machine give it 12 extra points
+-                        if (x.ContextData is VSCodeRemoteMachine)
+-                        {
+-                            x.Score = Convert.ToInt32(x.Score + (intersection * 2));
+-                        }
+-                    });
++                // if is a remote machine give it 12 extra points
++                if (x.ContextData is VSCodeRemoteMachine)
++                {
++                    x.Score = Convert.ToInt32(x.Score + (intersection * 2));
++                }
++            });
+ 
+             results = results.OrderByDescending(x => x.Score).ToList();
+             if (query.Search == string.Empty || query.Search.Replace(" ", string.Empty) == string.Empty)
+@@ -174,6 +175,108 @@ public void Init(PluginInitContext context)
+             _context = context;
+         }
+ 
++        public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
++        {
++            if (selectedResult?.ContextData is not VSCodeWorkspace workspace)
++            {
++                return new List<ContextMenuResult>();
++            }
++
++            string realPath = SystemPath.RealPath(workspace.RelativePath);
++
++            return new List<ContextMenuResult>
++            {
++                new ContextMenuResult
++                {
++                    PluginName = Name,
++                    Title = $"{Resources.CopyPath} (Ctrl+C)",
++                    Glyph = "\xE8C8", // Copy
++                    FontFamily = "Segoe Fluent Icons,Segoe MDL2 Assets",
++                    AcceleratorKey = Key.C,
++                    AcceleratorModifiers = ModifierKeys.Control,
++                    Action = context => CopyToClipboard(realPath),
++                },
++                new ContextMenuResult
++                {
++                    PluginName = Name,
++                    Title = $"{Resources.OpenInExplorer} (Ctrl+Shift+F)",
++                    Glyph = "\xEC50", // File Explorer
++                    FontFamily = "Segoe Fluent Icons,Segoe MDL2 Assets",
++                    AcceleratorKey = Key.F,
++                    AcceleratorModifiers = ModifierKeys.Control | ModifierKeys.Shift,
++                    Action = context => OpenInExplorer(realPath),
++                },
++                new ContextMenuResult
++                {
++                    PluginName = Name,
++                    Title = $"{Resources.OpenInConsole} (Ctrl+Shift+C)",
++                    Glyph = "\xE756", // Command Prompt
++                    FontFamily = "Segoe Fluent Icons,Segoe MDL2 Assets",
++                    AcceleratorKey = Key.C,
++                    AcceleratorModifiers = ModifierKeys.Control | ModifierKeys.Shift,
++                    Action = context => OpenInConsole(realPath),
++                },
++            };
++        }
++
++        private bool CopyToClipboard(string path)
++        {
++            try
++            {
++                Clipboard.SetText(path);
++                return true;
++            }
++            catch (Exception ex)
++            {
++                HandleError("Can't copy to clipboard", ex, showMsg: true);
++                return false;
++            }
++        }
++
++        private bool OpenInConsole(string path)
++        {
++            try
++            {
++                Helper.OpenInConsole(path);
++                return true;
++            }
++            catch (Exception ex)
++            {
++                HandleError($"Unable to open the specified path in the console: {path}", ex, showMsg: true);
++                return false;
++            }
++        }
++
++        private bool OpenInExplorer(string path)
++        {
++            if (!Helper.OpenInShell("explorer.exe", $"\"{path}\""))
++            {
++                HandleError($"Failed to open folder in Explorer at path: {path}", showMsg: true);
++                return false;
++            }
++
++            return true;
++        }
++
++        private void HandleError(string msg, Exception exception = null, bool showMsg = false)
++        {
++            if (exception != null)
++            {
++                Log.Exception(msg, exception, exception.GetType());
++            }
++            else
++            {
++                Log.Error(msg, typeof(VSCodeWorkspaces.Main));
++            }
++
++            if (showMsg)
++            {
++                _context.API.ShowMsg(
++                    $"Plugin: {_context.CurrentPluginMetadata.Name}",
++                    msg);
++            }
++        }
++
+         public string GetTranslatedPluginTitle()
+         {
+             return Resources.PluginTitle;
+diff --git a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.Designer.cs b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.Designer.cs
+index 9f7d4d920fe5..45914a338f20 100644
+--- a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.Designer.cs
++++ b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.Designer.cs
+@@ -140,5 +140,32 @@ internal static string Workspace {
+                 return ResourceManager.GetString("Workspace", resourceCulture);
+             }
+         }
++        
++        /// <summary>
++        ///   Looks up a localized string similar to Copy Path.
++        /// </summary>
++        internal static string CopyPath {
++            get {
++                return ResourceManager.GetString("CopyPath", resourceCulture);
++            }
++        }
++        
++        /// <summary>
++        ///   Looks up a localized string similar to Open in console.
++        /// </summary>
++        internal static string OpenInConsole {
++            get {
++                return ResourceManager.GetString("OpenInConsole", resourceCulture);
++            }
++        }
++        
++        /// <summary>
++        ///   Looks up a localized string similar to Open in Explorer.
++        /// </summary>
++        internal static string OpenInExplorer {
++            get {
++                return ResourceManager.GetString("OpenInExplorer", resourceCulture);
++            }
++        }
+     }
+ }
+diff --git a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.resx b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.resx
+index 01778a0beb61..de0254afd3b8 100644
+--- a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.resx
++++ b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/Properties/Resources.resx
+@@ -151,4 +151,13 @@
+     <value>Project Folder</value>
+     <comment>It refers to the Visual Studio Code Project Folders</comment>
+   </data>
++  <data name="CopyPath" xml:space="preserve">
++    <value>Copy path</value>
++  </data>
++  <data name="OpenInConsole" xml:space="preserve">
++    <value>Open in console</value>
++  </data>
++  <data name="OpenInExplorer" xml:space="preserve">
++    <value>Open in Explorer</value>
++  </data>
+ </root>
+\ No newline at end of file
+diff --git a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/plugin.json b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/plugin.json
+index 2c6d9cb70d70..c5f0a7b84c9d 100644
+--- a/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/plugin.json
++++ b/src/modules/launcher/Plugins/Community.PowerToys.Run.Plugin.VSCodeWorkspaces/plugin.json
+@@ -4,7 +4,7 @@
+   "ActionKeyword": "{",
+   "Name": "VS Code Workspaces",
+   "Author": "ricardosantos9521",
+-  "Version": "1.1.0",
++  "Version": "1.2.0",
+   "Language": "csharp",
+   "Website": "https://github.com/ricardosantos9521/PowerToys/",
+   "ExecuteFileName": "Community.PowerToys.Run.Plugin.VSCodeWorkspaces.dll",

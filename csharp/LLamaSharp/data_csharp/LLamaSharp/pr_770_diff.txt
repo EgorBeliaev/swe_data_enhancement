@@ -1,0 +1,741 @@
+diff --git a/LLama.Examples/ExampleRunner.cs b/LLama.Examples/ExampleRunner.cs
+index 7945a7e12..d8be45633 100644
+--- a/LLama.Examples/ExampleRunner.cs
++++ b/LLama.Examples/ExampleRunner.cs
+@@ -1,4 +1,4 @@
+-﻿using Spectre.Console;
++using Spectre.Console;
+ using LLama.Examples.Examples;
+ 
+ public class ExampleRunner
+@@ -31,6 +31,7 @@ public class ExampleRunner
+         { "Batched Executor: Fork", BatchedExecutorFork.Run },
+         { "Batched Executor: Rewind", BatchedExecutorRewind.Run },
+         { "Batched Executor: Guidance", BatchedExecutorGuidance.Run },
++        { "Batched Executor: LLava", BatchedExecutorLLava.Run },
+         { "Speech Chat: Integration with Whisper.net", SpeechChat.Run },
+         { "Exit", () => { Environment.Exit(0); return Task.CompletedTask; } }
+     };
+diff --git a/LLama.Examples/Examples/BatchedExecutorLLava.cs b/LLama.Examples/Examples/BatchedExecutorLLava.cs
+new file mode 100644
+index 000000000..73ac65b84
+--- /dev/null
++++ b/LLama.Examples/Examples/BatchedExecutorLLava.cs
+@@ -0,0 +1,91 @@
++using System.Text;
++using LLama.Batched;
++using LLama.Common;
++using LLama.Native;
++using LLama.Sampling;
++using Spectre.Console;
++
++namespace LLama.Examples.Examples;
++
++/// <summary>
++/// Demonstrates using LLava (image embeddings) with the batched executor.
++/// </summary>
++public class BatchedExecutorLLava
++{
++    /// <summary>
++    /// How many tokens of response to generate
++    /// </summary>
++    public const int TokenCount = 64;
++
++    public static async Task Run()
++    {
++        // Load model weights
++        var parameters = new ModelParams(UserSettings.GetModelPath());
++        using var model = await LLamaWeights.LoadFromFileAsync(parameters);
++        using var llava = await LLavaWeights.LoadFromFileAsync(UserSettings.GetMMProjPath());
++        
++        // Decide on the prompt
++        var prompt = model.Tokenize(AnsiConsole.Ask("Prompt (or ENTER for default):", "\nUSER: Provide a full description of the image.\nASSISTANT: "), true, false, Encoding.UTF8);
++        
++        // Get image and show it
++        var image = UserSettings.GetImagePath();
++        AnsiConsole.Write(new CanvasImage(image));
++        
++        // Create an executor with one conversation
++        using var executor = new BatchedExecutor(model, parameters);
++        using var conversation = executor.Create();
++
++        // Embed the image
++        SafeLlavaImageEmbedHandle embedding = null!;
++        await AnsiConsole
++             .Status()
++             .StartAsync("[yellow]Embedding image with CLIP[/]", async _ =>
++              {
++                  // ReSharper disable once AccessToDisposedClosure
++                  embedding = llava.CreateImageEmbeddings(await File.ReadAllBytesAsync(image));
++              });
++        
++        // Pass in the image and run inference until the entire image has been processed
++        await AnsiConsole
++             .Status()
++             .StartAsync("[yellow]Processing image embedding with language model[/]", async _ =>
++              {
++                  conversation.Prompt(embedding);
++                  while (executor.BatchedTokenCount > 0)
++                      await executor.Infer();
++              });
++
++        // Prompt with the text prompt
++        conversation.Prompt(prompt);
++        
++        // Run inference loop
++        var decoder = new StreamingTokenDecoder(executor.Context);
++        var sampler = new DefaultSamplingPipeline();
++        await AnsiConsole
++             .Progress()
++             .StartAsync(async ctx =>
++              {
++                  var task = ctx.AddTask("Generating Response");
++                  task.MaxValue = TokenCount;
++
++                  // Run a normal inference loop
++                  for (var i = 0; i < TokenCount; i++)
++                  {
++                      task.Increment(1);
++
++                      await executor.Infer();
++                      
++                      var token = sampler.Sample(executor.Context.NativeHandle, conversation.Sample(), Array.Empty<LLamaToken>());
++                      if (executor.Context.NativeHandle.ModelHandle.Tokens.IsEndOfGeneration(token))
++                          break;
++                      
++                      decoder.Add(token);
++                      conversation.Prompt(token);
++                  }
++              });
++
++        // Print final result
++        var str = decoder.Read();
++        AnsiConsole.MarkupInterpolated($"[green]{str}[/]");
++    }
++}
+\ No newline at end of file
+diff --git a/LLama/Batched/BatchedExecutor.cs b/LLama/Batched/BatchedExecutor.cs
+index b874922a8..cdb1835e4 100644
+--- a/LLama/Batched/BatchedExecutor.cs
++++ b/LLama/Batched/BatchedExecutor.cs
+@@ -1,5 +1,6 @@
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.Linq;
+ using System.Threading;
+ using System.Threading.Tasks;
+@@ -15,12 +16,12 @@ public sealed class BatchedExecutor
+     : IDisposable
+ {
+     private int _nextSequenceId;
+-    private readonly List<LLamaBatch> _batchQueue = [ ];
++    private readonly List<IBatch> _batchQueue = [ ];
+     
+     /// <summary>
+-    /// Held while inference is running
++    /// Set to 1 using interlocked exchange while inference is running
+     /// </summary>
+-    private readonly object _inferenceLock = new();
++    private int _inferenceLock = 0;
+ 
+     /// <summary>
+     /// Epoch is incremented twice every time Infer is called. Conversations can use this to keep track of
+@@ -41,7 +42,12 @@ public sealed class BatchedExecutor
+     /// <summary>
+     /// Get the number of tokens in the batch, waiting for <see cref="Infer"/> to be called
+     /// </summary>
+-    public int BatchedTokenCount => _batchQueue.Sum(a => a.TokenCount);
++    public int BatchedTokenCount => _batchQueue.Sum(a => a.ItemCount);
++
++    /// <summary>
++    /// Number of batches in the queue, waiting for <see cref="Infer"/> to be called
++    /// </summary>
++    public int BatchQueueCount => _batchQueue.Count;
+ 
+     /// <summary>
+     /// Check if this executor has been disposed.
+@@ -120,9 +126,11 @@ public async Task<DecodeResult> Infer(CancellationToken cancellation = default)
+         var next = GetNextBatch();
+         if (next == null)
+             return DecodeResult.Ok;
+-        
+-        // Take the inference lock, if this fails it's because inference is already running.
+-        if (!Monitor.TryEnter(_inferenceLock))
++
++        // This acts as a "lock" on inference, ensuring two inferences cannot run at once. First set the "_inferenceLock" field
++        // to the "key" value iff it is currently 0. If it is not currently 0 this will throw an exception.
++        var key = (int)(DateTime.UtcNow.Ticks & 0xFFFF_FFFF);
++        if (Interlocked.CompareExchange(ref _inferenceLock, key, 0) != 0)
+             throw new InvalidOperationException("Cannot start inference while it is already running");
+         try
+         {
+@@ -133,7 +141,7 @@ public async Task<DecodeResult> Infer(CancellationToken cancellation = default)
+                 Epoch++;
+ 
+             // Run the actual inference. This is the slow bit!
+-            var status = await Context.DecodeAsync(next, cancellation);
++            var status = await next.DecodeAsync(Context, cancellation);
+ 
+             // If there was an error then early exit without incrementing the epoch. This allows infer to be called
+             // again after the issue has been fixed (e.g. some KV cache space has been freed) to retry this operation.
+@@ -143,18 +151,20 @@ public async Task<DecodeResult> Infer(CancellationToken cancellation = default)
+                 return status;
+             }
+             
+-            // Everything was ok, advance the epoch and clear the batch we just ran inference for.
++            // Everything was ok, advance the epoch
+             Epoch++;
+-            next.Clear();
+             
+             return status;
+         }
+         finally
+         {
+-            Monitor.Exit(_inferenceLock);
++            // Set "_inferenceLock" field back to zero iff it is currently the "key" value we set earlier. It should be
++            // impossible for this to ever fail!
++            var old = Interlocked.CompareExchange(ref _inferenceLock, 0, key);
++            Debug.Assert(old == key);
+         }
+         
+-        LLamaBatch? GetNextBatch()
++        IBatch? GetNextBatch()
+         {
+             if (_batchQueue.Count == 0)
+                 return null;
+@@ -194,17 +204,86 @@ internal LLamaSeqId GetNextSequenceId()
+         // Find a batch with space for at least minCapacity tokens
+         for (var i = 0; i < _batchQueue.Count; i++)
+         {
+-            var capacity = Context.BatchSize - _batchQueue[i].TokenCount;
++            var item = _batchQueue[i];
++            if (item is not TokenBatch { Batch: var batch })
++                continue;
++
++            var capacity = Context.BatchSize - batch.TokenCount;
+             if (capacity < minCapacity)
+                 continue;
+ 
+-            if (_batchQueue[i].TokenCount < Context.BatchSize)
+-                return (_batchQueue[i], Epoch + (uint)(i + 1) * 2);
++            if (batch.TokenCount < Context.BatchSize)
++                return (batch, Epoch + (uint)(i + 1) * 2);
+         }
+         
+         // Add a new batch to the end of the queue
+         var end = new LLamaBatch();
+-        _batchQueue.Add(end);
++        _batchQueue.Add(new TokenBatch(end));
+         return (end, Epoch + (uint)_batchQueue.Count * 2);
+     }
++    
++    /// <summary>
++    /// Get a reference to a batch that embeddings can be added to.
++    /// </summary>
++    /// <param name="minCapacity"></param>
++    /// <returns></returns>
++    /// <exception cref="ArgumentOutOfRangeException"></exception>
++    internal (LLamaBatchEmbeddings batch, ulong epoch) GetEmbeddingBatch(int minCapacity = 1)
++    {
++        if (minCapacity > Context.BatchSize)
++            throw new ArgumentOutOfRangeException(nameof(minCapacity), $"Request batch capacity must be less than or equal to BatchSize ({Context.BatchSize})");
++        
++        // Find a batch with space for at least minCapacity embeddings
++        for (var i = 0; i < _batchQueue.Count; i++)
++        {
++            var item = _batchQueue[i];
++            if (item is not EmbeddingBatch { Batch: var batch })
++                continue;
++            
++            var capacity = Context.BatchSize - batch.EmbeddingsCount;
++            if (capacity < minCapacity)
++                continue;
++            
++            if (batch.EmbeddingsCount < Context.BatchSize)
++                return (batch, Epoch + (uint)(i + 1) * 2);
++        }
++        
++        // Add a new batch to the end of the queue
++        var end = new LLamaBatchEmbeddings(Context.EmbeddingSize);
++        _batchQueue.Add(new EmbeddingBatch(end));
++        return (end, Epoch + (uint)_batchQueue.Count * 2);
++    }
++
++    #region batches
++    private interface IBatch
++    {
++        int ItemCount { get; }
++        
++        Task<DecodeResult> DecodeAsync(LLamaContext ctx, CancellationToken token);
++    }
++    
++    private class TokenBatch(LLamaBatch batch)
++        : IBatch
++    {
++        public readonly LLamaBatch Batch = batch;
++        public int ItemCount => Batch.TokenCount;
++
++        public Task<DecodeResult> DecodeAsync(LLamaContext ctx, CancellationToken token)
++        {
++            return ctx.DecodeAsync(Batch, token);
++        }
++    }
++    
++    private class EmbeddingBatch(LLamaBatchEmbeddings batch)
++        : IBatch
++    {
++        public readonly LLamaBatchEmbeddings Batch = batch;
++        public int ItemCount => Batch.EmbeddingsCount;
++
++        public Task<DecodeResult> DecodeAsync(LLamaContext ctx, CancellationToken token)
++        {
++            return ctx.DecodeAsync(Batch, token);
++        }
++    }
++    #endregion
+ }
+\ No newline at end of file
+diff --git a/LLama/Batched/Conversation.cs b/LLama/Batched/Conversation.cs
+index 5616227ef..67ef7aa9b 100644
+--- a/LLama/Batched/Conversation.cs
++++ b/LLama/Batched/Conversation.cs
+@@ -278,6 +278,73 @@ public void Prompt(LLamaToken token)
+         Span<LLamaToken> span = [ token ];
+         Prompt(span);
+     }
++
++    /// <summary>
++    /// Prompt this conversation with an image embedding
++    /// </summary>
++    /// <param name="embedding"></param>
++    public void Prompt(SafeLlavaImageEmbedHandle embedding)
++    {
++        AssertCanBePrompted();
++
++        if (embedding.Model.EmbeddingDimensions != Executor.Model.EmbeddingSize)
++            throw new ArgumentException($"Embedding dimension mismatch between image embedding ({embedding.Model.EmbeddingDimensions}) and model ({Executor.Model.EmbeddingSize})");
++        
++        // Get a temporary array large enough to hold one embedding item
++        var tempArr = ArrayPool<float>.Shared.Rent(embedding.Model.EmbeddingDimensions);
++        var tempSpan = tempArr.AsSpan(0, embedding.Model.EmbeddingDimensions);
++        try
++        {
++            for (var i = 0; i < embedding.Model.PatchCount; i++)
++            {
++                // Get a batch with space
++                (var batch, _requiredEpoch) = Executor.GetEmbeddingBatch();
++                
++                batch.Add(
++                    (i, embedding),
++                    static (Span<float> dest, (int index, SafeLlavaImageEmbedHandle embedding) tup) => tup.embedding.GetEmbedding(dest, tup.index),
++                    _end++,
++                    ConversationId,
++                    i == embedding.Model.PatchCount - 1
++                );
++            }
++        }
++        finally
++        {
++            ArrayPool<float>.Shared.Return(tempArr);
++        }
++    }
++
++    /// <summary>
++    /// Prompt this conversation with embeddings
++    /// </summary>
++    /// <param name="embeddings">The raw values of the embeddings. This span must divide equally by the embedding size of this model.</param>
++    public void Prompt(ReadOnlySpan<float> embeddings)
++    {
++        AssertCanBePrompted();
++
++        var dim = Executor.Model.EmbeddingSize;
++        var count = embeddings.Length / dim;
++        if (count * dim != embeddings.Length)
++            throw new ArgumentException($"Incorrect embeddings span size, length ({embeddings.Length}) must be divisible by embedding dimensions ({Executor.Model.EmbeddingSize})");
++
++        while (embeddings.Length > 0)
++        {
++            // Get a batch with space
++            (var batch, _requiredEpoch) = Executor.GetEmbeddingBatch();
++
++            // Add 1 embedding to the batch
++            batch.Add(
++                embeddings.Slice(0, dim),
++                _end++,
++                ConversationId,
++                embeddings.Length == dim
++            );
++
++            // Advance to next embedding
++            embeddings = embeddings.Slice(dim);
++        }
++    }
+     #endregion
+ 
+     #region modify
+diff --git a/LLama/LLamaContext.cs b/LLama/LLamaContext.cs
+index 6335c1dc7..b6eedfb20 100644
+--- a/LLama/LLamaContext.cs
++++ b/LLama/LLamaContext.cs
+@@ -558,6 +558,28 @@ public Task<DecodeResult> DecodeAsync(LLamaBatch batch, CancellationToken cancel
+         {
+             return Task.Run(() => Decode(batch), cancellationToken);
+         }
++        
++        /// <summary>
++        /// </summary>
++        /// <param name="batch"></param>
++        public DecodeResult Decode(LLamaBatchEmbeddings batch)
++        {
++            if (batch.EmbeddingsCount == 0)
++                return 0;
++            if (batch.EmbeddingsCount > Params.BatchSize)
++                throw new ArgumentException("Input contains more tokens than configured batch size", nameof(batch));
++            
++            return (DecodeResult)NativeHandle.Decode(batch);
++        }
++        
++        /// <summary>
++        /// </summary>
++        /// <param name="batch"></param>
++        /// <param name="cancellationToken"></param>
++        public Task<DecodeResult> DecodeAsync(LLamaBatchEmbeddings batch, CancellationToken cancellationToken = default)
++        {
++            return Task.Run(() => Decode(batch), cancellationToken);
++        }
+         #endregion
+ 
+         /// <inheritdoc />
+diff --git a/LLama/Native/LLamaBatchEmbeddings.cs b/LLama/Native/LLamaBatchEmbeddings.cs
+new file mode 100644
+index 000000000..ccfed7402
+--- /dev/null
++++ b/LLama/Native/LLamaBatchEmbeddings.cs
+@@ -0,0 +1,275 @@
++using System;
++using System.Collections.Generic;
++using System.Runtime.CompilerServices;
++
++namespace LLama.Native;
++
++/// <summary>
++/// An embeddings batch allows submitting embeddings to multiple sequences simultaneously
++/// </summary>
++public class LLamaBatchEmbeddings
++{
++    private byte[] _logits;
++    
++    private float[] _embeddings;
++    private LLamaPos[] _positions;
++    
++    private int[] _sequenceIdCount;
++    private LLamaSeqId[][] _sequenceIds;
++    private IntPtr[] _sequenceIdsPtrs;
++    
++    /// <summary>
++    /// Keep a list of where logits can be sampled from
++    /// </summary>
++    private readonly List<(LLamaSeqId, int)> _logitPositions = new();
++    
++    /// <summary>
++    /// Get the number of logit positions that will be generated from this batch
++    /// </summary>
++    internal int LogitPositionCount => _logitPositions.Count;
++
++    /// <summary>
++    /// Size of an individual embedding
++    /// </summary>
++    public int EmbeddingDimensions { get; }
++
++    /// <summary>
++    /// The number of items in this batch
++    /// </summary>
++    public int EmbeddingsCount { get; private set; }
++    
++    /// <summary>
++    /// Maximum number of items that can be added to this batch (automatically grows if exceeded)
++    /// </summary>
++    private int EmbeddingsCapacity { get; set; }
++    
++    /// <summary>
++    /// Maximum number of sequences an item can be assigned to (automatically grows if exceeded)
++    /// </summary>
++    public int SequenceCapacity { get; private set; }
++
++    /// <summary>
++    /// Create a new batch for submitting inputs to llama.cpp
++    /// </summary>
++    public LLamaBatchEmbeddings(int embeddingDimensions)
++    {
++        // These can both be grown later, start off with reasonable numbers.
++        const int embeddingsCapacity = 128;
++        const int seqCapacity = 1;
++        
++        EmbeddingDimensions = embeddingDimensions;
++        SequenceCapacity = seqCapacity;
++        EmbeddingsCapacity = embeddingsCapacity;
++        
++        _logits = new byte[embeddingsCapacity];
++        _embeddings = new float[embeddingsCapacity * embeddingDimensions];
++        _positions = new LLamaPos[embeddingsCapacity];
++        
++        _sequenceIdCount = new int[embeddingsCapacity];
++        _sequenceIdsPtrs = new IntPtr[_sequenceIdCount.Length];
++        
++        _sequenceIds = new LLamaSeqId[embeddingsCapacity][];
++        for (var i = 0; i < _sequenceIds.Length; i++)
++            _sequenceIds[i] = new LLamaSeqId[SequenceCapacity];
++    }
++    
++    #region grow
++    private void GrowEmbeddingsCapacity()
++    {
++        var embeddings = EmbeddingsCount * 2;
++        EmbeddingsCapacity = embeddings;
++        
++        Array.Resize(ref _logits, embeddings);
++        Array.Resize(ref _embeddings, embeddings * EmbeddingDimensions);
++        Array.Resize(ref _positions, embeddings);
++        
++        Array.Resize(ref _sequenceIdCount, embeddings);
++        Array.Resize(ref _sequenceIdsPtrs, embeddings);
++        
++        Array.Resize(ref _sequenceIds, embeddings);
++        for (var i = 0; i < _sequenceIds.Length; i++)
++        {
++            // Growing the array filled elements with null, temporarily violating the nullability contract!
++            // ReSharper disable once NullCoalescingConditionIsAlwaysNotNullAccordingToAPIContract
++            _sequenceIds[i] ??= new LLamaSeqId[SequenceCapacity];
++        }
++    }
++    
++    private void GrowMaxSequences(int atLeast)
++    {
++        var seqCount = Math.Max(SequenceCapacity * 2, atLeast);
++        SequenceCapacity = seqCount;
++        
++        for (var i = 0; i < _sequenceIds.Length; i++)
++            Array.Resize(ref _sequenceIds[i], SequenceCapacity);
++    }
++    #endregion
++
++    internal GroupDisposable ToNativeBatch(out LLamaNativeBatch batch)
++    {
++        // This group holds all of the memory pins
++        var group = new GroupDisposable();
++        
++        unsafe
++        {
++            batch = new LLamaNativeBatch
++            {
++                n_tokens = EmbeddingsCount,
++                logits = (byte*)group.Add(_logits.AsMemory().Pin()).Pointer,
++                
++                n_seq_id = (int*)group.Add(_sequenceIdCount.AsMemory().Pin()).Pointer,
++                pos = (LLamaPos*)group.Add(_positions.AsMemory().Pin()).Pointer,
++                seq_id = (LLamaSeqId**)group.Add(_sequenceIdsPtrs.AsMemory().Pin()).Pointer,
++                
++                embd = (float*)group.Add(_embeddings.AsMemory().Pin()).Pointer,
++                tokens = null,
++            };
++            
++            // Create pointers to each of the arrays in turns
++            for (var i = 0; i < _sequenceIdsPtrs.Length; i++)
++                _sequenceIdsPtrs[i] = (IntPtr)group.Add(_sequenceIds[i].AsMemory().Pin()).Pointer;
++        }
++        
++        return group;
++    }
++
++    #region Add
++    /// <summary>
++    /// Add a single embedding to the batch at the same position in several sequences
++    /// </summary>
++    /// <remarks>https://github.com/ggerganov/llama.cpp/blob/ad939626577cd25b462e8026cc543efb71528472/common/common.cpp#L829C2-L829C2</remarks>
++    /// <param name="embedding">The embedding to add</param>
++    /// <param name="pos">The position to add it att</param>
++    /// <param name="sequences">The set of sequences to add this token to</param>
++    /// <param name="logits"></param>
++    /// <returns>The index that the token was added at. Use this for GetLogitsIth</returns>
++    public int Add(ReadOnlySpan<float> embedding, LLamaPos pos, ReadOnlySpan<LLamaSeqId> sequences, bool logits)
++    {
++        if (embedding.Length != EmbeddingDimensions)
++            throw new ArgumentException($"Embedding must have correct dimension (expected {EmbeddingDimensions}, actual {embedding.Length})", nameof(embedding));
++        
++        // Span<float> cannot be passed as a type parameter. Split the span up into a pointer/length to sneak
++        // it through. This is only safe because we know the pointer will not be used after this call has returned.
++        unsafe
++        {
++            fixed (float* srcPtr = embedding)
++            {
++                return Add(
++                    ((IntPtr)srcPtr, embedding.Length),
++                    (dest, src) => new Span<float>((float*)src.Item1.ToPointer(), src.Length).CopyTo(dest),
++                    pos,
++                    sequences,
++                    logits
++                );
++            }
++        }
++    }
++
++    /// <summary>
++    /// Add a single embedding to the batch for a single sequence
++    /// </summary>
++    /// <param name="embedding"></param>
++    /// <param name="pos"></param>
++    /// <param name="sequence"></param>
++    /// <param name="logits"></param>
++    /// <returns>The index that the token was added at. Use this for GetLogitsIth</returns>
++    public int Add(ReadOnlySpan<float> embedding, LLamaPos pos, LLamaSeqId sequence, bool logits)
++    {
++        Span<LLamaSeqId> seqs = stackalloc LLamaSeqId[] { sequence };
++        return Add(
++            embedding,
++            pos,
++            seqs,
++            logits
++        );
++    }
++
++    /// <summary>
++    /// Called by embeddings batch to write embeddings into a destination span
++    /// </summary>
++    /// <typeparam name="TParam">Type of user data parameter passed in</typeparam>
++    /// <param name="dest">Destination to write data to. Entire destination must be filled!</param>
++    /// <param name="parameter">User data parameter passed in</param>
++    public delegate void WriteEmbeddingsDelegate<in TParam>(Span<float> dest, TParam parameter);
++
++    /// <summary>
++    /// Add a single embedding to the batch at the same position in several sequences
++    /// </summary>
++    /// <remarks>https://github.com/ggerganov/llama.cpp/blob/ad939626577cd25b462e8026cc543efb71528472/common/common.cpp#L829C2-L829C2</remarks>
++    /// <typeparam name="TParam">Type of userdata passed to write delegate</typeparam>
++    /// <param name="parameter">Userdata passed to write delegate</param>
++    /// <param name="write">Delegate called once to write data into a span</param>
++    /// <param name="pos">Position to write this embedding to</param>
++    /// <param name="sequences">All sequences to assign this embedding to</param>
++    /// <param name="logits">Whether logits should be generated for this embedding</param>
++    /// <returns>The index that the token was added at. Use this for GetLogitsIth</returns>
++    public int Add<TParam>(TParam parameter, WriteEmbeddingsDelegate<TParam> write, LLamaPos pos, ReadOnlySpan<LLamaSeqId> sequences, bool logits)
++    {
++        // Grow capacity as necessary
++        if (EmbeddingsCount == EmbeddingsCapacity)
++            GrowEmbeddingsCapacity();
++        if (sequences.Length > SequenceCapacity)
++            GrowMaxSequences(sequences.Length);
++
++        // Add the items to the arrays
++        write(_embeddings.AsSpan(EmbeddingsCount * EmbeddingDimensions, EmbeddingDimensions), parameter);
++        _positions[EmbeddingsCount] = pos;
++        _sequenceIdCount[EmbeddingsCount] = sequences.Length;
++        for (var i = 0; i < sequences.Length; i++)
++            _sequenceIds[EmbeddingsCount][i] = sequences[i];
++        _logits[EmbeddingsCount] = Convert.ToByte(logits);
++        
++        // Store this position in the logits lookup if necessary
++        if (logits)
++        {
++            foreach (var sequence in sequences)
++                _logitPositions.Add((sequence, EmbeddingsCount));
++        }
++        
++        return EmbeddingsCount++;
++    }
++    
++    /// <summary>
++    /// Add a single embedding to the batch at a position for one sequence
++    /// </summary>
++    /// <remarks>https://github.com/ggerganov/llama.cpp/blob/ad939626577cd25b462e8026cc543efb71528472/common/common.cpp#L829C2-L829C2</remarks>
++    /// <typeparam name="TParam">Type of userdata passed to write delegate</typeparam>
++    /// <param name="parameter">Userdata passed to write delegate</param>
++    /// <param name="write">Delegate called once to write data into a span</param>
++    /// <param name="pos">Position to write this embedding to</param>
++    /// <param name="sequence">Sequence to assign this embedding to</param>
++    /// <param name="logits">Whether logits should be generated for this embedding</param>
++    /// <returns>The index that the token was added at. Use this for GetLogitsIth</returns>
++    public int Add<TParam>(TParam parameter, WriteEmbeddingsDelegate<TParam> write, LLamaPos pos, LLamaSeqId sequence, bool logits)
++    {
++        Span<LLamaSeqId> seqs = stackalloc LLamaSeqId[] { sequence };
++        return Add(
++            parameter,
++            write,
++            pos,
++            seqs,
++            logits
++        );
++    }
++    #endregion
++
++    /// <summary>
++    /// Set EmbeddingsCount to zero for this batch
++    /// </summary>
++    public void Clear()
++    {
++        EmbeddingsCount = 0;
++    }
++    
++    /// <summary>
++    /// Get the positions where logits can be sampled from
++    /// </summary>
++    /// <returns></returns>
++    internal Span<(LLamaSeqId, int)> GetLogitPositions(Span<(LLamaSeqId, int)> dest)
++    {
++        for (var i = 0; i < _logitPositions.Count; i++)
++            dest[i] = _logitPositions[i];
++        
++        return dest.Slice(0, _logitPositions.Count);
++    }
++}
+\ No newline at end of file
+diff --git a/LLama/Native/SafeLLamaContextHandle.cs b/LLama/Native/SafeLLamaContextHandle.cs
+index aa283fca4..96453cb4f 100644
+--- a/LLama/Native/SafeLLamaContextHandle.cs
++++ b/LLama/Native/SafeLLamaContextHandle.cs
+@@ -428,6 +428,24 @@ public DecodeResult Decode(LLamaBatch batch)
+ 
+             return (DecodeResult.Ok, 0);
+         }
++        
++        /// <summary>
++        /// </summary>
++        /// <param name="batch"></param>
++        /// <returns>Positive return values does not mean a fatal error, but rather a warning:<br />
++        ///  - 0: success<br />
++        ///  - 1: could not find a KV slot for the batch (try reducing the size of the batch or increase the context)<br />
++        ///  - &lt; 0: error<br />
++        /// </returns>
++        public DecodeResult Decode(LLamaBatchEmbeddings batch)
++        {
++            if (batch.EmbeddingsCount == 0)
++                return DecodeResult.Ok;
++            
++            lock (GlobalInferenceLock)
++                using (batch.ToNativeBatch(out var nb))
++                    return (DecodeResult)llama_decode(this, nb);
++        }
+         #endregion
+ 
+         #region state
+diff --git a/LLama/Native/SafeLlavaImageEmbedHandle.cs b/LLama/Native/SafeLlavaImageEmbedHandle.cs
+index 77b4eaf66..102c4b93f 100644
+--- a/LLama/Native/SafeLlavaImageEmbedHandle.cs
++++ b/LLama/Native/SafeLlavaImageEmbedHandle.cs
+@@ -14,6 +14,16 @@ public sealed class SafeLlavaImageEmbedHandle
+         /// Get the model used to create this image embedding
+         /// </summary>
+         public SafeLlavaModelHandle Model { get; private set; } = null!;
++        
++        /// <summary>
++        /// Get the number of dimensions in an embedding
++        /// </summary>
++        public int EmbeddingDimensions => Model.EmbeddingDimensions;
++        
++        /// <summary>
++        /// Get the number of "patches" in an image embedding
++        /// </summary>
++        public int PatchCount => Model.PatchCount;
+ 
+         #region embed
+         /// <summary>

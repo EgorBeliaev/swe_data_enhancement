@@ -1,0 +1,97 @@
+diff --git a/config.json.example b/config.json.example
+index 520c1220032..9a50e86a222 100644
+--- a/config.json.example
++++ b/config.json.example
+@@ -37,6 +37,7 @@
+   "NODE_DB_URI": "mongodb://localhost:27017/habitica-dev?replicaSet=rs",
+   "TEST_DB_URI": "mongodb://localhost:27017/habitica-test?replicaSet=rs",
+   "MONGODB_POOL_SIZE": "10",
++  "MONGODB_SOCKET_TIMEOUT": "20000",
+   "NODE_ENV": "development",
+   "PATH": "bin:node_modules/.bin:/usr/local/bin:/usr/bin:/bin",
+   "PAYPAL_BILLING_PLANS_basic_12mo": "basic_12mo",
+diff --git a/website/common/script/libs/errors.js b/website/common/script/libs/errors.js
+index c0e1bee9dff..6a35494db4f 100644
+--- a/website/common/script/libs/errors.js
++++ b/website/common/script/libs/errors.js
+@@ -60,6 +60,14 @@ export class TooManyRequests extends CustomError {
+   }
+ }
+ 
++export class RequestTimeout extends CustomError {
++  constructor (customMessage) {
++    super();
++    this.name = this.constructor.name;
++    this.httpCode = 408;
++    this.message = customMessage || 'The request timed out.';
++  }
++}
+ export class NotImplementedError extends CustomError {
+   constructor (str) {
+     super();
+diff --git a/website/server/libs/errors.js b/website/server/libs/errors.js
+index be85b4f22b8..2b570dbb7e3 100644
+--- a/website/server/libs/errors.js
++++ b/website/server/libs/errors.js
+@@ -67,6 +67,19 @@ export const { Forbidden } = common.errors;
+  */
+ export const { TooManyRequests } = common.errors;
+ 
++/**
++ * @apiDefine RequestTimeout
++ * @apiError RequestTimeout The request took too long to complete.
++ *
++ * @apiErrorExample Error-Response:
++ *     HTTP/1.1 408 RequestTimeout
++ *     {
++ *       "error": "RequestTimeout",
++ *       "message": "Access forbidden."
++ *     }
++ */
++export const { RequestTimeout } = common.errors;
++
+ /**
+  * @apiDefine NotificationNotFound
+  * @apiError NotificationNotFound The notification was not found.
+diff --git a/website/server/libs/setupMongoose.js b/website/server/libs/setupMongoose.js
+index 73bf734e90b..042b6307db3 100644
+--- a/website/server/libs/setupMongoose.js
++++ b/website/server/libs/setupMongoose.js
+@@ -9,12 +9,14 @@ import {
+ const IS_PROD = nconf.get('IS_PROD');
+ const MAINTENANCE_MODE = nconf.get('MAINTENANCE_MODE');
+ const POOL_SIZE = nconf.get('MONGODB_POOL_SIZE');
++const SOCKET_TIMEOUT = nconf.get('MONGODB_SOCKET_TIMEOUT');
+ 
+ // Do not connect to MongoDB when in maintenance mode
+ if (MAINTENANCE_MODE !== 'true') {
+   const mongooseOptions = getDefaultConnectionOptions();
+ 
+   if (POOL_SIZE) mongooseOptions.maxPoolSize = Number(POOL_SIZE);
++  if (SOCKET_TIMEOUT) mongooseOptions.socketTimeoutMS = Number(SOCKET_TIMEOUT);
+ 
+   const DB_URI = nconf.get('IS_TEST') ? nconf.get('TEST_DB_URI') : nconf.get('NODE_DB_URI');
+   const connectionUrl = IS_PROD ? DB_URI : getDevelopmentConnectionUrl(DB_URI);
+diff --git a/website/server/middlewares/errorHandler.js b/website/server/middlewares/errorHandler.js
+index 79d2b42b276..bd317a2b4ab 100644
+--- a/website/server/middlewares/errorHandler.js
++++ b/website/server/middlewares/errorHandler.js
+@@ -9,6 +9,7 @@ import {
+   CustomError,
+   BadRequest,
+   InternalServerError,
++  RequestTimeout,
+ } from '../libs/errors';
+ 
+ export default function errorHandler (err, req, res, next) { // eslint-disable-line no-unused-vars
+@@ -46,6 +47,10 @@ export default function errorHandler (err, req, res, next) { // eslint-disable-l
+     }));
+   }
+ 
++  if (err.name === 'MongoNetworkTimeoutError') {
++    responseErr = new RequestTimeout();
++  }
++
+   // Handle Stripe Card errors errors (can be safely shown to the users)
+   // https://stripe.com/docs/api/node#errors
+   if (err.type === 'StripeCardError') {

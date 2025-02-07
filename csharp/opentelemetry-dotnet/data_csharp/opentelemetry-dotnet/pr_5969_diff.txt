@@ -1,0 +1,969 @@
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExperimentalOptions.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExperimentalOptions.cs
+index 25b345ac96e..f86743325db 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExperimentalOptions.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExperimentalOptions.cs
+@@ -17,6 +17,8 @@ internal sealed class ExperimentalOptions
+ 
+     public const string OtlpDiskRetryDirectoryPathEnvVar = "OTEL_DOTNET_EXPERIMENTAL_OTLP_DISK_RETRY_DIRECTORY_PATH";
+ 
++    public const string OtlpUseCustomSerializer = "OTEL_DOTNET_EXPERIMENTAL_USE_CUSTOM_PROTOBUF_SERIALIZER";
++
+     public ExperimentalOptions()
+         : this(new ConfigurationBuilder().AddEnvironmentVariables().Build())
+     {
+@@ -29,6 +31,11 @@ public ExperimentalOptions(IConfiguration configuration)
+             this.EmitLogEventAttributes = emitLogEventAttributes;
+         }
+ 
++        if (configuration.TryGetBoolValue(OpenTelemetryProtocolExporterEventSource.Log, OtlpUseCustomSerializer, out var useCustomSerializer))
++        {
++            this.UseCustomProtobufSerializer = useCustomSerializer;
++        }
++
+         if (configuration.TryGetStringValue(OtlpRetryEnvVar, out var retryPolicy) && retryPolicy != null)
+         {
+             if (retryPolicy.Equals("in_memory", StringComparison.OrdinalIgnoreCase))
+@@ -78,4 +85,9 @@ public ExperimentalOptions(IConfiguration configuration)
+     /// Gets the path on disk where the telemetry will be stored for retries at a later point.
+     /// </summary>
+     public string? DiskRetryDirectoryPath { get; }
++
++    /// <summary>
++    /// Gets a value indicating whether custom serializer should be used for OTLP export.
++    /// </summary>
++    public bool UseCustomProtobufSerializer { get; }
+ }
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/IProtobufExportClient.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/IProtobufExportClient.cs
+new file mode 100644
+index 00000000000..617e5122134
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/IProtobufExportClient.cs
+@@ -0,0 +1,30 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++
++/// <summary>Export client interface.</summary>
++internal interface IProtobufExportClient
++{
++    /// <summary>
++    /// Method for sending export request to the server.
++    /// </summary>
++    /// <param name="buffer">The request body to send to the server.</param>
++    /// <param name="contentLength">length of the content.</param>
++    /// <param name="deadlineUtc">The deadline time in utc for export request to finish.</param>
++    /// <param name="cancellationToken">An optional token for canceling the call.</param>
++    /// <returns><see cref="ExportClientResponse"/>.</returns>
++    ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default);
++
++    /// <summary>
++    /// Method for shutting down the export client.
++    /// </summary>
++    /// <param name="timeoutMilliseconds">
++    /// The number of milliseconds to wait, or <c>Timeout.Infinite</c> to
++    /// wait indefinitely.
++    /// </param>
++    /// <returns>
++    /// Returns <c>true</c> if shutdown succeeded; otherwise, <c>false</c>.
++    /// </returns>
++    bool Shutdown(int timeoutMilliseconds);
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpGrpcExportClient.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpGrpcExportClient.cs
+new file mode 100644
+index 00000000000..c4f5ab5fcc6
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpGrpcExportClient.cs
+@@ -0,0 +1,102 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#if NETFRAMEWORK
++using System.Net.Http;
++#endif
++using System.Net.Http.Headers;
++using Grpc.Core;
++using OpenTelemetry.Internal;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++
++/// <summary>Base class for sending OTLP export request over gRPC.</summary>
++internal sealed class ProtobufOtlpGrpcExportClient : IProtobufExportClient
++{
++    private static readonly ExportClientHttpResponse SuccessExportResponse = new(success: true, deadlineUtc: default, response: null, exception: null);
++    private static readonly MediaTypeHeaderValue MediaHeaderValue = new("application/grpc");
++    private static readonly Version Http2RequestVersion = new(2, 0);
++
++    public ProtobufOtlpGrpcExportClient(OtlpExporterOptions options, HttpClient httpClient, string signalPath)
++    {
++        Guard.ThrowIfNull(options);
++        Guard.ThrowIfNull(httpClient);
++        Guard.ThrowIfNull(signalPath);
++        Guard.ThrowIfInvalidTimeout(options.TimeoutMilliseconds);
++
++        Uri exporterEndpoint = options.Endpoint.AppendPathIfNotPresent(signalPath);
++        this.Endpoint = new UriBuilder(exporterEndpoint).Uri;
++        this.Headers = options.GetHeaders<Dictionary<string, string>>((d, k, v) => d.Add(k, v));
++        this.HttpClient = httpClient;
++    }
++
++    internal HttpClient HttpClient { get; }
++
++    internal Uri Endpoint { get; set; }
++
++    internal IReadOnlyDictionary<string, string> Headers { get; }
++
++    internal int TimeoutMilliseconds { get; }
++
++    /// <inheritdoc/>
++    public ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default)
++    {
++        try
++        {
++            using var httpRequest = this.CreateHttpRequest(buffer, contentLength);
++
++            using var httpResponse = this.SendHttpRequest(httpRequest, cancellationToken);
++
++            try
++            {
++                httpResponse.EnsureSuccessStatusCode();
++            }
++            catch (HttpRequestException ex)
++            {
++                return new ExportClientHttpResponse(success: false, deadlineUtc: deadlineUtc, response: httpResponse, ex);
++            }
++
++            // TODO: Hande retries & failures.
++            return SuccessExportResponse;
++        }
++        catch (RpcException ex)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.FailedToReachCollector(this.Endpoint, ex);
++            return new ExportClientGrpcResponse(success: false, deadlineUtc: deadlineUtc, exception: ex);
++        }
++    }
++
++    public HttpRequestMessage CreateHttpRequest(byte[] buffer, int contentLength)
++    {
++        var request = new HttpRequestMessage(HttpMethod.Post, this.Endpoint);
++        request.Version = Http2RequestVersion;
++
++#if NET6_0_OR_GREATER
++        request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
++#endif
++
++        foreach (var header in this.Headers)
++        {
++            request.Headers.Add(header.Key, header.Value);
++        }
++
++        // TODO: Support compression.
++
++        request.Content = new ByteArrayContent(buffer, 0, contentLength);
++        request.Content.Headers.ContentType = MediaHeaderValue;
++
++        return request;
++    }
++
++    public HttpResponseMessage SendHttpRequest(HttpRequestMessage request, CancellationToken cancellationToken)
++    {
++        return this.HttpClient.SendAsync(request, cancellationToken).GetAwaiter().GetResult();
++    }
++
++    /// <inheritdoc/>
++    public bool Shutdown(int timeoutMilliseconds)
++    {
++        this.HttpClient.CancelPendingRequests();
++        return true;
++    }
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpHttpExportClient.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpHttpExportClient.cs
+new file mode 100644
+index 00000000000..fd624319990
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/ExportClient/ProtobufOtlpHttpExportClient.cs
+@@ -0,0 +1,110 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++#if NETFRAMEWORK
++using System.Net.Http;
++#endif
++using System.Net.Http.Headers;
++using OpenTelemetry.Internal;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++
++/// <summary>Class for sending OTLP trace export request over HTTP.</summary>
++internal sealed class ProtobufOtlpHttpExportClient : IProtobufExportClient
++{
++    private static readonly MediaTypeHeaderValue MediaHeaderValue = new("application/x-protobuf");
++    private static readonly ExportClientHttpResponse SuccessExportResponse = new(success: true, deadlineUtc: default, response: null, exception: null);
++#if NET
++    private readonly bool synchronousSendSupportedByCurrentPlatform;
++#endif
++
++    internal ProtobufOtlpHttpExportClient(OtlpExporterOptions options, HttpClient httpClient, string signalPath)
++    {
++        Guard.ThrowIfNull(options);
++        Guard.ThrowIfNull(httpClient);
++        Guard.ThrowIfNull(signalPath);
++        Guard.ThrowIfInvalidTimeout(options.TimeoutMilliseconds);
++
++        Uri exporterEndpoint = options.AppendSignalPathToEndpoint
++            ? options.Endpoint.AppendPathIfNotPresent(signalPath)
++            : options.Endpoint;
++        this.Endpoint = new UriBuilder(exporterEndpoint).Uri;
++        this.Headers = options.GetHeaders<Dictionary<string, string>>((d, k, v) => d.Add(k, v));
++        this.HttpClient = httpClient;
++
++#if NET
++        // See: https://github.com/dotnet/runtime/blob/280f2a0c60ce0378b8db49adc0eecc463d00fe5d/src/libraries/System.Net.Http/src/System/Net/Http/HttpClientHandler.AnyMobile.cs#L767
++        this.synchronousSendSupportedByCurrentPlatform = !OperatingSystem.IsAndroid()
++            && !OperatingSystem.IsIOS()
++            && !OperatingSystem.IsTvOS()
++            && !OperatingSystem.IsBrowser();
++#endif
++    }
++
++    internal HttpClient HttpClient { get; }
++
++    internal Uri Endpoint { get; set; }
++
++    internal IReadOnlyDictionary<string, string> Headers { get; }
++
++    /// <inheritdoc/>
++    public ExportClientResponse SendExportRequest(byte[] buffer, int contentLength, DateTime deadlineUtc, CancellationToken cancellationToken = default)
++    {
++        try
++        {
++            using var httpRequest = this.CreateHttpRequest(buffer, contentLength);
++
++            using var httpResponse = this.SendHttpRequest(httpRequest, cancellationToken);
++
++            try
++            {
++                httpResponse.EnsureSuccessStatusCode();
++            }
++            catch (HttpRequestException ex)
++            {
++                return new ExportClientHttpResponse(success: false, deadlineUtc: deadlineUtc, response: httpResponse, ex);
++            }
++
++            return SuccessExportResponse;
++        }
++        catch (HttpRequestException ex)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.FailedToReachCollector(this.Endpoint, ex);
++            return new ExportClientHttpResponse(success: false, deadlineUtc: deadlineUtc, response: null, exception: ex);
++        }
++    }
++
++    /// <inheritdoc/>
++    public bool Shutdown(int timeoutMilliseconds)
++    {
++        this.HttpClient.CancelPendingRequests();
++        return true;
++    }
++
++    public HttpRequestMessage CreateHttpRequest(byte[] exportRequest, int contentLength)
++    {
++        var request = new HttpRequestMessage(HttpMethod.Post, this.Endpoint);
++
++        foreach (var header in this.Headers)
++        {
++            request.Headers.Add(header.Key, header.Value);
++        }
++
++        var content = new ByteArrayContent(exportRequest, 0, contentLength);
++        content.Headers.ContentType = MediaHeaderValue;
++        request.Content = content;
++
++        return request;
++    }
++
++    public HttpResponseMessage SendHttpRequest(HttpRequestMessage request, CancellationToken cancellationToken)
++    {
++#if NET
++        return this.synchronousSendSupportedByCurrentPlatform
++        ? this.HttpClient.Send(request, cancellationToken)
++        : this.HttpClient.SendAsync(request, cancellationToken).GetAwaiter().GetResult();
++#else
++        return this.HttpClient.SendAsync(request, cancellationToken).GetAwaiter().GetResult();
++#endif
++    }
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceFieldNumberConstants.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceFieldNumberConstants.cs
+index c7d0198a99f..fa0b9737a68 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceFieldNumberConstants.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceFieldNumberConstants.cs
+@@ -5,8 +5,12 @@ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Serializer
+ 
+ internal static class ProtobufOtlpTraceFieldNumberConstants
+ {
+-    // Resource spans
+ #pragma warning disable SA1310 // Field names should not contain underscore
++
++    // Traces data
++    internal const int TracesData_Resource_Spans = 1;
++
++    // Resource spans
+     internal const int ResourceSpans_Resource = 1;
+     internal const int ResourceSpans_Scope_Spans = 2;
+     internal const int ResourceSpans_Schema_Url = 3;
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
+index 1301ba22a17..5f45224af4e 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Serializer/ProtobufOtlpTraceSerializer.cs
+@@ -20,12 +20,16 @@ internal static class ProtobufOtlpTraceSerializer
+ 
+     internal static int WriteTraceData(byte[] buffer, int writePosition, SdkLimitOptions sdkLimitOptions, Resources.Resource? resource, in Batch<Activity> batch)
+     {
++        writePosition = ProtobufSerializer.WriteTag(buffer, writePosition, ProtobufOtlpTraceFieldNumberConstants.TracesData_Resource_Spans, ProtobufWireType.LEN);
++        int resourceSpansScopeSpansLengthPosition = writePosition;
++        writePosition += ReserveSizeForLength;
++
+         foreach (var activity in batch)
+         {
+             var sourceName = activity.Source.Name;
+             if (!ScopeTracesList.TryGetValue(sourceName, out var activities))
+             {
+-                activities = ActivityListPool.Count > 0 ? ActivityListPool.Pop() : new List<Activity>();
++                activities = ActivityListPool.Count > 0 ? ActivityListPool.Pop() : [];
+                 ScopeTracesList[sourceName] = activities;
+             }
+ 
+@@ -34,6 +38,7 @@ internal static int WriteTraceData(byte[] buffer, int writePosition, SdkLimitOpt
+ 
+         writePosition = WriteResourceSpans(buffer, writePosition, sdkLimitOptions, resource, ScopeTracesList);
+         ReturnActivityListToPool();
++        ProtobufSerializer.WriteReservedLength(buffer, resourceSpansScopeSpansLengthPosition, writePosition - (resourceSpansScopeSpansLengthPosition + ReserveSizeForLength));
+ 
+         return writePosition;
+     }
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterPersistentStorageTransmissionHandler.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterPersistentStorageTransmissionHandler.cs
+index 9d4d86c71d2..199f1510b2f 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterPersistentStorageTransmissionHandler.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterPersistentStorageTransmissionHandler.cs
+@@ -56,7 +56,7 @@ internal bool InitiateAndWaitForRetryProcess(int timeOutMilliseconds)
+ 
+     protected override bool OnSubmitRequestFailure(TRequest request, ExportClientResponse response)
+     {
+-        if (RetryHelper.ShouldRetryRequest(request, response, OtlpRetry.InitialBackoffMilliseconds, out _))
++        if (RetryHelper.ShouldRetryRequest(response, OtlpRetry.InitialBackoffMilliseconds, out _))
+         {
+             byte[]? data = null;
+             if (request is ExportTraceServiceRequest traceRequest)
+@@ -158,7 +158,8 @@ private void RetryStoredRequests()
+                     {
+                         var deadlineUtc = DateTime.UtcNow.AddMilliseconds(this.TimeoutMilliseconds);
+                         var request = this.requestFactory.Invoke(data);
+-                        if (this.TryRetryRequest(request, deadlineUtc, out var response) || !RetryHelper.ShouldRetryRequest(request, response, OtlpRetry.InitialBackoffMilliseconds, out var retryInfo))
++                        if (this.TryRetryRequest(request, deadlineUtc, out var response)
++                            || !RetryHelper.ShouldRetryRequest(response, OtlpRetry.InitialBackoffMilliseconds, out var retryInfo))
+                         {
+                             blob.TryDelete();
+                         }
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterRetryTransmissionHandler.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterRetryTransmissionHandler.cs
+index 6904dc8dc4e..df54fb5f78b 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterRetryTransmissionHandler.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/OtlpExporterRetryTransmissionHandler.cs
+@@ -15,7 +15,7 @@ internal OtlpExporterRetryTransmissionHandler(IExportClient<TRequest> exportClie
+     protected override bool OnSubmitRequestFailure(TRequest request, ExportClientResponse response)
+     {
+         var nextRetryDelayMilliseconds = OtlpRetry.InitialBackoffMilliseconds;
+-        while (RetryHelper.ShouldRetryRequest(request, response, nextRetryDelayMilliseconds, out var retryResult))
++        while (RetryHelper.ShouldRetryRequest(response, nextRetryDelayMilliseconds, out var retryResult))
+         {
+             // Note: This delay cannot exceed the configured timeout period for otlp exporter.
+             // If the backend responds with `RetryAfter` duration that would result in exceeding the configured timeout period
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterPersistentStorageTransmissionHandler.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterPersistentStorageTransmissionHandler.cs
+new file mode 100644
+index 00000000000..8cd7c4ea7ca
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterPersistentStorageTransmissionHandler.cs
+@@ -0,0 +1,158 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++using System.Diagnostics;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++using OpenTelemetry.PersistentStorage.Abstractions;
++using OpenTelemetry.PersistentStorage.FileSystem;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmission;
++
++internal sealed class ProtobufOtlpExporterPersistentStorageTransmissionHandler : ProtobufOtlpExporterTransmissionHandler, IDisposable
++{
++    private const int RetryIntervalInMilliseconds = 60000;
++    private readonly ManualResetEvent shutdownEvent = new(false);
++    private readonly ManualResetEvent dataExportNotification = new(false);
++    private readonly AutoResetEvent exportEvent = new(false);
++    private readonly Thread thread;
++    private readonly PersistentBlobProvider persistentBlobProvider;
++    private bool disposed;
++
++    public ProtobufOtlpExporterPersistentStorageTransmissionHandler(IProtobufExportClient exportClient, double timeoutMilliseconds, string storagePath)
++        : this(new FileBlobProvider(storagePath), exportClient, timeoutMilliseconds)
++    {
++    }
++
++    internal ProtobufOtlpExporterPersistentStorageTransmissionHandler(PersistentBlobProvider persistentBlobProvider, IProtobufExportClient exportClient, double timeoutMilliseconds)
++        : base(exportClient, timeoutMilliseconds)
++    {
++        Debug.Assert(persistentBlobProvider != null, "persistentBlobProvider was null");
++        this.persistentBlobProvider = persistentBlobProvider!;
++
++        this.thread = new Thread(this.RetryStoredRequests)
++        {
++            Name = $"OtlpExporter Persistent Retry Storage",
++            IsBackground = true,
++        };
++
++        this.thread.Start();
++    }
++
++    // Used for test.
++    internal bool InitiateAndWaitForRetryProcess(int timeOutMilliseconds)
++    {
++        this.exportEvent.Set();
++
++        return this.dataExportNotification.WaitOne(timeOutMilliseconds);
++    }
++
++    protected override bool OnSubmitRequestFailure(byte[] request, int contentLength, ExportClientResponse response)
++    {
++        if (RetryHelper.ShouldRetryRequest(response, OtlpRetry.InitialBackoffMilliseconds, out _))
++        {
++            byte[]? data = null;
++
++            if (data != null)
++            {
++                return this.persistentBlobProvider.TryCreateBlob(data, out _);
++            }
++        }
++
++        return false;
++    }
++
++    protected override void OnShutdown(int timeoutMilliseconds)
++    {
++        var sw = timeoutMilliseconds == Timeout.Infinite ? null : Stopwatch.StartNew();
++
++        try
++        {
++            this.shutdownEvent.Set();
++        }
++        catch (ObjectDisposedException)
++        {
++            // Dispose was called before shutdown.
++        }
++
++        this.thread.Join(timeoutMilliseconds);
++
++        if (sw != null)
++        {
++            var timeout = timeoutMilliseconds - sw.ElapsedMilliseconds;
++
++            base.OnShutdown((int)Math.Max(timeout, 0));
++        }
++        else
++        {
++            base.OnShutdown(timeoutMilliseconds);
++        }
++    }
++
++    protected override void Dispose(bool disposing)
++    {
++        if (!this.disposed)
++        {
++            if (disposing)
++            {
++                this.shutdownEvent.Dispose();
++                this.exportEvent.Dispose();
++                this.dataExportNotification.Dispose();
++                (this.persistentBlobProvider as IDisposable)?.Dispose();
++            }
++
++            this.disposed = true;
++        }
++    }
++
++    private void RetryStoredRequests()
++    {
++        var handles = new WaitHandle[] { this.shutdownEvent, this.exportEvent };
++        while (true)
++        {
++            try
++            {
++                var index = WaitHandle.WaitAny(handles, RetryIntervalInMilliseconds);
++                if (index == 0)
++                {
++                    // Shutdown signaled
++                    break;
++                }
++
++                int fileCount = 0;
++
++                // TODO: Run maintenance job.
++                // Transmit 10 files at a time.
++                while (fileCount < 10 && !this.shutdownEvent.WaitOne(0))
++                {
++                    if (!this.persistentBlobProvider.TryGetBlob(out var blob))
++                    {
++                        break;
++                    }
++
++                    if (blob.TryLease((int)this.TimeoutMilliseconds) && blob.TryRead(out var data))
++                    {
++                        var deadlineUtc = DateTime.UtcNow.AddMilliseconds(this.TimeoutMilliseconds);
++                        if (this.TryRetryRequest(data, data.Length, deadlineUtc, out var response) || !RetryHelper.ShouldRetryRequest(response, OtlpRetry.InitialBackoffMilliseconds, out var retryInfo))
++                        {
++                            blob.TryDelete();
++                        }
++
++                        // TODO: extend the lease period based on the response from server on retryAfter.
++                    }
++
++                    fileCount++;
++                }
++
++                // Set and reset the handle to notify export and wait for next signal.
++                // This is used for InitiateAndWaitForRetryProcess.
++                this.dataExportNotification.Set();
++                this.dataExportNotification.Reset();
++            }
++            catch (Exception ex)
++            {
++                OpenTelemetryProtocolExporterEventSource.Log.RetryStoredRequestException(ex);
++                return;
++            }
++        }
++    }
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterRetryTransmissionHandler.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterRetryTransmissionHandler.cs
+new file mode 100644
+index 00000000000..c1d5515a53f
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterRetryTransmissionHandler.cs
+@@ -0,0 +1,35 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmission;
++
++internal sealed class ProtobufOtlpExporterRetryTransmissionHandler : ProtobufOtlpExporterTransmissionHandler
++{
++    internal ProtobufOtlpExporterRetryTransmissionHandler(IProtobufExportClient exportClient, double timeoutMilliseconds)
++        : base(exportClient, timeoutMilliseconds)
++    {
++    }
++
++    protected override bool OnSubmitRequestFailure(byte[] request, int contentLength, ExportClientResponse response)
++    {
++        var nextRetryDelayMilliseconds = OtlpRetry.InitialBackoffMilliseconds;
++        while (RetryHelper.ShouldRetryRequest(response, nextRetryDelayMilliseconds, out var retryResult))
++        {
++            // Note: This delay cannot exceed the configured timeout period for otlp exporter.
++            // If the backend responds with `RetryAfter` duration that would result in exceeding the configured timeout period
++            // we would fail fast and drop the data.
++            Thread.Sleep(retryResult.RetryDelay);
++
++            if (this.TryRetryRequest(request, contentLength, response.DeadlineUtc, out response))
++            {
++                return true;
++            }
++
++            nextRetryDelayMilliseconds = retryResult.NextRetryDelayMilliseconds;
++        }
++
++        return false;
++    }
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterTransmissionHandler.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterTransmissionHandler.cs
+new file mode 100644
+index 00000000000..db7ef77f74c
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/ProtobufOtlpExporterTransmissionHandler.cs
+@@ -0,0 +1,142 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++using System.Diagnostics;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.ExportClient;
++using OpenTelemetry.Internal;
++
++namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmission;
++
++internal class ProtobufOtlpExporterTransmissionHandler : IDisposable
++{
++    public ProtobufOtlpExporterTransmissionHandler(IProtobufExportClient exportClient, double timeoutMilliseconds)
++    {
++        Guard.ThrowIfNull(exportClient);
++
++        this.ExportClient = exportClient;
++        this.TimeoutMilliseconds = timeoutMilliseconds;
++    }
++
++    internal IProtobufExportClient ExportClient { get; }
++
++    internal double TimeoutMilliseconds { get; }
++
++    /// <summary>
++    /// Attempts to send an export request to the server.
++    /// </summary>
++    /// <param name="request">The request to send to the server.</param>
++    /// <param name="contentLength">length of content.</param>
++    /// <returns> <see langword="true" /> if the request is sent successfully; otherwise, <see
++    /// langword="false" />.
++    /// </returns>
++    public bool TrySubmitRequest(byte[] request, int contentLength)
++    {
++        try
++        {
++            var deadlineUtc = DateTime.UtcNow.AddMilliseconds(this.TimeoutMilliseconds);
++            var response = this.ExportClient.SendExportRequest(request, contentLength, deadlineUtc);
++            if (response.Success)
++            {
++                return true;
++            }
++
++            return this.OnSubmitRequestFailure(request, contentLength, response);
++        }
++        catch (Exception ex)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.TrySubmitRequestException(ex);
++            return false;
++        }
++    }
++
++    /// <summary>
++    /// Attempts to shutdown the transmission handler, blocks the current thread
++    /// until shutdown completed or timed out.
++    /// </summary>
++    /// <param name="timeoutMilliseconds">
++    /// The number (non-negative) of milliseconds to wait, or
++    /// <c>Timeout.Infinite</c> to wait indefinitely.
++    /// </param>
++    /// <returns>
++    /// Returns <see langword="true" /> if shutdown succeeded; otherwise, <see
++    /// langword="false" />.
++    /// </returns>
++    public bool Shutdown(int timeoutMilliseconds)
++    {
++        Guard.ThrowIfInvalidTimeout(timeoutMilliseconds);
++
++        var sw = timeoutMilliseconds == Timeout.Infinite ? null : Stopwatch.StartNew();
++
++        this.OnShutdown(timeoutMilliseconds);
++
++        if (sw != null)
++        {
++            var timeout = timeoutMilliseconds - sw.ElapsedMilliseconds;
++
++            return this.ExportClient.Shutdown((int)Math.Max(timeout, 0));
++        }
++
++        return this.ExportClient.Shutdown(timeoutMilliseconds);
++    }
++
++    /// <inheritdoc/>
++    public void Dispose()
++    {
++        this.Dispose(true);
++        GC.SuppressFinalize(this);
++    }
++
++    /// <summary>
++    /// Fired when the transmission handler is shutdown.
++    /// </summary>
++    /// <param name="timeoutMilliseconds">
++    /// The number (non-negative) of milliseconds to wait, or
++    /// <c>Timeout.Infinite</c> to wait indefinitely.
++    /// </param>
++    protected virtual void OnShutdown(int timeoutMilliseconds)
++    {
++    }
++
++    /// <summary>
++    /// Fired when a request could not be submitted.
++    /// </summary>
++    /// <param name="request">The request that was attempted to send to the server.</param>
++    /// <param name="contentLength">Length of content.</param>
++    /// <param name="response"><see cref="ExportClientResponse" />.</param>
++    /// <returns><see langword="true" /> If the request is resubmitted and succeeds; otherwise, <see
++    /// langword="false" />.</returns>
++    protected virtual bool OnSubmitRequestFailure(byte[] request, int contentLength, ExportClientResponse response) => false;
++
++    /// <summary>
++    /// Fired when resending a request to the server.
++    /// </summary>
++    /// <param name="request">The request to be resent to the server.</param>
++    /// <param name="contentLength">Length of content.</param>
++    /// <param name="deadlineUtc">The deadline time in utc for export request to finish.</param>
++    /// <param name="response"><see cref="ExportClientResponse" />.</param>
++    /// <returns><see langword="true" /> If the retry succeeds; otherwise, <see
++    /// langword="false" />.</returns>
++    protected bool TryRetryRequest(byte[] request, int contentLength, DateTime deadlineUtc, out ExportClientResponse response)
++    {
++        response = this.ExportClient.SendExportRequest(request, contentLength, deadlineUtc);
++        if (!response.Success)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.ExportMethodException(response.Exception, isRetry: true);
++            return false;
++        }
++
++        return true;
++    }
++
++    /// <summary>
++    /// Releases the unmanaged resources used by this class and optionally
++    /// releases the managed resources.
++    /// </summary>
++    /// <param name="disposing">
++    /// <see langword="true"/> to release both managed and unmanaged resources;
++    /// <see langword="false"/> to release only unmanaged resources.
++    /// </param>
++    protected virtual void Dispose(bool disposing)
++    {
++    }
++}
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/RetryHelper.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/RetryHelper.cs
+index f68d1255e42..79438dd77da 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/RetryHelper.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/Implementation/Transmission/RetryHelper.cs
+@@ -7,7 +7,7 @@ namespace OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmissi
+ 
+ internal static class RetryHelper
+ {
+-    internal static bool ShouldRetryRequest<TRequest>(TRequest request, ExportClientResponse response, int retryDelayMilliseconds, out OtlpRetry.RetryResult retryResult)
++    internal static bool ShouldRetryRequest(ExportClientResponse response, int retryDelayMilliseconds, out OtlpRetry.RetryResult retryResult)
+     {
+         if (response is ExportClientGrpcResponse grpcResponse)
+         {
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
+index b755e15880b..deba7326b8d 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpExporterOptionsExtensions.cs
+@@ -127,6 +127,50 @@ public static THeaders GetHeaders<THeaders>(this OtlpExporterOptions options, Ac
+         }
+     }
+ 
++    public static ProtobufOtlpExporterTransmissionHandler GetProtobufExportTransmissionHandler(this OtlpExporterOptions options, ExperimentalOptions experimentalOptions)
++    {
++        var exportClient = GetProtobufExportClient(options);
++
++        // `HttpClient.Timeout.TotalMilliseconds` would be populated with the correct timeout value for both the exporter configuration cases:
++        // 1. User provides their own HttpClient. This case is straightforward as the user wants to use their `HttpClient` and thereby the same client's timeout value.
++        // 2. If the user configures timeout via the exporter options, then the timeout set for the `HttpClient` initialized by the exporter will be set to user provided value.
++        double timeoutMilliseconds = exportClient is ProtobufOtlpHttpExportClient httpTraceExportClient
++            ? httpTraceExportClient.HttpClient.Timeout.TotalMilliseconds
++            : options.TimeoutMilliseconds;
++
++        if (experimentalOptions.EnableInMemoryRetry)
++        {
++            return new ProtobufOtlpExporterRetryTransmissionHandler(exportClient, timeoutMilliseconds);
++        }
++        else if (experimentalOptions.EnableDiskRetry)
++        {
++            Debug.Assert(!string.IsNullOrEmpty(experimentalOptions.DiskRetryDirectoryPath), $"{nameof(experimentalOptions.DiskRetryDirectoryPath)} is null or empty");
++
++            return new ProtobufOtlpExporterPersistentStorageTransmissionHandler(
++                exportClient,
++                timeoutMilliseconds,
++                Path.Combine(experimentalOptions.DiskRetryDirectoryPath, "traces"));
++        }
++        else
++        {
++            return new ProtobufOtlpExporterTransmissionHandler(exportClient, timeoutMilliseconds);
++        }
++    }
++
++    public static IProtobufExportClient GetProtobufExportClient(this OtlpExporterOptions options)
++    {
++        var httpClient = options.HttpClientFactory?.Invoke() ?? throw new InvalidOperationException("OtlpExporterOptions was missing HttpClientFactory or it returned null.");
++
++        if (options.Protocol == OtlpExportProtocol.Grpc)
++        {
++            return new ProtobufOtlpGrpcExportClient(options, httpClient, "opentelemetry.proto.collector.trace.v1.TraceService/Export");
++        }
++        else
++        {
++            return new ProtobufOtlpHttpExportClient(options, httpClient, "v1/traces");
++        }
++    }
++
+     public static OtlpExporterTransmissionHandler<MetricsOtlpCollector.ExportMetricsServiceRequest> GetMetricsExportTransmissionHandler(this OtlpExporterOptions options, ExperimentalOptions experimentalOptions)
+     {
+         var exportClient = GetMetricsExportClient(options);
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporterHelperExtensions.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporterHelperExtensions.cs
+index 3a18b3da423..731010fbdc1 100644
+--- a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporterHelperExtensions.cs
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/OtlpTraceExporterHelperExtensions.cs
+@@ -136,7 +136,16 @@ internal static BaseProcessor<Activity> BuildOtlpExporterProcessor(
+ 
+         exporterOptions!.TryEnableIHttpClientFactoryIntegration(serviceProvider!, "OtlpTraceExporter");
+ 
+-        BaseExporter<Activity> otlpExporter = new OtlpTraceExporter(exporterOptions!, sdkLimitOptions!, experimentalOptions!);
++        BaseExporter<Activity> otlpExporter;
++
++        if (experimentalOptions != null && experimentalOptions.UseCustomProtobufSerializer)
++        {
++            otlpExporter = new ProtobufOtlpTraceExporter(exporterOptions!, sdkLimitOptions!, experimentalOptions!);
++        }
++        else
++        {
++            otlpExporter = new OtlpTraceExporter(exporterOptions!, sdkLimitOptions!, experimentalOptions!);
++        }
+ 
+         if (configureExporterInstance != null)
+         {
+diff --git a/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/ProtobufOtlpTraceExporter.cs b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/ProtobufOtlpTraceExporter.cs
+new file mode 100644
+index 00000000000..ea9310c45f3
+--- /dev/null
++++ b/src/OpenTelemetry.Exporter.OpenTelemetryProtocol/ProtobufOtlpTraceExporter.cs
+@@ -0,0 +1,125 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++using System.Buffers.Binary;
++using System.Diagnostics;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Serializer;
++using OpenTelemetry.Exporter.OpenTelemetryProtocol.Implementation.Transmission;
++using OpenTelemetry.Resources;
++
++namespace OpenTelemetry.Exporter;
++
++/// <summary>
++/// Exporter consuming <see cref="Activity"/> and exporting the data using
++/// the OpenTelemetry protocol (OTLP).
++/// </summary>
++internal sealed class ProtobufOtlpTraceExporter : BaseExporter<Activity>
++{
++    private readonly SdkLimitOptions sdkLimitOptions;
++    private readonly ProtobufOtlpExporterTransmissionHandler transmissionHandler;
++    private readonly int startWritePosition;
++
++    private Resource? resource;
++
++    // Initial buffer size set to ~732KB.
++    // This choice allows us to gradually grow the buffer while targeting a final capacity of around 100 MB,
++    // by the 7th doubling to maintain efficient allocation without frequent resizing.
++    private byte[] buffer = new byte[750000];
++
++    /// <summary>
++    /// Initializes a new instance of the <see cref="ProtobufOtlpTraceExporter"/> class.
++    /// </summary>
++    /// <param name="options">Configuration options for the export.</param>
++    public ProtobufOtlpTraceExporter(OtlpExporterOptions options)
++        : this(options, sdkLimitOptions: new(), experimentalOptions: new(), transmissionHandler: null)
++    {
++    }
++
++    /// <summary>
++    /// Initializes a new instance of the <see cref="ProtobufOtlpTraceExporter"/> class.
++    /// </summary>
++    /// <param name="exporterOptions"><see cref="OtlpExporterOptions"/>.</param>
++    /// <param name="sdkLimitOptions"><see cref="SdkLimitOptions"/>.</param>
++    /// <param name="experimentalOptions"><see cref="ExperimentalOptions"/>.</param>
++    /// <param name="transmissionHandler"><see cref="OtlpExporterTransmissionHandler{T}"/>.</param>
++    internal ProtobufOtlpTraceExporter(
++        OtlpExporterOptions exporterOptions,
++        SdkLimitOptions sdkLimitOptions,
++        ExperimentalOptions experimentalOptions,
++        ProtobufOtlpExporterTransmissionHandler? transmissionHandler = null)
++    {
++        Debug.Assert(exporterOptions != null, "exporterOptions was null");
++        Debug.Assert(sdkLimitOptions != null, "sdkLimitOptions was null");
++
++        this.sdkLimitOptions = sdkLimitOptions!;
++        this.startWritePosition = exporterOptions!.Protocol == OtlpExportProtocol.Grpc ? 5 : 0;
++        this.transmissionHandler = transmissionHandler ?? exporterOptions!.GetProtobufExportTransmissionHandler(experimentalOptions);
++    }
++
++    internal Resource Resource => this.resource ??= this.ParentProvider.GetResource();
++
++    /// <inheritdoc/>
++    public override ExportResult Export(in Batch<Activity> activityBatch)
++    {
++        // Prevents the exporter's gRPC and HTTP operations from being instrumented.
++        using var scope = SuppressInstrumentationScope.Begin();
++
++        try
++        {
++            int writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(this.buffer, this.startWritePosition, this.sdkLimitOptions, this.Resource, activityBatch);
++
++            if (this.startWritePosition == 5)
++            {
++                // Grpc payload consists of 3 parts
++                // byte 0 - Specifying if the payload is compressed.
++                // 1-4 byte - Specifies the length of payload in big endian format.
++                // 5 and above -  Protobuf serialized data.
++                Span<byte> data = new Span<byte>(this.buffer, 1, 4);
++                var dataLength = writePosition - 5;
++                BinaryPrimitives.WriteUInt32BigEndian(data, (uint)dataLength);
++            }
++
++            if (!this.transmissionHandler.TrySubmitRequest(this.buffer, writePosition))
++            {
++                return ExportResult.Failure;
++            }
++        }
++        catch (IndexOutOfRangeException)
++        {
++            if (!this.IncreaseBufferSize())
++            {
++                throw;
++            }
++        }
++        catch (Exception ex)
++        {
++            OpenTelemetryProtocolExporterEventSource.Log.ExportMethodException(ex);
++            return ExportResult.Failure;
++        }
++
++        return ExportResult.Success;
++    }
++
++    /// <inheritdoc />
++    protected override bool OnShutdown(int timeoutMilliseconds)
++    {
++        return this.transmissionHandler.Shutdown(timeoutMilliseconds);
++    }
++
++    private bool IncreaseBufferSize()
++    {
++        var newBufferSize = this.buffer.Length * 2;
++
++        if (newBufferSize > 100 * 1024 * 1024)
++        {
++            return false;
++        }
++
++        var newBuffer = new byte[newBufferSize];
++        this.buffer.CopyTo(newBuffer, 0);
++        this.buffer = newBuffer;
++
++        return true;
++    }
++}
+diff --git a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+index 9d43558d3a4..eda9a6fa037 100644
+--- a/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
++++ b/test/OpenTelemetry.Exporter.OpenTelemetryProtocol.Tests/OtlpTraceExporterTests.cs
+@@ -1054,9 +1054,9 @@ private static OtlpCollector.ExportTraceServiceRequest CreateTraceExportRequest(
+         var buffer = new byte[4096];
+         var writePosition = ProtobufOtlpTraceSerializer.WriteTraceData(buffer, 0, sdkOptions, resource, batch);
+         using var stream = new MemoryStream(buffer, 0, writePosition);
+-        var tracesData = OtlpTrace.ResourceSpans.Parser.ParseFrom(stream);
++        var tracesData = OtlpTrace.TracesData.Parser.ParseFrom(stream);
+         var request = new OtlpCollector.ExportTraceServiceRequest();
+-        request.ResourceSpans.Add(tracesData);
++        request.ResourceSpans.Add(tracesData.ResourceSpans);
+         return request;
+     }
+ 

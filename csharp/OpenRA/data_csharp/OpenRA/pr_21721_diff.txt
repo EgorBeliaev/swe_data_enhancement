@@ -1,0 +1,214 @@
+diff --git a/OpenRA.Mods.Common/MapGenerator/Symmetry.cs b/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
+index 50e0cacdc24b..b69ecc82afd7 100644
+--- a/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
++++ b/OpenRA.Mods.Common/MapGenerator/Symmetry.cs
+@@ -278,26 +278,5 @@ public static void RotateAndMirrorOverCPos<T>(
+ 					action(projections, original);
+ 				}
+ 		}
+-
+-		/// <summary>
+-		/// Returns true iff xy is within reservationRadius of the center of a given CellLayer. If
+-		/// a mirroring is specified, the radius is measured from the mirror line instead of the
+-		/// center point.
+-		/// </summary>
+-		public static bool IsCPosNearCenter<T>(
+-			CPos cpos,
+-			CellLayer<T> cellLayer,
+-			int reservationRadius,
+-			Mirror mirror)
+-		{
+-			CPos[] testPoints;
+-			if (mirror == Mirror.None)
+-				testPoints = RotateAndMirrorCPos(cpos, cellLayer, 2, Mirror.None);
+-			else
+-				testPoints = RotateAndMirrorCPos(cpos, cellLayer, 1, mirror);
+-
+-			var separation = (testPoints[1] - testPoints[0]).LengthSquared;
+-			return separation <= reservationRadius * reservationRadius * 4;
+-		}
+ 	}
+ }
+diff --git a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+index d7de7b5df359..a6f0f7f96d43 100644
+--- a/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
++++ b/OpenRA.Mods.Common/Traits/World/RaMapGenerator.cs
+@@ -139,6 +139,8 @@ sealed class Parameters
+ 			[FieldLoader.Require]
+ 			public readonly int SpawnBuildSize = default;
+ 			[FieldLoader.Require]
++			public readonly int MinimumSpawnRadius = default;
++			[FieldLoader.Require]
+ 			public readonly int SpawnResourceSpawns = default;
+ 			[FieldLoader.Require]
+ 			public readonly int SpawnReservation = default;
+@@ -204,6 +206,8 @@ sealed class Parameters
+ 			[FieldLoader.Ignore]
+ 			public readonly IReadOnlySet<byte> DominantTerrain;
+ 			[FieldLoader.Ignore]
++			public readonly IReadOnlySet<byte> ZoneableTerrain;
++			[FieldLoader.Ignore]
+ 			public readonly IReadOnlySet<string> PartiallyPlayableCategories;
+ 			[FieldLoader.Ignore]
+ 			public readonly IReadOnlyList<string> ClearSegmentTypes;
+@@ -290,6 +294,7 @@ IReadOnlyList<string> ParseSegmentTypes(string key)
+ 				PartiallyPlayableTerrain = ParseTerrainIndexes("PartiallyPlayableTerrain");
+ 				UnplayableTerrain = ParseTerrainIndexes("UnplayableTerrain");
+ 				DominantTerrain = ParseTerrainIndexes("DominantTerrain");
++				ZoneableTerrain = ParseTerrainIndexes("ZoneableTerrain");
+ 
+ 				PartiallyPlayableCategories = my.NodeWithKey("PartiallyPlayableCategories").Value.Value
+ 					.Split(',', StringSplitOptions.RemoveEmptyEntries)
+@@ -394,6 +399,8 @@ public void Validate()
+ 					throw new MapGenerationException("SpawnReservation must be >= 1");
+ 				if (SpawnBuildSize < 1)
+ 					throw new MapGenerationException("SpawnBuildSize must be >= 1");
++				if (MinimumSpawnRadius < 1)
++					throw new MapGenerationException("MinimumSpawnRadius must be >= 1");
+ 				if (SpawnResourceSpawns < 0)
+ 					throw new MapGenerationException("SpawnResourceSpawns must be >= 0");
+ 				if (ResourceSpawnReservation < 1)
+@@ -1167,18 +1174,23 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					(projections, cpos) =>
+ 						projectionSpacing[cpos] = Symmetry.ProjectionProximity(projections) / 2);
+ 
+-				var spawnReservationRadius = minSpan * param.CentralSpawnReservationFraction / FractionMax;
+-				var spawnReservation = new CellLayer<bool>(map);
++				// Spawn bias tries to move spawns away from the map center and their symmetry
++				// projections.
++				var spawnBiasRadius = Math.Max(1, minSpan * param.CentralSpawnReservationFraction / FractionMax);
++				var spawnBias = new CellLayer<int>(map);
++				spawnBias.Clear(spawnBiasRadius);
++				CellLayerUtils.OverCircle(
++					cellLayer: spawnBias,
++					wCenter: wMapCenter,
++					wRadius: 1024 * spawnBiasRadius,
++					outside: false,
++					action: (mpos, _, _, wrSq) => spawnBias[mpos] = (int)Exts.ISqrt(wrSq) / 1024);
+ 				foreach (var mpos in map.AllCells.MapCoords)
+-					spawnReservation[mpos] = Symmetry.IsCPosNearCenter(
+-						mpos.ToCPos(gridType),
+-						spawnReservation,
+-						spawnReservationRadius,
+-						param.Mirror);
++					spawnBias[mpos] = Math.Min(spawnBias[mpos], projectionSpacing[mpos]);
+ 
+ 				var zoneable = new CellLayer<bool>(map);
+ 				foreach (var mpos in map.AllCells.MapCoords)
+-					zoneable[mpos] = playableArea[mpos] && param.ClearTerrain.Contains(tileset.GetTerrainIndex(map.Tiles[mpos]));
++					zoneable[mpos] = playableArea[mpos] && param.ZoneableTerrain.Contains(tileset.GetTerrainIndex(map.Tiles[mpos]));
+ 
+ 				foreach (var actorPlan in actorPlans)
+ 					foreach (var cpos in actorPlan.Footprint().Keys)
+@@ -1198,7 +1210,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					zoneable = newZoneable;
+ 				}
+ 
+-				if (param.Rotations > 1 || param.Mirror != 0)
++				if (param.Rotations > 1 || param.Mirror != Symmetry.Mirror.None)
+ 				{
+ 					// Reserve the center of the map - otherwise it will mess with rotations
+ 					CellLayerUtils.OverCircle(
+@@ -1221,14 +1233,15 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					var spawnPreference = new CellLayer<int>(map);
+ 					CellLayerUtils.ChebyshevRoom(spawnPreference, zoneable, false);
+ 					foreach (var mpos in map.AllCells.MapCoords)
+-					{
+-						var preference = Math.Min(spawnPreference[mpos], projectionSpacing[mpos]);
+-						if (spawnReservation[mpos] && preference > 1)
+-							preference = 1;
+-						else if (preference > param.SpawnRegionSize)
+-							preference = param.SpawnRegionSize;
+-						spawnPreference[mpos] = preference;
+-					}
++						if (spawnPreference[mpos] >= param.MinimumSpawnRadius &&
++							projectionSpacing[mpos] * 2 >= param.SpawnReservation + param.MinimumSpawnRadius)
++						{
++							spawnPreference[mpos] = spawnBias[mpos] * Math.Min(param.SpawnRegionSize, spawnPreference[mpos]);
++						}
++						else
++						{
++							spawnPreference[mpos] = 0;
++						}
+ 
+ 					var (chosenMPos, chosenValue) = CellLayerUtils.FindRandomBest(
+ 						spawnPreference,
+@@ -1238,7 +1251,6 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 					if (chosenValue < 1)
+ 						throw new MapGenerationException("Not enough room for player spawns");
+ 
+-					var room = chosenValue - 1;
+ 					var spawn = new ActorPlan(map, "mpspawn")
+ 					{
+ 						Location = chosenMPos.ToCPos(gridType),
+@@ -1299,7 +1311,7 @@ void TestSymmetry(CPos[] sources, CPos destination)
+ 						CellLayerUtils.OverCircle(
+ 							cellLayer: zoneable,
+ 							wCenter: projectedResourceSpawn.WPosLocation,
+-							wRadius: param.SpawnReservation * 1024,
++							wRadius: param.ResourceSpawnReservation * 1024,
+ 							outside: false,
+ 							action: (mpos, _, _, _) => zoneable[mpos] = false);
+ 				}
+diff --git a/mods/cnc/rules/map-generators.yaml b/mods/cnc/rules/map-generators.yaml
+index ac9403eceb7f..cd29a258e330 100644
+--- a/mods/cnc/rules/map-generators.yaml
++++ b/mods/cnc/rules/map-generators.yaml
+@@ -34,8 +34,9 @@
+ 						ResourceSpawnReservation: 8
+ 						SpawnRegionSize: 12
+ 						SpawnBuildSize: 8
++						MinimumSpawnRadius: 5
+ 						SpawnResourceSpawns: 3
+-						SpawnReservation: 20
++						SpawnReservation: 16
+ 						SpawnResourceBias: 1050
+ 						ResourcesPerPlayer: 50000
+ 						OreUniformity: 500
+@@ -56,6 +57,7 @@
+ 						PartiallyPlayableTerrain: River,Tree,Water
+ 						UnplayableTerrain: Rock
+ 						DominantTerrain: River,Rock,Tree,Water
++						ZoneableTerrain: Clear,Road
+ 						PartiallyPlayableCategories: Beach,Road
+ 						ClearSegmentTypes: Clear
+ 						BeachSegmentTypes: Beach
+diff --git a/mods/ra/rules/map-generators.yaml b/mods/ra/rules/map-generators.yaml
+index 1b0b16d4d966..49e2952493b4 100644
+--- a/mods/ra/rules/map-generators.yaml
++++ b/mods/ra/rules/map-generators.yaml
+@@ -34,8 +34,9 @@
+ 						ResourceSpawnReservation: 8
+ 						SpawnRegionSize: 12
+ 						SpawnBuildSize: 8
++						MinimumSpawnRadius: 5
+ 						SpawnResourceSpawns: 3
+-						SpawnReservation: 20
++						SpawnReservation: 16
+ 						SpawnResourceBias: 1150
+ 						ResourcesPerPlayer: 50000
+ 						OreUniformity: 250
+@@ -55,6 +56,7 @@
+ 						PartiallyPlayableTerrain: Tree
+ 						UnplayableTerrain: River,Rock
+ 						DominantTerrain: River,Rock,Tree,Water
++						ZoneableTerrain: Clear,Road
+ 						PartiallyPlayableCategories: Beach,Road
+ 						ClearSegmentTypes: Clear
+ 						BeachSegmentTypes: Beach
+@@ -159,6 +161,7 @@
+ 					Settings:
+ 						Water: 800
+ 						Forests: 0
++						MinimumSpawnRadius: 4
+ 				Choice@LargeIslands:
+ 					Label: label-ra-map-generator-choice-terrain-type-large-islands
+ 					Settings:
+@@ -181,6 +184,7 @@
+ 						TerrainFeatureSize: 5120
+ 						Forests: 0
+ 						SpawnBuildSize: 6
++						MinimumSpawnRadius: 4
+ 			Option@Rotations:
+ 				Label: label-ra-map-generator-option-rotations
+ 				SimpleChoice: Rotations

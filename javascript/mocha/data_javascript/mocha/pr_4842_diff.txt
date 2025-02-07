@@ -1,0 +1,205 @@
+diff --git a/lib/cli/run-helpers.js b/lib/cli/run-helpers.js
+index 2be7529e99..078ca7e434 100644
+--- a/lib/cli/run-helpers.js
++++ b/lib/cli/run-helpers.js
+@@ -225,18 +225,18 @@ exports.validateLegacyPlugin = (opts, pluginType, map = {}) => {
+ 
+   // if this exists, then it's already loaded, so nothing more to do.
+   if (!map[pluginId]) {
++    let foundId;
+     try {
+-      map[pluginId] = require(pluginId);
++      foundId = require.resolve(pluginId);
++      map[pluginId] = require(foundId);
+     } catch (err) {
+-      if (err.code === 'MODULE_NOT_FOUND') {
+-        // Try to load reporters from a path (absolute or relative)
+-        try {
+-          map[pluginId] = require(path.resolve(pluginId));
+-        } catch (err) {
+-          throw createUnknownError(err);
+-        }
+-      } else {
+-        throw createUnknownError(err);
++      if (foundId) throw createUnknownError(err);
++
++      // Try to load reporters from a cwd-relative path
++      try {
++        map[pluginId] = require(path.resolve(pluginId));
++      } catch (e) {
++        throw createUnknownError(e);
+       }
+     }
+   }
+diff --git a/lib/mocha.js b/lib/mocha.js
+index 880b9f0d71..cee11f3aa5 100644
+--- a/lib/mocha.js
++++ b/lib/mocha.js
+@@ -16,7 +16,6 @@ var Suite = require('./suite');
+ var esmUtils = require('./nodejs/esm-utils');
+ var createStatsCollector = require('./stats-collector');
+ const {
+-  warn,
+   createInvalidReporterError,
+   createInvalidInterfaceError,
+   createMochaInstanceAlreadyDisposedError,
+@@ -335,35 +334,26 @@ Mocha.prototype.reporter = function (reporterName, reporterOptions) {
+     }
+     // Try to load reporters from process.cwd() and node_modules
+     if (!reporter) {
++      let foundReporter;
+       try {
+-        reporter = require(reporterName);
++        foundReporter = require.resolve(reporterName);
++        reporter = require(foundReporter);
+       } catch (err) {
+-        if (err.code === 'MODULE_NOT_FOUND') {
+-          // Try to load reporters from a path (absolute or relative)
+-          try {
+-            reporter = require(path.resolve(utils.cwd(), reporterName));
+-          } catch (_err) {
+-            _err.code === 'MODULE_NOT_FOUND'
+-              ? warn(`'${reporterName}' reporter not found`)
+-              : warn(
+-                  `'${reporterName}' reporter blew up with error:\n ${err.stack}`
+-                );
+-          }
+-        } else {
+-          warn(`'${reporterName}' reporter blew up with error:\n ${err.stack}`);
++        if (foundReporter) {
++          throw createInvalidReporterError(err.message, foundReporter);
++        }
++        // Try to load reporters from a cwd-relative path
++        try {
++          reporter = require(path.resolve(reporterName));
++        } catch (e) {
++          throw createInvalidReporterError(e.message, reporterName);
+         }
+       }
+     }
+-    if (!reporter) {
+-      throw createInvalidReporterError(
+-        `invalid reporter '${reporterName}'`,
+-        reporterName
+-      );
+-    }
+     this._reporter = reporter;
+   }
+   this.options.reporterOption = reporterOptions;
+-  // alias option name is used in public reporters xunit/tap/progress
++  // alias option name is used in built-in reporters xunit/tap/progress
+   this.options.reporterOptions = reporterOptions;
+   return this;
+ };
+diff --git a/test/browser-specific/fixtures/webpack/webpack.config.js b/test/browser-specific/fixtures/webpack/webpack.config.js
+index 97c2ddc1d9..69fc5f5fd4 100644
+--- a/test/browser-specific/fixtures/webpack/webpack.config.js
++++ b/test/browser-specific/fixtures/webpack/webpack.config.js
+@@ -17,7 +17,7 @@ module.exports = {
+   plugins: [
+     new FailOnErrorsPlugin({
+       failOnErrors: true,
+-      failOnWarnings: true
++      failOnWarnings: false
+     })
+   ]
+ };
+diff --git a/test/node-unit/cli/run-helpers.spec.js b/test/node-unit/cli/run-helpers.spec.js
+index 4ad650f21d..889b48f50d 100644
+--- a/test/node-unit/cli/run-helpers.spec.js
++++ b/test/node-unit/cli/run-helpers.spec.js
+@@ -77,6 +77,23 @@ describe('helpers', function () {
+           {message: /wonky/, code: 'ERR_MOCHA_INVALID_REPORTER'}
+         );
+       });
++
++      it('should fail and report the original "MODULE_NOT_FOUND" error.message', function () {
++        expect(
++          () =>
++            validateLegacyPlugin(
++              {
++                reporter: require.resolve('./fixtures/bad-require.fixture.js')
++              },
++              'reporter'
++            ),
++          'to throw',
++          {
++            message: /Error: Cannot find module 'fake'/,
++            code: 'ERR_MOCHA_INVALID_REPORTER'
++          }
++        );
++      });
+     });
+   });
+ 
+diff --git a/test/node-unit/mocha.spec.js b/test/node-unit/mocha.spec.js
+index 8a30adb5d2..8bf48b1b06 100644
+--- a/test/node-unit/mocha.spec.js
++++ b/test/node-unit/mocha.spec.js
+@@ -246,7 +246,7 @@ describe('Mocha', function () {
+ 
+         it('should load from current working directory', function () {
+           expect(function () {
+-            mocha.reporter('./spec.js');
++            mocha.reporter('./lib/reporters/spec.js');
+           }, 'not to throw');
+         });
+ 
+@@ -255,7 +255,7 @@ describe('Mocha', function () {
+             expect(
+               function () {
+                 mocha.reporter(
+-                  '../../test/node-unit/fixtures/wonky-reporter.fixture.js'
++                  './test/node-unit/fixtures/wonky-reporter.fixture.js'
+                 );
+               },
+               'to throw',
+@@ -264,19 +264,6 @@ describe('Mocha', function () {
+               }
+             );
+           });
+-
+-          it('should warn about the error before throwing', function () {
+-            try {
+-              mocha.reporter(
+-                '../../test/node-unit/fixtures/wonky-reporter.fixture.js'
+-              );
+-            } catch (ignored) {
+-            } finally {
+-              expect(stubs.errors.warn, 'to have a call satisfying', [
+-                expect.it('to match', /reporter blew up/)
+-              ]);
+-            }
+-          });
+         });
+       });
+ 
+@@ -292,7 +279,7 @@ describe('Mocha', function () {
+             expect(
+               function () {
+                 mocha.reporter(
+-                  './test/node-unit/fixtures/wonky-reporter.fixture.js'
++                  '../test/node-unit/fixtures/wonky-reporter.fixture.js'
+                 );
+               },
+               'to throw',
+@@ -301,19 +288,6 @@ describe('Mocha', function () {
+               }
+             );
+           });
+-
+-          it('should warn about the error before throwing', function () {
+-            try {
+-              mocha.reporter(
+-                './test/node-unit/fixtures/wonky-reporter.fixture.js'
+-              );
+-            } catch (ignored) {
+-            } finally {
+-              expect(stubs.errors.warn, 'to have a call satisfying', [
+-                expect.it('to match', /reporter blew up/)
+-              ]);
+-            }
+-          });
+         });
+       });
+     });
