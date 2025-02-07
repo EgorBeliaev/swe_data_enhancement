@@ -29,7 +29,7 @@ def load_json(json_string):
 def read_truncated_json(json_string):
     """
     Attempts to read a JSON string that may be truncated.
-    Tries to recover as much data as possible.
+    Tries to recover as much data as possible by removing incomplete key-value pairs.
     """
     json_string = json_string.replace("```json", "").replace("`", "")
     try:
@@ -42,25 +42,33 @@ def read_truncated_json(json_string):
         # Find the position of the error
         error_position = e.pos
         # Attempt to truncate the string to the last complete JSON object
-        truncated_string = json_string[:error_position] + "}"
+        truncated_string = json_string[:error_position]
         
-        # Try to find the last complete JSON object
-        while truncated_string:
-            try:
-                data = json.loads(truncated_string)
-                return data
-            except json.JSONDecodeError:
-                # Remove the last character and try again
-                truncated_string = truncated_string[:-2] + "}"
-        # If no valid JSON can be recovered, return None
-        return None
+        # Remove the last incomplete key-value pair
+        last_comma_index = truncated_string.rfind(',')
+        if last_comma_index != -1:
+            truncated_string = truncated_string[:last_comma_index]
+        
+        # Properly close the JSON object
+        truncated_string = truncated_string.rstrip() + "}"
+
+        # Try to load the corrected JSON string
+        try:
+            data = json.loads(truncated_string)
+            print('Loaded fixed json')
+            return data
+        except json.JSONDecodeError:
+            # If no valid JSON can be recovered, return None
+            print('No sucess, discarded json')
+            return None
+
     
 def load_json_file(file_path):
     with open(file_path, 'r') as file:
         return json.load(file)
 
 # take sepasrately jsons which seem reasonable
-def filter_and_save_pairs(new_repo_dir, small_json_path, big_json_path, output_directory):
+def filter_and_save_pairs(new_repo_dir, small_json_path, big_json_path, output_directory, prefix=""):
     # Load JSON data
     small_json = load_json_file(small_json_path)
     big_json = load_json_file(big_json_path)
@@ -79,20 +87,28 @@ def filter_and_save_pairs(new_repo_dir, small_json_path, big_json_path, output_d
         shutil.copy(small_json_path, output_directory)
         shutil.copy(big_json_path, output_directory)
         print(f"Saved valid pair: {small_json_path} and {big_json_path}")
-        shutil.move(f'repos/{new_repo_dir}.zip', f'repos_filtered/{new_repo_dir}.zip')
+        shutil.move(f'{prefix}/repos/{new_repo_dir}.zip', f'{prefix}/repos_filtered/{new_repo_dir}.zip')
 
 
 
-os.makedirs('validation', exist_ok=True)
-os.makedirs('validation_filtered', exist_ok=True)
-os.makedirs('repos', exist_ok=True)
-os.makedirs('repos_filtered', exist_ok=True)
 
-def process_repo(repo_url, repo_name):
+
+def process_repo(repo_url, repo_name, prefix=""):
+
+    os.makedirs(f'{prefix}/validation', exist_ok=True)
+    os.makedirs(f'{prefix}/validation_filtered', exist_ok=True)
+    os.makedirs(f'{prefix}/repos', exist_ok=True)
+    os.makedirs(f'{prefix}/repos_filtered', exist_ok=True)
+
     # Define paths
-    data_folder = f"{repo_name}/data_{repo_name}"
-
+    if not prefix:
+        data_folder = f"{repo_name}/data_{repo_name.split("/")[-1]}"
+    else:
+        data_folder = f"{repo_name}/data_{prefix}"
+    
     repo_name = repo_name.split("/")[-1]
+
+    print(data_folder)
 
     # Iterate over all JSON files in the data folder
     for json_filename in os.listdir(data_folder):
@@ -155,10 +171,10 @@ def process_repo(repo_url, repo_name):
             repo_id =  str(uuid.uuid4()),
             
             if os.path.exists(f"{new_repo_dir}.zip"):
-                shutil.move(f"{new_repo_dir}.zip", f"repos/{new_repo_dir}.zip")
+                shutil.move(f"{new_repo_dir}.zip", f"{prefix}/repos/{new_repo_dir}.zip")
                 print(f"saving validation {new_repo_dir}")
                 validation = {
-                    "zip_path": f"repos/{new_repo_dir}.zip",
+                    "zip_path": f"{prefix}/{new_repo_dir}.zip",
                     "repo_id": repo_id,
                     "validations": [
                         {
@@ -169,7 +185,7 @@ def process_repo(repo_url, repo_name):
                     ],
                     "user_id": repo_id,
                 }
-                with open(f'validation/{new_repo_dir}.json', 'w') as outfile:
+                with open(f'{prefix}/validation/{new_repo_dir}.json', 'w') as outfile:
                     json.dump(validation, outfile, indent=4)
 
                 validation_big = {
@@ -185,10 +201,10 @@ def process_repo(repo_url, repo_name):
                     "user_id": repo_id,
                 }
 
-                with open(f'validation/{new_repo_dir}_big.json', 'w') as outfile:
+                with open(f'{prefix}/validation/{new_repo_dir}_big.json', 'w') as outfile:
                     json.dump(validation_big, outfile, indent=4)
 
-                filter_and_save_pairs(new_repo_dir, small_json_path=f'validation/{new_repo_dir}.json', big_json_path=f'validation/{new_repo_dir}_big.json', output_directory='validation_filtered')
+                filter_and_save_pairs(new_repo_dir, small_json_path=f'{prefix}/validation/{new_repo_dir}.json', big_json_path=f'{prefix}/validation/{new_repo_dir}_big.json', output_directory=f'{prefix}/validation_filtered', prefix=prefix)
 
 
                 print(f"Processed and zipped repository for PR {pr_number} with commit {commit_hash}\n\n")
@@ -200,6 +216,7 @@ java_directory = '../java'
 subfolders = [name for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
 
 for subfolder in subfolders:
+    print(subfolder)
     subfolder_path = os.path.join(java_directory, subfolder)
     prs_js_path = os.path.join(subfolder_path, 'prs_js.txt')
     
@@ -212,4 +229,4 @@ for subfolder in subfolders:
                 # Form the second argument
                 repo_name = f"{java_directory}/{subfolder}"
                 # Call process_repo with the extracted URL and constructed repo_name
-                process_repo(repo_url, repo_name)
+                process_repo(repo_url, repo_name, prefix=f"java/{subfolder}")
