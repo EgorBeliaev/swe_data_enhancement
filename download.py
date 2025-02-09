@@ -15,6 +15,36 @@ HEADERS = {
 GRAPHQL_URL = "https://api.github.com/graphql"
 REST_API_URL = "https://api.github.com/repos"
 
+import re
+
+def find_references(text):
+    """Find references to issues or PRs in the given text."""
+    return re.findall(r'(?:Fixes|Closes|Resolves) #(\d+)', json.dumps(text))
+
+def fetch_related_issues(owner, repo, issue_number):
+    """Fetch related issue details using GraphQL."""
+    query = """
+    query($owner: String!, $repo: String!, $issueNumber: Int!) {
+      repository(owner: $owner, name: $repo) {
+        issue(number: $issueNumber) {
+          title
+          body
+          state
+          comments(first: 10) {
+            nodes {
+              author {
+                login
+              }
+              body
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {"owner": owner, "repo": repo, "issueNumber": issue_number}
+    return graphql_query(query, variables)
+
 
 def extract_repo_and_pr(link):
     """Extract owner, repo, and PR number from a GitHub PR link."""
@@ -107,6 +137,18 @@ def process_pull_request(link, folder):
             {"author": {"login": "PR Description"}, "body": description}
         ] + review_comments + issue_comments
 
+        # Find references in PR description, comments, and reviews
+        references = find_references(review_comments_with_description)
+
+        # Fetch related discussions
+        related_discussions = []
+        for issue_number in set(references):
+            print(f"Fetching related discussion for issue #{issue_number}")
+            discussion = fetch_related_issues(owner, repo, int(issue_number))
+            related_discussions.append(discussion)
+
+        review_comments_with_description += related_discussions
+
         # Print results
         print(f"\nPull Request #{pr_number} Summary:")
         print(f"Title: {title}")
@@ -135,11 +177,12 @@ def process_pull_request(link, folder):
 
 # List of pull request links
 pr_links = [
-    "https://github.com/expressjs/express/pull/6236"
+    "https://github.com/deskflow/deskflow/pull/8062"
 ]
 
 if __name__ == "__main__":
+    os.makedirs('tmp/data_tmp', exist_ok=True)
     
     # Process each pull request
     for link in pr_links:
-        process_pull_request(link)
+        process_pull_request(link, 'tmp')
