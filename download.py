@@ -19,7 +19,8 @@ import re
 
 def find_references(text):
     """Find references to issues or PRs in the given text."""
-    return re.findall(r'(?:Fixes|Closes|Resolves) #(\d+)', json.dumps(text))
+    pattern = r'(?:Fixes|Closes|Resolves|In|in|fixes|closes|resolves|issue|Issue|Bug|bug):? #(\d+)'
+    return re.findall(pattern, json.dumps(text))
 
 def fetch_related_issues(owner, repo, issue_number):
     """Fetch related issue details using GraphQL."""
@@ -177,7 +178,8 @@ def process_pull_request(link, folder):
 
 # List of pull request links
 pr_links = [
-    "https://github.com/deskflow/deskflow/pull/8062"
+    "https://github.com/deskflow/deskflow/pull/8062",
+    "https://github.com/deskflow/deskflow/pull/7730"
 ]
 
 if __name__ == "__main__":
