@@ -1,0 +1,2557 @@
+diff --git a/lib/bean/settings/settings.dart b/lib/bean/settings/settings.dart
+deleted file mode 100644
+index e85f5f71..00000000
+--- a/lib/bean/settings/settings.dart
++++ /dev/null
+@@ -1,142 +0,0 @@
+-import 'package:flutter/material.dart';
+-import 'package:hive/hive.dart';
+-import 'package:kazumi/bean/dialog/dialog_helper.dart';
+-import 'package:kazumi/utils/storage.dart';
+-
+-class SetSwitchItem extends StatefulWidget {
+-  final String? title;
+-  final String? subTitle;
+-  final String? setKey;
+-  final bool? defaultVal;
+-  final Function? callFn;
+-  final bool? needReboot;
+-
+-  const SetSwitchItem({
+-    this.title,
+-    this.subTitle,
+-    this.setKey,
+-    this.defaultVal,
+-    this.callFn,
+-    this.needReboot,
+-    super.key,
+-  });
+-
+-  @override
+-  State<SetSwitchItem> createState() => _SetSwitchItemState();
+-}
+-
+-class _SetSwitchItemState extends State<SetSwitchItem> {
+-  // ignore: non_constant_identifier_names
+-  Box Setting = GStorage.setting;
+-  late bool val;
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-    val = Setting.get(widget.setKey, defaultValue: widget.defaultVal ?? false);
+-  }
+-
+-  void switchChange(value) async {
+-    val = value ?? !val;
+-    await Setting.put(widget.setKey, val);
+-    widget.callFn?.call(val);
+-    if (widget.needReboot != null && widget.needReboot!) {
+-      KazumiDialog.showToast(message: '重启生效');
+-    }
+-    setState(() {});
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    TextStyle titleStyle = Theme.of(context).textTheme.titleMedium!;
+-    TextStyle subTitleStyle = Theme.of(context)
+-        .textTheme
+-        .labelMedium!
+-        .copyWith(color: Theme.of(context).colorScheme.outline);
+-    return ListTile(
+-      enableFeedback: true,
+-      onTap: () => switchChange(null),
+-      title: Text(widget.title!, style: titleStyle),
+-      subtitle: widget.subTitle != null
+-          ? Text(widget.subTitle!, style: subTitleStyle)
+-          : null,
+-      trailing: Transform.scale(
+-        alignment: Alignment.centerRight, // 缩放Switch的大小后保持右侧对齐, 避免右侧空隙过大
+-        scale: 0.8,
+-        child: Switch(
+-          value: val,
+-          onChanged: (val) => switchChange(val),
+-        ),
+-      ),
+-    );
+-  }
+-}
+-
+-class SelectDialog<T> extends StatefulWidget {
+-  final T value;
+-  final String title;
+-  final List<dynamic> values;
+-  const SelectDialog(
+-      {super.key,
+-      required this.value,
+-      required this.values,
+-      required this.title});
+-
+-  @override
+-  State<SelectDialog<T>> createState() => _SelectDialogState<T>();
+-}
+-
+-class _SelectDialogState<T> extends State<SelectDialog<T>> {
+-  late T _tempValue;
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-    _tempValue = widget.value;
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    TextStyle titleStyle = Theme.of(context).textTheme.titleMedium!;
+-
+-    return AlertDialog(
+-      title: Text(widget.title),
+-      contentPadding: const EdgeInsets.fromLTRB(0, 12, 0, 12),
+-      content: StatefulBuilder(builder: (context, StateSetter setState) {
+-        return SingleChildScrollView(
+-          child: Column(
+-            mainAxisSize: MainAxisSize.min,
+-            children: [
+-              for (var i in widget.values) ...[
+-                RadioListTile(
+-                  value: i['value'],
+-                  title: Text(i['title'], style: titleStyle),
+-                  groupValue: _tempValue,
+-                  onChanged: (value) {
+-                    setState(() {
+-                      _tempValue = value as T;
+-                    });
+-                  },
+-                ),
+-              ]
+-            ],
+-          ),
+-        );
+-      }),
+-      actions: [
+-        TextButton(
+-          onPressed: () => Navigator.pop(context),
+-          child: Text(
+-            '取消',
+-            style: TextStyle(color: Theme.of(context).colorScheme.outline),
+-          ),
+-        ),
+-        TextButton(
+-          onPressed: () => Navigator.pop(context, _tempValue),
+-          child: const Text('确定'),
+-        )
+-      ],
+-    );
+-  }
+-}
+-
+diff --git a/lib/pages/about/about_page.dart b/lib/pages/about/about_page.dart
+index be035a51..1a0e7eab 100644
+--- a/lib/pages/about/about_page.dart
++++ b/lib/pages/about/about_page.dart
+@@ -1,12 +1,15 @@
+ import 'dart:io';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_modular/flutter_modular.dart';
++import 'package:hive/hive.dart';
+ import 'package:kazumi/pages/my/my_controller.dart';
+ import 'package:kazumi/request/api.dart';
+ import 'package:url_launcher/url_launcher.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+ import 'package:path_provider/path_provider.dart';
+ import 'package:kazumi/bean/dialog/dialog_helper.dart';
++import 'package:card_settings_ui/card_settings_ui.dart';
++import 'package:kazumi/utils/storage.dart';
+ 
+ class AboutPage extends StatefulWidget {
+   const AboutPage({super.key});
+@@ -19,12 +22,16 @@ class _AboutPageState extends State<AboutPage> {
+   late dynamic defaultDanmakuArea;
+   late dynamic defaultThemeMode;
+   late dynamic defaultThemeColor;
++  Box setting = GStorage.setting;
++  late bool autoUpdate;
+   double _cacheSizeMB = -1;
+   final MyController myController = Modular.get<MyController>();
+ 
+   @override
+   void initState() {
+     super.initState();
++    autoUpdate =
++        setting.get(SettingBoxKey.autoUpdate, defaultValue: true);
+     _getCacheSize();
+   }
+ 
+@@ -121,103 +128,99 @@ class _AboutPageState extends State<AboutPage> {
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('关于')),
+         // backgroundColor: Colors.transparent,
+-        body: Column(
+-          children: [
+-            ListTile(
+-              title: const Text('开源许可证'),
+-              subtitle: Text('查看所有开源许可证',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-              onTap: () {
+-                Modular.to.pushNamed('/settings/about/license');
+-              },
+-            ),
+-            ListTile(
+-              onTap: () {
+-                launchUrl(Uri.parse(Api.sourceUrl),
+-                    mode: LaunchMode.externalApplication);
+-              },
+-              dense: false,
+-              title: const Text('项目主页'),
+-              trailing: Text('Github',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                launchUrl(Uri.parse(Api.iconUrl),
+-                    mode: LaunchMode.externalApplication);
+-              },
+-              dense: false,
+-              title: const Text('图标创作'),
+-              trailing: Text('Pixiv',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                launchUrl(Uri.parse(Api.bangumiIndex),
+-                    mode: LaunchMode.externalApplication);
+-              },
+-              dense: false,
+-              title: const Text('番剧索引'),
+-              trailing: Text('Bangumi',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                launchUrl(Uri.parse(Api.dandanIndex),
+-                    mode: LaunchMode.externalApplication);
+-              },
+-              dense: false,
+-              title: const Text('弹幕来源'),
+-              trailing: Text('DanDanPlay',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                Modular.to.pushNamed('/settings/about/logs');
+-              },
+-              dense: false,
+-              title: const Text('错误日志'),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                _showCacheDialog();
+-              },
+-              dense: false,
+-              title: const Text('清除缓存'),
+-              trailing: _cacheSizeMB == -1
+-                  ? const Text('统计中...')
+-                  : Text('${_cacheSizeMB.toStringAsFixed(2)}MB',
+-                      style: Theme.of(context).textTheme.labelMedium!.copyWith(
+-                          color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                myController.checkUpdata();
+-              },
+-              dense: false,
+-              title: const Text('检查更新'),
+-              trailing: Text('当前版本 ${Api.version}',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              physics: const NeverScrollableScrollPhysics(),
++              sections: [
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/about/license');
++                      },
++                      title: const Text('开源许可证'),
++                      description: const Text('查看所有开源许可证'),
++                    ),],),
++                SettingsSection(
++                  title: const Text('外部链接'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        launchUrl(Uri.parse(Api.sourceUrl),
++                            mode: LaunchMode.externalApplication);
++                      },
++                      title: const Text('项目主页'),
++                      value: const Text('Github'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        launchUrl(Uri.parse(Api.iconUrl),
++                            mode: LaunchMode.externalApplication);
++                      },
++                      title: const Text('图标创作'),
++                      value: const Text('Pixiv'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        launchUrl(Uri.parse(Api.bangumiIndex),
++                            mode: LaunchMode.externalApplication);
++                      },
++                      title: const Text('番剧索引'),
++                      value: const Text('Bangumi'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        launchUrl(Uri.parse(Api.dandanIndex),
++                            mode: LaunchMode.externalApplication);
++                      },
++                      title: const Text('弹幕来源'),
++                      value: const Text('DanDanPlay'),
++                    ),],),
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/about/logs');
++                      },
++                      title: const Text('错误日志'),
++                    ),],),
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        _showCacheDialog();
++                      },
++                      title: const Text('清除缓存'),
++                      value: _cacheSizeMB == -1
++                          ? const Text('统计中...')
++                          : Text('${_cacheSizeMB.toStringAsFixed(2)}MB'),
++                    ),],),
++                SettingsSection(
++                  title: const Text('应用更新'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        autoUpdate = value ?? !autoUpdate;
++                        await setting.put(SettingBoxKey.autoUpdate, autoUpdate);
++                        setState(() {});
++                      },
++                      title: const Text('自动更新'),
++                      initialValue: autoUpdate,
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        myController.checkUpdata();
++                      },
++                      title: const Text('检查更新'),
++                      value: const Text('当前版本 ${Api.version}'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/lib/pages/my/my_page.dart b/lib/pages/my/my_page.dart
+index ccb47892..5f06f091 100644
+--- a/lib/pages/my/my_page.dart
++++ b/lib/pages/my/my_page.dart
+@@ -1,3 +1,4 @@
++import 'package:card_settings_ui/card_settings_ui.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_modular/flutter_modular.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+@@ -45,66 +46,84 @@ class _MyPageState extends State<MyPage> {
+       },
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('我的')),
+-        body: ListView(
+-          children: [
+-            ListTile(
+-              onTap: () {
+-                Modular.to.pushNamed('/settings/history');
+-              },
+-              dense: false,
+-              title: const Text('历史记录'),
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              sections: [
++                SettingsSection(
++                  title: const Text('播放历史与视频源'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/history/');
++                      },
++                      leading: const Icon(Icons.history_rounded),
++                      title: const Text('历史记录'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/plugin/');
++                      },
++                      leading: const Icon(Icons.rule_folder_rounded),
++                      title: const Text('规则管理'),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('播放器设置'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/player');
++                      },
++                      leading: const Icon(Icons.display_settings_rounded),
++                      title: const Text('播放设置'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/danmaku/');
++                      },
++                      leading: const Icon(Icons.subtitles_rounded),
++                      title: const Text('弹幕设置'),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('应用与外观'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/theme');
++                      },
++                      leading: const Icon(Icons.palette_rounded),
++                      title: const Text('外观设置'),
++                      // trailing: const Icon(Icons.navigate_next),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/webdav/');
++                      },
++                      leading: const Icon(Icons.cloud_circle_rounded),
++                      title: const Text('同步设置'),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('其他'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        Modular.to.pushNamed('/settings/about/');
++                      },
++                      leading: const Icon(Icons.info_outline_rounded),
++                      title: const Text('关于'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/plugin');
+-              },
+-              dense: false,
+-              title: const Text('规则管理'),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/player');
+-              },
+-              dense: false,
+-              title: const Text('播放设置'),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/danmaku');
+-              },
+-              dense: false,
+-              title: const Text('弹幕设置'),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/theme');
+-              },
+-              dense: false,
+-              title: const Text('外观设置'),
+-              // trailing: const Icon(Icons.navigate_next),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/webdav');
+-              },
+-              dense: false,
+-              title: const Text('同步设置'),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/other');
+-              },
+-              dense: false,
+-              title: const Text('其他设置'),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                Modular.to.pushNamed('/settings/about');
+-              },
+-              dense: false,
+-              title: const Text('关于'),
+-            ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/lib/pages/plugin_editor/plugin_editor_page.dart b/lib/pages/plugin_editor/plugin_editor_page.dart
+index 909335f2..1eef9ae5 100644
+--- a/lib/pages/plugin_editor/plugin_editor_page.dart
++++ b/lib/pages/plugin_editor/plugin_editor_page.dart
+@@ -68,90 +68,116 @@ class _PluginEditorPageState extends State<PluginEditorPage> {
+       ),
+       body: SingleChildScrollView(
+         padding: const EdgeInsets.all(16.0),
+-        child: Column(
+-          children: [
+-            SwitchListTile(
+-              title: const Text('内置播放器'),
+-              subtitle: const Text('调试时保持禁用'),
+-              value: useNativePlayer,
+-              onChanged: (bool value) {
+-                setState(() {
+-                  useNativePlayer = value;
+-                });
+-              },
+-            ),
+-            const SizedBox(height: 20),
+-            TextField(
+-              controller: nameController,
+-              decoration: const InputDecoration(labelText: 'Name'),
+-            ),
+-            TextField(
+-              controller: versionController,
+-              decoration: const InputDecoration(labelText: 'Version'),
+-            ),
+-            TextField(
+-              controller: baseURLController,
+-              decoration: const InputDecoration(labelText: 'BaseURL'),
+-            ),
+-            TextField(
+-              controller: searchURLController,
+-              decoration: const InputDecoration(labelText: 'SearchURL'),
+-            ),
+-            TextField(
+-              controller: searchListController,
+-              decoration: const InputDecoration(labelText: 'SearchList'),
+-            ),
+-            TextField(
+-              controller: searchNameController,
+-              decoration: const InputDecoration(labelText: 'SearchName'),
+-            ),
+-            TextField(
+-              controller: searchResultController,
+-              decoration: const InputDecoration(labelText: 'SearchResult'),
+-            ),
+-            TextField(
+-              controller: chapterRoadsController,
+-              decoration: const InputDecoration(labelText: 'ChapterRoads'),
+-            ),
+-            TextField(
+-              controller: chapterResultController,
+-              decoration: const InputDecoration(labelText: 'ChapterResult'),
+-            ),
+-            const SizedBox(height: 20),
+-            ExpansionTile(
+-              title: const Text('高级选项'),
++        child: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: Column(
+               children: [
+                 SwitchListTile(
+-                  title: const Text('简易解析'),
+-                  subtitle: const Text('使用简易解析器而不是现代解析器'),
+-                  value: useLegacyParser,
++                  title: const Text('内置播放器'),
++                  subtitle: const Text('调试时保持禁用'),
++                  value: useNativePlayer,
+                   onChanged: (bool value) {
+                     setState(() {
+-                      useLegacyParser = value;
++                      useNativePlayer = value;
+                     });
+                   },
+                 ),
+-                SwitchListTile(
+-                  title: const Text('POST'),
+-                  subtitle: const Text('使用POST而不是GET进行检索'),
+-                  value: usePost,
+-                  onChanged: (bool value) {
+-                    setState(() {
+-                      usePost = value;
+-                    });
+-                  },
++                const SizedBox(height: 20),
++                TextField(
++                  controller: nameController,
++                  decoration: const InputDecoration(
++                      labelText: 'Name', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: versionController,
++                  decoration: const InputDecoration(
++                      labelText: 'Version', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: baseURLController,
++                  decoration: const InputDecoration(
++                      labelText: 'BaseURL', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: searchURLController,
++                  decoration: const InputDecoration(
++                      labelText: 'SearchURL', border: OutlineInputBorder()),
+                 ),
++                const SizedBox(height: 20),
+                 TextField(
+-                  controller: userAgentController,
+-                  decoration: const InputDecoration(labelText: 'UserAgent'),
++                  controller: searchListController,
++                  decoration: const InputDecoration(
++                      labelText: 'SearchList', border: OutlineInputBorder()),
+                 ),
++                const SizedBox(height: 20),
+                 TextField(
+-                  controller: refererController,
+-                  decoration: const InputDecoration(labelText: 'Referer'),
++                  controller: searchNameController,
++                  decoration: const InputDecoration(
++                      labelText: 'SearchName', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: searchResultController,
++                  decoration: const InputDecoration(
++                      labelText: 'SearchResult', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: chapterRoadsController,
++                  decoration: const InputDecoration(
++                      labelText: 'ChapterRoads', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: chapterResultController,
++                  decoration: const InputDecoration(
++                      labelText: 'ChapterResult', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                ExpansionTile(
++                  title: const Text('高级选项'),
++                  children: [
++                    SwitchListTile(
++                      title: const Text('简易解析'),
++                      subtitle: const Text('使用简易解析器而不是现代解析器'),
++                      value: useLegacyParser,
++                      onChanged: (bool value) {
++                        setState(() {
++                          useLegacyParser = value;
++                        });
++                      },
++                    ),
++                    SwitchListTile(
++                      title: const Text('POST'),
++                      subtitle: const Text('使用POST而不是GET进行检索'),
++                      value: usePost,
++                      onChanged: (bool value) {
++                        setState(() {
++                          usePost = value;
++                        });
++                      },
++                    ),
++                    const SizedBox(height: 20),
++                    TextField(
++                      controller: userAgentController,
++                      decoration: const InputDecoration(
++                          labelText: 'UserAgent', border: OutlineInputBorder()),
++                    ),
++                    const SizedBox(height: 20),
++                    TextField(
++                      controller: refererController,
++                      decoration: const InputDecoration(
++                          labelText: 'Referer', border: OutlineInputBorder()),
++                    ),
++                  ],
+                 ),
+               ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+       floatingActionButton: FloatingActionButton(
+diff --git a/lib/pages/plugin_editor/plugin_shop_page.dart b/lib/pages/plugin_editor/plugin_shop_page.dart
+index 71c992cd..b0967d50 100644
+--- a/lib/pages/plugin_editor/plugin_shop_page.dart
++++ b/lib/pages/plugin_editor/plugin_shop_page.dart
+@@ -41,6 +41,8 @@ class _PluginShopPageState extends State<PluginShopPage> {
+         loading = true;
+         timeout = false;
+       });
++      enableGitProxy =
++          setting.get(SettingBoxKey.enableGitProxy, defaultValue: false);
+       pluginsController.queryPluginHTTPList().then((_) {
+         setState(() {
+           loading = false;
+@@ -194,7 +196,7 @@ class _PluginShopPageState extends State<PluginShopPage> {
+         ),
+         FilledButton.tonal(
+             onPressed: () {
+-              Modular.to.pushNamed('/settings/other');
++              Modular.to.pushNamed('/settings/webdav/');
+             },
+             child: Text(enableGitProxy ? '禁用镜像' : '启用镜像')),
+         const SizedBox(
+diff --git a/lib/pages/settings/danmaku/danmaku_module.dart b/lib/pages/settings/danmaku/danmaku_module.dart
+index 5bc61021..75d6e0dc 100644
+--- a/lib/pages/settings/danmaku/danmaku_module.dart
++++ b/lib/pages/settings/danmaku/danmaku_module.dart
+@@ -1,5 +1,4 @@
+ import 'package:kazumi/pages/settings/danmaku/danmaku_settings.dart';
+-import 'package:kazumi/pages/settings/danmaku/danmaku_source_settings.dart';
+ import 'package:flutter_modular/flutter_modular.dart';
+ 
+ class DanmakuModule extends Module {
+@@ -9,6 +8,6 @@ class DanmakuModule extends Module {
+   @override
+   void routes(r) {
+     r.child("/", child: (_) => const DanmakuSettingsPage());
+-    r.child("/source", child: (_) => const DanmakuSourceSettingsPage());
++    // r.child("/source", child: (_) => const DanmakuSourceSettingsPage());
+   }
+ }
+diff --git a/lib/pages/settings/danmaku/danmaku_settings.dart b/lib/pages/settings/danmaku/danmaku_settings.dart
+index 4d2f1097..e5c144bf 100644
+--- a/lib/pages/settings/danmaku/danmaku_settings.dart
++++ b/lib/pages/settings/danmaku/danmaku_settings.dart
+@@ -1,13 +1,13 @@
+ import 'package:kazumi/utils/utils.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_modular/flutter_modular.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+ import 'package:kazumi/utils/storage.dart';
+ import 'package:hive/hive.dart';
+ import 'package:kazumi/bean/dialog/dialog_helper.dart';
+ import 'package:kazumi/pages/popular/popular_controller.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+ import 'package:kazumi/utils/constants.dart';
++import 'package:card_settings_ui/card_settings_ui.dart';
+ 
+ class DanmakuSettingsPage extends StatefulWidget {
+   const DanmakuSettingsPage({super.key});
+@@ -23,6 +23,16 @@ class _DanmakuSettingsPageState extends State<DanmakuSettingsPage> {
+   late dynamic defaultDanmakuFontSize;
+   late int defaultDanmakuFontWeight;
+   final PopularController popularController = Modular.get<PopularController>();
++  late bool danmakuEnabledByDefault;
++  late bool danmakuBorder;
++  late bool danmakuTop;
++  late bool danmakuBottom;
++  late bool danmakuScroll;
++  late bool danmakuColor;
++  late bool danmakuMassive;
++  late bool danmakuBiliBiliSource;
++  late bool danmakuGamerSource;
++  late bool danmakuDanDanSource;
+ 
+   @override
+   void initState() {
+@@ -35,6 +45,24 @@ class _DanmakuSettingsPageState extends State<DanmakuSettingsPage> {
+         defaultValue: (Utils.isCompact()) ? 16.0 : 25.0);
+     defaultDanmakuFontWeight =
+         setting.get(SettingBoxKey.danmakuFontWeight, defaultValue: 4);
++    danmakuEnabledByDefault =
++        setting.get(SettingBoxKey.danmakuEnabledByDefault, defaultValue: false);
++    danmakuBorder =
++        setting.get(SettingBoxKey.danmakuBorder, defaultValue: true);
++    danmakuTop = setting.get(SettingBoxKey.danmakuTop, defaultValue: true);
++    danmakuBottom =
++        setting.get(SettingBoxKey.danmakuBottom, defaultValue: false);
++    danmakuScroll =
++        setting.get(SettingBoxKey.danmakuScroll, defaultValue: true);
++    danmakuColor = setting.get(SettingBoxKey.danmakuColor, defaultValue: true);
++    danmakuMassive =
++        setting.get(SettingBoxKey.danmakuMassive, defaultValue: false);
++    danmakuBiliBiliSource =
++        setting.get(SettingBoxKey.danmakuBiliBiliSource, defaultValue: true);
++    danmakuGamerSource =
++        setting.get(SettingBoxKey.danmakuGamerSource, defaultValue: true);
++    danmakuDanDanSource =
++        setting.get(SettingBoxKey.danmakuDanDanSource, defaultValue: true);
+   }
+ 
+   void onBackPressed(BuildContext context) {
+@@ -79,318 +107,375 @@ class _DanmakuSettingsPageState extends State<DanmakuSettingsPage> {
+       },
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('弹幕设置')),
+-        body: ListView(
+-          children: [
+-            ListTile(
+-              onTap: () {
+-                Modular.to.pushNamed('/settings/danmaku/source');
+-              },
+-              dense: false,
+-              title: const Text('弹幕来源'),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '默认开启',
+-                subTitle: '默认是否随视频播放弹幕',
+-                setKey: SettingBoxKey.danmakuEnabledByDefault,
+-                defaultVal: false,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '弹幕描边',
+-                setKey: SettingBoxKey.danmakuBorder,
+-                defaultVal: true,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '顶部弹幕',
+-                setKey: SettingBoxKey.danmakuTop,
+-                defaultVal: true,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '底部弹幕',
+-                setKey: SettingBoxKey.danmakuBottom,
+-                defaultVal: false,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '滚动弹幕',
+-                setKey: SettingBoxKey.danmakuScroll,
+-                defaultVal: true,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '弹幕颜色',
+-                setKey: SettingBoxKey.danmakuColor,
+-                defaultVal: true,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '海量弹幕',
+-                subTitle: '弹幕过多时进行叠加绘制',
+-                setKey: SettingBoxKey.danmakuMassive,
+-                defaultVal: false,
+-              ),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('字体大小'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          return Wrap(
+-                            spacing: 8,
+-                            runSpacing: Utils.isDesktop() ? 8 : 0,
+-                            children: [
+-                              for (final double i in danFontList) ...<Widget>[
+-                                if (i == defaultDanmakuFontSize) ...<Widget>[
+-                                  FilledButton(
+-                                    onPressed: () async {
+-                                      updateDanmakuFontSize(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ] else ...[
+-                                  FilledButton.tonal(
+-                                    onPressed: () async {
+-                                      updateDanmakuFontSize(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ]
+-                              ]
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              sections: [
++                SettingsSection(
++                  title: const Text('弹幕'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuEnabledByDefault =
++                            value ?? !danmakuEnabledByDefault;
++                        await setting.put(SettingBoxKey.danmakuEnabledByDefault,
++                            danmakuEnabledByDefault);
++                        setState(() {});
++                      },
++                      title: const Text('默认开启'),
++                      description: const Text('默认是否随视频播放弹幕'),
++                      initialValue: danmakuEnabledByDefault,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('弹幕来源'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuBiliBiliSource = value ?? !danmakuBiliBiliSource;
++                        await setting.put(SettingBoxKey.danmakuBiliBiliSource,
++                            danmakuBiliBiliSource);
++                        setState(() {});
++                      },
++                      title: const Text('BiliBili'),
++                      initialValue: danmakuBiliBiliSource,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuGamerSource = value ?? !danmakuGamerSource;
++                        await setting.put(SettingBoxKey.danmakuGamerSource,
++                            danmakuGamerSource);
++                        setState(() {});
++                      },
++                      title: const Text('Gamer'),
++                      initialValue: danmakuGamerSource,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuDanDanSource = value ?? !danmakuDanDanSource;
++                        await setting.put(SettingBoxKey.danmakuDanDanSource,
++                            danmakuDanDanSource);
++                        setState(() {});
++                      },
++                      title: const Text('DanDan'),
++                      initialValue: danmakuDanDanSource,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('弹幕显示'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('弹幕区域'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              return Wrap(
++                                spacing: 8,
++                                runSpacing: Utils.isDesktop() ? 8 : 0,
++                                children: [
++                                  for (final double i
++                                  in danAreaList) ...<Widget>[
++                                    if (i == defaultDanmakuArea) ...<Widget>[
++                                      FilledButton(
++                                        onPressed: () async {
++                                          updateDanmakuArea(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ] else ...[
++                                      FilledButton.tonal(
++                                        onPressed: () async {
++                                          updateDanmakuArea(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ]
++                                  ]
++                                ],
++                              );
++                            }),
++                            actions: <Widget>[
++                              TextButton(
++                                onPressed: () => KazumiDialog.dismiss(),
++                                child: Text(
++                                  '取消',
++                                  style: TextStyle(
++                                      color: Theme.of(context)
++                                          .colorScheme
++                                          .outline),
++                                ),
++                              ),
++                              TextButton(
++                                onPressed: () async {
++                                  updateDanmakuArea(1.0);
++                                  KazumiDialog.dismiss();
++                                },
++                                child: const Text('默认设置'),
++                              ),
+                             ],
+                           );
+-                        }),
+-                        actions: <Widget>[
+-                          TextButton(
+-                            onPressed: () => KazumiDialog.dismiss(),
+-                            child: Text(
+-                              '取消',
+-                              style: TextStyle(
+-                                  color: Theme.of(context).colorScheme.outline),
+-                            ),
+-                          ),
+-                          TextButton(
+-                            onPressed: () async {
+-                              updateDanmakuFontSize(
+-                                  (Utils.isCompact()) ? 16.0 : 25.0);
+-                              KazumiDialog.dismiss();
+-                            },
+-                            child: const Text('默认设置'),
+-                          ),
+-                        ],
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('字体大小'),
+-              subtitle: Text('$defaultDanmakuFontSize',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('字体字重'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          return Wrap(
+-                            spacing: 8,
+-                            runSpacing: Utils.isDesktop() ? 8 : 0,
+-                            children: [
+-                              for (final int i
+-                                  in danFontWeightList) ...<Widget>[
+-                                if (i == defaultDanmakuFontWeight) ...<Widget>[
+-                                  FilledButton(
+-                                    onPressed: () async {
+-                                      updateDanmakuFontWeight(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ] else ...[
+-                                  FilledButton.tonal(
+-                                    onPressed: () async {
+-                                      updateDanmakuFontWeight(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ]
+-                              ]
++                        });
++                      },
++                      title: const Text('弹幕区域'),
++                      value: Text('占据 $defaultDanmakuArea 屏幕'),
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuTop = value ?? !danmakuTop;
++                        await setting.put(SettingBoxKey.danmakuTop, danmakuTop);
++                        setState(() {});
++                      },
++                      title: const Text('顶部弹幕'),
++                      initialValue: danmakuTop,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuBottom = value ?? !danmakuBottom;
++                        await setting.put(
++                            SettingBoxKey.danmakuBottom, danmakuBottom);
++                        setState(() {});
++                      },
++                      title: const Text('底部弹幕'),
++                      initialValue: danmakuBottom,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuScroll = value ?? !danmakuScroll;
++                        await setting.put(
++                            SettingBoxKey.danmakuScroll, danmakuScroll);
++                        setState(() {});
++                      },
++                      title: const Text('滚动弹幕'),
++                      initialValue: danmakuScroll,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuMassive = value ?? !danmakuMassive;
++                        await setting.put(
++                            SettingBoxKey.danmakuMassive, danmakuMassive);
++                        setState(() {});
++                      },
++                      title: const Text('海量弹幕'),
++                      description: const Text('弹幕过多时进行叠加绘制'),
++                      initialValue: danmakuMassive,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('弹幕样式'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuBorder = value ?? !danmakuBorder;
++                        await setting.put(
++                            SettingBoxKey.danmakuBorder, danmakuBorder);
++                        setState(() {});
++                      },
++                      title: const Text('弹幕描边'),
++                      initialValue: danmakuBorder,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        danmakuColor = value ?? !danmakuColor;
++                        await setting.put(
++                            SettingBoxKey.danmakuColor, danmakuColor);
++                        setState(() {});
++                      },
++                      title: const Text('弹幕颜色'),
++                      initialValue: danmakuColor,
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('字体大小'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              return Wrap(
++                                spacing: 8,
++                                runSpacing: Utils.isDesktop() ? 8 : 0,
++                                children: [
++                                  for (final double i
++                                      in danFontList) ...<Widget>[
++                                    if (i ==
++                                        defaultDanmakuFontSize) ...<Widget>[
++                                      FilledButton(
++                                        onPressed: () async {
++                                          updateDanmakuFontSize(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ] else ...[
++                                      FilledButton.tonal(
++                                        onPressed: () async {
++                                          updateDanmakuFontSize(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ]
++                                  ]
++                                ],
++                              );
++                            }),
++                            actions: <Widget>[
++                              TextButton(
++                                onPressed: () => KazumiDialog.dismiss(),
++                                child: Text(
++                                  '取消',
++                                  style: TextStyle(
++                                      color: Theme.of(context)
++                                          .colorScheme
++                                          .outline),
++                                ),
++                              ),
++                              TextButton(
++                                onPressed: () async {
++                                  updateDanmakuFontSize(
++                                      (Utils.isCompact()) ? 16.0 : 25.0);
++                                  KazumiDialog.dismiss();
++                                },
++                                child: const Text('默认设置'),
++                              ),
+                             ],
+                           );
+-                        }),
+-                        actions: <Widget>[
+-                          TextButton(
+-                            onPressed: () => KazumiDialog.dismiss(),
+-                            child: Text(
+-                              '取消',
+-                              style: TextStyle(
+-                                  color: Theme.of(context).colorScheme.outline),
+-                            ),
+-                          ),
+-                          TextButton(
+-                            onPressed: () async {
+-                              updateDanmakuFontWeight(4);
+-                              KazumiDialog.dismiss();
+-                            },
+-                            child: const Text('默认设置'),
+-                          ),
+-                        ],
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('字体字重'),
+-              subtitle: Text('$defaultDanmakuFontWeight',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('弹幕不透明度'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          return Wrap(
+-                            spacing: 8,
+-                            runSpacing: Utils.isDesktop() ? 8 : 0,
+-                            children: [
+-                              for (final double i
+-                                  in danOpacityList) ...<Widget>[
+-                                if (i == defaultDanmakuOpacity) ...<Widget>[
+-                                  FilledButton(
+-                                    onPressed: () async {
+-                                      updateDanmakuOpacity(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ] else ...[
+-                                  FilledButton.tonal(
+-                                    onPressed: () async {
+-                                      updateDanmakuOpacity(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ]
+-                              ]
++                        });
++                      },
++                      title: const Text('字体大小'),
++                      value: Text('$defaultDanmakuFontSize'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('字体字重'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              return Wrap(
++                                spacing: 8,
++                                runSpacing: Utils.isDesktop() ? 8 : 0,
++                                children: [
++                                  for (final int i
++                                      in danFontWeightList) ...<Widget>[
++                                    if (i ==
++                                        defaultDanmakuFontWeight) ...<Widget>[
++                                      FilledButton(
++                                        onPressed: () async {
++                                          updateDanmakuFontWeight(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ] else ...[
++                                      FilledButton.tonal(
++                                        onPressed: () async {
++                                          updateDanmakuFontWeight(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ]
++                                  ]
++                                ],
++                              );
++                            }),
++                            actions: <Widget>[
++                              TextButton(
++                                onPressed: () => KazumiDialog.dismiss(),
++                                child: Text(
++                                  '取消',
++                                  style: TextStyle(
++                                      color: Theme.of(context)
++                                          .colorScheme
++                                          .outline),
++                                ),
++                              ),
++                              TextButton(
++                                onPressed: () async {
++                                  updateDanmakuFontWeight(4);
++                                  KazumiDialog.dismiss();
++                                },
++                                child: const Text('默认设置'),
++                              ),
+                             ],
+                           );
+-                        }),
+-                        actions: <Widget>[
+-                          TextButton(
+-                            onPressed: () => KazumiDialog.dismiss(),
+-                            child: Text(
+-                              '取消',
+-                              style: TextStyle(
+-                                  color: Theme.of(context).colorScheme.outline),
+-                            ),
+-                          ),
+-                          TextButton(
+-                            onPressed: () async {
+-                              updateDanmakuOpacity(1.0);
+-                              KazumiDialog.dismiss();
+-                            },
+-                            child: const Text('默认设置'),
+-                          ),
+-                        ],
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('弹幕不透明度'),
+-              subtitle: Text('$defaultDanmakuOpacity',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('弹幕区域'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          return Wrap(
+-                            spacing: 8,
+-                            runSpacing: Utils.isDesktop() ? 8 : 0,
+-                            children: [
+-                              for (final double i in danAreaList) ...<Widget>[
+-                                if (i == defaultDanmakuArea) ...<Widget>[
+-                                  FilledButton(
+-                                    onPressed: () async {
+-                                      updateDanmakuArea(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ] else ...[
+-                                  FilledButton.tonal(
+-                                    onPressed: () async {
+-                                      updateDanmakuArea(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ]
+-                              ]
++                        });
++                      },
++                      title: const Text('字体字重'),
++                      value: Text('$defaultDanmakuFontWeight'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('弹幕不透明度'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              return Wrap(
++                                spacing: 8,
++                                runSpacing: Utils.isDesktop() ? 8 : 0,
++                                children: [
++                                  for (final double i
++                                      in danOpacityList) ...<Widget>[
++                                    if (i == defaultDanmakuOpacity) ...<Widget>[
++                                      FilledButton(
++                                        onPressed: () async {
++                                          updateDanmakuOpacity(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ] else ...[
++                                      FilledButton.tonal(
++                                        onPressed: () async {
++                                          updateDanmakuOpacity(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ]
++                                  ]
++                                ],
++                              );
++                            }),
++                            actions: <Widget>[
++                              TextButton(
++                                onPressed: () => KazumiDialog.dismiss(),
++                                child: Text(
++                                  '取消',
++                                  style: TextStyle(
++                                      color: Theme.of(context)
++                                          .colorScheme
++                                          .outline),
++                                ),
++                              ),
++                              TextButton(
++                                onPressed: () async {
++                                  updateDanmakuOpacity(1.0);
++                                  KazumiDialog.dismiss();
++                                },
++                                child: const Text('默认设置'),
++                              ),
+                             ],
+                           );
+-                        }),
+-                        actions: <Widget>[
+-                          TextButton(
+-                            onPressed: () => KazumiDialog.dismiss(),
+-                            child: Text(
+-                              '取消',
+-                              style: TextStyle(
+-                                  color: Theme.of(context).colorScheme.outline),
+-                            ),
+-                          ),
+-                          TextButton(
+-                            onPressed: () async {
+-                              updateDanmakuArea(1.0);
+-                              KazumiDialog.dismiss();
+-                            },
+-                            child: const Text('默认设置'),
+-                          ),
+-                        ],
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('弹幕区域'),
+-              subtitle: Text('占据 $defaultDanmakuArea 屏幕',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
++                        });
++                      },
++                      title: const Text('弹幕不透明度'),
++                      value: Text('$defaultDanmakuOpacity'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/lib/pages/settings/danmaku/danmaku_source_settings.dart b/lib/pages/settings/danmaku/danmaku_source_settings.dart
+deleted file mode 100644
+index 34bd6bff..00000000
+--- a/lib/pages/settings/danmaku/danmaku_source_settings.dart
++++ /dev/null
+@@ -1,52 +0,0 @@
+-import 'package:flutter/material.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+-import 'package:kazumi/utils/storage.dart';
+-import 'package:hive/hive.dart';
+-import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+-
+-class DanmakuSourceSettingsPage extends StatefulWidget {
+-  const DanmakuSourceSettingsPage({super.key});
+-
+-  @override
+-  State<DanmakuSourceSettingsPage> createState() =>
+-      _DanmakuSourceSettingsPageState();
+-}
+-
+-class _DanmakuSourceSettingsPageState extends State<DanmakuSourceSettingsPage> {
+-  Box setting = GStorage.setting;
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return PopScope(
+-      canPop: true,
+-      child: Scaffold(
+-        appBar: const SysAppBar(title: Text('弹幕来源')),
+-        body: ListView(
+-          children: const [
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'BiliBili',
+-                setKey: SettingBoxKey.danmakuBiliBiliSource,
+-                defaultVal: true,
+-              ),
+-            ),
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'Gamer',
+-                setKey: SettingBoxKey.danmakuGamerSource,
+-                defaultVal: true,
+-              ),
+-            ),
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'DanDan',
+-                setKey: SettingBoxKey.danmakuDanDanSource,
+-                defaultVal: true,
+-              ),
+-            ),
+-          ],
+-        ),
+-      ),
+-    );
+-  }
+-}
+diff --git a/lib/pages/settings/other_settings.dart b/lib/pages/settings/other_settings.dart
+deleted file mode 100644
+index 87b01af1..00000000
+--- a/lib/pages/settings/other_settings.dart
++++ /dev/null
+@@ -1,69 +0,0 @@
+-import 'package:flutter/material.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+-import 'package:kazumi/utils/storage.dart';
+-import 'package:hive/hive.dart';
+-import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+-
+-class OtherSettingsPage extends StatefulWidget {
+-  const OtherSettingsPage({super.key});
+-
+-  @override
+-  State<OtherSettingsPage> createState() => _OtherSettingsPageState();
+-}
+-
+-class _OtherSettingsPageState extends State<OtherSettingsPage> {
+-  Box setting = GStorage.setting;
+-  late dynamic enableGitProxy;
+-
+-  @override
+-  void initState() {
+-    super.initState();
+-    enableGitProxy =
+-        setting.get(SettingBoxKey.enableGitProxy, defaultValue: false);
+-  }
+-
+-  void onBackPressed(BuildContext context) {
+-    // Navigator.of(context).pop();
+-  }
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    WidgetsBinding.instance.addPostFrameCallback((_) {});
+-    return PopScope(
+-      canPop: true,
+-      onPopInvokedWithResult: (bool didPop, Object? result) {
+-        onBackPressed(context);
+-      },
+-      child: const Scaffold(
+-        appBar: SysAppBar(title: Text('其他设置')),
+-        body: Column(
+-          children: [
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'Github镜像',
+-                subTitle: '使用镜像访问规则托管仓库',
+-                setKey: SettingBoxKey.enableGitProxy,
+-                defaultVal: false,
+-              ),
+-            ),
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: '隐身模式',
+-                subTitle: '不保留观看记录',
+-                setKey: SettingBoxKey.privateMode,
+-                defaultVal: false,
+-              ),
+-            ),
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: '自动更新',
+-                setKey: SettingBoxKey.autoUpdate,
+-                defaultVal: true,
+-              ),
+-            ),
+-          ],
+-        ),
+-      ),
+-    );
+-  }
+-}
+diff --git a/lib/pages/settings/player_settings.dart b/lib/pages/settings/player_settings.dart
+index 2cb0fd47..8311fb39 100644
+--- a/lib/pages/settings/player_settings.dart
++++ b/lib/pages/settings/player_settings.dart
+@@ -2,10 +2,10 @@ import 'package:flutter/material.dart';
+ import 'package:kazumi/bean/dialog/dialog_helper.dart';
+ import 'package:hive/hive.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+ import 'package:kazumi/utils/constants.dart';
+ import 'package:kazumi/utils/storage.dart';
+ import 'package:kazumi/utils/utils.dart';
++import 'package:card_settings_ui/card_settings_ui.dart';
+ 
+ class PlayerSettingsPage extends StatefulWidget {
+   const PlayerSettingsPage({super.key});
+@@ -17,12 +17,21 @@ class PlayerSettingsPage extends StatefulWidget {
+ class _PlayerSettingsPageState extends State<PlayerSettingsPage> {
+   Box setting = GStorage.setting;
+   late double defaultPlaySpeed;
++  late bool hAenable;
++  late bool lowMemoryMode;
++  late bool playResume;
++  late bool privateMode;
+ 
+   @override
+   void initState() {
+     super.initState();
+     defaultPlaySpeed =
+         setting.get(SettingBoxKey.defaultPlaySpeed, defaultValue: 1.0);
++    hAenable = setting.get(SettingBoxKey.hAenable, defaultValue: true);
++    lowMemoryMode =
++        setting.get(SettingBoxKey.lowMemoryMode, defaultValue: false);
++    playResume = setting.get(SettingBoxKey.playResume, defaultValue: true);
++    privateMode = setting.get(SettingBoxKey.privateMode, defaultValue: false);
+   }
+ 
+   void onBackPressed(BuildContext context) {
+@@ -46,96 +55,127 @@ class _PlayerSettingsPageState extends State<PlayerSettingsPage> {
+       },
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('播放设置')),
+-        body: Column(
+-          children: [
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '硬件解码',
+-                setKey: SettingBoxKey.hAenable,
+-                defaultVal: true,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '低内存模式',
+-                subTitle: '禁用高级缓存以减少内存占用',
+-                setKey: SettingBoxKey.lowMemoryMode,
+-                defaultVal: false,
+-              ),
+-            ),
+-            const InkWell(
+-              child: SetSwitchItem(
+-                title: '自动跳转',
+-                subTitle: '跳转到上次播放位置',
+-                setKey: SettingBoxKey.playResume,
+-                defaultVal: true,
+-              ),
+-            ),
+-            ListTile(
+-              onTap: () async {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('默认倍速'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          final List<double> playSpeedList;
+-                          playSpeedList = defaultPlaySpeedList;
+-                          return Wrap(
+-                            spacing: 8,
+-                            runSpacing: Utils.isDesktop() ? 8 : 0,
+-                            children: [
+-                              for (final double i in playSpeedList) ...<Widget>[
+-                                if (i == defaultPlaySpeed) ...<Widget>[
+-                                  FilledButton(
+-                                    onPressed: () async {
+-                                      updateDefaultPlaySpeed(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ] else ...[
+-                                  FilledButton.tonal(
+-                                    onPressed: () async {
+-                                      updateDefaultPlaySpeed(i);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Text(i.toString()),
+-                                  ),
+-                                ]
+-                              ]
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              sections: [
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        hAenable = value ?? !hAenable;
++                        await setting.put(SettingBoxKey.hAenable, hAenable);
++                        setState(() {});
++                      },
++                      title: const Text('硬件解码'),
++                      initialValue: hAenable,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        lowMemoryMode = value ?? !lowMemoryMode;
++                        await setting.put(
++                            SettingBoxKey.lowMemoryMode, lowMemoryMode);
++                        setState(() {});
++                      },
++                      title: const Text('低内存模式'),
++                      description: const Text('禁用高级缓存以减少内存占用'),
++                      initialValue: lowMemoryMode,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        playResume = value ?? !playResume;
++                        await setting.put(SettingBoxKey.playResume, playResume);
++                        setState(() {});
++                      },
++                      title: const Text('自动跳转'),
++                      description: const Text('跳转到上次播放位置'),
++                      initialValue: playResume,
++                    ),
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        privateMode = value ?? !privateMode;
++                        await setting.put(SettingBoxKey.privateMode, privateMode);
++                        setState(() {});
++                      },
++                      title: const Text('隐身模式'),
++                      description: const Text('不保留观看记录'),
++                      initialValue: privateMode,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('默认倍速'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              final List<double> playSpeedList;
++                              playSpeedList = defaultPlaySpeedList;
++                              return Wrap(
++                                spacing: 8,
++                                runSpacing: Utils.isDesktop() ? 8 : 0,
++                                children: [
++                                  for (final double i
++                                      in playSpeedList) ...<Widget>[
++                                    if (i == defaultPlaySpeed) ...<Widget>[
++                                      FilledButton(
++                                        onPressed: () async {
++                                          updateDefaultPlaySpeed(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ] else ...[
++                                      FilledButton.tonal(
++                                        onPressed: () async {
++                                          updateDefaultPlaySpeed(i);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Text(i.toString()),
++                                      ),
++                                    ]
++                                  ]
++                                ],
++                              );
++                            }),
++                            actions: <Widget>[
++                              TextButton(
++                                onPressed: () => KazumiDialog.dismiss(),
++                                child: Text(
++                                  '取消',
++                                  style: TextStyle(
++                                      color: Theme.of(context)
++                                          .colorScheme
++                                          .outline),
++                                ),
++                              ),
++                              TextButton(
++                                onPressed: () async {
++                                  updateDefaultPlaySpeed(1.0);
++                                  KazumiDialog.dismiss();
++                                },
++                                child: const Text('默认设置'),
++                              ),
+                             ],
+                           );
+-                        }),
+-                        actions: <Widget>[
+-                          TextButton(
+-                            onPressed: () => KazumiDialog.dismiss(),
+-                            child: Text(
+-                              '取消',
+-                              style: TextStyle(
+-                                  color: Theme.of(context).colorScheme.outline),
+-                            ),
+-                          ),
+-                          TextButton(
+-                            onPressed: () async {
+-                              updateDefaultPlaySpeed(1.0);
+-                              KazumiDialog.dismiss();
+-                            },
+-                            child: const Text('默认设置'),
+-                          ),
+-                        ],
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('默认倍速'),
+-              subtitle: Text('$defaultPlaySpeed',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
++                        });
++                      },
++                      title: const Text('默认倍速'),
++                      value: Text('$defaultPlaySpeed'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/lib/pages/settings/settings_module.dart b/lib/pages/settings/settings_module.dart
+index defa92ca..664093c2 100644
+--- a/lib/pages/settings/settings_module.dart
++++ b/lib/pages/settings/settings_module.dart
+@@ -6,7 +6,6 @@ import 'package:kazumi/pages/history/history_module.dart';
+ import 'package:kazumi/pages/settings/theme_settings_page.dart';
+ import 'package:kazumi/pages/settings/player_settings.dart';
+ import 'package:kazumi/pages/settings/displaymode_settings.dart';
+-import 'package:kazumi/pages/settings/other_settings.dart';
+ import 'package:kazumi/pages/webdav_editor/webdav_module.dart';
+ 
+ class SettingsModule extends Module {
+@@ -18,7 +17,7 @@ class SettingsModule extends Module {
+       child: (_) => const SetDisplayMode(),
+     );
+     r.child("/player", child: (_) => const PlayerSettingsPage());
+-    r.child("/other", child: (_) => const OtherSettingsPage());
++    // r.child("/other", child: (_) => const OtherSettingsPage());
+     r.module("/webdav", module: WebDavModule());
+     r.module("/about", module: AboutModule());
+     r.module("/plugin", module: PluginModule());
+diff --git a/lib/pages/settings/theme_settings_page.dart b/lib/pages/settings/theme_settings_page.dart
+index ec60bdd8..2e2b5d1b 100644
+--- a/lib/pages/settings/theme_settings_page.dart
++++ b/lib/pages/settings/theme_settings_page.dart
+@@ -8,8 +8,8 @@ import 'package:adaptive_theme/adaptive_theme.dart';
+ import 'package:kazumi/pages/popular/popular_controller.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
+ import 'package:kazumi/bean/settings/color_type.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+ import 'package:kazumi/utils/utils.dart';
++import 'package:card_settings_ui/card_settings_ui.dart';
+ 
+ class ThemeSettingsPage extends StatefulWidget {
+   const ThemeSettingsPage({super.key});
+@@ -113,180 +113,195 @@ class _ThemeSettingsPageState extends State<ThemeSettingsPage> {
+       },
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('外观设置')),
+-        body: Column(
+-          children: [
+-            ListTile(
+-              onTap: () async {
+-                final List<Map<String, dynamic>> colorThemes = colorThemeTypes;
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('配色方案'),
+-                        content: StatefulBuilder(builder:
+-                            (BuildContext context, StateSetter setState) {
+-                          return Wrap(
+-                            alignment: WrapAlignment.center,
+-                            spacing: 22,
+-                            runSpacing: 18,
+-                            children: [
+-                              ...colorThemes.map(
+-                                (e) {
+-                                  final index = colorThemes.indexOf(e);
+-                                  return GestureDetector(
+-                                    onTap: () {
+-                                      index == 0
+-                                          ? resetTheme()
+-                                          : setTheme(e['color']);
+-                                      KazumiDialog.dismiss();
+-                                    },
+-                                    child: Column(
+-                                      children: [
+-                                        Container(
+-                                          width: 46,
+-                                          height: 46,
+-                                          decoration: BoxDecoration(
+-                                            color: e['color'].withOpacity(0.8),
+-                                            borderRadius:
+-                                                BorderRadius.circular(50),
+-                                            border: Border.all(
+-                                              width: 2,
+-                                              color:
+-                                                  e['color'].withOpacity(0.8),
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              sections: [
++                SettingsSection(
++                  title: const Text('外观'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('配色方案'),
++                            content: StatefulBuilder(builder:
++                                (BuildContext context, StateSetter setState) {
++                              final List<Map<String, dynamic>> colorThemes =
++                                  colorThemeTypes;
++                              return Wrap(
++                                alignment: WrapAlignment.center,
++                                spacing: 22,
++                                runSpacing: 18,
++                                children: [
++                                  ...colorThemes.map(
++                                    (e) {
++                                      final index = colorThemes.indexOf(e);
++                                      return GestureDetector(
++                                        onTap: () {
++                                          index == 0
++                                              ? resetTheme()
++                                              : setTheme(e['color']);
++                                          KazumiDialog.dismiss();
++                                        },
++                                        child: Column(
++                                          children: [
++                                            Container(
++                                              width: 46,
++                                              height: 46,
++                                              decoration: BoxDecoration(
++                                                color:
++                                                    e['color'].withOpacity(0.8),
++                                                borderRadius:
++                                                    BorderRadius.circular(50),
++                                                border: Border.all(
++                                                  width: 2,
++                                                  color: e['color']
++                                                      .withOpacity(0.8),
++                                                ),
++                                              ),
++                                              child: AnimatedOpacity(
++                                                opacity: (e['color']
++                                                                .value
++                                                                .toRadixString(
++                                                                    16) ==
++                                                            defaultThemeColor ||
++                                                        (defaultThemeColor ==
++                                                                'default' &&
++                                                            index == 0))
++                                                    ? 1
++                                                    : 0,
++                                                duration: const Duration(
++                                                    milliseconds: 200),
++                                                child: const Icon(
++                                                  Icons.done,
++                                                  color: Colors.black,
++                                                  size: 20,
++                                                ),
++                                              ),
+                                             ),
+-                                          ),
+-                                          child: AnimatedOpacity(
+-                                            opacity: (e['color']
+-                                                        .value
+-                                                        .toRadixString(16) ==
+-                                                    defaultThemeColor ||
+-                                                (defaultThemeColor ==
+-                                                        'default' &&
+-                                                    index == 0))
+-                                            ? 1
+-                                            : 0,
+-                                            duration:
+-                                                const Duration(milliseconds: 200),
+-                                            child: const Icon(
+-                                              Icons.done,
+-                                              color: Colors.black,
+-                                              size: 20,
++                                            const SizedBox(height: 3),
++                                            Text(
++                                              e['label'],
++                                              style: TextStyle(
++                                                fontSize: 12,
++                                                color: Theme.of(context)
++                                                    .colorScheme
++                                                    .outline,
++                                              ),
+                                             ),
+-                                          ),
++                                          ],
+                                         ),
+-                                        const SizedBox(height: 3),
+-                                        Text(
+-                                          e['label'],
+-                                          style: TextStyle(
+-                                            fontSize: 12,
+-                                            color: Theme.of(context)
+-                                                .colorScheme
+-                                                .outline,
+-                                          ),
+-                                        ),
+-                                      ],
+-                                    ),
+-                                  );
+-                                },
+-                              )
+-                            ],
++                                      );
++                                    },
++                                  )
++                                ],
++                              );
++                            }),
+                           );
+-                        }),
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('配色方案'),
+-            ),
+-            Platform.isAndroid
+-                ? ListTile(
+-                    onTap: () async {
+-                      Modular.to.pushNamed('/settings/theme/display');
+-                    },
+-                    dense: false,
+-                    title: const Text('屏幕帧率'),
+-                    // trailing: const Icon(Icons.navigate_next),
+-                  )
+-                : Container(),
+-            ListTile(
+-              onTap: () {
+-                KazumiDialog.show(
+-                    builder: (context) {
+-                      return AlertDialog(
+-                        title: const Text('主题模式'),
+-                        content: StatefulBuilder(
+-                          builder:
+-                              (BuildContext context, StateSetter setState) {
+-                            return Wrap(
+-                              spacing: 8,
+-                              runSpacing: Utils.isDesktop() ? 8 : 0,
+-                              children: [
+-                                defaultThemeMode == 'system'
+-                                    ? FilledButton(
+-                                        onPressed: () {
+-                                          updateTheme('system');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("跟随系统"))
+-                                    : FilledButton.tonal(
+-                                        onPressed: () {
+-                                          updateTheme('system');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("跟随系统")),
+-                                defaultThemeMode == 'light'
+-                                    ? FilledButton(
+-                                        onPressed: () {
+-                                          updateTheme('light');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("浅色"))
+-                                    : FilledButton.tonal(
+-                                        onPressed: () {
+-                                          updateTheme('light');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("浅色")),
+-                                defaultThemeMode == 'dark'
+-                                    ? FilledButton(
+-                                        onPressed: () {
+-                                          updateTheme('dark');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("深色"))
+-                                    : FilledButton.tonal(
+-                                        onPressed: () {
+-                                          updateTheme('dark');
+-                                          KazumiDialog.dismiss();
+-                                        },
+-                                        child: const Text("深色")),
+-                              ],
+-                            );
+-                          },
+-                        ),
+-                      );
+-                    });
+-              },
+-              dense: false,
+-              title: const Text('主题模式'),
+-              subtitle: Text(
+-                  defaultThemeMode == 'light'
+-                      ? '浅色'
+-                      : (defaultThemeMode == 'dark' ? '深色' : '跟随系统'),
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'OLED优化',
+-                subTitle: '深色模式下使用纯黑背景',
+-                setKey: SettingBoxKey.oledEnhance,
+-                callFn: (_) => {updateOledEnhance()},
+-                defaultVal: false,
+-              ),
++                        });
++                      },
++                      title: const Text('配色方案'),
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) {
++                        KazumiDialog.show(builder: (context) {
++                          return AlertDialog(
++                            title: const Text('深色模式'),
++                            content: StatefulBuilder(
++                              builder:
++                                  (BuildContext context, StateSetter setState) {
++                                return Wrap(
++                                  spacing: 8,
++                                  runSpacing: Utils.isDesktop() ? 8 : 0,
++                                  children: [
++                                    defaultThemeMode == 'system'
++                                        ? FilledButton(
++                                            onPressed: () {
++                                              updateTheme('system');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("跟随系统"))
++                                        : FilledButton.tonal(
++                                            onPressed: () {
++                                              updateTheme('system');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("跟随系统")),
++                                    defaultThemeMode == 'light'
++                                        ? FilledButton(
++                                            onPressed: () {
++                                              updateTheme('light');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("浅色"))
++                                        : FilledButton.tonal(
++                                            onPressed: () {
++                                              updateTheme('light');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("浅色")),
++                                    defaultThemeMode == 'dark'
++                                        ? FilledButton(
++                                            onPressed: () {
++                                              updateTheme('dark');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("深色"))
++                                        : FilledButton.tonal(
++                                            onPressed: () {
++                                              updateTheme('dark');
++                                              KazumiDialog.dismiss();
++                                            },
++                                            child: const Text("深色")),
++                                  ],
++                                );
++                              },
++                            ),
++                          );
++                        });
++                      },
++                      title: const Text('深色模式'),
++                      value: Text(
++                        defaultThemeMode == 'light'
++                            ? '浅色'
++                            : (defaultThemeMode == 'dark' ? '深色' : '跟随系统'),
++                      ),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        oledEnhance = value ?? !oledEnhance;
++                        await setting.put(
++                            SettingBoxKey.oledEnhance, oledEnhance);
++                        updateOledEnhance();
++                        setState(() {});
++                      },
++                      title: const Text('OLED优化'),
++                      description: const Text('深色模式下使用纯黑背景'),
++                      initialValue: oledEnhance,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  bottomInfo: const Text('仅安卓可以修改'),
++                  tiles: [
++                    SettingsTile.navigation(
++                      enabled: Platform.isAndroid,
++                      onPressed: (_) async {
++                        Modular.to.pushNamed('/settings/theme/display');
++                      },
++                      title: const Text('屏幕帧率'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/lib/pages/webdav_editor/webdav_editor_page.dart b/lib/pages/webdav_editor/webdav_editor_page.dart
+index e3ee0356..ecea7539 100644
+--- a/lib/pages/webdav_editor/webdav_editor_page.dart
++++ b/lib/pages/webdav_editor/webdav_editor_page.dart
+@@ -41,34 +41,46 @@ class _WebDavEditorPageState extends State<WebDavEditorPage> {
+       ),
+       body: SingleChildScrollView(
+         padding: const EdgeInsets.all(16.0),
+-        child: Column(
+-          children: [
+-            TextField(
+-              controller: webDavURLController,
+-              decoration: const InputDecoration(labelText: 'URL'),
++        child: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: Column(
++              children: [
++                TextField(
++                  controller: webDavURLController,
++                  decoration: const InputDecoration(
++                      labelText: 'URL', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: webDavUsernameController,
++                  decoration: const InputDecoration(
++                      labelText: 'Username', border: OutlineInputBorder()),
++                ),
++                const SizedBox(height: 20),
++                TextField(
++                  controller: webDavPasswordController,
++                  decoration: const InputDecoration(
++                      labelText: 'Password', border: OutlineInputBorder()),
++                ),
++                // const SizedBox(height: 20),
++                // ExpansionTile(
++                //   title: const Text('高级选项'),
++                //   children: [],
++                // ),
++              ],
+             ),
+-            TextField(
+-              controller: webDavUsernameController,
+-              decoration: const InputDecoration(labelText: 'Username'),
+-            ),
+-            TextField(
+-              controller: webDavPasswordController,
+-              decoration: const InputDecoration(labelText: 'Password'),
+-            ),
+-            // const SizedBox(height: 20),
+-            // ExpansionTile(
+-            //   title: const Text('高级选项'),
+-            //   children: [],
+-            // ),
+-          ],
++          ),
+         ),
+       ),
+       floatingActionButton: FloatingActionButton(
+         child: const Icon(Icons.save),
+         onPressed: () async {
+           setting.put(SettingBoxKey.webDavURL, webDavURLController.text);
+-          setting.put(SettingBoxKey.webDavUsername, webDavUsernameController.text);
+-          setting.put(SettingBoxKey.webDavPassword, webDavPasswordController.text);
++          setting.put(
++              SettingBoxKey.webDavUsername, webDavUsernameController.text);
++          setting.put(
++              SettingBoxKey.webDavPassword, webDavPasswordController.text);
+           var webDav = WebDav();
+           try {
+             await webDav.init();
+diff --git a/lib/pages/webdav_editor/webdav_setting.dart b/lib/pages/webdav_editor/webdav_setting.dart
+index 5ebefbe4..76cbb370 100644
+--- a/lib/pages/webdav_editor/webdav_setting.dart
++++ b/lib/pages/webdav_editor/webdav_setting.dart
+@@ -1,11 +1,11 @@
+ import 'package:flutter/material.dart';
+ import 'package:kazumi/bean/dialog/dialog_helper.dart';
+-import 'package:kazumi/bean/settings/settings.dart';
+ import 'package:kazumi/utils/storage.dart';
+ import 'package:kazumi/utils/webdav.dart';
+ import 'package:hive/hive.dart';
+ import 'package:flutter_modular/flutter_modular.dart';
+ import 'package:kazumi/bean/appbar/sys_app_bar.dart';
++import 'package:card_settings_ui/card_settings_ui.dart';
+ 
+ class WebDavSettingsPage extends StatefulWidget {
+   const WebDavSettingsPage({super.key});
+@@ -16,10 +16,14 @@ class WebDavSettingsPage extends StatefulWidget {
+ 
+ class _PlayerSettingsPageState extends State<WebDavSettingsPage> {
+   Box setting = GStorage.setting;
++  late bool webDavEnable;
++  late bool enableGitProxy;
+ 
+   @override
+   void initState() {
+     super.initState();
++    webDavEnable = setting.get(SettingBoxKey.webDavEnable, defaultValue: false);
++    enableGitProxy = setting.get(SettingBoxKey.enableGitProxy, defaultValue: false);
+   }
+ 
+   void onBackPressed(BuildContext context) {}
+@@ -90,56 +94,77 @@ class _PlayerSettingsPageState extends State<WebDavSettingsPage> {
+       },
+       child: Scaffold(
+         appBar: const SysAppBar(title: Text('同步设置')),
+-        body: Column(
+-          children: [
+-            InkWell(
+-              child: SetSwitchItem(
+-                title: 'WEBDAV同步',
+-                subTitle: '使用WEBDAV自动同步观看记录',
+-                setKey: SettingBoxKey.webDavEnable,
+-                callFn: (val) {
+-                  if (val) {
+-                    checkWebDav();
+-                  }
+-                },
+-                defaultVal: false,
+-              ),
++        body: Center(
++          child: SizedBox(
++            width: (MediaQuery.of(context).size.width > 1000) ? 1000 : null,
++            child: SettingsList(
++              sections: [
++                SettingsSection(
++                  title: const Text('Github'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        enableGitProxy = value ?? !enableGitProxy;
++                        await setting.put(SettingBoxKey.enableGitProxy, enableGitProxy);
++                        setState(() {});
++                      },
++                      title: const Text('Github镜像'),
++                      description: const Text('使用镜像访问规则托管仓库'),
++                      initialValue: enableGitProxy,
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  title: const Text('WEBDAV'),
++                  tiles: [
++                    SettingsTile.switchTile(
++                      onToggle: (value) async {
++                        webDavEnable = value ?? !webDavEnable;
++                        await setting.put(SettingBoxKey.webDavEnable, webDavEnable);
++                        setState(() {});
++                      },
++                      title: const Text('WEBDAV同步'),
++                      description: const Text('使用WEBDAV自动同步观看记录'),
++                      initialValue: webDavEnable,
++                    ),
++                    SettingsTile.navigation(
++                      onPressed: (_) async {
++                        Modular.to.pushNamed('/settings/webdav/editor');
++                      },
++                      title: Text(
++                        'WEBDAV配置',
++                        style: Theme.of(context).textTheme.titleMedium!,
++                      ),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  bottomInfo: const Text('立即上传观看记录到WEBDAV'),
++                  tiles: [
++                    SettingsTile(
++                      trailing: const Icon(Icons.cloud_upload_rounded),
++                      onPressed: (_) {
++                        updateWebdav();
++                      },
++                      title: const Text('手动上传'),
++                    ),
++                  ],
++                ),
++                SettingsSection(
++                  bottomInfo: const Text('立即下载观看记录到本地'),
++                  tiles: [
++                    SettingsTile(
++                      trailing: const Icon(Icons.cloud_download_rounded),
++                      onPressed: (_) {
++                        downloadWebdav();
++                      },
++                      title: const Text('手动下载'),
++                    ),
++                  ],
++                ),
++              ],
+             ),
+-            ListTile(
+-              onTap: () async {
+-                Modular.to.pushNamed('/settings/webdav/editor');
+-              },
+-              dense: false,
+-              title: Text(
+-                'WEBDAV配置',
+-                style: Theme.of(context).textTheme.titleMedium!,
+-              ),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                updateWebdav();
+-              },
+-              dense: false,
+-              title: const Text('手动上传'),
+-              subtitle: Text('立即上传观看记录到WEBDAV',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-            ListTile(
+-              onTap: () {
+-                downloadWebdav();
+-              },
+-              dense: false,
+-              title: const Text('手动下载'),
+-              subtitle: Text('立即下载观看记录到本地',
+-                  style: Theme.of(context)
+-                      .textTheme
+-                      .labelMedium!
+-                      .copyWith(color: Theme.of(context).colorScheme.outline)),
+-            ),
+-          ],
++          ),
+         ),
+       ),
+     );
+diff --git a/pubspec.lock b/pubspec.lock
+index 92c7088d..e2c0c640 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -182,6 +182,15 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "0.2.5"
++  card_settings_ui:
++    dependency: "direct main"
++    description:
++      path: "."
++      ref: main
++      resolved-ref: b050ff751329a290b65e851adb19718e55efc1e2
++      url: "https://github.com/ErBWs/card-settings-ui.git"
++    source: git
++    version: "1.0.0"
+   characters:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index b7b494f7..63faff0b 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -50,6 +50,10 @@ dependencies:
+   hive: ^2.2.3
+   hive_flutter: ^1.1.0
+   cached_network_image: ^3.4.1
++  card_settings_ui:
++    git:
++      url: https://github.com/ErBWs/card-settings-ui.git
++      ref: main
+ 
+   # fvp: ^0.28.0
+   # video_player: ^2.9.1

@@ -1,0 +1,773 @@
+diff --git a/packages/serverpod/lib/src/server/websocket_request_handlers/helpers/method_stream_manager.dart b/packages/serverpod/lib/src/server/websocket_request_handlers/helpers/method_stream_manager.dart
+index 239765b55b..e50a5ab4e7 100644
+--- a/packages/serverpod/lib/src/server/websocket_request_handlers/helpers/method_stream_manager.dart
++++ b/packages/serverpod/lib/src/server/websocket_request_handlers/helpers/method_stream_manager.dart
+@@ -129,7 +129,6 @@ typedef _OnInputStreamClosed = void Function(
+   CloseReason? closeReason,
+   MethodStreamCallContext callContext,
+ );
+-typedef _OnAllStreamsClosed = void Function();
+ 
+ /// Manages the streams for an endpoint method call.
+ /// Should only be used by Serverpod packages.
+@@ -143,16 +142,13 @@ class MethodStreamManager {
+   final _OnOutputStreamError? _onOutputStreamError;
+   final _OnOutputStreamClosed? _onOutputStreamClosed;
+   final _OnInputStreamClosed? _onInputStreamClosed;
+-  final _OnAllStreamsClosed? _onAllStreamsClosed;
+ 
+   MethodStreamManager({
+     _OnInputStreamClosed? onInputStreamClosed,
+     _OnOutputStreamClosed? onOutputStreamClosed,
+     _OnOutputStreamError? onOutputStreamError,
+     _OnOutputStreamValue? onOutputStreamValue,
+-    _OnAllStreamsClosed? onAllStreamsClosed,
+-  })  : _onAllStreamsClosed = onAllStreamsClosed,
+-        _onInputStreamClosed = onInputStreamClosed,
++  })  : _onInputStreamClosed = onInputStreamClosed,
+         _onOutputStreamClosed = onOutputStreamClosed,
+         _onOutputStreamError = onOutputStreamError,
+         _onOutputStreamValue = onOutputStreamValue;
+@@ -555,10 +551,6 @@ class MethodStreamManager {
+     }
+ 
+     await _closeControllers(inputStreamControllers);
+-
+-    if (_outputStreamContexts.isEmpty && _inputStreamContexts.isEmpty) {
+-      _onAllStreamsClosed?.call();
+-    }
+   }
+ 
+   void _handleMethodWithStreamReturn({
+diff --git a/packages/serverpod/lib/src/server/websocket_request_handlers/method_websocket_request_handler.dart b/packages/serverpod/lib/src/server/websocket_request_handlers/method_websocket_request_handler.dart
+index ab5d159989..1f337f26ca 100644
+--- a/packages/serverpod/lib/src/server/websocket_request_handlers/method_websocket_request_handler.dart
++++ b/packages/serverpod/lib/src/server/websocket_request_handlers/method_websocket_request_handler.dart
+@@ -190,11 +190,6 @@ class MethodWebsocketRequestHandler {
+           serializationManager: server.serializationManager,
+         ));
+       },
+-      onAllStreamsClosed: () {
+-        server.serverpod.logVerbose(
+-            'Closing method stream websocket on all streams closed.');
+-        webSocket.close();
+-      },
+     );
+   }
+ 
+diff --git a/tests/serverpod_test_server/lib/src/endpoints/method_streaming.dart b/tests/serverpod_test_server/lib/src/endpoints/method_streaming.dart
+index 5729183d43..016f10224f 100644
+--- a/tests/serverpod_test_server/lib/src/endpoints/method_streaming.dart
++++ b/tests/serverpod_test_server/lib/src/endpoints/method_streaming.dart
+@@ -14,15 +14,19 @@ class MethodStreaming extends Endpoint {
+     }
+   }
+ 
++  static Completer<StreamController<int>>? neverEndingStreamController;
+   Stream<int> neverEndingStreamWithDelay(
+     Session session,
+     int millisecondsDelay,
+-  ) async* {
+-    int i = 0;
+-    while (true) {
+-      await Future.delayed(Duration(milliseconds: millisecondsDelay));
+-      yield i++;
+-    }
++  ) {
++    var controller = StreamController<int>();
++    neverEndingStreamController?.complete(controller);
++    controller.addStream(Stream.periodic(
++      Duration(milliseconds: millisecondsDelay),
++      (i) => i,
++    ));
++
++    return controller.stream;
+   }
+ 
+   Future<void> methodCallEndpoint(Session session) async {}
+@@ -197,22 +201,22 @@ class MethodStreaming extends Endpoint {
+     return completer.future;
+   }
+ 
+-  Stream<int> delayedStreamResponse(Session session, int delay) async* {
+-    var uuid = Uuid().v4();
+-    var completer = Completer<void>();
+-    _delayedResponses[uuid] = completer;
++  static Completer<StreamController<int>>? delayedStreamResponseController;
++  Stream<int> delayedStreamResponse(Session session, int delay) {
++    var controller = StreamController<int>();
++    delayedStreamResponseController?.complete(controller);
+ 
+     Future.delayed(Duration(seconds: delay), () {
+-      _delayedResponses.remove(uuid)?.complete();
++      controller.add(42);
+     });
+ 
+-    await completer.future;
+-
+-    yield 42;
++    return controller.stream;
+   }
+ 
++  static Completer<Session>? delayedNeverListenedInputStreamCompleter;
+   Future<void> delayedNeverListenedInputStream(
+       Session session, int delay, Stream<int> stream) async {
++    delayedNeverListenedInputStreamCompleter?.complete(session);
+     var uuid = Uuid().v4();
+     var completer = Completer<void>();
+     _delayedResponses[uuid] = completer;
+@@ -224,8 +228,10 @@ class MethodStreaming extends Endpoint {
+     await completer.future;
+   }
+ 
++  static Completer<Session>? delayedPausedInputStreamCompleter;
+   Future<void> delayedPausedInputStream(
+       Session session, int delay, Stream<int> stream) async {
++    delayedPausedInputStreamCompleter?.complete(session);
+     var uuid = Uuid().v4();
+     var completer = Completer<void>();
+     _delayedResponses[uuid] = completer;
+diff --git a/tests/serverpod_test_server/test_e2e/method_streaming/open_stream_test.dart b/tests/serverpod_test_server/test_e2e/method_streaming/open_stream_test.dart
+new file mode 100644
+index 0000000000..8e74ff3c23
+--- /dev/null
++++ b/tests/serverpod_test_server/test_e2e/method_streaming/open_stream_test.dart
+@@ -0,0 +1,57 @@
++import 'dart:async';
++
++import 'package:serverpod_test_client/serverpod_test_client.dart';
++import 'package:serverpod_test_server/test_util/config.dart';
++import 'package:test/test.dart';
++
++void main() {
++  test(
++      'Given a client '
++      'when calling an endpoint multiple times in quick succession '
++      'then all streams complete successfully', () async {
++    var client = Client(serverUrl);
++    var numMessages = 1000;
++    List<Future> streamCompleteFutures = [];
++    for (var i = 0; i < 10; i++) {
++      var stream = client.methodStreaming.intStreamFromValue(numMessages);
++      streamCompleteFutures.add(stream.last);
++    }
++
++    for (var future in streamCompleteFutures) {
++      await expectLater(future, completes);
++    }
++  });
++
++  test(
++      'Given multiple method streaming connections to the same endpoint '
++      'when streams are listened, paused and resumed '
++      'then all streams complete successfully', () async {
++    var client = Client(serverUrl);
++    var numMessages = 1000;
++    List<Future> streamCompleteFutures = [];
++    for (var i = 0; i < 10; i++) {
++      var streamIsComplete = Completer();
++      streamCompleteFutures.add(streamIsComplete.future);
++
++      var stream = client.methodStreaming.intStreamFromValue(numMessages);
++      var beenPaused = false;
++      late StreamSubscription<int> subscription;
++      subscription = stream.listen(
++        (data) async {
++          if (!beenPaused) {
++            subscription.pause();
++            beenPaused = true;
++            await Future.delayed(Duration(milliseconds: 100), () {
++              subscription.resume();
++            });
++          }
++        },
++        onDone: () => streamIsComplete.complete(),
++      );
++    }
++
++    for (var future in streamCompleteFutures) {
++      await expectLater(future, completes);
++    }
++  });
++}
+diff --git a/tests/serverpod_test_server/test_integration/websockets/method_websockets/close_method_stream_command_test.dart b/tests/serverpod_test_server/test_integration/websockets/method_websockets/close_method_stream_command_test.dart
+index d9d93c5141..50847d43fe 100644
+--- a/tests/serverpod_test_server/test_integration/websockets/method_websockets/close_method_stream_command_test.dart
++++ b/tests/serverpod_test_server/test_integration/websockets/method_websockets/close_method_stream_command_test.dart
+@@ -1,5 +1,6 @@
+ import 'dart:async';
+ 
++import 'package:serverpod_test_server/src/endpoints/method_streaming.dart';
+ import 'package:serverpod_test_server/test_util/config.dart';
+ import 'package:serverpod_test_server/test_util/test_completer_timeout.dart';
+ import 'package:serverpod_test_server/test_util/test_serverpod.dart';
+@@ -27,7 +28,7 @@ void main() {
+     });
+ 
+     group('with a connected method stream has a delayed response', () {
+-      late Completer<void> webSocketCompleter;
++      late Completer<void> delayedStreamIsCanceled;
+       late Completer<void> delayedResponseClosed;
+ 
+       var endpoint = 'methodStreaming';
+@@ -37,7 +38,16 @@ void main() {
+       setUp(() async {
+         var delayedResponseOpen = Completer<void>();
+         delayedResponseClosed = Completer<void>();
+-        webSocketCompleter = Completer<void>();
++        delayedStreamIsCanceled = Completer<void>();
++
++        var delayedStreamResponseCompleter = Completer<StreamController<int>>();
++        MethodStreaming.delayedStreamResponseController =
++            delayedStreamResponseCompleter;
++
++        delayedStreamResponseCompleter.future
++            .then((StreamController controller) => controller.onCancel = () {
++                  delayedStreamIsCanceled.complete();
++                });
+ 
+         webSocket.stream.listen((event) {
+           var message = WebSocketMessage.fromJsonString(
+@@ -52,8 +62,6 @@ void main() {
+             if (message.connectionId == connectionId)
+               delayedResponseClosed.complete();
+           }
+-        }, onDone: () {
+-          webSocketCompleter.complete();
+         });
+ 
+         webSocket.sink.add(OpenMethodStreamCommand.buildMessage(
+@@ -86,7 +94,7 @@ void main() {
+       });
+ 
+       test(
+-          'when stream is closed by a CloseMethodStreamCommand then websocket connection is closed.',
++          'when stream is closed by a CloseMethodStreamCommand then delayed stream is canceled.',
+           () async {
+         webSocket.sink.add(CloseMethodStreamCommand.buildMessage(
+           endpoint: endpoint,
+@@ -96,7 +104,7 @@ void main() {
+         ));
+ 
+         await expectLater(
+-          webSocketCompleter.future.timeout(Duration(seconds: 5)),
++          delayedStreamIsCanceled.future.timeout(Duration(seconds: 5)),
+           completes,
+           reason:
+               'Websocket connection was not closed when only stream was closed.',
+@@ -201,6 +209,7 @@ void main() {
+   group(
+       'Given a single method stream connection to an endpoint that has delayed stream response',
+       () {
++    late Completer<void> delayedStreamIsCanceled;
+     var server = IntegrationTestServer.create();
+     late WebSocketChannel webSocket;
+     var endpoint = 'methodStreaming';
+@@ -208,6 +217,17 @@ void main() {
+     var connectionId = const Uuid().v4obj();
+ 
+     setUp(() async {
++      delayedStreamIsCanceled = Completer<void>();
++
++      var delayedStreamResponseCompleter = Completer<StreamController<int>>();
++      MethodStreaming.delayedStreamResponseController =
++          delayedStreamResponseCompleter;
++
++      delayedStreamResponseCompleter.future
++          .then((StreamController controller) => controller.onCancel = () {
++                delayedStreamIsCanceled.complete();
++              });
++
+       await server.start();
+       webSocket = WebSocketChannel.connect(
+         Uri.parse(serverMethodWebsocketUrl),
+@@ -229,14 +249,13 @@ void main() {
+     });
+ 
+     test(
+-        'when a CloseMethodStreamCommand is sent then websocket connection is closed',
++        'when a CloseMethodStreamCommand is sent then endpoint stream is canceled',
+         () async {
+-      var websocketCompleter = Completer<void>();
+-      webSocket.stream.listen((event) {
+-        // Listen to the to keep it open.
+-      }, onDone: () {
+-        websocketCompleter.complete();
+-      });
++      webSocket.stream.listen(
++        (event) {
++          // Listen to the to keep it open.
++        },
++      );
+ 
+       webSocket.sink.add(CloseMethodStreamCommand.buildMessage(
+         endpoint: endpoint,
+@@ -246,10 +265,11 @@ void main() {
+       ));
+ 
+       await expectLater(
+-          websocketCompleter.future.timeout(Duration(seconds: 10)).catchError(
+-              (error) => fail('Websocket connection was never closed.')),
++          delayedStreamIsCanceled.future
++              .timeout(Duration(seconds: 10))
++              .catchError(
++                  (error) => fail('Delayed stream was never cancelled.')),
+           completes);
+-      expect(webSocket.closeCode, isNotNull);
+     });
+   });
+ 
+@@ -261,8 +281,19 @@ void main() {
+     var endpoint = 'methodStreaming';
+     var method = 'delayedNeverListenedInputStream';
+     var connectionId = const Uuid().v4obj();
++    late Completer endpointSessionIsClosed;
+ 
+     setUp(() async {
++      var delayedNeverListenedInputStreamCompleter = Completer<Session>();
++      MethodStreaming.delayedNeverListenedInputStreamCompleter =
++          delayedNeverListenedInputStreamCompleter;
++
++      endpointSessionIsClosed = Completer();
++      delayedNeverListenedInputStreamCompleter.future
++          .then((Session session) => session.addWillCloseListener(
++                (_) => endpointSessionIsClosed.complete(),
++              ));
++
+       await server.start();
+       webSocket = WebSocketChannel.connect(
+         Uri.parse(serverMethodWebsocketUrl),
+@@ -284,13 +315,10 @@ void main() {
+     });
+ 
+     test(
+-        'when a CloseMethodStreamCommand is sent then websocket connection is closed',
++        'when a CloseMethodStreamCommand is sent then endpoint session is closed',
+         () async {
+-      var websocketCompleter = Completer<void>();
+       webSocket.stream.listen((event) {
+         // Listen to the to keep it open.
+-      }, onDone: () {
+-        websocketCompleter.complete();
+       });
+ 
+       webSocket.sink.add(CloseMethodStreamCommand.buildMessage(
+@@ -301,10 +329,11 @@ void main() {
+       ));
+ 
+       await expectLater(
+-          websocketCompleter.future.timeout(Duration(seconds: 10)).catchError(
+-              (error) => fail('Websocket connection was never closed.')),
++          endpointSessionIsClosed.future
++              .timeout(Duration(seconds: 10))
++              .catchError(
++                  (error) => fail('Endpoint session was never closed.')),
+           completes);
+-      expect(webSocket.closeCode, isNotNull);
+     });
+   });
+ 
+@@ -316,8 +345,19 @@ void main() {
+     var endpoint = 'methodStreaming';
+     var method = 'delayedPausedInputStream';
+     var connectionId = const Uuid().v4obj();
++    late Completer endpointSessionIsClosed;
+ 
+     setUp(() async {
++      var delayedPausedInputStreamCompleter = Completer<Session>();
++      MethodStreaming.delayedPausedInputStreamCompleter =
++          delayedPausedInputStreamCompleter;
++
++      endpointSessionIsClosed = Completer();
++      delayedPausedInputStreamCompleter.future
++          .then((Session session) => session.addWillCloseListener(
++                (_) => endpointSessionIsClosed.complete(),
++              ));
++
+       await server.start();
+       webSocket = WebSocketChannel.connect(
+         Uri.parse(serverMethodWebsocketUrl),
+@@ -339,13 +379,10 @@ void main() {
+     });
+ 
+     test(
+-        'when a CloseMethodStreamCommand is sent then websocket connection is closed',
++        'when a CloseMethodStreamCommand is sent then endpoint session is closed',
+         () async {
+-      var websocketCompleter = Completer<void>();
+       webSocket.stream.listen((event) {
+         // Listen to the to keep it open.
+-      }, onDone: () {
+-        websocketCompleter.complete();
+       });
+ 
+       webSocket.sink.add(CloseMethodStreamCommand.buildMessage(
+@@ -356,10 +393,11 @@ void main() {
+       ));
+ 
+       await expectLater(
+-          websocketCompleter.future.timeout(Duration(seconds: 10)).catchError(
+-              (error) => fail('Websocket connection was never closed.')),
++          endpointSessionIsClosed.future
++              .timeout(Duration(seconds: 10))
++              .catchError(
++                  (error) => fail('Endpoint session was never closed.')),
+           completes);
+-      expect(webSocket.closeCode, isNotNull);
+     });
+   });
+ 
+diff --git a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_return_websocket_connection_test.dart b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_return_websocket_connection_test.dart
+index 8c6dd260ec..17add63fe6 100644
+--- a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_return_websocket_connection_test.dart
++++ b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_return_websocket_connection_test.dart
+@@ -8,82 +8,6 @@ import 'package:test/test.dart';
+ import 'package:web_socket_channel/web_socket_channel.dart';
+ 
+ void main() {
+-  group('Given a single method stream connection when the method returns ', () {
+-    var endpoint = 'methodStreaming';
+-    var method = 'intStreamFromValue';
+-
+-    late Serverpod server;
+-    late WebSocketChannel webSocket;
+-
+-    late Completer<CloseMethodStreamCommand> closeMethodStreamCommand;
+-    late Completer<void> webSocketCompleter;
+-    TestCompleterTimeout testCompleterTimeout = TestCompleterTimeout();
+-
+-    setUp(() async {
+-      server = IntegrationTestServer.create();
+-      await server.start();
+-      webSocket = WebSocketChannel.connect(
+-        Uri.parse(serverMethodWebsocketUrl),
+-      );
+-
+-      await webSocket.ready;
+-
+-      closeMethodStreamCommand = Completer<CloseMethodStreamCommand>();
+-      webSocketCompleter = Completer<void>();
+-      var streamOpened = Completer<void>();
+-
+-      testCompleterTimeout.start({
+-        'closeMethodStreamCommand': closeMethodStreamCommand,
+-        'webSocketCompleter': webSocketCompleter,
+-        'streamOpened': streamOpened,
+-      });
+-
+-      webSocket.stream.listen((event) {
+-        var message = WebSocketMessage.fromJsonString(
+-          event,
+-          server.serializationManager,
+-        );
+-        ;
+-        if (message is OpenMethodStreamResponse) {
+-          streamOpened.complete();
+-        } else if (message is CloseMethodStreamCommand) {
+-          closeMethodStreamCommand.complete(message);
+-        }
+-      }, onDone: () {
+-        webSocketCompleter.complete();
+-      });
+-
+-      webSocket.sink.add(OpenMethodStreamCommand.buildMessage(
+-        endpoint: endpoint,
+-        method: method,
+-        args: {'value': 4},
+-        connectionId: const Uuid().v4obj(),
+-        inputStreams: [],
+-      ));
+-
+-      await streamOpened.future;
+-      assert(streamOpened.isCompleted == true,
+-          'Failed to open method stream with server');
+-      await closeMethodStreamCommand.future;
+-      assert(closeMethodStreamCommand.isCompleted == true,
+-          'Failed to receive close method stream from server');
+-    });
+-
+-    tearDown(() async {
+-      testCompleterTimeout.cancel();
+-      await server.shutdown(exitProcess: false);
+-      await webSocket.sink.close();
+-    });
+-
+-    test('then websocket connection is closed.', () async {
+-      webSocketCompleter.future.catchError((error) {
+-        fail('Failed to close websocket.');
+-      });
+-
+-      await expectLater(webSocketCompleter.future, completes);
+-    });
+-  });
+-
+   group('Given multiple method stream connections when one returns', () {
+     var endpoint = 'methodStreaming';
+     var keepAliveMethod = 'intEchoStream';
+@@ -191,154 +115,6 @@ void main() {
+     });
+   });
+ 
+-  group('Given a single method stream connection when the method throws', () {
+-    var endpoint = 'methodStreaming';
+-    var method = 'outStreamThrowsException';
+-
+-    late Serverpod server;
+-    late WebSocketChannel webSocket;
+-
+-    late Completer<CloseMethodStreamCommand> closeMethodStreamCommand;
+-    late Completer<void> webSocketCompleter;
+-    TestCompleterTimeout testCompleterTimeout = TestCompleterTimeout();
+-
+-    setUp(() async {
+-      server = IntegrationTestServer.create();
+-      await server.start();
+-      webSocket = WebSocketChannel.connect(
+-        Uri.parse(serverMethodWebsocketUrl),
+-      );
+-
+-      await webSocket.ready;
+-
+-      closeMethodStreamCommand = Completer<CloseMethodStreamCommand>();
+-      webSocketCompleter = Completer<void>();
+-      var streamOpened = Completer<void>();
+-
+-      testCompleterTimeout.start({
+-        'closeMethodStreamCommand': closeMethodStreamCommand,
+-        'webSocketCompleter': webSocketCompleter,
+-        'streamOpened': streamOpened,
+-      });
+-
+-      webSocket.stream.listen((event) {
+-        var message = WebSocketMessage.fromJsonString(
+-          event,
+-          server.serializationManager,
+-        );
+-        ;
+-        if (message is OpenMethodStreamResponse) {
+-          streamOpened.complete();
+-        } else if (message is CloseMethodStreamCommand) {
+-          closeMethodStreamCommand.complete(message);
+-        }
+-      }, onDone: () {
+-        webSocketCompleter.complete();
+-      });
+-
+-      webSocket.sink.add(OpenMethodStreamCommand.buildMessage(
+-        endpoint: endpoint,
+-        method: method,
+-        args: {},
+-        connectionId: const Uuid().v4obj(),
+-        inputStreams: [],
+-      ));
+-
+-      await streamOpened.future;
+-      assert(streamOpened.isCompleted == true,
+-          'Failed to open method stream with server');
+-    });
+-
+-    tearDown(() async {
+-      testCompleterTimeout.cancel();
+-      await server.shutdown(exitProcess: false);
+-      await webSocket.sink.close();
+-    });
+-
+-    test('then websocket connection is closed.', () async {
+-      webSocketCompleter.future.catchError((error) {
+-        fail('Failed to close websocket.');
+-      });
+-
+-      await expectLater(webSocketCompleter.future, completes);
+-    });
+-  });
+-
+-  group(
+-      'Given a single method stream connection when the method throws serializable exception then webSocket connection is closed.',
+-      () {
+-    var endpoint = 'methodStreaming';
+-    var method = 'outStreamThrowsSerializableException';
+-
+-    late Serverpod server;
+-    late WebSocketChannel webSocket;
+-
+-    late Completer<CloseMethodStreamCommand> closeMethodStreamCommand;
+-    late Completer<void> webSocketCompleter;
+-    TestCompleterTimeout testCompleterTimeout = TestCompleterTimeout();
+-
+-    setUp(() async {
+-      server = IntegrationTestServer.create();
+-      await server.start();
+-      webSocket = WebSocketChannel.connect(
+-        Uri.parse(serverMethodWebsocketUrl),
+-      );
+-
+-      await webSocket.ready;
+-
+-      closeMethodStreamCommand = Completer<CloseMethodStreamCommand>();
+-      webSocketCompleter = Completer<void>();
+-      var streamOpened = Completer<void>();
+-
+-      testCompleterTimeout.start({
+-        'closeMethodStreamCommand': closeMethodStreamCommand,
+-        'webSocketCompleter': webSocketCompleter,
+-        'streamOpened': streamOpened,
+-      });
+-
+-      webSocket.stream.listen((event) {
+-        var message = WebSocketMessage.fromJsonString(
+-          event,
+-          server.serializationManager,
+-        );
+-        ;
+-        if (message is OpenMethodStreamResponse) {
+-          streamOpened.complete();
+-        } else if (message is CloseMethodStreamCommand) {
+-          closeMethodStreamCommand.complete(message);
+-        }
+-      }, onDone: () {
+-        webSocketCompleter.complete();
+-      });
+-
+-      webSocket.sink.add(OpenMethodStreamCommand.buildMessage(
+-        endpoint: endpoint,
+-        method: method,
+-        args: {},
+-        connectionId: const Uuid().v4obj(),
+-        inputStreams: [],
+-      ));
+-
+-      await streamOpened.future;
+-      assert(streamOpened.isCompleted == true,
+-          'Failed to open method stream with server');
+-    });
+-
+-    tearDown(() async {
+-      testCompleterTimeout.cancel();
+-      await server.shutdown(exitProcess: false);
+-      await webSocket.sink.close();
+-    });
+-
+-    test('then websocket connection is closed.', () async {
+-      webSocketCompleter.future.catchError((error) {
+-        fail('Failed to close websocket.');
+-      });
+-
+-      await expectLater(webSocketCompleter.future, completes);
+-    });
+-  });
+-
+   group(
+       'Given multiple method stream connections when one throws then webSocket connection is not closed.',
+       () {
+diff --git a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_stream_message_test.dart b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_stream_message_test.dart
+index 2efed125f5..b99aa0f602 100644
+--- a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_stream_message_test.dart
++++ b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_stream_message_test.dart
+@@ -212,13 +212,6 @@ void main() {
+         expect(closeMethodStreamCommandMessage.connectionId, connectionId);
+         expect(closeMethodStreamCommandMessage.reason, CloseReason.done);
+       });
+-
+-      test('then the stream is closed.', () async {
+-        expect(
+-          webSocketCompleter.future.timeout(Duration(seconds: 5)),
+-          completes,
+-        );
+-      });
+     });
+ 
+     group(
+@@ -304,13 +297,6 @@ void main() {
+         expect(closeMethodStreamCommandMessage.connectionId, connectionId);
+         expect(closeMethodStreamCommandMessage.reason, CloseReason.done);
+       });
+-
+-      test('then the stream is closed.', () async {
+-        expect(
+-          webSocketCompleter.future.timeout(Duration(seconds: 5)),
+-          completes,
+-        );
+-      });
+     });
+ 
+     group(
+diff --git a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_streams/never_ending_yield_test.dart b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_streams/never_ending_yield_test.dart
+index bd3b8219eb..3738192edb 100644
+--- a/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_streams/never_ending_yield_test.dart
++++ b/tests/serverpod_test_server/test_integration/websockets/method_websockets/method_streams/never_ending_yield_test.dart
+@@ -1,5 +1,6 @@
+ import 'dart:async';
+ 
++import 'package:serverpod_test_server/src/endpoints/method_streaming.dart';
+ import 'package:serverpod_test_server/test_util/config.dart';
+ import 'package:serverpod_test_server/test_util/test_completer_timeout.dart';
+ import 'package:serverpod_test_server/test_util/test_serverpod.dart';
+@@ -16,24 +17,34 @@ void main() {
+ 
+     late Serverpod server;
+     late WebSocketChannel webSocket;
+-    late Completer webSocketClosed;
++    late Completer neverEndingStreamIsCanceled;
+     TestCompleterTimeout testCompleterTimeout = TestCompleterTimeout();
+ 
+     var connectionId = const Uuid().v4obj();
+ 
+     setUp(() async {
++      var neverEndingStreamControllerCompleter =
++          Completer<StreamController<int>>();
++      MethodStreaming.neverEndingStreamController =
++          neverEndingStreamControllerCompleter;
++
++      neverEndingStreamIsCanceled = Completer();
++      neverEndingStreamControllerCompleter.future
++          .then((StreamController controller) {
++        controller.onCancel = () => neverEndingStreamIsCanceled.complete();
++      });
++
+       server = IntegrationTestServer.create();
+       await server.start();
+       webSocket = WebSocketChannel.connect(
+         Uri.parse(serverMethodWebsocketUrl),
+       );
+       await webSocket.ready;
+-      webSocketClosed = Completer();
+       var streamOpened = Completer<void>();
+ 
+       testCompleterTimeout.start({
+         'streamOpened': streamOpened,
+-        'webSocketClosed': webSocketClosed,
++        'neverEndingStreamIsCanceled': neverEndingStreamIsCanceled,
+       });
+ 
+       webSocket.stream.listen((event) {
+@@ -45,8 +56,6 @@ void main() {
+         if (message is OpenMethodStreamResponse) {
+           streamOpened.complete();
+         }
+-      }, onDone: () {
+-        webSocketClosed.complete();
+       });
+ 
+       webSocket.sink.add(OpenMethodStreamCommand.buildMessage(
+@@ -68,7 +77,7 @@ void main() {
+       await webSocket.sink.close();
+     });
+ 
+-    test('when method stream is closed then websocket connection is closed.',
++    test('when method stream is closed then never ending stream is canceled.',
+         () async {
+       webSocket.sink.add(CloseMethodStreamCommand.buildMessage(
+         endpoint: endpoint,
+@@ -77,11 +86,7 @@ void main() {
+         reason: CloseReason.done,
+       ));
+ 
+-      webSocketClosed.future.catchError((error) {
+-        fail('Failed to close websocket connection.');
+-      });
+-
+-      await expectLater(webSocketClosed.future, completes);
++      await expectLater(neverEndingStreamIsCanceled.future, completes);
+     });
+   });
+ }

@@ -1,0 +1,387 @@
+diff --git a/packages/flame/benchmark/update_components_benchmark.dart b/packages/flame/benchmark/update_components_benchmark.dart
+index baa322591a3..9914fa8f48a 100644
+--- a/packages/flame/benchmark/update_components_benchmark.dart
++++ b/packages/flame/benchmark/update_components_benchmark.dart
+@@ -7,6 +7,7 @@ import 'package:flame/game.dart';
+ const _amountComponents = 1000;
+ const _amountTicks = 2000;
+ const _amountInputs = 500;
++const _amountChildren = 10;
+ 
+ class UpdateComponentsBenchmark extends AsyncBenchmarkBase {
+   final Random random;
+@@ -65,6 +66,13 @@ class _BenchmarkComponent extends PositionComponent {
+ 
+   _BenchmarkComponent(this.id);
+ 
++  @override
++  Future<void> onLoad() async {
++    for (var i = 0; i < _amountChildren; i++) {
++      await add(PositionComponent(position: Vector2(i * 2, 0)));
++    }
++  }
++
+   void input({
+     required int xDirection,
+     required bool doJump,
+diff --git a/packages/flame/lib/src/camera/viewport.dart b/packages/flame/lib/src/camera/viewport.dart
+index 2fd3b511315..c8dbcb4a912 100644
+--- a/packages/flame/lib/src/camera/viewport.dart
++++ b/packages/flame/lib/src/camera/viewport.dart
+@@ -91,7 +91,9 @@ abstract class Viewport extends Component
+     }
+     onViewportResize();
+     if (hasChildren) {
+-      children.forEach((child) => child.onParentResize(_size));
++      for (final child in children) {
++        child.onParentResize(_size);
++      }
+     }
+   }
+ 
+diff --git a/packages/flame/lib/src/collisions/hitboxes/shape_hitbox.dart b/packages/flame/lib/src/collisions/hitboxes/shape_hitbox.dart
+index 5d37f29c168..8a5cded1461 100644
+--- a/packages/flame/lib/src/collisions/hitboxes/shape_hitbox.dart
++++ b/packages/flame/lib/src/collisions/hitboxes/shape_hitbox.dart
+@@ -89,10 +89,12 @@ mixin ShapeHitbox on ShapeComponent implements Hitbox<ShapeHitbox> {
+       _validAabb = false;
+       onAabbChanged?.call();
+     };
+-    ancestors(includeSelf: true).whereType<PositionComponent>().forEach((c) {
+-      _transformAncestors.add(c.transform);
+-      c.transform.addListener(_transformListener);
+-    });
++    final positionComponents =
++        ancestors(includeSelf: true).whereType<PositionComponent>();
++    for (final ancestor in positionComponents) {
++      _transformAncestors.add(ancestor.transform);
++      ancestor.transform.addListener(_transformListener);
++    }
+ 
+     if (shouldFillParent) {
+       _parentSizeListener = () {
+diff --git a/packages/flame/lib/src/collisions/standard_collision_detection.dart b/packages/flame/lib/src/collisions/standard_collision_detection.dart
+index 20fadc8a325..6d8048768ca 100644
+--- a/packages/flame/lib/src/collisions/standard_collision_detection.dart
++++ b/packages/flame/lib/src/collisions/standard_collision_detection.dart
+@@ -167,7 +167,11 @@ class StandardCollisionDetection<B extends Broadphase<ShapeHitbox>>
+     List<ShapeHitbox>? ignoreHitboxes,
+     List<RaycastResult<ShapeHitbox>>? out,
+   }) sync* {
+-    out?.forEach((e) => e.reset());
++    if (out != null) {
++      for (final result in out) {
++        result.reset();
++      }
++    }
+     var currentRay = ray;
+     for (var i = 0; i < maxDepth; i++) {
+       final hasResultObject = (out?.length ?? 0) > i;
+diff --git a/packages/flame/lib/src/components/core/component.dart b/packages/flame/lib/src/components/core/component.dart
+index 4fb0a4623b8..a0e61f76b0a 100644
+--- a/packages/flame/lib/src/components/core/component.dart
++++ b/packages/flame/lib/src/components/core/component.dart
+@@ -524,7 +524,12 @@ class Component {
+   /// priority of the direct siblings, not the children or the ancestors.
+   void updateTree(double dt) {
+     update(dt);
+-    _children?.forEach((c) => c.updateTree(dt));
++    final children = _children;
++    if (children != null) {
++      for (final child in children) {
++        child.updateTree(dt);
++      }
++    }
+   }
+ 
+   /// This method will be invoked from lifecycle if [child] has been added
+@@ -535,7 +540,12 @@ class Component {
+ 
+   void renderTree(Canvas canvas) {
+     render(canvas);
+-    _children?.forEach((c) => c.renderTree(canvas));
++    final children = _children;
++    if (children != null) {
++      for (final child in children) {
++        child.renderTree(canvas);
++      }
++    }
+ 
+     // Any debug rendering should be rendered on top of everything
+     if (debugMode) {
+@@ -868,11 +878,14 @@ class Component {
+   @mustCallSuper
+   @internal
+   void handleResize(Vector2 size) {
+-    _children?.forEach((child) {
+-      if (child.isLoading || child.isLoaded) {
+-        child.onGameResize(size);
++    final children = _children;
++    if (children != null) {
++      for (final child in children) {
++        if (child.isLoading || child.isLoaded) {
++          child.onGameResize(size);
++        }
+       }
+-    });
++    }
+   }
+ 
+   FutureOr<void> _startLoading() {
+diff --git a/packages/flame/lib/src/components/core/component_set.dart b/packages/flame/lib/src/components/core/component_set.dart
+index 0f4e4fd99dc..ffecdaa7d34 100644
+--- a/packages/flame/lib/src/components/core/component_set.dart
++++ b/packages/flame/lib/src/components/core/component_set.dart
+@@ -106,6 +106,8 @@ class ComponentSet extends QueryableOrderedSet<Component> {
+     final elements = toList();
+     // bypass the wrapper because the components are already added
+     super.clear();
+-    elements.forEach(super.add);
++    for (final element in elements) {
++      super.add(element);
++    }
+   }
+ }
+diff --git a/packages/flame/lib/src/components/core/component_tree_root.dart b/packages/flame/lib/src/components/core/component_tree_root.dart
+index 7c680021659..cc1c24b45a8 100644
+--- a/packages/flame/lib/src/components/core/component_tree_root.dart
++++ b/packages/flame/lib/src/components/core/component_tree_root.dart
+@@ -158,12 +158,12 @@ class ComponentTreeRoot extends Component {
+   @internal
+   void handleResize(Vector2 size) {
+     super.handleResize(size);
+-    _queue.forEach((event) {
++    for (final event in _queue) {
+       if ((event.kind == _LifecycleEventKind.add) &&
+           (event.child!.isLoading || event.child!.isLoaded)) {
+         event.child!.onGameResize(size);
+       }
+-    });
++    }
+   }
+ 
+   @mustCallSuper
+diff --git a/packages/flame/lib/src/components/mixins/has_paint.dart b/packages/flame/lib/src/components/mixins/has_paint.dart
+index 30ef95a3711..2d1c5545f57 100644
+--- a/packages/flame/lib/src/components/mixins/has_paint.dart
++++ b/packages/flame/lib/src/components/mixins/has_paint.dart
+@@ -208,9 +208,12 @@ class _MultiPaintOpacityProvider<T extends Object> implements OpacityProvider {
+       maxOpacity = max(target.getOpacity(paintId: paintId), maxOpacity);
+     }
+     if (includeLayers) {
+-      target.paintLayersInternal?.forEach(
+-        (paint) => maxOpacity = max(paint.color.a, maxOpacity),
+-      );
++      final targetLayers = target.paintLayersInternal;
++      if (targetLayers != null) {
++        for (final paint in targetLayers) {
++          maxOpacity = max(paint.color.a, maxOpacity);
++        }
++      }
+     }
+ 
+     return maxOpacity;
+diff --git a/packages/flame/lib/src/components/position_component.dart b/packages/flame/lib/src/components/position_component.dart
+index 39d49e97cde..2274d645258 100644
+--- a/packages/flame/lib/src/components/position_component.dart
++++ b/packages/flame/lib/src/components/position_component.dart
+@@ -1,5 +1,4 @@
+ import 'dart:math' as math;
+-
+ import 'dart:ui' hide Offset;
+ 
+ import 'package:collection/collection.dart';
+@@ -195,7 +194,9 @@ class PositionComponent extends Component
+   set size(Vector2 size) {
+     _size.setFrom(size);
+     if (hasChildren) {
+-      children.forEach((child) => child.onParentResize(_size));
++      for (final child in children) {
++        child.onParentResize(_size);
++      }
+     }
+   }
+ 
+diff --git a/packages/flame/lib/src/components/text_box_component.dart b/packages/flame/lib/src/components/text_box_component.dart
+index 7aece0d0e4d..dd4c1f23087 100644
+--- a/packages/flame/lib/src/components/text_box_component.dart
++++ b/packages/flame/lib/src/components/text_box_component.dart
+@@ -168,7 +168,7 @@ class TextBoxComponent<T extends TextRenderer> extends TextComponent {
+     lines.clear();
+     var lineHeight = 0.0;
+     final maxBoxWidth = _fixedSize ? width : _boxConfig.maxWidth;
+-    text.split(' ').forEach((word) {
++    for (final word in text.split(' ')) {
+       final wordLines = word.split('\n');
+       final possibleLine =
+           lines.isEmpty ? wordLines[0] : '${lines.last} ${wordLines[0]}';
+@@ -192,7 +192,7 @@ class TextBoxComponent<T extends TextRenderer> extends TextComponent {
+       } else {
+         lines.addAll(wordLines);
+       }
+-    });
++    }
+     _totalLines = lines.length;
+     _lineHeight = lineHeight;
+     size = _recomputeSize();
+diff --git a/packages/flame/lib/src/events/flame_game_mixins/double_tap_dispatcher.dart b/packages/flame/lib/src/events/flame_game_mixins/double_tap_dispatcher.dart
+index 1a1efa5f78d..f3029bf67dc 100644
+--- a/packages/flame/lib/src/events/flame_game_mixins/double_tap_dispatcher.dart
++++ b/packages/flame/lib/src/events/flame_game_mixins/double_tap_dispatcher.dart
+@@ -36,12 +36,16 @@ class DoubleTapDispatcher extends Component with HasGameReference<FlameGame> {
+   }
+ 
+   void _onDoubleTapUp(DoubleTapEvent event) {
+-    _components.forEach((component) => component.onDoubleTapUp(event));
++    for (final component in _components) {
++      component.onDoubleTapUp(event);
++    }
+     _components.clear();
+   }
+ 
+   void _onDoubleTapCancel(DoubleTapCancelEvent event) {
+-    _components.forEach((component) => component.onDoubleTapCancel(event));
++    for (final component in _components) {
++      component.onDoubleTapCancel(event);
++    }
+     _components.clear();
+   }
+ 
+diff --git a/packages/flame/lib/src/experimental/geometry/shapes/polygon.dart b/packages/flame/lib/src/experimental/geometry/shapes/polygon.dart
+index 809788b9608..66b7070a485 100644
+--- a/packages/flame/lib/src/experimental/geometry/shapes/polygon.dart
++++ b/packages/flame/lib/src/experimental/geometry/shapes/polygon.dart
+@@ -65,7 +65,7 @@ class Polygon extends Shape {
+     var nInteriorAngles = 0;
+     var nExteriorAngles = 0;
+     var previousEdge = _edges.last;
+-    _edges.forEach((edge) {
++    for (final edge in _edges) {
+       final crossProduct = edge.cross(previousEdge);
+       previousEdge = edge;
+       // A straight angle counts as both internal and external
+@@ -75,7 +75,7 @@ class Polygon extends Shape {
+       if (crossProduct <= 0) {
+         nExteriorAngles++;
+       }
+-    });
++    }
+     if (nInteriorAngles < nExteriorAngles) {
+       _reverseVertices();
+       _initializeEdges();
+@@ -116,7 +116,9 @@ class Polygon extends Shape {
+   Aabb2? _aabb;
+   Aabb2 _calculateAabb() {
+     final aabb = Aabb2.minMax(_vertices.first, _vertices.first);
+-    _vertices.forEach(aabb.hullPoint);
++    for (final vertex in _vertices) {
++      aabb.hullPoint(vertex);
++    }
+     return aabb;
+   }
+ 
+diff --git a/packages/flame/lib/src/game/flame_game.dart b/packages/flame/lib/src/game/flame_game.dart
+index 59cde184c2c..92cbfed51c7 100644
+--- a/packages/flame/lib/src/game/flame_game.dart
++++ b/packages/flame/lib/src/game/flame_game.dart
+@@ -186,7 +186,9 @@ class FlameGame<W extends World> extends ComponentTreeRoot
+     // there is no way to explicitly call the [Component]'s implementation,
+     // we propagate the event to [FlameGame]'s children manually.
+     handleResize(size);
+-    children.forEach((child) => child.onParentResize(size));
++    for (final child in children) {
++      child.onParentResize(size);
++    }
+   }
+ 
+   /// Ensure that all pending tree operations finish.
+diff --git a/packages/flame/lib/src/geometry/line_segment.dart b/packages/flame/lib/src/geometry/line_segment.dart
+index d3492198e34..64e2c55dba8 100644
+--- a/packages/flame/lib/src/geometry/line_segment.dart
++++ b/packages/flame/lib/src/geometry/line_segment.dart
+@@ -48,7 +48,9 @@ class LineSegment {
+       };
+       if (overlaps.isNotEmpty) {
+         final sum = Vector2.zero();
+-        overlaps.forEach(sum.add);
++        for (final overlap in overlaps) {
++          sum.add(overlap);
++        }
+         return [sum..scale(1 / overlaps.length)];
+       }
+     }
+diff --git a/packages/flame/lib/src/layers/layer.dart b/packages/flame/lib/src/layers/layer.dart
+index 1f7dd5c724d..310eb8efde3 100644
+--- a/packages/flame/lib/src/layers/layer.dart
++++ b/packages/flame/lib/src/layers/layer.dart
+@@ -14,16 +14,21 @@ abstract class Layer {
+ 
+   @mustCallSuper
+   void render(Canvas canvas, {double x = 0.0, double y = 0.0}) {
+-    if (_picture == null) {
++    final picture = _picture;
++    if (picture == null) {
+       return;
+     }
+ 
+     canvas.save();
+     canvas.translate(x, y);
+ 
+-    preProcessors.forEach((p) => p.process(_picture!, canvas));
+-    canvas.drawPicture(_picture!);
+-    postProcessors.forEach((p) => p.process(_picture!, canvas));
++    for (final p in preProcessors) {
++      p.process(picture, canvas);
++    }
++    canvas.drawPicture(picture);
++    for (final p in postProcessors) {
++      p.process(picture, canvas);
++    }
+     canvas.restore();
+   }
+ 
+diff --git a/packages/flame/lib/src/parallax.dart b/packages/flame/lib/src/parallax.dart
+index c6ea4b99029..9d3234ddb61 100644
+--- a/packages/flame/lib/src/parallax.dart
++++ b/packages/flame/lib/src/parallax.dart
+@@ -468,7 +468,7 @@ class Parallax {
+   final _delta = Vector2.zero();
+ 
+   void update(double dt) {
+-    layers.forEach((layer) {
++    for (final layer in layers) {
+       layer.update(
+         _delta
+           ..setFrom(baseVelocity)
+@@ -476,7 +476,7 @@ class Parallax {
+           ..scale(dt),
+         dt,
+       );
+-    });
++    }
+   }
+ 
+   /// Note that this method only should be used if all of your layers should
+diff --git a/packages/flame/lib/src/text/elements/group_element.dart b/packages/flame/lib/src/text/elements/group_element.dart
+index da8624dc907..4df7824e567 100644
+--- a/packages/flame/lib/src/text/elements/group_element.dart
++++ b/packages/flame/lib/src/text/elements/group_element.dart
+@@ -12,12 +12,16 @@ class GroupElement extends BlockElement {
+ 
+   @override
+   void translate(double dx, double dy) {
+-    children.forEach((child) => child.translate(dx, dy));
++    for (final child in children) {
++      child.translate(dx, dy);
++    }
+   }
+ 
+   @override
+   void draw(Canvas canvas) {
+-    children.forEach((child) => child.draw(canvas));
++    for (final child in children) {
++      child.draw(canvas);
++    }
+   }
+ 
+   @override

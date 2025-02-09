@@ -1,0 +1,3779 @@
+diff --git a/tests/bootstrap_project/test/module_test.dart b/tests/bootstrap_project/test/module_test.dart
+index f1987d4761..943774e202 100644
+--- a/tests/bootstrap_project/test/module_test.dart
++++ b/tests/bootstrap_project/test/module_test.dart
+@@ -1,6 +1,5 @@
+ @Timeout(Duration(minutes: 12))
+ 
+-import 'dart:convert';
+ import 'dart:io';
+ 
+ import 'package:path/path.dart' as path;
+diff --git a/tests/bootstrap_project/test/project_mini_test.dart b/tests/bootstrap_project/test/project_mini_test.dart
+index ccf3fedf73..82a75e71e8 100644
+--- a/tests/bootstrap_project/test/project_mini_test.dart
++++ b/tests/bootstrap_project/test/project_mini_test.dart
+@@ -1,6 +1,5 @@
+ @Timeout(Duration(minutes: 12))
+ 
+-import 'dart:convert';
+ import 'dart:io';
+ 
+ import 'package:path/path.dart' as path;
+diff --git a/tests/bootstrap_project/test/project_test.dart b/tests/bootstrap_project/test/project_test.dart
+index 4df6031c0f..61001340e4 100644
+--- a/tests/bootstrap_project/test/project_test.dart
++++ b/tests/bootstrap_project/test/project_test.dart
+@@ -1,6 +1,5 @@
+ @Timeout(Duration(minutes: 12))
+ 
+-import 'dart:convert';
+ import 'dart:io';
+ 
+ import 'package:http/http.dart' as http;
+diff --git a/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart b/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
+index 4c4fabbad4..f52c234374 100644
+--- a/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
++++ b/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
+@@ -102,7 +102,170 @@ void main() async {
+       await Future.delayed(const Duration(seconds: 1));
+ 
+       var protocolFileName = 'test_entity';
+-      var protocolFile = File(createProtocolFilePath(
++      var protocolFile = File(createProtocolFileInModelDirectory(
++        tempPath,
++        serverDir,
++        protocolFileName,
++      ));
++      protocolFile.createSync(recursive: true);
++      protocolFile.writeAsStringSync('''
++class: TestEntity
++fields:
++  name: String
++''', flush: true);
++
++      await expectLater(
++        generateStreamSearch.keywordFound,
++        completion(isTrue),
++        reason:
++            'Incremental code generation did not complete before timeout was reached.',
++      );
++
++      // Validate that entity file is generated
++      var entityFileName = '$protocolFileName.dart';
++      var entityDirectory =
++          Directory(createClientModelDirectoryPath(tempPath, clientDir));
++      var entityFiles = entityDirectory.listSync();
++      expect(
++        entityFiles.map((e) => path.basename(e.path)),
++        contains(entityFileName),
++        reason: 'Entity file not found.',
++      );
++
++      // Validate that entity file contains expected content
++      var entityFile = entityFiles.firstWhereOrNull(
++        (e) => path.basename(e.path) == entityFileName,
++      );
++      expect(
++        entityFile,
++        isA<File>(),
++        reason: 'Entity file did not have expected type.',
++      );
++      var entityFileContents = (entityFile as File).readAsStringSync();
++      expect(
++        entityFileContents,
++        contains('class TestEntity'),
++        reason: 'Entity file did not contain expected class.',
++      );
++
++      // Update model file
++      protocolFile.writeAsStringSync('''
++class: TestEntity
++fields:
++  name: String
++  age: int
++''', flush: true);
++
++      await expectLater(
++        generateStreamSearch.keywordFound,
++        completion(isTrue),
++        reason:
++            'Incremental code generation did not complete before timeout was reached.',
++      );
++
++      // Validate file is changed to reflect update
++      entityFiles = entityDirectory.listSync();
++      expect(
++        entityFiles.map((e) => path.basename(e.path)),
++        contains(entityFileName),
++        reason: 'Entity file not found.',
++      );
++      entityFileContents = entityFile.readAsStringSync();
++      expect(
++        entityFileContents,
++        contains('int age'),
++        reason: 'Entity file did not contain the added field.',
++      );
++
++      protocolFile.deleteSync();
++      await expectLater(
++        generateStreamSearch.keywordFound,
++        completion(isTrue),
++        reason:
++            'Incremental code generation did not complete before timeout was reached.',
++      );
++
++      entityFiles = entityDirectory.listSync();
++      expect(
++        entityFiles.map((e) => path.basename(e.path)),
++        isNot(contains(entityFileName)),
++        reason: 'Entity file still exists found.',
++      );
++    });
++  });
++
++  group(
++      'Given a model file in the "lib/src/ directory that is changed when generate watch is active',
++      () {
++    var (projectName, commandRoot) = createRandomProjectName(tempPath);
++    var (serverDir, _, clientDir) = createProjectFolderPaths(projectName);
++
++    late Process createProcess;
++    Process? generateWatch;
++    KeywordSearchInStream generateStreamSearch = KeywordSearchInStream(
++      keywords: generateWatchCompletionKeywords,
++    );
++    setUp(() async {
++      createProcess = await Process.start(
++        'serverpod',
++        ['create', projectName, '-v', '--no-analytics'],
++        workingDirectory: tempPath,
++        environment: {
++          'SERVERPOD_HOME': rootPath,
++        },
++      );
++
++      createProcess.stdout.transform(const Utf8Decoder()).listen(print);
++      createProcess.stderr.transform(const Utf8Decoder()).listen(print);
++
++      var createProjectExitCode = await createProcess.exitCode;
++      assert(
++        createProjectExitCode == 0,
++        'Failed to create the serverpod project.',
++      );
++    });
++
++    tearDown(() async {
++      createProcess.kill();
++      generateWatch?.kill();
++      generateStreamSearch.cancel();
++    });
++
++    test('then the entity files are generated and updated as expected.',
++        () async {
++      generateWatch = await Process.start(
++        'serverpod',
++        ['generate', '--watch', '-v', '--no-analytics'],
++        workingDirectory: path.join(tempPath, serverDir),
++        environment: {
++          'SERVERPOD_HOME': rootPath,
++        },
++      );
++
++      generateStreamSearch = KeywordSearchInStream(
++        keywords: generateWatchCompletionKeywords,
++      );
++      generateWatch!.stdout
++          .transform(const Utf8Decoder())
++          .transform(const LineSplitter())
++          .listen(generateStreamSearch.onData);
++      generateWatch!.stderr
++          .transform(const Utf8Decoder())
++          .transform(const LineSplitter())
++          .listen(print);
++
++      await expectLater(
++        generateStreamSearch.keywordFound,
++        completion(isTrue),
++        reason:
++            'Initial code generation did not complete before timeout was reached.',
++      );
++      // This delay is required to ensure that the generate watch is
++      // ready to receive file changes after the initial generation.
++      await Future.delayed(const Duration(seconds: 1));
++
++      var protocolFileName = 'test_entity';
++      var protocolFile = File(createProjectProtocolFile(
+         tempPath,
+         serverDir,
+         protocolFileName,
+@@ -588,7 +751,7 @@ class TestEndpoint extends Endpoint {
+ ''', flush: true);
+ 
+       var protocolFileName = 'test_entity';
+-      var protocolFile = File(createProtocolFilePath(
++      var protocolFile = File(createProtocolFileInModelDirectory(
+         tempPath,
+         serverDir,
+         protocolFileName,
+@@ -664,7 +827,7 @@ fields:
+           .createSync(
+         recursive: true,
+       );
+-      protocolFile.renameSync(createProtocolFilePath(
++      protocolFile.renameSync(createProtocolFileInModelDirectory(
+         tempPath,
+         serverDir,
+         protocolFileName,
+@@ -760,7 +923,7 @@ fields:
+       await Future.delayed(const Duration(seconds: 1));
+ 
+       var protocolFileName = 'test_entity';
+-      var protocolFile = File(createProtocolFilePath(
++      var protocolFile = File(createProtocolFileInModelDirectory(
+         tempPath,
+         serverDir,
+         protocolFileName,
+@@ -854,7 +1017,7 @@ String createModelDirectoryPath(
+   return path.joinAll([...basePath, subFolder]);
+ }
+ 
+-String createProtocolFilePath(
++String createProtocolFileInModelDirectory(
+   String tmpFolder,
+   String serverDir,
+   String fileName, {
+@@ -866,6 +1029,22 @@ String createProtocolFilePath(
+   );
+ }
+ 
++String createProjectProtocolFile(
++  String tmpFolder,
++  String serverDir,
++  String fileName, {
++  List<String>? pathParts,
++}) {
++  return path.joinAll([
++    tmpFolder,
++    serverDir,
++    'lib',
++    'src',
++    ...?pathParts,
++    '$fileName.spy.yaml',
++  ]);
++}
++
+ String createProjectDartFilePath({
+   required String tmpFolder,
+   required String serverDir,
+diff --git a/tests/serverpod_test_client/lib/src/protocol/client.dart b/tests/serverpod_test_client/lib/src/protocol/client.dart
+index f99e8dfbff..990a6b570b 100644
+--- a/tests/serverpod_test_client/lib/src/protocol/client.dart
++++ b/tests/serverpod_test_client/lib/src/protocol/client.dart
+@@ -37,7 +37,9 @@ import 'package:serverpod_test_client/src/protocol/scopes/scope_server_only_fiel
+     as _i19;
+ import 'package:serverpod_test_client/src/protocol/scopes/scope_server_only_field_child.dart'
+     as _i20;
+-import 'protocol.dart' as _i21;
++import 'package:serverpod_test_client/src/protocol/my_feature/models/my_feature_model.dart'
++    as _i21;
++import 'protocol.dart' as _i22;
+ 
+ /// {@category Endpoint}
+ class EndpointAsyncTasks extends _i1.EndpointRef {
+@@ -2404,6 +2406,13 @@ class EndpointMyFeature extends _i1.EndpointRef {
+         'myFeatureMethod',
+         {},
+       );
++
++  _i2.Future<_i21.MyFeatureModel> myFeatureModel() =>
++      caller.callServerEndpoint<_i21.MyFeatureModel>(
++        'myFeature',
++        'myFeatureModel',
++        {},
++      );
+ }
+ 
+ class Modules {
+@@ -2433,7 +2442,7 @@ class Client extends _i1.ServerpodClientShared {
+     bool? disconnectStreamsOnLostInternetConnection,
+   }) : super(
+           host,
+-          _i21.Protocol(),
++          _i22.Protocol(),
+           securityContext: securityContext,
+           authenticationKeyManager: authenticationKeyManager,
+           streamingConnectionTimeout: streamingConnectionTimeout,
+diff --git a/tests/serverpod_test_client/lib/src/protocol/my_feature/models/my_feature_model.dart b/tests/serverpod_test_client/lib/src/protocol/my_feature/models/my_feature_model.dart
+new file mode 100644
+index 0000000000..111062a6df
+--- /dev/null
++++ b/tests/serverpod_test_client/lib/src/protocol/my_feature/models/my_feature_model.dart
+@@ -0,0 +1,44 @@
++/* AUTOMATICALLY GENERATED CODE DO NOT MODIFY */
++/*   To generate run: "serverpod generate"    */
++
++// ignore_for_file: implementation_imports
++// ignore_for_file: library_private_types_in_public_api
++// ignore_for_file: non_constant_identifier_names
++// ignore_for_file: public_member_api_docs
++// ignore_for_file: type_literal_in_constant_pattern
++// ignore_for_file: use_super_parameters
++
++// ignore_for_file: no_leading_underscores_for_library_prefixes
++import 'package:serverpod_client/serverpod_client.dart' as _i1;
++
++abstract class MyFeatureModel implements _i1.SerializableModel {
++  MyFeatureModel._({required this.name});
++
++  factory MyFeatureModel({required String name}) = _MyFeatureModelImpl;
++
++  factory MyFeatureModel.fromJson(Map<String, dynamic> jsonSerialization) {
++    return MyFeatureModel(name: jsonSerialization['name'] as String);
++  }
++
++  String name;
++
++  MyFeatureModel copyWith({String? name});
++  @override
++  Map<String, dynamic> toJson() {
++    return {'name': name};
++  }
++
++  @override
++  String toString() {
++    return _i1.SerializationManager.encode(this);
++  }
++}
++
++class _MyFeatureModelImpl extends MyFeatureModel {
++  _MyFeatureModelImpl({required String name}) : super._(name: name);
++
++  @override
++  MyFeatureModel copyWith({String? name}) {
++    return MyFeatureModel(name: name ?? this.name);
++  }
++}
+diff --git a/tests/serverpod_test_client/lib/src/protocol/protocol.dart b/tests/serverpod_test_client/lib/src/protocol/protocol.dart
+index 78e2b711fa..adcd9effe8 100644
+--- a/tests/serverpod_test_client/lib/src/protocol/protocol.dart
++++ b/tests/serverpod_test_client/lib/src/protocol/protocol.dart
+@@ -130,16 +130,17 @@ import 'types.dart' as _i110;
+ import 'types_list.dart' as _i111;
+ import 'types_map.dart' as _i112;
+ import 'unique_data.dart' as _i113;
++import 'my_feature/models/my_feature_model.dart' as _i114;
+ import 'package:serverpod_test_module_client/serverpod_test_module_client.dart'
+-    as _i114;
+-import 'dart:typed_data' as _i115;
+-import 'package:serverpod_test_client/src/custom_classes.dart' as _i116;
+-import 'package:serverpod_test_client/src/protocol/simple_data.dart' as _i117;
+-import 'package:serverpod_test_client/src/protocol/test_enum.dart' as _i118;
++    as _i115;
++import 'dart:typed_data' as _i116;
++import 'package:serverpod_test_client/src/custom_classes.dart' as _i117;
++import 'package:serverpod_test_client/src/protocol/simple_data.dart' as _i118;
++import 'package:serverpod_test_client/src/protocol/test_enum.dart' as _i119;
+ import 'package:serverpod_test_client/src/protocol_custom_classes.dart'
+-    as _i119;
+-import 'package:serverpod_test_shared/serverpod_test_shared.dart' as _i120;
+-import 'package:serverpod_auth_client/serverpod_auth_client.dart' as _i121;
++    as _i120;
++import 'package:serverpod_test_shared/serverpod_test_shared.dart' as _i121;
++import 'package:serverpod_auth_client/serverpod_auth_client.dart' as _i122;
+ export 'defaults/boolean/bool_default.dart';
+ export 'defaults/boolean/bool_default_mix.dart';
+ export 'defaults/boolean/bool_default_model.dart';
+@@ -253,6 +254,7 @@ export 'types.dart';
+ export 'types_list.dart';
+ export 'types_map.dart';
+ export 'unique_data.dart';
++export 'my_feature/models/my_feature_model.dart';
+ export 'client.dart';
+ 
+ class Protocol extends _i1.SerializationManager {
+@@ -610,6 +612,9 @@ class Protocol extends _i1.SerializationManager {
+     if (t == _i113.UniqueData) {
+       return _i113.UniqueData.fromJson(data) as T;
+     }
++    if (t == _i114.MyFeatureModel) {
++      return _i114.MyFeatureModel.fromJson(data) as T;
++    }
+     if (t == _i1.getType<_i2.BoolDefault?>()) {
+       return (data != null ? _i2.BoolDefault.fromJson(data) : null) as T;
+     }
+@@ -994,6 +999,9 @@ class Protocol extends _i1.SerializationManager {
+     if (t == _i1.getType<_i113.UniqueData?>()) {
+       return (data != null ? _i113.UniqueData.fromJson(data) : null) as T;
+     }
++    if (t == _i1.getType<_i114.MyFeatureModel?>()) {
++      return (data != null ? _i114.MyFeatureModel.fromJson(data) : null) as T;
++    }
+     if (t == _i1.getType<List<_i38.EmptyModelRelationItem>?>()) {
+       return (data != null
+           ? (data as List)
+@@ -1109,14 +1117,14 @@ class Protocol extends _i1.SerializationManager {
+           ? (data as List).map((e) => deserialize<_i78.Cat>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == List<_i114.ModuleClass>) {
++    if (t == List<_i115.ModuleClass>) {
+       return (data as List)
+-          .map((e) => deserialize<_i114.ModuleClass>(e))
++          .map((e) => deserialize<_i115.ModuleClass>(e))
+           .toList() as dynamic;
+     }
+-    if (t == Map<String, _i114.ModuleClass>) {
++    if (t == Map<String, _i115.ModuleClass>) {
+       return (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i114.ModuleClass>(v)))
++              deserialize<String>(k), deserialize<_i115.ModuleClass>(v)))
+           as dynamic;
+     }
+     if (t == List<int>) {
+@@ -1176,22 +1184,22 @@ class Protocol extends _i1.SerializationManager {
+           ? (data as List).map((e) => deserialize<DateTime?>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == List<_i115.ByteData>) {
+-      return (data as List).map((e) => deserialize<_i115.ByteData>(e)).toList()
++    if (t == List<_i116.ByteData>) {
++      return (data as List).map((e) => deserialize<_i116.ByteData>(e)).toList()
+           as dynamic;
+     }
+-    if (t == _i1.getType<List<_i115.ByteData>?>()) {
++    if (t == _i1.getType<List<_i116.ByteData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i115.ByteData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i116.ByteData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == List<_i115.ByteData?>) {
+-      return (data as List).map((e) => deserialize<_i115.ByteData?>(e)).toList()
++    if (t == List<_i116.ByteData?>) {
++      return (data as List).map((e) => deserialize<_i116.ByteData?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == _i1.getType<List<_i115.ByteData?>?>()) {
++    if (t == _i1.getType<List<_i116.ByteData?>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i115.ByteData?>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i116.ByteData?>(e)).toList()
+           : null) as dynamic;
+     }
+     if (t == List<Duration>) {
+@@ -1252,8 +1260,8 @@ class Protocol extends _i1.SerializationManager {
+               (k, v) => MapEntry(deserialize<String>(k), deserialize<int?>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i116.CustomClass3) {
+-      return _i116.CustomClass3.fromJson(data) as T;
++    if (t == _i117.CustomClass3) {
++      return _i117.CustomClass3.fromJson(data) as T;
+     }
+     if (t == List<_i108.TestEnum>) {
+       return (data as List).map((e) => deserialize<_i108.TestEnum>(e)).toList()
+@@ -1281,9 +1289,9 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<DateTime>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i115.ByteData>) {
++    if (t == Map<String, _i116.ByteData>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i115.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i116.ByteData>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, Duration>) {
+@@ -1310,9 +1318,9 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<DateTime?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i115.ByteData?>) {
++    if (t == Map<String, _i116.ByteData?>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i115.ByteData?>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i116.ByteData?>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, Duration?>) {
+@@ -1404,9 +1412,9 @@ class Protocol extends _i1.SerializationManager {
+           ? (data as List).map((e) => deserialize<String>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i115.ByteData>?>()) {
++    if (t == _i1.getType<List<_i116.ByteData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i115.ByteData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i116.ByteData>(e)).toList()
+           : null) as dynamic;
+     }
+     if (t == _i1.getType<List<Duration>?>()) {
+@@ -1489,10 +1497,10 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<String>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<_i115.ByteData, String>?>()) {
++    if (t == _i1.getType<Map<_i116.ByteData, String>?>()) {
+       return (data != null
+           ? Map.fromEntries((data as List).map((e) => MapEntry(
+-              deserialize<_i115.ByteData>(e['k']),
++              deserialize<_i116.ByteData>(e['k']),
+               deserialize<String>(e['v']))))
+           : null) as dynamic;
+     }
+@@ -1577,10 +1585,10 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<String>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i115.ByteData>?>()) {
++    if (t == _i1.getType<Map<String, _i116.ByteData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i115.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i116.ByteData>(v)))
+           : null) as dynamic;
+     }
+     if (t == _i1.getType<Map<String, Duration>?>()) {
+@@ -1634,9 +1642,9 @@ class Protocol extends _i1.SerializationManager {
+       return (data as List).map((e) => deserialize<String>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i117.SimpleData>) {
++    if (t == List<_i118.SimpleData>) {
+       return (data as List)
+-          .map((e) => deserialize<_i117.SimpleData>(e))
++          .map((e) => deserialize<_i118.SimpleData>(e))
+           .toList() as dynamic;
+     }
+     if (t == List<int>) {
+@@ -1727,40 +1735,40 @@ class Protocol extends _i1.SerializationManager {
+       return (data as List).map((e) => deserialize<DateTime?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i115.ByteData>) {
+-      return (data as List).map((e) => deserialize<_i115.ByteData>(e)).toList()
++    if (t == List<_i116.ByteData>) {
++      return (data as List).map((e) => deserialize<_i116.ByteData>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i115.ByteData?>) {
+-      return (data as List).map((e) => deserialize<_i115.ByteData?>(e)).toList()
++    if (t == List<_i116.ByteData?>) {
++      return (data as List).map((e) => deserialize<_i116.ByteData?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i117.SimpleData?>) {
++    if (t == List<_i118.SimpleData?>) {
+       return (data as List)
+-          .map((e) => deserialize<_i117.SimpleData?>(e))
++          .map((e) => deserialize<_i118.SimpleData?>(e))
+           .toList() as dynamic;
+     }
+-    if (t == _i1.getType<List<_i117.SimpleData>?>()) {
++    if (t == _i1.getType<List<_i118.SimpleData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i117.SimpleData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i118.SimpleData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i117.SimpleData>?>()) {
++    if (t == _i1.getType<List<_i118.SimpleData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i117.SimpleData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i118.SimpleData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i117.SimpleData?>?>()) {
++    if (t == _i1.getType<List<_i118.SimpleData?>?>()) {
+       return (data != null
+           ? (data as List)
+-              .map((e) => deserialize<_i117.SimpleData?>(e))
++              .map((e) => deserialize<_i118.SimpleData?>(e))
+               .toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i117.SimpleData?>?>()) {
++    if (t == _i1.getType<List<_i118.SimpleData?>?>()) {
+       return (data != null
+           ? (data as List)
+-              .map((e) => deserialize<_i117.SimpleData?>(e))
++              .map((e) => deserialize<_i118.SimpleData?>(e))
+               .toList()
+           : null) as dynamic;
+     }
+@@ -1815,14 +1823,14 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<int>(e['k']), deserialize<int>(e['v']))))
+           as dynamic;
+     }
+-    if (t == Map<_i118.TestEnum, int>) {
++    if (t == Map<_i119.TestEnum, int>) {
+       return Map.fromEntries((data as List).map((e) => MapEntry(
+-              deserialize<_i118.TestEnum>(e['k']), deserialize<int>(e['v']))))
++              deserialize<_i119.TestEnum>(e['k']), deserialize<int>(e['v']))))
+           as dynamic;
+     }
+-    if (t == Map<String, _i118.TestEnum>) {
++    if (t == Map<String, _i119.TestEnum>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i118.TestEnum>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i119.TestEnum>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, double>) {
+@@ -1861,47 +1869,47 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<DateTime?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i115.ByteData>) {
++    if (t == Map<String, _i116.ByteData>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i115.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i116.ByteData>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i115.ByteData?>) {
++    if (t == Map<String, _i116.ByteData?>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i115.ByteData?>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i116.ByteData?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i117.SimpleData>) {
++    if (t == Map<String, _i118.SimpleData>) {
+       return (data as Map).map((k, v) => MapEntry(
+-          deserialize<String>(k), deserialize<_i117.SimpleData>(v))) as dynamic;
++          deserialize<String>(k), deserialize<_i118.SimpleData>(v))) as dynamic;
+     }
+-    if (t == Map<String, _i117.SimpleData?>) {
++    if (t == Map<String, _i118.SimpleData?>) {
+       return (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i117.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i118.SimpleData?>(v)))
+           as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i117.SimpleData>?>()) {
++    if (t == _i1.getType<Map<String, _i118.SimpleData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i117.SimpleData>(v)))
++              deserialize<String>(k), deserialize<_i118.SimpleData>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i117.SimpleData>?>()) {
++    if (t == _i1.getType<Map<String, _i118.SimpleData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i117.SimpleData>(v)))
++              deserialize<String>(k), deserialize<_i118.SimpleData>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i117.SimpleData?>?>()) {
++    if (t == _i1.getType<Map<String, _i118.SimpleData?>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i117.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i118.SimpleData?>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i117.SimpleData?>?>()) {
++    if (t == _i1.getType<Map<String, _i118.SimpleData?>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i117.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i118.SimpleData?>(v)))
+           : null) as dynamic;
+     }
+     if (t == Map<String, Duration>) {
+@@ -1914,47 +1922,47 @@ class Protocol extends _i1.SerializationManager {
+               MapEntry(deserialize<String>(k), deserialize<Duration?>(v)))
+           as dynamic;
+     }
+-    if (t == _i116.CustomClass) {
+-      return _i116.CustomClass.fromJson(data) as T;
++    if (t == _i117.CustomClass) {
++      return _i117.CustomClass.fromJson(data) as T;
+     }
+-    if (t == _i116.CustomClass2) {
+-      return _i116.CustomClass2.fromJson(data) as T;
++    if (t == _i117.CustomClass2) {
++      return _i117.CustomClass2.fromJson(data) as T;
+     }
+-    if (t == _i119.ProtocolCustomClass) {
+-      return _i119.ProtocolCustomClass.fromJson(data) as T;
++    if (t == _i120.ProtocolCustomClass) {
++      return _i120.ProtocolCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i120.ExternalCustomClass) {
+-      return _i120.ExternalCustomClass.fromJson(data) as T;
++    if (t == _i121.ExternalCustomClass) {
++      return _i121.ExternalCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i120.FreezedCustomClass) {
+-      return _i120.FreezedCustomClass.fromJson(data) as T;
++    if (t == _i121.FreezedCustomClass) {
++      return _i121.FreezedCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i1.getType<_i116.CustomClass?>()) {
+-      return (data != null ? _i116.CustomClass.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i117.CustomClass?>()) {
++      return (data != null ? _i117.CustomClass.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i116.CustomClass2?>()) {
+-      return (data != null ? _i116.CustomClass2.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i117.CustomClass2?>()) {
++      return (data != null ? _i117.CustomClass2.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i116.CustomClass3?>()) {
+-      return (data != null ? _i116.CustomClass3.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i117.CustomClass3?>()) {
++      return (data != null ? _i117.CustomClass3.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i119.ProtocolCustomClass?>()) {
+-      return (data != null ? _i119.ProtocolCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i120.ProtocolCustomClass?>()) {
++      return (data != null ? _i120.ProtocolCustomClass.fromJson(data) : null)
+           as T;
+     }
+-    if (t == _i1.getType<_i120.ExternalCustomClass?>()) {
+-      return (data != null ? _i120.ExternalCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i121.ExternalCustomClass?>()) {
++      return (data != null ? _i121.ExternalCustomClass.fromJson(data) : null)
+           as T;
+     }
+-    if (t == _i1.getType<_i120.FreezedCustomClass?>()) {
+-      return (data != null ? _i120.FreezedCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i121.FreezedCustomClass?>()) {
++      return (data != null ? _i121.FreezedCustomClass.fromJson(data) : null)
+           as T;
+     }
+     try {
+-      return _i121.Protocol().deserialize<T>(data, t);
++      return _i122.Protocol().deserialize<T>(data, t);
+     } on _i1.DeserializationTypeNotFoundException catch (_) {}
+     try {
+-      return _i114.Protocol().deserialize<T>(data, t);
++      return _i115.Protocol().deserialize<T>(data, t);
+     } on _i1.DeserializationTypeNotFoundException catch (_) {}
+     return super.deserialize<T>(data, t);
+   }
+@@ -1963,22 +1971,22 @@ class Protocol extends _i1.SerializationManager {
+   String? getClassNameForObject(Object? data) {
+     String? className = super.getClassNameForObject(data);
+     if (className != null) return className;
+-    if (data is _i116.CustomClass) {
++    if (data is _i117.CustomClass) {
+       return 'CustomClass';
+     }
+-    if (data is _i116.CustomClass2) {
++    if (data is _i117.CustomClass2) {
+       return 'CustomClass2';
+     }
+-    if (data is _i116.CustomClass3) {
++    if (data is _i117.CustomClass3) {
+       return 'CustomClass3';
+     }
+-    if (data is _i119.ProtocolCustomClass) {
++    if (data is _i120.ProtocolCustomClass) {
+       return 'ProtocolCustomClass';
+     }
+-    if (data is _i120.ExternalCustomClass) {
++    if (data is _i121.ExternalCustomClass) {
+       return 'ExternalCustomClass';
+     }
+-    if (data is _i120.FreezedCustomClass) {
++    if (data is _i121.FreezedCustomClass) {
+       return 'FreezedCustomClass';
+     }
+     if (data is _i2.BoolDefault) {
+@@ -2323,11 +2331,14 @@ class Protocol extends _i1.SerializationManager {
+     if (data is _i113.UniqueData) {
+       return 'UniqueData';
+     }
+-    className = _i121.Protocol().getClassNameForObject(data);
++    if (data is _i114.MyFeatureModel) {
++      return 'MyFeatureModel';
++    }
++    className = _i122.Protocol().getClassNameForObject(data);
+     if (className != null) {
+       return 'serverpod_auth.$className';
+     }
+-    className = _i114.Protocol().getClassNameForObject(data);
++    className = _i115.Protocol().getClassNameForObject(data);
+     if (className != null) {
+       return 'serverpod_test_module.$className';
+     }
+@@ -2341,22 +2352,22 @@ class Protocol extends _i1.SerializationManager {
+       return super.deserializeByClassName(data);
+     }
+     if (dataClassName == 'CustomClass') {
+-      return deserialize<_i116.CustomClass>(data['data']);
++      return deserialize<_i117.CustomClass>(data['data']);
+     }
+     if (dataClassName == 'CustomClass2') {
+-      return deserialize<_i116.CustomClass2>(data['data']);
++      return deserialize<_i117.CustomClass2>(data['data']);
+     }
+     if (dataClassName == 'CustomClass3') {
+-      return deserialize<_i116.CustomClass3>(data['data']);
++      return deserialize<_i117.CustomClass3>(data['data']);
+     }
+     if (dataClassName == 'ProtocolCustomClass') {
+-      return deserialize<_i119.ProtocolCustomClass>(data['data']);
++      return deserialize<_i120.ProtocolCustomClass>(data['data']);
+     }
+     if (dataClassName == 'ExternalCustomClass') {
+-      return deserialize<_i120.ExternalCustomClass>(data['data']);
++      return deserialize<_i121.ExternalCustomClass>(data['data']);
+     }
+     if (dataClassName == 'FreezedCustomClass') {
+-      return deserialize<_i120.FreezedCustomClass>(data['data']);
++      return deserialize<_i121.FreezedCustomClass>(data['data']);
+     }
+     if (dataClassName == 'BoolDefault') {
+       return deserialize<_i2.BoolDefault>(data['data']);
+@@ -2700,13 +2711,16 @@ class Protocol extends _i1.SerializationManager {
+     if (dataClassName == 'UniqueData') {
+       return deserialize<_i113.UniqueData>(data['data']);
+     }
++    if (dataClassName == 'MyFeatureModel') {
++      return deserialize<_i114.MyFeatureModel>(data['data']);
++    }
+     if (dataClassName.startsWith('serverpod_auth.')) {
+       data['className'] = dataClassName.substring(15);
+-      return _i121.Protocol().deserializeByClassName(data);
++      return _i122.Protocol().deserializeByClassName(data);
+     }
+     if (dataClassName.startsWith('serverpod_test_module.')) {
+       data['className'] = dataClassName.substring(22);
+-      return _i114.Protocol().deserializeByClassName(data);
++      return _i115.Protocol().deserializeByClassName(data);
+     }
+     return super.deserializeByClassName(data);
+   }
+diff --git a/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/client.dart b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/client.dart
+index 290a2d6938..1560fe518f 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/client.dart
++++ b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/client.dart
+@@ -13,6 +13,8 @@ import 'package:serverpod_client/serverpod_client.dart' as _i1;
+ import 'dart:async' as _i2;
+ import 'package:serverpod_test_module_client/src/protocol/module_class.dart'
+     as _i3;
++import 'package:serverpod_test_module_client/src/protocol/module_feature/models/my_feature_model.dart'
++    as _i4;
+ 
+ /// {@category Endpoint}
+ class EndpointModule extends _i1.EndpointRef {
+@@ -71,19 +73,44 @@ class EndpointStreaming extends _i1.EndpointRef {
+       );
+ }
+ 
++/// {@category Endpoint}
++class EndpointMyModuleFeature extends _i1.EndpointRef {
++  EndpointMyModuleFeature(_i1.EndpointCaller caller) : super(caller);
++
++  @override
++  String get name => 'serverpod_test_module.myModuleFeature';
++
++  _i2.Future<String> myFeatureMethod() => caller.callServerEndpoint<String>(
++        'serverpod_test_module.myModuleFeature',
++        'myFeatureMethod',
++        {},
++      );
++
++  _i2.Future<_i4.MyModuleFeatureModel> myFeatureModel() =>
++      caller.callServerEndpoint<_i4.MyModuleFeatureModel>(
++        'serverpod_test_module.myModuleFeature',
++        'myFeatureModel',
++        {},
++      );
++}
++
+ class Caller extends _i1.ModuleEndpointCaller {
+   Caller(_i1.ServerpodClientShared client) : super(client) {
+     module = EndpointModule(this);
+     streaming = EndpointStreaming(this);
++    myModuleFeature = EndpointMyModuleFeature(this);
+   }
+ 
+   late final EndpointModule module;
+ 
+   late final EndpointStreaming streaming;
+ 
++  late final EndpointMyModuleFeature myModuleFeature;
++
+   @override
+   Map<String, _i1.EndpointRef> get endpointRefLookup => {
+         'serverpod_test_module.module': module,
+         'serverpod_test_module.streaming': streaming,
++        'serverpod_test_module.myModuleFeature': myModuleFeature,
+       };
+ }
+diff --git a/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/module_feature/models/my_feature_model.dart b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/module_feature/models/my_feature_model.dart
+new file mode 100644
+index 0000000000..94e17f2000
+--- /dev/null
++++ b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/module_feature/models/my_feature_model.dart
+@@ -0,0 +1,46 @@
++/* AUTOMATICALLY GENERATED CODE DO NOT MODIFY */
++/*   To generate run: "serverpod generate"    */
++
++// ignore_for_file: implementation_imports
++// ignore_for_file: library_private_types_in_public_api
++// ignore_for_file: non_constant_identifier_names
++// ignore_for_file: public_member_api_docs
++// ignore_for_file: type_literal_in_constant_pattern
++// ignore_for_file: use_super_parameters
++
++// ignore_for_file: no_leading_underscores_for_library_prefixes
++import 'package:serverpod_client/serverpod_client.dart' as _i1;
++
++abstract class MyModuleFeatureModel implements _i1.SerializableModel {
++  MyModuleFeatureModel._({required this.name});
++
++  factory MyModuleFeatureModel({required String name}) =
++      _MyModuleFeatureModelImpl;
++
++  factory MyModuleFeatureModel.fromJson(
++      Map<String, dynamic> jsonSerialization) {
++    return MyModuleFeatureModel(name: jsonSerialization['name'] as String);
++  }
++
++  String name;
++
++  MyModuleFeatureModel copyWith({String? name});
++  @override
++  Map<String, dynamic> toJson() {
++    return {'name': name};
++  }
++
++  @override
++  String toString() {
++    return _i1.SerializationManager.encode(this);
++  }
++}
++
++class _MyModuleFeatureModelImpl extends MyModuleFeatureModel {
++  _MyModuleFeatureModelImpl({required String name}) : super._(name: name);
++
++  @override
++  MyModuleFeatureModel copyWith({String? name}) {
++    return MyModuleFeatureModel(name: name ?? this.name);
++  }
++}
+diff --git a/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/protocol.dart b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/protocol.dart
+index b0306f1e66..5078afdeaa 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/protocol.dart
++++ b/tests/serverpod_test_module/serverpod_test_module_client/lib/src/protocol/protocol.dart
+@@ -11,7 +11,9 @@
+ // ignore_for_file: no_leading_underscores_for_library_prefixes
+ import 'package:serverpod_client/serverpod_client.dart' as _i1;
+ import 'module_class.dart' as _i2;
++import 'module_feature/models/my_feature_model.dart' as _i3;
+ export 'module_class.dart';
++export 'module_feature/models/my_feature_model.dart';
+ export 'client.dart';
+ 
+ class Protocol extends _i1.SerializationManager {
+@@ -30,9 +32,16 @@ class Protocol extends _i1.SerializationManager {
+     if (t == _i2.ModuleClass) {
+       return _i2.ModuleClass.fromJson(data) as T;
+     }
++    if (t == _i3.MyModuleFeatureModel) {
++      return _i3.MyModuleFeatureModel.fromJson(data) as T;
++    }
+     if (t == _i1.getType<_i2.ModuleClass?>()) {
+       return (data != null ? _i2.ModuleClass.fromJson(data) : null) as T;
+     }
++    if (t == _i1.getType<_i3.MyModuleFeatureModel?>()) {
++      return (data != null ? _i3.MyModuleFeatureModel.fromJson(data) : null)
++          as T;
++    }
+     return super.deserialize<T>(data, t);
+   }
+ 
+@@ -43,6 +52,9 @@ class Protocol extends _i1.SerializationManager {
+     if (data is _i2.ModuleClass) {
+       return 'ModuleClass';
+     }
++    if (data is _i3.MyModuleFeatureModel) {
++      return 'MyModuleFeatureModel';
++    }
+     return null;
+   }
+ 
+@@ -55,6 +67,9 @@ class Protocol extends _i1.SerializationManager {
+     if (dataClassName == 'ModuleClass') {
+       return deserialize<_i2.ModuleClass>(data['data']);
+     }
++    if (dataClassName == 'MyModuleFeatureModel') {
++      return deserialize<_i3.MyModuleFeatureModel>(data['data']);
++    }
+     return super.deserializeByClassName(data);
+   }
+ }
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/endpoints.dart b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/endpoints.dart
+index 33d0497132..68b5ffd3ac 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/endpoints.dart
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/endpoints.dart
+@@ -12,8 +12,9 @@
+ import 'package:serverpod/serverpod.dart' as _i1;
+ import '../endpoints/module_endpoint.dart' as _i2;
+ import '../endpoints/streaming.dart' as _i3;
++import '../module_feature/endpoints/my_feature_endpoint.dart' as _i4;
+ import 'package:serverpod_test_module_server/src/generated/module_class.dart'
+-    as _i4;
++    as _i5;
+ 
+ class Endpoints extends _i1.EndpointDispatch {
+   @override
+@@ -31,6 +32,12 @@ class Endpoints extends _i1.EndpointDispatch {
+           'streaming',
+           'serverpod_test_module',
+         ),
++      'myModuleFeature': _i4.MyModuleFeatureEndpoint()
++        ..initialize(
++          server,
++          'myModuleFeature',
++          'serverpod_test_module',
++        ),
+     };
+     connectors['module'] = _i1.EndpointConnector(
+       name: 'module',
+@@ -59,7 +66,7 @@ class Endpoints extends _i1.EndpointDispatch {
+           params: {
+             'object': _i1.ParameterDescription(
+               name: 'object',
+-              type: _i1.getType<_i4.ModuleClass>(),
++              type: _i1.getType<_i5.ModuleClass>(),
+               nullable: false,
+             )
+           },
+@@ -141,5 +148,31 @@ class Endpoints extends _i1.EndpointDispatch {
+         ),
+       },
+     );
++    connectors['myModuleFeature'] = _i1.EndpointConnector(
++      name: 'myModuleFeature',
++      endpoint: endpoints['myModuleFeature']!,
++      methodConnectors: {
++        'myFeatureMethod': _i1.MethodConnector(
++          name: 'myFeatureMethod',
++          params: {},
++          call: (
++            _i1.Session session,
++            Map<String, dynamic> params,
++          ) async =>
++              (endpoints['myModuleFeature'] as _i4.MyModuleFeatureEndpoint)
++                  .myFeatureMethod(session),
++        ),
++        'myFeatureModel': _i1.MethodConnector(
++          name: 'myFeatureModel',
++          params: {},
++          call: (
++            _i1.Session session,
++            Map<String, dynamic> params,
++          ) async =>
++              (endpoints['myModuleFeature'] as _i4.MyModuleFeatureEndpoint)
++                  .myFeatureModel(session),
++        ),
++      },
++    );
+   }
+ }
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/module_feature/models/my_feature_model.dart b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/module_feature/models/my_feature_model.dart
+new file mode 100644
+index 0000000000..26fb2f48e8
+--- /dev/null
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/module_feature/models/my_feature_model.dart
+@@ -0,0 +1,52 @@
++/* AUTOMATICALLY GENERATED CODE DO NOT MODIFY */
++/*   To generate run: "serverpod generate"    */
++
++// ignore_for_file: implementation_imports
++// ignore_for_file: library_private_types_in_public_api
++// ignore_for_file: non_constant_identifier_names
++// ignore_for_file: public_member_api_docs
++// ignore_for_file: type_literal_in_constant_pattern
++// ignore_for_file: use_super_parameters
++
++// ignore_for_file: no_leading_underscores_for_library_prefixes
++import 'package:serverpod/serverpod.dart' as _i1;
++
++abstract class MyModuleFeatureModel
++    implements _i1.SerializableModel, _i1.ProtocolSerialization {
++  MyModuleFeatureModel._({required this.name});
++
++  factory MyModuleFeatureModel({required String name}) =
++      _MyModuleFeatureModelImpl;
++
++  factory MyModuleFeatureModel.fromJson(
++      Map<String, dynamic> jsonSerialization) {
++    return MyModuleFeatureModel(name: jsonSerialization['name'] as String);
++  }
++
++  String name;
++
++  MyModuleFeatureModel copyWith({String? name});
++  @override
++  Map<String, dynamic> toJson() {
++    return {'name': name};
++  }
++
++  @override
++  Map<String, dynamic> toJsonForProtocol() {
++    return {'name': name};
++  }
++
++  @override
++  String toString() {
++    return _i1.SerializationManager.encode(this);
++  }
++}
++
++class _MyModuleFeatureModelImpl extends MyModuleFeatureModel {
++  _MyModuleFeatureModelImpl({required String name}) : super._(name: name);
++
++  @override
++  MyModuleFeatureModel copyWith({String? name}) {
++    return MyModuleFeatureModel(name: name ?? this.name);
++  }
++}
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.dart b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.dart
+index 6504312201..b87e37677b 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.dart
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.dart
+@@ -12,7 +12,9 @@
+ import 'package:serverpod/serverpod.dart' as _i1;
+ import 'package:serverpod/protocol.dart' as _i2;
+ import 'module_class.dart' as _i3;
++import 'module_feature/models/my_feature_model.dart' as _i4;
+ export 'module_class.dart';
++export 'module_feature/models/my_feature_model.dart';
+ 
+ class Protocol extends _i1.SerializationManagerServer {
+   Protocol._();
+@@ -32,9 +34,16 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (t == _i3.ModuleClass) {
+       return _i3.ModuleClass.fromJson(data) as T;
+     }
++    if (t == _i4.MyModuleFeatureModel) {
++      return _i4.MyModuleFeatureModel.fromJson(data) as T;
++    }
+     if (t == _i1.getType<_i3.ModuleClass?>()) {
+       return (data != null ? _i3.ModuleClass.fromJson(data) : null) as T;
+     }
++    if (t == _i1.getType<_i4.MyModuleFeatureModel?>()) {
++      return (data != null ? _i4.MyModuleFeatureModel.fromJson(data) : null)
++          as T;
++    }
+     try {
+       return _i2.Protocol().deserialize<T>(data, t);
+     } on _i1.DeserializationTypeNotFoundException catch (_) {}
+@@ -48,6 +57,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (data is _i3.ModuleClass) {
+       return 'ModuleClass';
+     }
++    if (data is _i4.MyModuleFeatureModel) {
++      return 'MyModuleFeatureModel';
++    }
+     className = _i2.Protocol().getClassNameForObject(data);
+     if (className != null) {
+       return 'serverpod.$className';
+@@ -64,6 +76,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (dataClassName == 'ModuleClass') {
+       return deserialize<_i3.ModuleClass>(data['data']);
+     }
++    if (dataClassName == 'MyModuleFeatureModel') {
++      return deserialize<_i4.MyModuleFeatureModel>(data['data']);
++    }
+     if (dataClassName.startsWith('serverpod.')) {
+       data['className'] = dataClassName.substring(10);
+       return _i2.Protocol().deserializeByClassName(data);
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.yaml b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.yaml
+index 1bee3a76b5..aef0edbe29 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.yaml
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/generated/protocol.yaml
+@@ -6,3 +6,6 @@ streaming:
+   - wasStreamClosedCalled:
+   - intEchoStream:
+   - simpleInputReturnStream:
++myModuleFeature:
++  - myFeatureMethod:
++  - myFeatureModel:
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/endpoints/my_feature_endpoint.dart b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/endpoints/my_feature_endpoint.dart
+new file mode 100644
+index 0000000000..e34805d745
+--- /dev/null
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/endpoints/my_feature_endpoint.dart
+@@ -0,0 +1,12 @@
++import 'package:serverpod/serverpod.dart';
++import 'package:serverpod_test_module_server/src/generated/protocol.dart';
++
++class MyModuleFeatureEndpoint extends Endpoint {
++  Future<String> myFeatureMethod(Session session) async {
++    return 'Hello, world!';
++  }
++
++  Future<MyModuleFeatureModel> myFeatureModel(Session session) async {
++    return MyModuleFeatureModel(name: 'Isak');
++  }
++}
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/models/my_feature_model.spy.yaml b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/models/my_feature_model.spy.yaml
+new file mode 100644
+index 0000000000..e1dcaf0aee
+--- /dev/null
++++ b/tests/serverpod_test_module/serverpod_test_module_server/lib/src/module_feature/models/my_feature_model.spy.yaml
+@@ -0,0 +1,3 @@
++class: MyModuleFeatureModel
++fields:
++    name: String
+diff --git a/tests/serverpod_test_module/serverpod_test_module_server/test/integration/test_tools/serverpod_test_tools.dart b/tests/serverpod_test_module/serverpod_test_module_server/test/integration/test_tools/serverpod_test_tools.dart
+index 77b5344e5d..e4efd08fc3 100644
+--- a/tests/serverpod_test_module/serverpod_test_module_server/test/integration/test_tools/serverpod_test_tools.dart
++++ b/tests/serverpod_test_module/serverpod_test_module_server/test/integration/test_tools/serverpod_test_tools.dart
+@@ -16,6 +16,8 @@ import 'package:serverpod/serverpod.dart' as _i2;
+ import 'dart:async' as _i3;
+ import 'package:serverpod_test_module_server/src/generated/module_class.dart'
+     as _i4;
++import 'package:serverpod_test_module_server/src/generated/module_feature/models/my_feature_model.dart'
++    as _i5;
+ import 'package:serverpod_test_module_server/src/generated/protocol.dart';
+ import 'package:serverpod_test_module_server/src/generated/endpoints.dart';
+ export 'package:serverpod_test/serverpod_test_public_exports.dart';
+@@ -99,6 +101,8 @@ class TestEndpoints {
+   late final _ModuleEndpoint module;
+ 
+   late final _StreamingEndpoint streaming;
++
++  late final _MyModuleFeatureEndpoint myModuleFeature;
+ }
+ 
+ class _InternalTestEndpoints extends TestEndpoints
+@@ -116,6 +120,10 @@ class _InternalTestEndpoints extends TestEndpoints
+       endpoints,
+       serializationManager,
+     );
++    myModuleFeature = _MyModuleFeatureEndpoint(
++      endpoints,
++      serializationManager,
++    );
+   }
+ }
+ 
+@@ -314,3 +322,68 @@ class _StreamingEndpoint {
+     });
+   }
+ }
++
++class _MyModuleFeatureEndpoint {
++  _MyModuleFeatureEndpoint(
++    this._endpointDispatch,
++    this._serializationManager,
++  );
++
++  final _i2.EndpointDispatch _endpointDispatch;
++
++  final _i2.SerializationManager _serializationManager;
++
++  _i3.Future<String> myFeatureMethod(
++      _i1.TestSessionBuilder sessionBuilder) async {
++    return _i1.callAwaitableFunctionAndHandleExceptions(() async {
++      var _localUniqueSession =
++          (sessionBuilder as _i1.InternalTestSessionBuilder).internalBuild(
++        endpoint: 'myModuleFeature',
++        method: 'myFeatureMethod',
++      );
++      try {
++        var _localCallContext = await _endpointDispatch.getMethodCallContext(
++          createSessionCallback: (_) => _localUniqueSession,
++          endpointPath: 'myModuleFeature',
++          methodName: 'myFeatureMethod',
++          parameters: _i1.testObjectToJson({}),
++          serializationManager: _serializationManager,
++        );
++        var _localReturnValue = await (_localCallContext.method.call(
++          _localUniqueSession,
++          _localCallContext.arguments,
++        ) as _i3.Future<String>);
++        return _localReturnValue;
++      } finally {
++        await _localUniqueSession.close();
++      }
++    });
++  }
++
++  _i3.Future<_i5.MyModuleFeatureModel> myFeatureModel(
++      _i1.TestSessionBuilder sessionBuilder) async {
++    return _i1.callAwaitableFunctionAndHandleExceptions(() async {
++      var _localUniqueSession =
++          (sessionBuilder as _i1.InternalTestSessionBuilder).internalBuild(
++        endpoint: 'myModuleFeature',
++        method: 'myFeatureModel',
++      );
++      try {
++        var _localCallContext = await _endpointDispatch.getMethodCallContext(
++          createSessionCallback: (_) => _localUniqueSession,
++          endpointPath: 'myModuleFeature',
++          methodName: 'myFeatureModel',
++          parameters: _i1.testObjectToJson({}),
++          serializationManager: _serializationManager,
++        );
++        var _localReturnValue = await (_localCallContext.method.call(
++          _localUniqueSession,
++          _localCallContext.arguments,
++        ) as _i3.Future<_i5.MyModuleFeatureModel>);
++        return _localReturnValue;
++      } finally {
++        await _localUniqueSession.close();
++      }
++    });
++  }
++}
+diff --git a/tests/serverpod_test_server/lib/src/generated/endpoints.dart b/tests/serverpod_test_server/lib/src/generated/endpoints.dart
+index 796dbfb564..a5bc1ebf34 100644
+--- a/tests/serverpod_test_server/lib/src/generated/endpoints.dart
++++ b/tests/serverpod_test_server/lib/src/generated/endpoints.dart
+@@ -5145,7 +5145,17 @@ class Endpoints extends _i1.EndpointDispatch {
+           ) async =>
+               (endpoints['myFeature'] as _i37.MyFeatureEndpoint)
+                   .myFeatureMethod(session),
+-        )
++        ),
++        'myFeatureModel': _i1.MethodConnector(
++          name: 'myFeatureModel',
++          params: {},
++          call: (
++            _i1.Session session,
++            Map<String, dynamic> params,
++          ) async =>
++              (endpoints['myFeature'] as _i37.MyFeatureEndpoint)
++                  .myFeatureModel(session),
++        ),
+       },
+     );
+     modules['serverpod_auth'] = _i50.Endpoints()..initializeEndpoints(server);
+diff --git a/tests/serverpod_test_server/lib/src/generated/my_feature/models/my_feature_model.dart b/tests/serverpod_test_server/lib/src/generated/my_feature/models/my_feature_model.dart
+new file mode 100644
+index 0000000000..7df75c014f
+--- /dev/null
++++ b/tests/serverpod_test_server/lib/src/generated/my_feature/models/my_feature_model.dart
+@@ -0,0 +1,50 @@
++/* AUTOMATICALLY GENERATED CODE DO NOT MODIFY */
++/*   To generate run: "serverpod generate"    */
++
++// ignore_for_file: implementation_imports
++// ignore_for_file: library_private_types_in_public_api
++// ignore_for_file: non_constant_identifier_names
++// ignore_for_file: public_member_api_docs
++// ignore_for_file: type_literal_in_constant_pattern
++// ignore_for_file: use_super_parameters
++
++// ignore_for_file: no_leading_underscores_for_library_prefixes
++import 'package:serverpod/serverpod.dart' as _i1;
++
++abstract class MyFeatureModel
++    implements _i1.SerializableModel, _i1.ProtocolSerialization {
++  MyFeatureModel._({required this.name});
++
++  factory MyFeatureModel({required String name}) = _MyFeatureModelImpl;
++
++  factory MyFeatureModel.fromJson(Map<String, dynamic> jsonSerialization) {
++    return MyFeatureModel(name: jsonSerialization['name'] as String);
++  }
++
++  String name;
++
++  MyFeatureModel copyWith({String? name});
++  @override
++  Map<String, dynamic> toJson() {
++    return {'name': name};
++  }
++
++  @override
++  Map<String, dynamic> toJsonForProtocol() {
++    return {'name': name};
++  }
++
++  @override
++  String toString() {
++    return _i1.SerializationManager.encode(this);
++  }
++}
++
++class _MyFeatureModelImpl extends MyFeatureModel {
++  _MyFeatureModelImpl({required String name}) : super._(name: name);
++
++  @override
++  MyFeatureModel copyWith({String? name}) {
++    return MyFeatureModel(name: name ?? this.name);
++  }
++}
+diff --git a/tests/serverpod_test_server/lib/src/generated/protocol.dart b/tests/serverpod_test_server/lib/src/generated/protocol.dart
+index 7e2fe13ce1..8c0db85721 100644
+--- a/tests/serverpod_test_server/lib/src/generated/protocol.dart
++++ b/tests/serverpod_test_server/lib/src/generated/protocol.dart
+@@ -136,13 +136,14 @@ import 'types.dart' as _i115;
+ import 'types_list.dart' as _i116;
+ import 'types_map.dart' as _i117;
+ import 'unique_data.dart' as _i118;
+-import 'dart:typed_data' as _i119;
+-import 'package:serverpod_test_server/src/custom_classes.dart' as _i120;
+-import 'package:serverpod_test_server/src/generated/simple_data.dart' as _i121;
+-import 'package:serverpod_test_server/src/generated/test_enum.dart' as _i122;
++import 'my_feature/models/my_feature_model.dart' as _i119;
++import 'dart:typed_data' as _i120;
++import 'package:serverpod_test_server/src/custom_classes.dart' as _i121;
++import 'package:serverpod_test_server/src/generated/simple_data.dart' as _i122;
++import 'package:serverpod_test_server/src/generated/test_enum.dart' as _i123;
+ import 'package:serverpod_test_server/src/protocol_custom_classes.dart'
+-    as _i123;
+-import 'package:serverpod_test_shared/serverpod_test_shared.dart' as _i124;
++    as _i124;
++import 'package:serverpod_test_shared/serverpod_test_shared.dart' as _i125;
+ export 'defaults/boolean/bool_default.dart';
+ export 'defaults/boolean/bool_default_mix.dart';
+ export 'defaults/boolean/bool_default_model.dart';
+@@ -258,6 +259,7 @@ export 'types.dart';
+ export 'types_list.dart';
+ export 'types_map.dart';
+ export 'unique_data.dart';
++export 'my_feature/models/my_feature_model.dart';
+ 
+ class Protocol extends _i1.SerializationManagerServer {
+   Protocol._();
+@@ -5079,6 +5081,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (t == _i118.UniqueData) {
+       return _i118.UniqueData.fromJson(data) as T;
+     }
++    if (t == _i119.MyFeatureModel) {
++      return _i119.MyFeatureModel.fromJson(data) as T;
++    }
+     if (t == _i1.getType<_i5.BoolDefault?>()) {
+       return (data != null ? _i5.BoolDefault.fromJson(data) : null) as T;
+     }
+@@ -5470,6 +5475,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (t == _i1.getType<_i118.UniqueData?>()) {
+       return (data != null ? _i118.UniqueData.fromJson(data) : null) as T;
+     }
++    if (t == _i1.getType<_i119.MyFeatureModel?>()) {
++      return (data != null ? _i119.MyFeatureModel.fromJson(data) : null) as T;
++    }
+     if (t == _i1.getType<List<_i41.EmptyModelRelationItem>?>()) {
+       return (data != null
+           ? (data as List)
+@@ -5651,22 +5659,22 @@ class Protocol extends _i1.SerializationManagerServer {
+           ? (data as List).map((e) => deserialize<DateTime?>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == List<_i119.ByteData>) {
+-      return (data as List).map((e) => deserialize<_i119.ByteData>(e)).toList()
++    if (t == List<_i120.ByteData>) {
++      return (data as List).map((e) => deserialize<_i120.ByteData>(e)).toList()
+           as dynamic;
+     }
+-    if (t == _i1.getType<List<_i119.ByteData>?>()) {
++    if (t == _i1.getType<List<_i120.ByteData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i119.ByteData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i120.ByteData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == List<_i119.ByteData?>) {
+-      return (data as List).map((e) => deserialize<_i119.ByteData?>(e)).toList()
++    if (t == List<_i120.ByteData?>) {
++      return (data as List).map((e) => deserialize<_i120.ByteData?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == _i1.getType<List<_i119.ByteData?>?>()) {
++    if (t == _i1.getType<List<_i120.ByteData?>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i119.ByteData?>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i120.ByteData?>(e)).toList()
+           : null) as dynamic;
+     }
+     if (t == List<Duration>) {
+@@ -5727,8 +5735,8 @@ class Protocol extends _i1.SerializationManagerServer {
+               (k, v) => MapEntry(deserialize<String>(k), deserialize<int?>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i120.CustomClass3) {
+-      return _i120.CustomClass3.fromJson(data) as T;
++    if (t == _i121.CustomClass3) {
++      return _i121.CustomClass3.fromJson(data) as T;
+     }
+     if (t == List<_i113.TestEnum>) {
+       return (data as List).map((e) => deserialize<_i113.TestEnum>(e)).toList()
+@@ -5756,9 +5764,9 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<DateTime>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i119.ByteData>) {
++    if (t == Map<String, _i120.ByteData>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i119.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i120.ByteData>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, Duration>) {
+@@ -5785,9 +5793,9 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<DateTime?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i119.ByteData?>) {
++    if (t == Map<String, _i120.ByteData?>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i119.ByteData?>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i120.ByteData?>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, Duration?>) {
+@@ -5892,9 +5900,9 @@ class Protocol extends _i1.SerializationManagerServer {
+           ? (data as List).map((e) => deserialize<String>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i119.ByteData>?>()) {
++    if (t == _i1.getType<List<_i120.ByteData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i119.ByteData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i120.ByteData>(e)).toList()
+           : null) as dynamic;
+     }
+     if (t == _i1.getType<List<Duration>?>()) {
+@@ -5977,10 +5985,10 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<String>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<_i119.ByteData, String>?>()) {
++    if (t == _i1.getType<Map<_i120.ByteData, String>?>()) {
+       return (data != null
+           ? Map.fromEntries((data as List).map((e) => MapEntry(
+-              deserialize<_i119.ByteData>(e['k']),
++              deserialize<_i120.ByteData>(e['k']),
+               deserialize<String>(e['v']))))
+           : null) as dynamic;
+     }
+@@ -6065,10 +6073,10 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<String>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i119.ByteData>?>()) {
++    if (t == _i1.getType<Map<String, _i120.ByteData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i119.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i120.ByteData>(v)))
+           : null) as dynamic;
+     }
+     if (t == _i1.getType<Map<String, Duration>?>()) {
+@@ -6122,9 +6130,9 @@ class Protocol extends _i1.SerializationManagerServer {
+       return (data as List).map((e) => deserialize<String>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i121.SimpleData>) {
++    if (t == List<_i122.SimpleData>) {
+       return (data as List)
+-          .map((e) => deserialize<_i121.SimpleData>(e))
++          .map((e) => deserialize<_i122.SimpleData>(e))
+           .toList() as dynamic;
+     }
+     if (t == List<int>) {
+@@ -6215,40 +6223,40 @@ class Protocol extends _i1.SerializationManagerServer {
+       return (data as List).map((e) => deserialize<DateTime?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i119.ByteData>) {
+-      return (data as List).map((e) => deserialize<_i119.ByteData>(e)).toList()
++    if (t == List<_i120.ByteData>) {
++      return (data as List).map((e) => deserialize<_i120.ByteData>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i119.ByteData?>) {
+-      return (data as List).map((e) => deserialize<_i119.ByteData?>(e)).toList()
++    if (t == List<_i120.ByteData?>) {
++      return (data as List).map((e) => deserialize<_i120.ByteData?>(e)).toList()
+           as dynamic;
+     }
+-    if (t == List<_i121.SimpleData?>) {
++    if (t == List<_i122.SimpleData?>) {
+       return (data as List)
+-          .map((e) => deserialize<_i121.SimpleData?>(e))
++          .map((e) => deserialize<_i122.SimpleData?>(e))
+           .toList() as dynamic;
+     }
+-    if (t == _i1.getType<List<_i121.SimpleData>?>()) {
++    if (t == _i1.getType<List<_i122.SimpleData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i121.SimpleData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i122.SimpleData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i121.SimpleData>?>()) {
++    if (t == _i1.getType<List<_i122.SimpleData>?>()) {
+       return (data != null
+-          ? (data as List).map((e) => deserialize<_i121.SimpleData>(e)).toList()
++          ? (data as List).map((e) => deserialize<_i122.SimpleData>(e)).toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i121.SimpleData?>?>()) {
++    if (t == _i1.getType<List<_i122.SimpleData?>?>()) {
+       return (data != null
+           ? (data as List)
+-              .map((e) => deserialize<_i121.SimpleData?>(e))
++              .map((e) => deserialize<_i122.SimpleData?>(e))
+               .toList()
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<List<_i121.SimpleData?>?>()) {
++    if (t == _i1.getType<List<_i122.SimpleData?>?>()) {
+       return (data != null
+           ? (data as List)
+-              .map((e) => deserialize<_i121.SimpleData?>(e))
++              .map((e) => deserialize<_i122.SimpleData?>(e))
+               .toList()
+           : null) as dynamic;
+     }
+@@ -6303,14 +6311,14 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<int>(e['k']), deserialize<int>(e['v']))))
+           as dynamic;
+     }
+-    if (t == Map<_i122.TestEnum, int>) {
++    if (t == Map<_i123.TestEnum, int>) {
+       return Map.fromEntries((data as List).map((e) => MapEntry(
+-              deserialize<_i122.TestEnum>(e['k']), deserialize<int>(e['v']))))
++              deserialize<_i123.TestEnum>(e['k']), deserialize<int>(e['v']))))
+           as dynamic;
+     }
+-    if (t == Map<String, _i122.TestEnum>) {
++    if (t == Map<String, _i123.TestEnum>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i122.TestEnum>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i123.TestEnum>(v)))
+           as dynamic;
+     }
+     if (t == Map<String, double>) {
+@@ -6349,47 +6357,47 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<DateTime?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i119.ByteData>) {
++    if (t == Map<String, _i120.ByteData>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i119.ByteData>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i120.ByteData>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i119.ByteData?>) {
++    if (t == Map<String, _i120.ByteData?>) {
+       return (data as Map).map((k, v) =>
+-              MapEntry(deserialize<String>(k), deserialize<_i119.ByteData?>(v)))
++              MapEntry(deserialize<String>(k), deserialize<_i120.ByteData?>(v)))
+           as dynamic;
+     }
+-    if (t == Map<String, _i121.SimpleData>) {
++    if (t == Map<String, _i122.SimpleData>) {
+       return (data as Map).map((k, v) => MapEntry(
+-          deserialize<String>(k), deserialize<_i121.SimpleData>(v))) as dynamic;
++          deserialize<String>(k), deserialize<_i122.SimpleData>(v))) as dynamic;
+     }
+-    if (t == Map<String, _i121.SimpleData?>) {
++    if (t == Map<String, _i122.SimpleData?>) {
+       return (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i121.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i122.SimpleData?>(v)))
+           as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i121.SimpleData>?>()) {
++    if (t == _i1.getType<Map<String, _i122.SimpleData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i121.SimpleData>(v)))
++              deserialize<String>(k), deserialize<_i122.SimpleData>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i121.SimpleData>?>()) {
++    if (t == _i1.getType<Map<String, _i122.SimpleData>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i121.SimpleData>(v)))
++              deserialize<String>(k), deserialize<_i122.SimpleData>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i121.SimpleData?>?>()) {
++    if (t == _i1.getType<Map<String, _i122.SimpleData?>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i121.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i122.SimpleData?>(v)))
+           : null) as dynamic;
+     }
+-    if (t == _i1.getType<Map<String, _i121.SimpleData?>?>()) {
++    if (t == _i1.getType<Map<String, _i122.SimpleData?>?>()) {
+       return (data != null
+           ? (data as Map).map((k, v) => MapEntry(
+-              deserialize<String>(k), deserialize<_i121.SimpleData?>(v)))
++              deserialize<String>(k), deserialize<_i122.SimpleData?>(v)))
+           : null) as dynamic;
+     }
+     if (t == Map<String, Duration>) {
+@@ -6402,40 +6410,40 @@ class Protocol extends _i1.SerializationManagerServer {
+               MapEntry(deserialize<String>(k), deserialize<Duration?>(v)))
+           as dynamic;
+     }
+-    if (t == _i120.CustomClass) {
+-      return _i120.CustomClass.fromJson(data) as T;
++    if (t == _i121.CustomClass) {
++      return _i121.CustomClass.fromJson(data) as T;
+     }
+-    if (t == _i120.CustomClass2) {
+-      return _i120.CustomClass2.fromJson(data) as T;
++    if (t == _i121.CustomClass2) {
++      return _i121.CustomClass2.fromJson(data) as T;
+     }
+-    if (t == _i123.ProtocolCustomClass) {
+-      return _i123.ProtocolCustomClass.fromJson(data) as T;
++    if (t == _i124.ProtocolCustomClass) {
++      return _i124.ProtocolCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i124.ExternalCustomClass) {
+-      return _i124.ExternalCustomClass.fromJson(data) as T;
++    if (t == _i125.ExternalCustomClass) {
++      return _i125.ExternalCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i124.FreezedCustomClass) {
+-      return _i124.FreezedCustomClass.fromJson(data) as T;
++    if (t == _i125.FreezedCustomClass) {
++      return _i125.FreezedCustomClass.fromJson(data) as T;
+     }
+-    if (t == _i1.getType<_i120.CustomClass?>()) {
+-      return (data != null ? _i120.CustomClass.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i121.CustomClass?>()) {
++      return (data != null ? _i121.CustomClass.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i120.CustomClass2?>()) {
+-      return (data != null ? _i120.CustomClass2.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i121.CustomClass2?>()) {
++      return (data != null ? _i121.CustomClass2.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i120.CustomClass3?>()) {
+-      return (data != null ? _i120.CustomClass3.fromJson(data) : null) as T;
++    if (t == _i1.getType<_i121.CustomClass3?>()) {
++      return (data != null ? _i121.CustomClass3.fromJson(data) : null) as T;
+     }
+-    if (t == _i1.getType<_i123.ProtocolCustomClass?>()) {
+-      return (data != null ? _i123.ProtocolCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i124.ProtocolCustomClass?>()) {
++      return (data != null ? _i124.ProtocolCustomClass.fromJson(data) : null)
+           as T;
+     }
+-    if (t == _i1.getType<_i124.ExternalCustomClass?>()) {
+-      return (data != null ? _i124.ExternalCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i125.ExternalCustomClass?>()) {
++      return (data != null ? _i125.ExternalCustomClass.fromJson(data) : null)
+           as T;
+     }
+-    if (t == _i1.getType<_i124.FreezedCustomClass?>()) {
+-      return (data != null ? _i124.FreezedCustomClass.fromJson(data) : null)
++    if (t == _i1.getType<_i125.FreezedCustomClass?>()) {
++      return (data != null ? _i125.FreezedCustomClass.fromJson(data) : null)
+           as T;
+     }
+     try {
+@@ -6454,22 +6462,22 @@ class Protocol extends _i1.SerializationManagerServer {
+   String? getClassNameForObject(Object? data) {
+     String? className = super.getClassNameForObject(data);
+     if (className != null) return className;
+-    if (data is _i120.CustomClass) {
++    if (data is _i121.CustomClass) {
+       return 'CustomClass';
+     }
+-    if (data is _i120.CustomClass2) {
++    if (data is _i121.CustomClass2) {
+       return 'CustomClass2';
+     }
+-    if (data is _i120.CustomClass3) {
++    if (data is _i121.CustomClass3) {
+       return 'CustomClass3';
+     }
+-    if (data is _i123.ProtocolCustomClass) {
++    if (data is _i124.ProtocolCustomClass) {
+       return 'ProtocolCustomClass';
+     }
+-    if (data is _i124.ExternalCustomClass) {
++    if (data is _i125.ExternalCustomClass) {
+       return 'ExternalCustomClass';
+     }
+-    if (data is _i124.FreezedCustomClass) {
++    if (data is _i125.FreezedCustomClass) {
+       return 'FreezedCustomClass';
+     }
+     if (data is _i5.BoolDefault) {
+@@ -6820,6 +6828,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (data is _i118.UniqueData) {
+       return 'UniqueData';
+     }
++    if (data is _i119.MyFeatureModel) {
++      return 'MyFeatureModel';
++    }
+     className = _i2.Protocol().getClassNameForObject(data);
+     if (className != null) {
+       return 'serverpod.$className';
+@@ -6842,22 +6853,22 @@ class Protocol extends _i1.SerializationManagerServer {
+       return super.deserializeByClassName(data);
+     }
+     if (dataClassName == 'CustomClass') {
+-      return deserialize<_i120.CustomClass>(data['data']);
++      return deserialize<_i121.CustomClass>(data['data']);
+     }
+     if (dataClassName == 'CustomClass2') {
+-      return deserialize<_i120.CustomClass2>(data['data']);
++      return deserialize<_i121.CustomClass2>(data['data']);
+     }
+     if (dataClassName == 'CustomClass3') {
+-      return deserialize<_i120.CustomClass3>(data['data']);
++      return deserialize<_i121.CustomClass3>(data['data']);
+     }
+     if (dataClassName == 'ProtocolCustomClass') {
+-      return deserialize<_i123.ProtocolCustomClass>(data['data']);
++      return deserialize<_i124.ProtocolCustomClass>(data['data']);
+     }
+     if (dataClassName == 'ExternalCustomClass') {
+-      return deserialize<_i124.ExternalCustomClass>(data['data']);
++      return deserialize<_i125.ExternalCustomClass>(data['data']);
+     }
+     if (dataClassName == 'FreezedCustomClass') {
+-      return deserialize<_i124.FreezedCustomClass>(data['data']);
++      return deserialize<_i125.FreezedCustomClass>(data['data']);
+     }
+     if (dataClassName == 'BoolDefault') {
+       return deserialize<_i5.BoolDefault>(data['data']);
+@@ -7207,6 +7218,9 @@ class Protocol extends _i1.SerializationManagerServer {
+     if (dataClassName == 'UniqueData') {
+       return deserialize<_i118.UniqueData>(data['data']);
+     }
++    if (dataClassName == 'MyFeatureModel') {
++      return deserialize<_i119.MyFeatureModel>(data['data']);
++    }
+     if (dataClassName.startsWith('serverpod.')) {
+       data['className'] = dataClassName.substring(10);
+       return _i2.Protocol().deserializeByClassName(data);
+diff --git a/tests/serverpod_test_server/lib/src/generated/protocol.yaml b/tests/serverpod_test_server/lib/src/generated/protocol.yaml
+index 92e3937830..3794dec77e 100644
+--- a/tests/serverpod_test_server/lib/src/generated/protocol.yaml
++++ b/tests/serverpod_test_server/lib/src/generated/protocol.yaml
+@@ -294,3 +294,4 @@ authenticatedTestTools:
+   - intEchoStream:
+ myFeature:
+   - myFeatureMethod:
++  - myFeatureModel:
+diff --git a/tests/serverpod_test_server/lib/src/my_feature/endpoints/my_feature_endpoint.dart b/tests/serverpod_test_server/lib/src/my_feature/endpoints/my_feature_endpoint.dart
+index 2fdbf6368d..ba93437692 100644
+--- a/tests/serverpod_test_server/lib/src/my_feature/endpoints/my_feature_endpoint.dart
++++ b/tests/serverpod_test_server/lib/src/my_feature/endpoints/my_feature_endpoint.dart
+@@ -1,7 +1,12 @@
+ import 'package:serverpod/serverpod.dart';
++import 'package:serverpod_test_server/src/generated/protocol.dart';
+ 
+ class MyFeatureEndpoint extends Endpoint {
+   Future<String> myFeatureMethod(Session session) async {
+     return 'Hello, world!';
+   }
++
++  Future<MyFeatureModel> myFeatureModel(Session session) async {
++    return MyFeatureModel(name: 'Alex');
++  }
+ }
+diff --git a/tests/serverpod_test_server/lib/src/my_feature/models/my_feature_model.spy.yaml b/tests/serverpod_test_server/lib/src/my_feature/models/my_feature_model.spy.yaml
+new file mode 100644
+index 0000000000..6c71403dc6
+--- /dev/null
++++ b/tests/serverpod_test_server/lib/src/my_feature/models/my_feature_model.spy.yaml
+@@ -0,0 +1,3 @@
++class: MyFeatureModel
++fields:
++    name: String
+diff --git a/tests/serverpod_test_server/test_e2e/definition_in_feature_directory_test.dart b/tests/serverpod_test_server/test_e2e/definition_in_feature_directory_test.dart
+new file mode 100644
+index 0000000000..0c22132b44
+--- /dev/null
++++ b/tests/serverpod_test_server/test_e2e/definition_in_feature_directory_test.dart
+@@ -0,0 +1,53 @@
++import 'package:serverpod_test_client/serverpod_test_client.dart';
++import 'package:serverpod_test_module_client/serverpod_test_module_client.dart';
++import 'package:serverpod_test_server/test_util/config.dart';
++import 'package:serverpod_test_server/test_util/test_key_manager.dart';
++import 'package:test/test.dart';
++
++void main() {
++  var client = Client(
++    serverUrl,
++    authenticationKeyManager: TestAuthKeyManager(),
++  );
++
++  group('Given an endpoint that is defined outside of the endpoint directory',
++      () {
++    test('when calling the endpoint then call is successful', () async {
++      var response = client.myFeature.myFeatureMethod();
++      await expectLater(response, completion('Hello, world!'));
++    });
++  });
++
++  group(
++      'Given a module endpoint that is defined outside of the endpoint directory',
++      () {
++    test('when calling the endpoint then call is successful', () async {
++      var response = client.modules.module.myModuleFeature.myFeatureMethod();
++      await expectLater(response, completion('Hello, world!'));
++    });
++  });
++
++  group(
++      'Given an endpoint that returns a model defined outside of the models directory',
++      () {
++    test('when calling the endpoint then call is successful', () async {
++      var response = client.myFeature.myFeatureModel();
++      await expectLater(
++          response,
++          completion(isA<MyFeatureModel>()
++              .having((model) => model.name, 'name', 'Alex')));
++    });
++  });
++
++  group(
++      'Given a module endpoint that returns a model defined outside of the models directory',
++      () {
++    test('when calling the endpoint then call is successful', () async {
++      var response = client.modules.module.myModuleFeature.myFeatureModel();
++      await expectLater(
++          response,
++          completion(isA<MyModuleFeatureModel>()
++              .having((model) => model.name, 'name', 'Isak')));
++    });
++  });
++}
+diff --git a/tests/serverpod_test_server/test_e2e/endpoint_test.dart b/tests/serverpod_test_server/test_e2e/endpoint_test.dart
+deleted file mode 100644
+index 3f5b1bc301..0000000000
+--- a/tests/serverpod_test_server/test_e2e/endpoint_test.dart
++++ /dev/null
+@@ -1,19 +0,0 @@
+-import 'package:serverpod_test_client/serverpod_test_client.dart';
+-import 'package:serverpod_test_server/test_util/config.dart';
+-import 'package:serverpod_test_server/test_util/test_key_manager.dart';
+-import 'package:test/test.dart';
+-
+-void main() {
+-  var client = Client(
+-    serverUrl,
+-    authenticationKeyManager: TestAuthKeyManager(),
+-  );
+-
+-  group('Given an endpoint that is defined outside of the endpoint directory',
+-      () {
+-    test('when calling the endpoint then call is successful', () async {
+-      var response = client.myFeature.myFeatureMethod();
+-      await expectLater(response, completion('Hello, world!'));
+-    });
+-  });
+-}
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/serverpod_test_tools.dart b/tests/serverpod_test_server/test_integration/test_tools/serverpod_test_tools.dart
+index 21103e4c79..ec0d4af7de 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/serverpod_test_tools.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/serverpod_test_tools.dart
+@@ -40,6 +40,8 @@ import 'package:serverpod_test_server/src/generated/scopes/scope_server_only_fie
+     as _i20;
+ import 'package:serverpod_test_server/src/generated/scopes/scope_server_only_field_child.dart'
+     as _i21;
++import 'package:serverpod_test_server/src/generated/my_feature/models/my_feature_model.dart'
++    as _i22;
+ import 'package:serverpod_test_server/src/generated/protocol.dart';
+ import 'package:serverpod_test_server/src/generated/endpoints.dart';
+ export 'package:serverpod_test/serverpod_test_public_exports.dart';
+@@ -8295,4 +8297,31 @@ class _MyFeatureEndpoint {
+       }
+     });
+   }
++
++  _i3.Future<_i22.MyFeatureModel> myFeatureModel(
++      _i1.TestSessionBuilder sessionBuilder) async {
++    return _i1.callAwaitableFunctionAndHandleExceptions(() async {
++      var _localUniqueSession =
++          (sessionBuilder as _i1.InternalTestSessionBuilder).internalBuild(
++        endpoint: 'myFeature',
++        method: 'myFeatureModel',
++      );
++      try {
++        var _localCallContext = await _endpointDispatch.getMethodCallContext(
++          createSessionCallback: (_) => _localUniqueSession,
++          endpointPath: 'myFeature',
++          methodName: 'myFeatureModel',
++          parameters: _i1.testObjectToJson({}),
++          serializationManager: _serializationManager,
++        );
++        var _localReturnValue = await (_localCallContext.method.call(
++          _localUniqueSession,
++          _localCallContext.arguments,
++        ) as _i3.Future<_i22.MyFeatureModel>);
++        return _localReturnValue;
++      } finally {
++        await _localUniqueSession.close();
++      }
++    });
++  }
+ }
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/model_analyzer.dart b/tools/serverpod_cli/lib/src/analyzer/models/model_analyzer.dart
+index 8b3674facf..99fbb37fae 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/model_analyzer.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/model_analyzer.dart
+@@ -146,6 +146,12 @@ class SerializableModelAnalyzer {
+       parsedModels: ParsedModelsCollection(models),
+     );
+ 
++    var generateCollisionErrors = validateDuplicateFileName(
++      documentContents,
++      restrictions,
++    );
++    collector.addErrors(generateCollisionErrors);
++
+     Set<ValidateNode> documentStructure;
+     switch (definitionType) {
+       case Keyword.classType:
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
+index 22f00e2171..b342bc2732 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
+@@ -1,5 +1,7 @@
++import 'package:path/path.dart' as path;
+ import 'package:serverpod_cli/src/analyzer/models/checker/analyze_checker.dart';
+ import 'package:serverpod_cli/src/analyzer/models/definitions.dart';
++import 'package:serverpod_cli/src/util/model_helper.dart';
+ 
+ /// A collection of all parsed models, and their potential collisions.
+ class ParsedModelsCollection {
+@@ -8,12 +10,14 @@ class ParsedModelsCollection {
+   late final Map<String, List<SerializableModelDefinition>> classNames;
+   late final Map<String, List<SerializableModelDefinition>> tableNames;
+   late final Map<String, List<SerializableModelDefinition>> indexNames;
++  late final Map<String, List<SerializableModelDefinition>> filePaths;
+ 
+   ParsedModelsCollection(this.models) {
+     modules = models.map((e) => e.moduleAlias).toSet();
+     classNames = _createClassNameMap(models);
+     tableNames = _createTableNameMap(models);
+     indexNames = _createIndexNameMap(models);
++    filePaths = _createFilePathMap(models);
+   }
+ 
+   Set<String> get moduleNames => modules;
+@@ -76,6 +80,44 @@ class ParsedModelsCollection {
+     return indexNames;
+   }
+ 
++  Map<String, List<SerializableModelDefinition>> _createFilePathMap(
++    List<SerializableModelDefinition> models,
++  ) {
++    Map<String, List<SerializableModelDefinition>> filePaths = {};
++    for (var model
++        in models.where((e) => e.moduleAlias == defaultModuleAlias)) {
++      filePaths.update(
++        _buildFilePath(model),
++        (value) => value..add(model),
++        ifAbsent: () => [model],
++      );
++    }
++
++    return filePaths;
++  }
++
++  String _buildFilePath(SerializableModelDefinition model) {
++    return path.joinAll([...model.subDirParts, '${model.fileName}.dart']);
++  }
++
++  bool isFilePathUnique(
++    SerializableModelDefinition classDefinition,
++  ) {
++    return _isKeyGloballyUnique(
++      classDefinition,
++      _buildFilePath(classDefinition),
++      filePaths,
++    );
++  }
++
++  SerializableModelDefinition findByFilePath(
++    SerializableModelDefinition model, {
++    SerializableModelDefinition? ignore,
++  }) {
++    var models = _filterIgnored(filePaths[_buildFilePath(model)], ignore);
++    return models.first;
++  }
++
+   bool isTableNameUnique(
+     SerializableModelDefinition? classDefinition,
+     String tableName,
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_validator.dart b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_validator.dart
+index 65f199e68f..d1f29bd7b8 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_validator.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_validator.dart
+@@ -1,5 +1,6 @@
+ import 'package:serverpod_cli/src/analyzer/code_analysis_collector.dart';
+ import 'package:serverpod_cli/src/analyzer/models/validation/keywords.dart';
++import 'package:serverpod_cli/src/analyzer/models/validation/restrictions.dart';
+ import 'package:serverpod_cli/src/util/extensions.dart';
+ import 'package:yaml/yaml.dart';
+ 
+@@ -42,6 +43,29 @@ List<SourceSpanSeverityException> validateTopLevelModelType(
+   return errors;
+ }
+ 
++List<SourceSpanSeverityException> validateDuplicateFileName(
++  YamlMap documentContents,
++  Restrictions restrictions,
++) {
++  var model = restrictions.documentDefinition;
++  var parsedModels = restrictions.parsedModels;
++
++  if (model == null) return [];
++
++  if (!parsedModels.isFilePathUnique(model)) {
++    var otherClass = parsedModels.findByFilePath(model, ignore: model);
++
++    return [
++      SourceSpanSeverityException(
++        'File collision with "${otherClass.className}" was detected for the generated model, please provide a unique path or filename for the model.',
++        documentContents.span,
++      )
++    ];
++  }
++
++  return [];
++}
++
+ /// Recursively validates a yaml document against a set of [ValidateNode]s.
+ /// The [documentType] represents the parent key of the [documentContents],
+ /// in the initial processing this is expected to be the top level model type
+diff --git a/tools/serverpod_cli/lib/src/test_util/builders/model_source_builder.dart b/tools/serverpod_cli/lib/src/test_util/builders/model_source_builder.dart
+index 8081b820ad..07450dfcd8 100644
+--- a/tools/serverpod_cli/lib/src/test_util/builders/model_source_builder.dart
++++ b/tools/serverpod_cli/lib/src/test_util/builders/model_source_builder.dart
+@@ -2,22 +2,25 @@ import 'package:path/path.dart';
+ import 'package:serverpod_cli/src/util/model_helper.dart';
+ 
+ class ModelSourceBuilder {
+-  late String moduleAlias;
+-  late String yaml;
+-  late List<String> _yamlSourcePathParts;
++  String moduleAlias;
++  String yaml;
++  String fileName;
++  List<String> yamlSourcePathParts;
+   Uri? yamlSourceUri;
+-  late List<String> protocolRootPathParts;
++  List<String> subDirPathParts;
++  String fileExtension;
+ 
+-  ModelSourceBuilder() {
+-    withYaml('''
++  ModelSourceBuilder()
++      : fileExtension = '.yaml',
++        subDirPathParts = [],
++        fileName = 'example',
++        yamlSourcePathParts = ['lib', 'src', 'model'],
++        moduleAlias = defaultModuleAlias,
++        yaml = '''
+     class: Example
+     fields:
+       name: String
+-    ''');
+-    _yamlSourcePathParts = ['lib', 'src', 'model', 'example.yaml'];
+-    protocolRootPathParts = [];
+-    moduleAlias = defaultModuleAlias;
+-  }
++''';
+ 
+   ModelSourceBuilder withModuleAlias(String moduleAlias) {
+     this.moduleAlias = moduleAlias;
+@@ -25,7 +28,7 @@ class ModelSourceBuilder {
+   }
+ 
+   ModelSourceBuilder withFileName(String fileName) {
+-    _yamlSourcePathParts = ['lib', 'src', 'model', '$fileName.yaml'];
++    this.fileName = fileName;
+     return this;
+   }
+ 
+@@ -39,21 +42,37 @@ class ModelSourceBuilder {
+     return this;
+   }
+ 
+-  ModelSourceBuilder withProtocolRootPathParts(
+-      List<String> protocolRootPathParts) {
+-    this.protocolRootPathParts = protocolRootPathParts;
++  ModelSourceBuilder withProtocolRootPathParts(List<String> subDirPathParts) {
++    this.subDirPathParts = subDirPathParts;
++    return this;
++  }
++
++  ModelSourceBuilder withYamlSourcePathParts(List<String> yamlSourcePathParts) {
++    this.yamlSourcePathParts = yamlSourcePathParts;
++    return this;
++  }
++
++  ModelSourceBuilder withFileExtension(String fileExtension) {
++    this.fileExtension = fileExtension;
+     return this;
+   }
+ 
+   ModelSource build() {
+     var yamlSourceUri = Uri(
+-      path: joinAll(['module', moduleAlias, ..._yamlSourcePathParts]),
++      path: joinAll(
++        [
++          'module',
++          moduleAlias,
++          ...yamlSourcePathParts,
++          '$fileName$fileExtension'
++        ],
++      ),
+     );
+     return ModelSource(
+       moduleAlias,
+       yaml,
+       this.yamlSourceUri ?? yamlSourceUri,
+-      protocolRootPathParts,
++      subDirPathParts,
+     );
+   }
+ }
+diff --git a/tools/serverpod_cli/lib/src/util/model_helper.dart b/tools/serverpod_cli/lib/src/util/model_helper.dart
+index eba65d70d6..600ef86184 100644
+--- a/tools/serverpod_cli/lib/src/util/model_helper.dart
++++ b/tools/serverpod_cli/lib/src/util/model_helper.dart
+@@ -19,14 +19,22 @@ class ModelSource {
+   );
+ }
+ 
+-const modelFileExtensions = [
+-  '.yaml',
+-  '.yml',
++const spyModelFileExtensions = [
+   '.spy',
+   '.spy.yaml',
+   '.spy.yml',
+ ];
+ 
++const yamlModelFileExtensions = [
++  '.yaml',
++  '.yml',
++];
++
++const modelFileExtensions = [
++  ...spyModelFileExtensions,
++  ...yamlModelFileExtensions,
++];
++
+ class ModelHelper {
+   static Future<List<ModelSource>> loadProjectYamlModelsFromDisk(
+     GeneratorConfig config,
+@@ -34,31 +42,17 @@ class ModelHelper {
+     var modelSources = <ModelSource>[];
+ 
+     var modelSource = await _loadYamlModelsFromDisk(
+-      defaultModuleAlias,
+-      _absolutePathParts(config.modelSourcePathParts),
++      moduleAlias: defaultModuleAlias,
+       loadConfig: config,
++      absoluteSourcePathParts: _absolutePathParts(config.libSourcePathParts),
+     );
+     modelSources.addAll(modelSource);
+ 
+-    modelSource = await _loadYamlModelsFromDisk(
+-      defaultModuleAlias,
+-      _absolutePathParts(config.protocolSourcePathParts),
+-      loadConfig: config,
+-    );
+-    modelSources.addAll(modelSource);
+-
+-    for (var module in config.modulesDependent) {
+-      modelSource = await _loadYamlModelsFromDisk(
+-        module.nickname,
+-        module.modelSourcePathParts,
+-        loadConfig: module,
+-      );
+-      modelSources.addAll(modelSource);
+-
++    for (var moduleConfig in config.modulesDependent) {
+       modelSource = await _loadYamlModelsFromDisk(
+-        module.nickname,
+-        module.protocolSourcePathParts,
+-        loadConfig: module,
++        moduleAlias: moduleConfig.nickname,
++        loadConfig: moduleConfig,
++        absoluteSourcePathParts: moduleConfig.libSourcePathParts,
+       );
+       modelSources.addAll(modelSource);
+     }
+@@ -75,12 +69,15 @@ class ModelHelper {
+     return split(absolute(joinAll(pathParts)));
+   }
+ 
+-  static Future<List<ModelSource>> _loadYamlModelsFromDisk(
+-    String moduleAlias,
+-    List<String> pathParts, {
++  static Future<List<ModelSource>> _loadYamlModelsFromDisk({
++    required List<String> absoluteSourcePathParts,
+     required ModelLoadConfig loadConfig,
++    required String moduleAlias,
+   }) async {
+-    var files = await _loadAllModelFiles(pathParts, loadConfig: loadConfig);
++    var files = await _loadAllModelFiles(
++      loadConfig: loadConfig,
++      absoluteSourcePathParts,
++    );
+ 
+     List<ModelSource> sources = [];
+     for (var model in files) {
+@@ -90,7 +87,10 @@ class ModelHelper {
+         moduleAlias,
+         yaml,
+         model.uri,
+-        _extractPathFromModelRoot(pathParts, model.uri),
++        extractPathFromConfig(
++          loadConfig,
++          model.uri,
++        ),
+       ));
+     }
+ 
+@@ -101,18 +101,22 @@ class ModelHelper {
+     String path, {
+     required ModelLoadConfig loadConfig,
+   }) {
+-    var allowedModelPaths = [
++    if (spyModelFileExtensions.any((ext) => path.endsWith(ext))) {
++      return true;
++    }
++
++    var allowedYamlExtensionModelPaths = [
+       joinAll(loadConfig.relativeModelSourcePathParts),
+       joinAll(loadConfig.relativeProtocolSourcePathParts),
+     ];
+ 
+-    var hasValidPath = path.containsAny(allowedModelPaths);
++    var allowedYamlPath = path.containsAny(allowedYamlExtensionModelPaths);
+ 
+-    var hasValidExtension = modelFileExtensions.any(
++    var yamlExtension = yamlModelFileExtensions.any(
+       (ext) => path.endsWith(ext),
+     );
+ 
+-    return hasValidPath && hasValidExtension;
++    return allowedYamlPath && yamlExtension;
+   }
+ 
+   static Future<Iterable<File>> _loadAllModelFiles(
+@@ -142,17 +146,21 @@ class ModelHelper {
+         ));
+   }
+ 
+-  static List<String> extractPathFromConfig(ModelLoadConfig config, Uri uri) {
+-    List<List<String>> paths = [
++  static List<String> extractPathFromConfig(
++    ModelLoadConfig config,
++    Uri uri,
++  ) {
++    List<List<String>> modelRootPathParts = [
+       config.protocolSourcePathParts,
+       config.modelSourcePathParts,
+       config.srcSourcePathParts,
+       config.libSourcePathParts,
+     ];
+ 
+-    for (var path in paths) {
+-      if (isWithin(joinAll(path), uri.path)) {
+-        return _extractPathFromModelRoot(path, uri);
++    for (var pathParts in modelRootPathParts) {
++      var directory = Directory(joinAll(pathParts));
++      if (isWithin(directory.absolute.path, uri.toFilePath())) {
++        return _extractPathFromModelRoot(directory, uri);
+       }
+     }
+ 
+@@ -160,12 +168,18 @@ class ModelHelper {
+   }
+ 
+   static List<String> _extractPathFromModelRoot(
+-    List<String> pathParts,
++    Directory sourceDir,
+     Uri fileUri,
+   ) {
+-    var sourceDir = Directory(joinAll(pathParts));
+-    var sourceDirPartsLength = split(sourceDir.path).length;
++    var relativePath = relative(
++      dirname(fileUri.toFilePath()),
++      from: sourceDir.path,
++    );
++
++    if (relativePath == '.') {
++      return [];
++    }
+ 
+-    return split(dirname(fromUri(fileUri))).skip(sourceDirPartsLength).toList();
++    return split(relativePath);
+   }
+ }
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/file_name_conflicts_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/file_name_conflicts_test.dart
+new file mode 100644
+index 0000000000..33324d5c9b
+--- /dev/null
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/file_name_conflicts_test.dart
+@@ -0,0 +1,93 @@
++import 'package:serverpod_cli/src/analyzer/models/stateful_analyzer.dart';
++import 'package:serverpod_cli/src/generator/code_generation_collector.dart';
++import 'package:serverpod_cli/src/test_util/builders/generator_config_builder.dart';
++import 'package:serverpod_cli/src/test_util/builders/model_source_builder.dart';
++import 'package:test/test.dart';
++
++void main() {
++  var config = GeneratorConfigBuilder().build();
++
++  group('Given two models with the same generated file path when analyzing',
++      () {
++    var modelSources = [
++      ModelSourceBuilder()
++          .withFileName('example')
++          .withYamlSourcePathParts(['lib', 'src'])
++          .withFileExtension('.spy.yaml')
++          .withYaml(
++            '''
++        class: MyFirstModel
++        fields:
++          name: String
++        ''',
++          )
++          .build(),
++      ModelSourceBuilder()
++          .withFileName('example')
++          .withYamlSourcePathParts(['lib', 'src', 'protocol']).withYaml(
++        '''
++        class: MySecondModel
++        fields:
++          name: String
++        ''',
++      ).build()
++    ];
++
++    var collector = CodeGenerationCollector();
++    StatefulAnalyzer(config, modelSources, onErrorsCollector(collector))
++        .validateAll();
++
++    test('then errors are collected for each file.', () {
++      expect(
++        collector.errors,
++        hasLength(2),
++        reason: 'Expected an error but none was generated.',
++      );
++    });
++
++    test(
++        'then error informs the user that there is a generated file collision.',
++        () {
++      var error = collector.errors.first;
++      expect(
++        error.message,
++        'File collision with "MySecondModel" was detected for the generated model, please provide a unique path or filename for the model.',
++      );
++    });
++  });
++
++  group(
++      'Given a project model and a module model with the same generated file path when analyzing',
++      () {
++    var modelSources = [
++      ModelSourceBuilder()
++          .withModuleAlias('my_module')
++          .withFileName('example')
++          .withYaml(
++        '''
++        class: ProjectModel
++        fields:
++          name: String
++        ''',
++      ).build(),
++      ModelSourceBuilder().withFileName('example').withYaml(
++        '''
++        class: ModuleModel
++        fields:
++          name: String
++        ''',
++      ).build()
++    ];
++
++    var collector = CodeGenerationCollector();
++    StatefulAnalyzer(config, modelSources, onErrorsCollector(collector))
++        .validateAll();
++
++    test('then no error is collected.', () {
++      expect(
++        collector.errors,
++        isEmpty,
++      );
++    });
++  });
++}
+diff --git a/tools/serverpod_cli/test/integration/util/model_helper/model_file_load_test.dart b/tools/serverpod_cli/test/integration/util/model_helper/model_file_load_test.dart
+index 166e778704..3e4f6f4008 100644
+--- a/tools/serverpod_cli/test/integration/util/model_helper/model_file_load_test.dart
++++ b/tools/serverpod_cli/test/integration/util/model_helper/model_file_load_test.dart
+@@ -48,9 +48,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -77,9 +77,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -109,9 +109,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -138,9 +138,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -181,9 +181,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -210,9 +210,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -242,9 +242,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -275,9 +275,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -304,9 +304,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -347,9 +347,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -376,9 +376,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -408,9 +408,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -441,9 +441,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -458,6 +458,61 @@ void main() {
+       });
+     });
+ 
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
+     group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+@@ -470,15 +525,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });
+@@ -513,9 +601,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -542,9 +630,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -574,9 +662,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -607,10 +695,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
+-
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -624,6 +711,61 @@ void main() {
+       });
+     });
+ 
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
+     group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+@@ -636,15 +778,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });
+@@ -679,9 +854,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -708,9 +883,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -740,9 +915,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -773,9 +948,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -790,6 +965,61 @@ void main() {
+       });
+     });
+ 
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
+     group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+@@ -802,15 +1032,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          testProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });
+diff --git a/tools/serverpod_cli/test/integration/util/model_helper/module_model_file_load_test.dart b/tools/serverpod_cli/test/integration/util/model_helper/module_model_file_load_test.dart
+index 2a2825b614..f45aa2d4dc 100644
+--- a/tools/serverpod_cli/test/integration/util/model_helper/module_model_file_load_test.dart
++++ b/tools/serverpod_cli/test/integration/util/model_helper/module_model_file_load_test.dart
+@@ -57,9 +57,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -86,9 +86,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -118,9 +118,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -147,9 +147,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -194,9 +194,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -223,9 +223,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -255,9 +255,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -288,9 +288,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -317,9 +317,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -364,9 +364,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -393,9 +393,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -425,9 +425,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -458,9 +458,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -475,7 +475,62 @@ void main() {
+       });
+     });
+ 
+-    group('placed in the module "lib/src" directory when loaded', () {
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
++    group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+       setUp(() async {
+@@ -487,15 +542,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });
+@@ -534,9 +622,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -563,9 +651,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -595,9 +683,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -628,9 +716,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -645,7 +733,62 @@ void main() {
+       });
+     });
+ 
+-    group('placed in the module "lib/src" directory when loaded', () {
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
++    group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+       setUp(() async {
+@@ -657,15 +800,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });
+@@ -704,9 +880,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -733,9 +909,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+@@ -765,9 +941,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -798,9 +974,9 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ 
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+@@ -815,7 +991,62 @@ void main() {
+       });
+     });
+ 
+-    group('placed in the module "lib/src" directory when loaded', () {
++    group('placed in the "lib" directory when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
++      });
++    });
++
++    group('placed in the "lib/src" directory when loaded', () {
+       late List<ModelSource> models;
+ 
+       setUp(() async {
+@@ -827,15 +1058,48 @@ void main() {
+         ));
+         modelFile.createSync(recursive: true);
+         modelFile.writeAsStringSync('''
+-  class: Example
+-  fields:
+-    name: String
++class: Example
++fields:
++  name: String
+ ''');
+         models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+       });
+ 
+-      test('then the class is not serialized.', () async {
+-        expect(models, hasLength(0));
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, isEmpty);
++      });
++    });
++
++    group('placed in a feature directory inside of "lib/src" when loaded', () {
++      late List<ModelSource> models;
++
++      setUp(() async {
++        var modelFile = File(join(
++          moduleProject.path,
++          'lib',
++          'src',
++          'my_feature',
++          modelFileName,
++        ));
++        modelFile.createSync(recursive: true);
++        modelFile.writeAsStringSync('''
++class: Example
++fields:
++  name: String
++''');
++        models = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++      });
++
++      test('then the class is serialized.', () async {
++        expect(models, hasLength(1));
++      });
++
++      test('then modelSource has the correct subDirPathParts', () async {
++        expect(models.firstOrNull?.subDirPathParts, ['my_feature']);
+       });
+     });
+   });

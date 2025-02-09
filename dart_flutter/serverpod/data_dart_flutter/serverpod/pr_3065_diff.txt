@@ -1,0 +1,196 @@
+diff --git a/packages/serverpod/lib/src/relic/web_server.dart b/packages/serverpod/lib/src/relic/web_server.dart
+index 2d0ee9e72d..0b12cf513e 100644
+--- a/packages/serverpod/lib/src/relic/web_server.dart
++++ b/packages/serverpod/lib/src/relic/web_server.dart
+@@ -1,6 +1,7 @@
+ import 'dart:async';
+ import 'dart:convert';
+ import 'dart:io';
++import 'dart:typed_data';
+ 
+ import 'package:path/path.dart' as path;
+ import 'package:serverpod/serverpod.dart';
+@@ -265,17 +266,16 @@ abstract class Route {
+   }
+ 
+   static Future<String?> _readBody(HttpRequest request) async {
+-    // TODO: Find more efficient solution?
++    var builder = BytesBuilder();
+     var len = 0;
+-    var data = <int>[];
+     await for (var segment in request) {
+       len += segment.length;
+       if (len > 10240) {
+         return null;
+       }
+-      data += segment;
++      builder.add(segment);
+     }
+-    return const Utf8Decoder().convert(data);
++    return const Utf8Decoder().convert(builder.toBytes());
+   }
+ }
+ 
+diff --git a/packages/serverpod/lib/src/server/server.dart b/packages/serverpod/lib/src/server/server.dart
+index 2e54b13011..b76e0f8780 100644
+--- a/packages/serverpod/lib/src/server/server.dart
++++ b/packages/serverpod/lib/src/server/server.dart
+@@ -276,10 +276,19 @@ class Server {
+       return;
+     }
+ 
+-    String? body;
++    String body;
+     if (readBody) {
+       try {
+         body = await _readBody(request);
++      } on _RequestTooLargeException catch (e) {
++        if (serverpod.runtimeSettings.logMalformedCalls) {
++          // TODO: Log to database?
++          stderr.writeln('${DateTime.now().toUtc()} ${e.errorDescription}');
++        }
++        request.response.statusCode = HttpStatus.requestEntityTooLarge;
++        request.response.write(e.errorDescription);
++        await request.response.close();
++        return;
+       } catch (e, stackTrace) {
+         stderr.writeln(
+             '${DateTime.now().toUtc()} Internal server error. Failed to read body of request.');
+@@ -293,7 +302,7 @@ class Server {
+       body = '';
+     }
+ 
+-    var result = await _handleUriCall(uri, body!, request);
++    var result = await _handleUriCall(uri, body, request);
+ 
+     if (result is ResultNoSuchEndpoint) {
+       if (serverpod.runtimeSettings.logMalformedCalls) {
+@@ -401,16 +410,17 @@ class Server {
+     );
+   }
+ 
+-  Future<String?> _readBody(HttpRequest request) async {
+-    // TODO: Find more efficient solution?
++  Future<String> _readBody(HttpRequest request) async {
++    var builder = BytesBuilder();
+     var len = 0;
+-    var data = <int>[];
+     await for (var segment in request) {
+       len += segment.length;
+-      if (len > serverpod.config.maxRequestSize) return null;
+-      data += segment;
++      if (len > serverpod.config.maxRequestSize) {
++        throw _RequestTooLargeException(serverpod.config.maxRequestSize);
++      }
++      builder.add(segment);
+     }
+-    return const Utf8Decoder().convert(data);
++    return const Utf8Decoder().convert(builder.toBytes());
+   }
+ 
+   Future<Result> _handleUriCall(
+@@ -559,3 +569,31 @@ class Server {
+     _running = false;
+   }
+ }
++
++/// The result of a failed request to the server where the request size
++/// exceeds the maximum allowed limit.
++///
++/// This error provides details about the maximum allowed size, allowing the
++/// client to adjust their request accordingly.
++class _RequestTooLargeException implements Exception {
++  /// Maximum allowed request size in bytes.
++  final int maxSize;
++
++  /// Description of the error.
++  ///
++  /// Contains a human-readable explanation of the error, including the maximum
++  /// allowed size and the actual size of the request.
++  final String errorDescription;
++
++  /// Creates a new [ResultRequestTooLarge] object.
++  ///
++  /// - [maxSize]: The maximum allowed size for the request in bytes.
++  _RequestTooLargeException(this.maxSize)
++      : errorDescription =
++            'Request size exceeds the maximum allowed size of $maxSize bytes.';
++
++  @override
++  String toString() {
++    return errorDescription;
++  }
++}
+diff --git a/tests/serverpod_test_server/test_integration/request/request_size_test.dart b/tests/serverpod_test_server/test_integration/request/request_size_test.dart
+new file mode 100644
+index 0000000000..36b1ed6d88
+--- /dev/null
++++ b/tests/serverpod_test_server/test_integration/request/request_size_test.dart
+@@ -0,0 +1,67 @@
++import 'dart:convert';
++import 'dart:io';
++
++import 'package:http/http.dart' as http;
++import 'package:serverpod/serverpod.dart';
++import 'package:serverpod_test_server/test_util/test_serverpod.dart';
++import 'package:test/test.dart';
++
++void main() {
++  group('Given a Serverpod server with a maximum request size of 10 bytes', () {
++    late Serverpod server;
++    late Session session;
++    const int maxRequestSize = 10; // Maximum allowed request size in bytes
++
++    setUp(() async {
++      server = IntegrationTestServer.create(
++        config: ServerpodConfig(
++          maxRequestSize: maxRequestSize,
++          database: null,
++          apiServer: ServerConfig(
++            port: 8080,
++            publicHost: 'localhost',
++            publicPort: 8080,
++            publicScheme: 'http',
++          ),
++        ),
++      );
++      await server.start();
++
++      session = await server.createSession(enableLogging: false);
++    });
++
++    tearDown(() async {
++      await session.close();
++      await server.shutdown(exitProcess: false);
++    });
++    group('when a request with a body larger than 10 bytes is sent', () {
++      late http.Response response;
++
++      setUp(() async {
++        var uri = Uri.parse('http://localhost:8080/test');
++        var body = {};
++        for (var i = 0; i < 10; i++) {
++          body[i.toString()] = 'Hello, Serverpod!';
++        }
++        var jsonBody = jsonEncode(body);
++
++        response = await http.post(
++          uri,
++          body: jsonBody,
++        );
++      });
++
++      test('then response has 413 status code.', () {
++        expect(response.statusCode, equals(HttpStatus.requestEntityTooLarge));
++      });
++
++      test(
++          'then response contains an error message indicating the request size '
++          'exceeded the maximum allowed size', () {
++        var expectedMessage =
++            'Request size exceeds the maximum allowed size of $maxRequestSize bytes.';
++        expect(response.body, equals(expectedMessage));
++      });
++    });
++  });
++}

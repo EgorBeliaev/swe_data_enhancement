@@ -1,0 +1,176 @@
+diff --git a/lib/collision/block_movement_collision.dart b/lib/collision/block_movement_collision.dart
+index 05359ed34..2b131e3ec 100644
+--- a/lib/collision/block_movement_collision.dart
++++ b/lib/collision/block_movement_collision.dart
+@@ -47,19 +47,22 @@ mixin BlockMovementCollision on Movement {
+     CollisionData collisionData,
+   ) {
+     _lastCollisionData = collisionData;
++
+     if (_bodyType.isDynamic) {
+       Vector2 correction;
+-      double depth = 0;
+-      if (collisionData.depth > 0) {
+-        depth = collisionData.depth + 0.08;
++      double depth = collisionData.depth;
++      if (depth != 0) {
++        depth = collisionData.depth.abs() + 0.08;
+       }
+ 
+       correction = (-collisionData.normal * depth);
+       if ((other is BlockMovementCollision) && other._bodyType.isDynamic) {
+         correction = (-collisionData.normal * depth / 2);
+       }
++
+       correctPositionFromCollision(position + correction);
+     }
++
+     velocity -= getVelocityReflection(other, collisionData);
+   }
+ 
+diff --git a/lib/collision/collision_util.dart b/lib/collision/collision_util.dart
+index 3d08efb4f..4ce378216 100644
+--- a/lib/collision/collision_util.dart
++++ b/lib/collision/collision_util.dart
+@@ -97,11 +97,45 @@ class CollisionUtil {
+   }
+ }
+ 
++final _cachedGlobalVertices = ValueCache<List<Vector2>>();
++
+ extension PolygonComponentExt on PolygonComponent {
+   List<Vector2> get absoluteVertices {
+-    Vector2 p = absolutePosition;
+-    return vertices.map((element) {
++    final Vector2 p = absolutePosition;
++    final adjustedVerticies =
++        absoluteAngle == 0 ? vertices : rotatedVerticesBonfire(absoluteAngle);
++
++    final result = adjustedVerticies.map((element) {
+       return element.translated(p.x, p.y);
+-    }).toList();
++    }).toList(growable: false);
++    return result;
++  }
++
++  /// gives back the shape vectors multiplied by the size and scale
++  List<Vector2> rotatedVerticesBonfire(double parentAngle) {
++    final angle = parentAngle;
++    if (!_cachedGlobalVertices.isCacheValid<dynamic>(<dynamic>[
++      size,
++      angle,
++    ])) {
++      final globalVertices = List.generate(
++        vertices.length,
++        (_) => Vector2.zero(),
++        growable: false,
++      );
++
++      for (var i = 0; i < vertices.length; i++) {
++        final vertex = vertices[i];
++        globalVertices[i]
++          ..setFrom(vertex)
++          ..rotate(angle);
++      }
++
++      _cachedGlobalVertices.updateCache<dynamic>(
++        globalVertices,
++        <dynamic>[size.clone(), angle],
++      );
++    }
++    return _cachedGlobalVertices.value!;
+   }
+ }
+diff --git a/lib/map/base/tile.dart b/lib/map/base/tile.dart
+index 66575cb95..33fe38d39 100644
+--- a/lib/map/base/tile.dart
++++ b/lib/map/base/tile.dart
+@@ -1,3 +1,5 @@
++import 'dart:math' as math;
++
+ import 'package:bonfire/map/base/tile_component.dart';
+ import 'package:bonfire/map/base/tile_with_collision.dart';
+ import 'package:bonfire/map/util/map_assets_manager.dart';
+@@ -204,20 +206,44 @@ class Tile {
+     tile.id = id;
+     tile.angle = angle;
+     tile.opacity = opacity;
+-
+-    if (angle != 0) {
+-      tile.anchor = Anchor.center;
+-      tile.position = tile.position +
+-          Vector2(
+-            width / 2,
+-            height / 2,
+-          );
+-    }
+     if (isFlipHorizontal) {
+       tile.flipHorizontallyAroundCenter();
+     }
+     if (isFlipVertical) {
+       tile.flipVerticallyAroundCenter();
+     }
++
++    // Needs to be debugged with different anchors. Works for default.
++    // tile.anchor = Anchor.topCenter;
++    _translateTileAngle(tile); // Force tile to be in it's box after rotation
++  }
++
++  void _translateTileAngle(TileComponent tile) {
++    // Depending or where the rotated object is - move it to positive coordinates:
++
++    final angle = tile.angle;
++    final sin = math.sin(angle);
++    final cos = math.cos(angle);
++    if (tile.anchor.x != 0.5) {
++      final delta =
++          (1 - 2 * tile.anchor.x) * tile.width * tile.transform.scale.x;
++      if (cos < 0.9) {
++        tile.transform.x -= delta * cos;
++      }
++      if (sin < 0.9) {
++        tile.transform.y -= delta * sin;
++      }
++    }
++
++    if (tile.anchor.y != 0.5) {
++      final delta =
++          (1 - 2 * tile.anchor.y) * tile.height * tile.transform.scale.y;
++      if (sin > 0.9) {
++        tile.transform.x += delta * sin;
++      }
++      if (cos < 0.9) {
++        tile.transform.y -= delta * cos;
++      }
++    }
+   }
+ }
+diff --git a/lib/map/tiled/builder/tiled_world_builder.dart b/lib/map/tiled/builder/tiled_world_builder.dart
+index c805563cf..0c61be311 100644
+--- a/lib/map/tiled/builder/tiled_world_builder.dart
++++ b/lib/map/tiled/builder/tiled_world_builder.dart
+@@ -148,6 +148,7 @@ class TiledWorldBuilder {
+     for (var tile in tileLayer.data ?? const <int>[]) {
+       if (tile != 0) {
+         var data = _getDataTile(tile);
++
+         if (data != null) {
+           bool tileIsAbove = ((data.type?.contains(ABOVE_TYPE) ?? false) ||
+               (data.tileClass?.contains(ABOVE_TYPE) ?? false) ||
+@@ -341,6 +342,7 @@ class TiledWorldBuilder {
+         tileSetContain,
+         (index - tilesetFirsTgId),
+       );
++
+       return TiledItemTileSet(
+         type: object.type,
+         collisions: object.collisions,
+@@ -563,6 +565,8 @@ class TiledWorldBuilder {
+       size: Vector2(width, height),
+       position: isObjectCollision ? null : Vector2(x, y),
+       isSolid: true,
++      // Angle here is not used because
++      // collision object is already rotated
+     );
+ 
+     if (ellipse == true) {

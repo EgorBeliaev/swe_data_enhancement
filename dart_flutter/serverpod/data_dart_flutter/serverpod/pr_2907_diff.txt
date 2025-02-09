@@ -1,0 +1,758 @@
+diff --git a/packages/serverpod_test/lib/src/test_database_proxy.dart b/packages/serverpod_test/lib/src/test_database_proxy.dart
+index 2377baff6d..481cc3f097 100644
+--- a/packages/serverpod_test/lib/src/test_database_proxy.dart
++++ b/packages/serverpod_test/lib/src/test_database_proxy.dart
+@@ -1,7 +1,7 @@
+ import 'package:serverpod/serverpod.dart';
+ import 'package:serverpod_test/src/transaction_manager.dart';
+-
+ import 'with_serverpod.dart';
++import 'package:synchronized/synchronized.dart';
+ 
+ /// A database proxy that forwards all calls to the provided database.
+ class TestDatabaseProxy implements Database {
+@@ -9,6 +9,8 @@ class TestDatabaseProxy implements Database {
+   final RollbackDatabase _rollbackDatabase;
+   final TransactionManager _transactionManager;
+ 
++  final Lock _databaseOperationLock = Lock();
++
+   /// Creates a new [TestDatabaseProxy]
+   TestDatabaseProxy(this._db, this._rollbackDatabase, this._transactionManager);
+ 
+@@ -19,11 +21,14 @@ class TestDatabaseProxy implements Database {
+     bool useCache = true,
+     Transaction? transaction,
+   }) {
+-    return _db.count<T>(
+-      where: where,
+-      limit: limit,
+-      useCache: useCache,
+-      transaction: transaction,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.count<T>(
++        where: where,
++        limit: limit,
++        useCache: useCache,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -32,7 +37,13 @@ class TestDatabaseProxy implements Database {
+     List<T> rows, {
+     Transaction? transaction,
+   }) {
+-    return _db.delete<T>(rows, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.delete<T>(
++        rows,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -40,7 +51,13 @@ class TestDatabaseProxy implements Database {
+     T row, {
+     Transaction? transaction,
+   }) {
+-    return _db.deleteRow<T>(row, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.deleteRow<T>(
++        row,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -48,7 +65,13 @@ class TestDatabaseProxy implements Database {
+     required Expression where,
+     Transaction? transaction,
+   }) {
+-    return _db.deleteWhere<T>(where: where, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.deleteWhere<T>(
++        where: where,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -62,15 +85,18 @@ class TestDatabaseProxy implements Database {
+     Transaction? transaction,
+     Include? include,
+   }) {
+-    return _db.find<T>(
+-      where: where,
+-      limit: limit,
+-      offset: offset,
+-      orderBy: orderBy,
+-      orderByList: orderByList,
+-      orderDescending: orderDescending,
+-      transaction: transaction,
+-      include: include,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.find<T>(
++        where: where,
++        limit: limit,
++        offset: offset,
++        orderBy: orderBy,
++        orderByList: orderByList,
++        orderDescending: orderDescending,
++        transaction: transaction,
++        include: include,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -80,7 +106,10 @@ class TestDatabaseProxy implements Database {
+     Transaction? transaction,
+     Include? include,
+   }) {
+-    return _db.findById<T>(id, transaction: transaction, include: include);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.findById<T>(id, transaction: transaction, include: include),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -93,14 +122,17 @@ class TestDatabaseProxy implements Database {
+     Transaction? transaction,
+     Include? include,
+   }) {
+-    return _db.findFirstRow<T>(
+-      where: where,
+-      offset: offset,
+-      orderBy: orderBy,
+-      orderByList: orderByList,
+-      orderDescending: orderDescending,
+-      transaction: transaction,
+-      include: include,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.findFirstRow<T>(
++        where: where,
++        offset: offset,
++        orderBy: orderBy,
++        orderByList: orderByList,
++        orderDescending: orderDescending,
++        transaction: transaction,
++        include: include,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -109,7 +141,13 @@ class TestDatabaseProxy implements Database {
+     List<T> rows, {
+     Transaction? transaction,
+   }) {
+-    return _db.insert<T>(rows, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.insert<T>(
++        rows,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -117,7 +155,13 @@ class TestDatabaseProxy implements Database {
+     T row, {
+     Transaction? transaction,
+   }) {
+-    return _db.insertRow<T>(row, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.insertRow<T>(
++        row,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -150,7 +194,7 @@ class TestDatabaseProxy implements Database {
+ 
+     try {
+       var result = await transactionFunction(localTransaction);
+-      await _transactionManager.removePreviousSavePoint(unlock: true);
++      await _transactionManager.releasePreviousSavePoint(unlock: true);
+       return result;
+     } catch (e) {
+       await _transactionManager.rollbackToPreviousSavePoint(unlock: true);
+@@ -164,6 +208,25 @@ class TestDatabaseProxy implements Database {
+     int? timeoutInSeconds,
+     Transaction? transaction,
+     QueryParameters? parameters,
++  }) {
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.unsafeExecute(
++        query,
++        timeoutInSeconds: timeoutInSeconds,
++        transaction: transaction,
++        parameters: parameters,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
++  }
++
++  /// This method is not guarded by the test guard and should only be
++  /// used by the package internal [TransactionManager].
++  Future<int> unsafeExecuteWithoutDatabaseExceptionGuard(
++    String query, {
++    int? timeoutInSeconds,
++    Transaction? transaction,
++    QueryParameters? parameters,
+   }) {
+     return _db.unsafeExecute(
+       query,
+@@ -180,11 +243,14 @@ class TestDatabaseProxy implements Database {
+     Transaction? transaction,
+     QueryParameters? parameters,
+   }) {
+-    return _db.unsafeQuery(
+-      query,
+-      timeoutInSeconds: timeoutInSeconds,
+-      transaction: transaction,
+-      parameters: parameters,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.unsafeQuery(
++        query,
++        timeoutInSeconds: timeoutInSeconds,
++        transaction: transaction,
++        parameters: parameters,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -194,10 +260,13 @@ class TestDatabaseProxy implements Database {
+     int? timeoutInSeconds,
+     Transaction? transaction,
+   }) {
+-    return _db.unsafeSimpleExecute(
+-      query,
+-      timeoutInSeconds: timeoutInSeconds,
+-      transaction: transaction,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.unsafeSimpleExecute(
++        query,
++        timeoutInSeconds: timeoutInSeconds,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -207,10 +276,13 @@ class TestDatabaseProxy implements Database {
+     int? timeoutInSeconds,
+     Transaction? transaction,
+   }) {
+-    return _db.unsafeSimpleQuery(
+-      query,
+-      timeoutInSeconds: timeoutInSeconds,
+-      transaction: transaction,
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.unsafeSimpleQuery(
++        query,
++        timeoutInSeconds: timeoutInSeconds,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
+     );
+   }
+ 
+@@ -220,7 +292,14 @@ class TestDatabaseProxy implements Database {
+     List<Column>? columns,
+     Transaction? transaction,
+   }) {
+-    return _db.update<T>(rows, columns: columns, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () => _db.update<T>(
++        rows,
++        columns: columns,
++        transaction: transaction,
++      ),
++      isPartOfUserTransaction: transaction != null,
++    );
+   }
+ 
+   @override
+@@ -229,6 +308,49 @@ class TestDatabaseProxy implements Database {
+     List<Column>? columns,
+     Transaction? transaction,
+   }) {
+-    return _db.updateRow<T>(row, columns: columns, transaction: transaction);
++    return _rollbackSingleOperationIfDatabaseException(
++      () async {
++        return _db.updateRow<T>(
++          row,
++          columns: columns,
++          transaction: transaction,
++        );
++      },
++      isPartOfUserTransaction: transaction != null,
++    );
++  }
++
++  Future<T> _rollbackSingleOperationIfDatabaseException<T>(
++    Future<T> Function() databaseOperation, {
++    required bool isPartOfUserTransaction,
++  }) async {
++    if (_rollbackDatabase == RollbackDatabase.disabled) {
++      return databaseOperation();
++    }
++
++    return _databaseOperationLock.synchronized(() async {
++      try {
++        await _transactionManager.addSavePoint(
++          lock: true,
++          isPartOfTransaction: isPartOfUserTransaction,
++        );
++      } on ConcurrentTransactionsException {
++        throw InvalidConfigurationException(
++          'Concurrent database calls outside an already active transaction '
++          'are not supported when database rollbacks are enabled. '
++          'If this is intended, disable rolling back the '
++          'database by setting `rollbackDatabase` to `RollbackDatabase.disabled`.',
++        );
++      }
++
++      try {
++        var result = await databaseOperation();
++        await _transactionManager.releasePreviousSavePoint(unlock: true);
++        return result;
++      } on DatabaseException catch (_) {
++        await _transactionManager.rollbackToPreviousSavePoint(unlock: true);
++        rethrow;
++      }
++    });
+   }
+ }
+diff --git a/packages/serverpod_test/lib/src/transaction_manager.dart b/packages/serverpod_test/lib/src/transaction_manager.dart
+index be950043a8..16c0be9142 100644
+--- a/packages/serverpod_test/lib/src/transaction_manager.dart
++++ b/packages/serverpod_test/lib/src/transaction_manager.dart
+@@ -73,12 +73,15 @@ class TransactionManager {
+   }
+ 
+   /// Creates a savepoint in the current transaction.
+-  Future<void> addSavePoint({bool lock = false}) async {
++  Future<void> addSavePoint({
++    bool lock = false,
++    bool isPartOfTransaction = false,
++  }) async {
+     if (currentTransaction == null) {
+       throw StateError('No ongoing transaction.');
+     }
+ 
+-    if (_isTransactionStackLocked) {
++    if (_isTransactionStackLocked && !isPartOfTransaction) {
+       throw ConcurrentTransactionsException();
+     } else if (lock) {
+       _isTransactionStackLocked = true;
+@@ -87,7 +90,7 @@ class TransactionManager {
+     var savePointId = _getNextSavePointId();
+     _savePointIds.add(savePointId);
+ 
+-    await serverpodSession.db.unsafeExecute(
++    await serverpodSession.db.unsafeExecuteWithoutDatabaseExceptionGuard(
+       'SAVEPOINT $savePointId;',
+       transaction: currentTransaction,
+     );
+@@ -104,16 +107,16 @@ class TransactionManager {
+ 
+   /// Rolls back the database to the previous save point in the current transaction.
+   Future<void> rollbackToPreviousSavePoint({bool unlock = false}) async {
+-    var savePointId = await removePreviousSavePoint(unlock: unlock);
++    var savePointId = await _popPreviousSavePointId(unlock: unlock);
+ 
+-    await serverpodSession.db.unsafeExecute(
++    await serverpodSession.db.unsafeExecuteWithoutDatabaseExceptionGuard(
+       'ROLLBACK TO SAVEPOINT $savePointId;',
+       transaction: currentTransaction,
+     );
+   }
+ 
+   /// Removes the previous save point in the current transaction.
+-  Future<String> removePreviousSavePoint({bool unlock = false}) async {
++  Future<String> _popPreviousSavePointId({bool unlock = false}) async {
+     if (currentTransaction == null) {
+       throw StateError('No ongoing transaction.');
+     }
+@@ -128,4 +131,14 @@ class TransactionManager {
+ 
+     return _savePointIds.removeLast();
+   }
++
++  /// Releases the previous save point in the current transaction.
++  Future<void> releasePreviousSavePoint({bool unlock = true}) async {
++    var savePointId = await _popPreviousSavePointId(unlock: unlock);
++
++    await serverpodSession.db.unsafeExecuteWithoutDatabaseExceptionGuard(
++      'RELEASE SAVEPOINT $savePointId;',
++      transaction: currentTransaction,
++    );
++  }
+ }
+diff --git a/packages/serverpod_test/pubspec.yaml b/packages/serverpod_test/pubspec.yaml
+index a97d4cf470..85644b2792 100644
+--- a/packages/serverpod_test/pubspec.yaml
++++ b/packages/serverpod_test/pubspec.yaml
+@@ -16,6 +16,7 @@ dependencies:
+   test: ^1.24.2
+   serverpod: 2.1.5
+   meta: ^1.8.0
++  synchronized: ^3.1.0
+ 
+ dependency_overrides:
+   serverpod:
+diff --git a/templates/pubspecs/packages/serverpod_test/pubspec.yaml b/templates/pubspecs/packages/serverpod_test/pubspec.yaml
+index 5eedb2e880..56214d74bf 100644
+--- a/templates/pubspecs/packages/serverpod_test/pubspec.yaml
++++ b/templates/pubspecs/packages/serverpod_test/pubspec.yaml
+@@ -15,6 +15,7 @@ dependencies:
+   test: ^1.24.2
+   serverpod: SERVERPOD_VERSION
+   meta: ^1.8.0
++  synchronized: ^3.1.0
+ 
+ dependency_overrides:
+   serverpod:
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/database_operations_in_endpoint_test.dart b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+similarity index 83%
+rename from tests/serverpod_test_server/test_integration/test_tools/database_operations_in_endpoint_test.dart
+rename to tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+index f0eb96baf9..f8fe1ccd42 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/database_operations_in_endpoint_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+@@ -416,4 +416,99 @@ void main() {
+       rollbackDatabase: RollbackDatabase.disabled,
+     );
+   });
++
++  withServerpod(
++    'Given rollbackDatabase is not disabled ',
++    rollbackDatabase: RollbackDatabase.afterEach,
++    (sessionBuilder, _) {
++      var session = sessionBuilder.build();
++
++      group('when creating UniqueData with the same unique value', () {
++        late Future failingInsert;
++        setUp(() async {
++          await UniqueData.db.insertRow(
++            session,
++            UniqueData(email: 'test@test.com', number: 1),
++          );
++          failingInsert = UniqueData.db.insertRow(
++            session,
++            UniqueData(email: 'test@test.com', number: 1),
++          );
++        });
++
++        test('then should throw database exception', () async {
++          await expectLater(
++            failingInsert,
++            throwsA(
++              allOf(
++                isA<DatabaseException>(),
++              ),
++            ),
++          );
++        });
++
++        test(
++            'then catching database exception should not prevent further database operations',
++            () async {
++          SimpleData? simpleData;
++          try {
++            await failingInsert;
++          } on DatabaseException catch (_) {
++            simpleData =
++                await SimpleData.db.insertRow(session, SimpleData(num: 123));
++          }
++
++          expect(simpleData, isNotNull);
++          expect(simpleData?.num, 123);
++        });
++      });
++
++      test(
++          'when creating multiple UniqueData with the same unique value in parallel '
++          'then should throw database exception but still insert the one that was successful',
++          () async {
++        try {
++          await Future.wait([
++            UniqueData.db.insertRow(
++              session,
++              UniqueData(email: 'test@test2.com', number: 2),
++            ),
++            UniqueData.db.insertRow(
++              session,
++              UniqueData(email: 'test@test2.com', number: 2),
++            ),
++          ]);
++        } on DatabaseException catch (_) {}
++
++        var uniqueDatas = await UniqueData.db.find(session);
++
++        expect(uniqueDatas, hasLength(1));
++        expect(uniqueDatas.first.email, 'test@test2.com');
++      });
++
++      test(
++          'when creating multiple SimpleData in parallel '
++          'then should have inserted all', () async {
++        await Future.wait([
++          SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 1),
++          ),
++          SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 2),
++          ),
++          SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 3),
++          ),
++        ]);
++
++        var simpleDatas = await SimpleData.db.find(session);
++
++        expect(simpleDatas, hasLength(3));
++        expect(simpleDatas.map((s) => s.num), containsAll([1, 2, 3]));
++      });
++    },
++  );
+ }
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+index b5f39d1bdc..edb9497b23 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+@@ -6,17 +6,135 @@ import 'serverpod_test_tools.dart';
+ 
+ void main() {
+   withServerpod(
+-    'Given transaction call in test',
++    'Given transaction call in test and rollbacks are enabled',
++    rollbackDatabase: RollbackDatabase.afterEach,
+     (sessionBuilder, endpoints) {
+       var session = sessionBuilder.build();
+ 
++      test(
++          'when inserting an object '
++          'then should be persisted if transaction completes', () async {
++        await session.db.transaction((transaction) async {
++          await SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 1),
++            transaction: transaction,
++          );
++        });
++
++        var simpleDatas = await SimpleData.db.find(session);
++        expect(simpleDatas, hasLength(1));
++        expect(simpleDatas.first.num, 1);
++      });
++
++      test(
++          'when inserting objects in parallel '
++          'then should be persisted if transaction completes', () async {
++        await session.db.transaction((transaction) async {
++          await Future.wait([
++            SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 1),
++              transaction: transaction,
++            ),
++            SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 2),
++              transaction: transaction,
++            ),
++            SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 3),
++              transaction: transaction,
++            )
++          ]);
++        });
++
++        var simpleDatas = await SimpleData.db.find(session);
++
++        expect(simpleDatas, hasLength(3));
++        expect(simpleDatas.map((s) => s.num), containsAll([1, 2, 3]));
++      });
++
++      test(
++          'when inserting an object in parallel to a transaction'
++          'then should throw exception due to concurrent operations', () async {
++        var future = Future.wait([
++          session.db.transaction((transaction) {
++            return SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 1),
++              transaction: transaction,
++            );
++          }),
++          SimpleData.db.insertRow(session, SimpleData(num: 2)),
++        ]);
++
++        await expectLater(
++            future,
++            throwsA(allOf(
++              isA<InvalidConfigurationException>(),
++              (e) =>
++                  e.message ==
++                  'Concurrent database calls outside an already active transaction '
++                      'are not supported when database rollbacks are enabled. '
++                      'If this is intended, disable rolling back the '
++                      'database by setting `rollbackDatabase` to `RollbackDatabase.disabled`.',
++            )));
++      });
++
++      test(
++          'when inserting an object without transaction but is executed inside a transaction'
++          'then should throw exception due to concurrent operations', () async {
++        var future = session.db.transaction((tx) async {
++          await SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 1),
++            transaction: null,
++          );
++        });
++
++        await expectLater(
++            future,
++            throwsA(allOf(
++              isA<InvalidConfigurationException>(),
++              (e) =>
++                  e.message ==
++                  'Concurrent database calls outside an already active transaction '
++                      'are not supported when database rollbacks are enabled. '
++                      'If this is intended, disable rolling back the '
++                      'database by setting `rollbackDatabase` to `RollbackDatabase.disabled`.',
++            )));
++      });
++
++      test(
++          'when executing transactions in parallel'
++          'then should throw exception due to concurrent operations', () async {
++        var future = Future.wait([
++          session.db.transaction((tx) async {}),
++          session.db.transaction((tx) async {})
++        ]);
++
++        await expectLater(
++            future,
++            throwsA(allOf(
++              isA<InvalidConfigurationException>(),
++              (e) =>
++                  e.message ==
++                  'Concurrent calls to transaction are not supported when database rollbacks are enabled. '
++                      'Disable rolling back the database by setting `rollbackDatabase` to `RollbackDatabase.disabled`.',
++            )));
++      });
++
+       test(
+           'when database exception occurs '
+           'then should not fail `dart test` by leaking exceptions', () async {
+-        var future = session.db.transaction((tx) async {
++        var future = session.db.transaction((transaction) async {
+           var data = UniqueData(number: 1, email: 'test@test.com');
+-          await UniqueData.db.insertRow(session, data);
+-          await UniqueData.db.insertRow(session, data);
++          await UniqueData.db
++              .insertRow(session, data, transaction: transaction);
++          await UniqueData.db
++              .insertRow(session, data, transaction: transaction);
+         });
+ 
+         // Even though this exception is caught in this test, due to how transactions work
+@@ -37,6 +155,75 @@ void main() {
+     },
+   );
+ 
++  withServerpod('Given transaction calls when rollbacks are disabled',
++      rollbackDatabase: RollbackDatabase.disabled, (sessionBuilder, endpoints) {
++    var session = sessionBuilder.build();
++
++    tearDown(() async {
++      await SimpleData.db.deleteWhere(
++        session,
++        where: (_) => Constant.bool(true),
++      );
++    });
++
++    test(
++        'when inserting an object in parallel to a transaction'
++        'then should persist both', () async {
++      await Future.wait([
++        session.db.transaction((transaction) {
++          return SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 1),
++            transaction: transaction,
++          );
++        }),
++        SimpleData.db.insertRow(session, SimpleData(num: 2)),
++      ]);
++      var simpleDatas = await SimpleData.db.find(session);
++      expect(simpleDatas, hasLength(2));
++      expect(simpleDatas.map((s) => s.num), containsAll([1, 2]));
++    });
++
++    test(
++        'when inserting an object without transaction but is executed inside a transaction'
++        'then should persist object', () async {
++      await session.db.transaction((tx) async {
++        // This is a theoretical scenario that would likely be
++        // considered erroneous in real code
++        await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 1),
++          transaction: null,
++        );
++      });
++
++      var simpleDatas = await SimpleData.db.find(session);
++      expect(simpleDatas, hasLength(1));
++      expect(simpleDatas.first.num, 1);
++    });
++
++    test(
++        'when inserting objects inside transactions in parallel'
++        'then should persist objects', () async {
++      await Future.wait([
++        session.db.transaction((transaction) => SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 1),
++              transaction: transaction,
++            )),
++        session.db.transaction((transaction) => SimpleData.db.insertRow(
++              session,
++              SimpleData(num: 2),
++              transaction: transaction,
++            ))
++      ]);
++
++      var simpleDatas = await SimpleData.db.find(session);
++      expect(simpleDatas, hasLength(2));
++      expect(simpleDatas.map((s) => s.num), containsAll([1, 2]));
++    });
++  });
++
+   group('Demontrate transaction difference between prod and test tools', () {
+     withServerpod(
+       'Given transaction call in test with database rollbacks enabled (default)',

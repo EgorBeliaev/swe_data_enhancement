@@ -3,7 +3,7 @@ from summarization import summarize_changes
 import os
 
 # Explore subfolders in the "java" directory
-java_directory = 'csharp'
+java_directory = 'dart_flutter'
 folders = [os.path.join(java_directory, name) for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
 
 

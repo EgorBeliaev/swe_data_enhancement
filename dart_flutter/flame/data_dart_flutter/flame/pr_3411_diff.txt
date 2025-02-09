@@ -1,0 +1,464 @@
+diff --git a/packages/flame_3d/lib/src/resources/light/light.dart b/packages/flame_3d/lib/src/resources/light/light.dart
+index e688caefcff..b6b584ed2b8 100644
+--- a/packages/flame_3d/lib/src/resources/light/light.dart
++++ b/packages/flame_3d/lib/src/resources/light/light.dart
+@@ -17,7 +17,10 @@ class Light extends Resource<void> {
+   Light({
+     required this.transform,
+     required this.source,
+-  }) : super(null);
++  });
++
++  @override
++  void createResource() {}
+ 
+   void apply(int index, Shader shader) {
+     shader.setVector3('Light$index.position', transform.position);
+diff --git a/packages/flame_3d/lib/src/resources/material/material.dart b/packages/flame_3d/lib/src/resources/material/material.dart
+index 753838efee7..86e1d2350b5 100644
+--- a/packages/flame_3d/lib/src/resources/material/material.dart
++++ b/packages/flame_3d/lib/src/resources/material/material.dart
+@@ -12,41 +12,28 @@ abstract class Material extends Resource<gpu.RenderPipeline> {
+     required Shader vertexShader,
+     required Shader fragmentShader,
+   })  : _vertexShader = vertexShader,
+-        _fragmentShader = fragmentShader,
+-        super(
+-          gpu.gpuContext.createRenderPipeline(
+-            vertexShader.compile().resource,
+-            fragmentShader.compile().resource,
+-          ),
+-        );
++        _fragmentShader = fragmentShader;
+ 
+   @override
+-  gpu.RenderPipeline get resource {
+-    var resource = super.resource;
+-    if (_recreateResource) {
+-      resource = super.resource = gpu.gpuContext.createRenderPipeline(
+-        _vertexShader.compile().resource,
+-        _fragmentShader.compile().resource,
+-      );
+-      _recreateResource = false;
+-    }
+-    return resource;
++  gpu.RenderPipeline createResource() {
++    return gpu.gpuContext.createRenderPipeline(
++      _vertexShader.compile().resource,
++      _fragmentShader.compile().resource,
++    );
+   }
+ 
+-  bool _recreateResource = false;
+-
+   Shader get vertexShader => _vertexShader;
+   Shader _vertexShader;
+   set vertexShader(Shader shader) {
+     _vertexShader = shader;
+-    _recreateResource = true;
++    recreateResource = true;
+   }
+ 
+   Shader get fragmentShader => _fragmentShader;
+   Shader _fragmentShader;
+   set fragmentShader(Shader shader) {
+     _fragmentShader = shader;
+-    _recreateResource = true;
++    recreateResource = true;
+   }
+ 
+   void bind(GraphicsDevice device) {}
+diff --git a/packages/flame_3d/lib/src/resources/mesh/mesh.dart b/packages/flame_3d/lib/src/resources/mesh/mesh.dart
+index c2fa8b42b13..1e9089a7366 100644
+--- a/packages/flame_3d/lib/src/resources/mesh/mesh.dart
++++ b/packages/flame_3d/lib/src/resources/mesh/mesh.dart
+@@ -11,9 +11,7 @@ import 'package:flame_3d/resources.dart';
+ /// {@endtemplate}
+ class Mesh extends Resource<void> {
+   /// {@macro mesh}
+-  Mesh()
+-      : _surfaces = [],
+-        super(null);
++  Mesh() : _surfaces = [];
+ 
+   final List<Surface> _surfaces;
+   Aabb3? _aabb;
+@@ -32,6 +30,9 @@ class Mesh extends Resource<void> {
+     }
+   }
+ 
++  @override
++  void createResource() {}
++
+   /// The total surface count of the mesh.
+   int get surfaceCount => _surfaces.length;
+ 
+diff --git a/packages/flame_3d/lib/src/resources/mesh/surface.dart b/packages/flame_3d/lib/src/resources/mesh/surface.dart
+index b561768b47a..b310afdee37 100644
+--- a/packages/flame_3d/lib/src/resources/mesh/surface.dart
++++ b/packages/flame_3d/lib/src/resources/mesh/surface.dart
+@@ -23,7 +23,7 @@ class Surface extends Resource<gpu.DeviceBuffer?> {
+      * If `true`, the normals will be calculated if they are not provided.
+      */
+     bool calculateNormals = true,
+-  }) : super(null) {
++  }) {
+     final normalizedVertices = _normalize(
+       vertices: vertices,
+       indices: indices,
+@@ -61,25 +61,27 @@ class Surface extends Resource<gpu.DeviceBuffer?> {
+   int get indexCount => _indexCount;
+   late int _indexCount;
+ 
++  int? resourceSizeInByes;
++
+   @override
+-  gpu.DeviceBuffer? get resource {
+-    var resource = super.resource;
++  bool get recreateResource {
+     final sizeInBytes = _vertices.lengthInBytes + _indices.lengthInBytes;
+-    if (resource?.sizeInBytes != sizeInBytes) {
+-      // Store the device buffer in the resource parent.
+-      resource = super.resource = gpu.gpuContext.createDeviceBuffer(
+-        gpu.StorageMode.hostVisible,
+-        sizeInBytes,
+-      );
++    return resourceSizeInByes != sizeInBytes;
++  }
+ 
+-      resource
+-        ?..overwrite(_vertices.asByteData())
+-        ..overwrite(
+-          _indices.asByteData(),
+-          destinationOffsetInBytes: _vertices.lengthInBytes,
+-        );
+-    }
+-    return resource;
++  @override
++  gpu.DeviceBuffer? createResource() {
++    final sizeInBytes = _vertices.lengthInBytes + _indices.lengthInBytes;
++    resourceSizeInByes = sizeInBytes;
++    return gpu.gpuContext.createDeviceBuffer(
++      gpu.StorageMode.hostVisible,
++      sizeInBytes,
++    )
++      ?..overwrite(_vertices.asByteData())
++      ..overwrite(
++        _indices.asByteData(),
++        destinationOffsetInBytes: _vertices.lengthInBytes,
++      );
+   }
+ 
+   void _calculateAabb(List<Vertex> vertices) {
+diff --git a/packages/flame_3d/lib/src/resources/resource.dart b/packages/flame_3d/lib/src/resources/resource.dart
+index b36e6f9e744..2bbeb8cb8d5 100644
+--- a/packages/flame_3d/lib/src/resources/resource.dart
++++ b/packages/flame_3d/lib/src/resources/resource.dart
+@@ -1,5 +1,3 @@
+-import 'package:meta/meta.dart';
+-
+ // TODO(wolfenrain): in the long run it would be nice of we can make it
+ // automatically refer to same type of objects to prevent memory leaks
+ 
+@@ -7,13 +5,17 @@ import 'package:meta/meta.dart';
+ /// A Resource is the base class for any resource typed classes. The primary
+ /// use case is to be a data container.
+ /// {@endtemplate}
+-class Resource<R> {
+-  /// {@macro resource}
+-  Resource(this._resource);
++abstract class Resource<R> {
++  R? _resource;
++  bool recreateResource = true;
++
++  R createResource();
+ 
+-  /// The resource data.
+-  R get resource => _resource;
+-  @protected
+-  set resource(R resource) => _resource = resource;
+-  R _resource;
++  R get resource {
++    if (recreateResource) {
++      _resource = createResource();
++      recreateResource = false;
++    }
++    return _resource!;
++  }
+ }
+diff --git a/packages/flame_3d/lib/src/resources/shader/shader.dart b/packages/flame_3d/lib/src/resources/shader/shader.dart
+index 30e645130e5..db844d64567 100644
+--- a/packages/flame_3d/lib/src/resources/shader/shader.dart
++++ b/packages/flame_3d/lib/src/resources/shader/shader.dart
+@@ -10,6 +10,8 @@ import 'package:flutter_gpu/gpu.dart' as gpu;
+ ///
+ /// {@endtemplate}
+ class ShaderResource extends Resource<gpu.Shader> {
++  final gpu.Shader shader;
++
+   /// {@macro shader_resource}
+   factory ShaderResource.createFromAsset({
+     required String asset,
+@@ -22,17 +24,20 @@ class ShaderResource extends Resource<gpu.Shader> {
+     if (shader == null) {
+       throw StateError('Shader "$shaderName" not found in library "$asset"');
+     }
+-    return ShaderResource._(shader, slots: slots);
++    return ShaderResource._(shader: shader, slots: slots);
+   }
+ 
+-  ShaderResource._(
+-    super.resource, {
++  ShaderResource._({
++    required this.shader,
+     List<UniformSlot> slots = const [],
+   }) {
+     for (final slot in slots) {
+-      slot.resource = resource.getUniformSlot(slot.name);
++      slot.uniformSlot = resource.getUniformSlot(slot.name);
+     }
+   }
++
++  @override
++  gpu.Shader createResource() => shader;
+ }
+ 
+ class Shader {
+diff --git a/packages/flame_3d/lib/src/resources/shader/uniform_array.dart b/packages/flame_3d/lib/src/resources/shader/uniform_array.dart
+index e65779ba64c..eee9bbb3fe8 100644
+--- a/packages/flame_3d/lib/src/resources/shader/uniform_array.dart
++++ b/packages/flame_3d/lib/src/resources/shader/uniform_array.dart
+@@ -19,27 +19,23 @@ class UniformArray extends UniformInstance<UniformArrayKey, ByteBuffer> {
+   final List<Map<int, ({int hash, List<double> data})>> _storage = [];
+ 
+   @override
+-  ByteBuffer? get resource {
+-    if (super.resource == null) {
+-      final data = <double>[];
+-      for (final element in _storage) {
+-        var previousIndex = -1;
+-        for (final entry in element.entries) {
+-          if (previousIndex + 1 != entry.key) {
+-            final field = slot.fields.indexed
+-                .firstWhere((e) => e.$1 == previousIndex + 1);
+-            throw StateError(
+-              'Uniform ${slot.name}.${field.$2} was not set',
+-            );
+-          }
+-          previousIndex = entry.key;
+-          data.addAll(entry.value.data);
++  ByteBuffer createResource() {
++    final data = <double>[];
++    for (final element in _storage) {
++      var previousIndex = -1;
++      for (final entry in element.entries) {
++        if (previousIndex + 1 != entry.key) {
++          final field =
++              slot.fields.indexed.firstWhere((e) => e.$1 == previousIndex + 1);
++          throw StateError(
++            'Uniform ${slot.name}.${field.$2} was not set',
++          );
+         }
++        previousIndex = entry.key;
++        data.addAll(entry.value.data);
+       }
+-      super.resource = Float32List.fromList(data).buffer;
+     }
+-
+-    return super.resource;
++    return Float32List.fromList(data).buffer;
+   }
+ 
+   Map<int, ({int hash, List<double> data})> _get(int idx) {
+@@ -67,7 +63,7 @@ class UniformArray extends UniformInstance<UniformArrayKey, ByteBuffer> {
+     storage[index] = (data: data, hash: hash);
+ 
+     // Clear the cache.
+-    super.resource = null;
++    recreateResource = true;
+   }
+ 
+   @override
+diff --git a/packages/flame_3d/lib/src/resources/shader/uniform_instance.dart b/packages/flame_3d/lib/src/resources/shader/uniform_instance.dart
+index 22f18b6f013..47d8701ac97 100644
+--- a/packages/flame_3d/lib/src/resources/shader/uniform_instance.dart
++++ b/packages/flame_3d/lib/src/resources/shader/uniform_instance.dart
+@@ -7,7 +7,7 @@ import 'package:flame_3d/resources.dart';
+ /// {@endtemplate}
+ abstract class UniformInstance<K, T> extends Resource<T?> {
+   /// {@macro uniform_instance}
+-  UniformInstance(this.slot) : super(null);
++  UniformInstance(this.slot);
+ 
+   /// The slot this instance belongs too.
+   final UniformSlot slot;
+diff --git a/packages/flame_3d/lib/src/resources/shader/uniform_sampler.dart b/packages/flame_3d/lib/src/resources/shader/uniform_sampler.dart
+index b2f168558df..b00c9b1200d 100644
+--- a/packages/flame_3d/lib/src/resources/shader/uniform_sampler.dart
++++ b/packages/flame_3d/lib/src/resources/shader/uniform_sampler.dart
+@@ -5,6 +5,8 @@ import 'package:flame_3d/resources.dart';
+ /// Instance of a uniform sampler. Represented by a [Texture].
+ /// {@endtemplate}
+ class UniformSampler extends UniformInstance<void, Texture> {
++  Texture? texture;
++
+   /// {@macro uniform_sampler}
+   UniformSampler(super.slot);
+ 
+@@ -15,9 +17,13 @@ class UniformSampler extends UniformInstance<void, Texture> {
+ 
+   @override
+   void set(void key, Texture value) {
+-    resource = value;
++    texture = value;
++    recreateResource = true;
+   }
+ 
++  @override
++  Texture createResource() => texture!;
++
+   @override
+   void makeKey(int? idx, String? field) {}
+ }
+diff --git a/packages/flame_3d/lib/src/resources/shader/uniform_slot.dart b/packages/flame_3d/lib/src/resources/shader/uniform_slot.dart
+index fa53a1b4f80..4ce59378fa6 100644
+--- a/packages/flame_3d/lib/src/resources/shader/uniform_slot.dart
++++ b/packages/flame_3d/lib/src/resources/shader/uniform_slot.dart
+@@ -10,8 +10,7 @@ import 'package:flutter_gpu/gpu.dart' as gpu;
+ /// {@endtemplate}
+ class UniformSlot extends Resource<gpu.UniformSlot?> {
+   UniformSlot._(this.name, this.fields, this._instanceCreator)
+-      : _fieldIndices = {for (var (index, key) in fields.indexed) key: index},
+-        super(null);
++      : _fieldIndices = {for (var (index, key) in fields.indexed) key: index};
+ 
+   /// {@macro uniform_slot}
+   ///
+@@ -51,4 +50,14 @@ class UniformSlot extends Resource<gpu.UniformSlot?> {
+   int indexOf(String field) => _fieldIndices[field]!;
+ 
+   UniformInstance create() => _instanceCreator.call(this);
++
++  gpu.UniformSlot? _uniformSlot;
++
++  set uniformSlot(gpu.UniformSlot value) {
++    _uniformSlot = value;
++    recreateResource = true;
++  }
++
++  @override
++  gpu.UniformSlot? createResource() => _uniformSlot;
+ }
+diff --git a/packages/flame_3d/lib/src/resources/shader/uniform_value.dart b/packages/flame_3d/lib/src/resources/shader/uniform_value.dart
+index ed2995f6c1f..1953325af10 100644
+--- a/packages/flame_3d/lib/src/resources/shader/uniform_value.dart
++++ b/packages/flame_3d/lib/src/resources/shader/uniform_value.dart
+@@ -18,26 +18,21 @@ class UniformValue extends UniformInstance<String, ByteBuffer> {
+   final Map<int, ({int hash, Float32List data})> _storage = HashMap();
+ 
+   @override
+-  ByteBuffer? get resource {
+-    if (super.resource == null) {
+-      var previousIndex = -1;
+-
+-      final entries = _storage.entries.toList()
+-        ..sort(Comparing.on((c) => c.key));
+-      final data = entries.fold<List<double>>([], (p, e) {
+-        if (previousIndex + 1 != e.key) {
+-          final field =
+-              slot.fields.indexed.firstWhere((e) => e.$1 == previousIndex + 1);
+-          throw StateError('Uniform ${slot.name}.${field.$2} was not set');
+-        }
+-        previousIndex = e.key;
+-        return p..addAll(e.value.data);
+-      });
+-
+-      super.resource = Float32List.fromList(data).buffer;
+-    }
+-
+-    return super.resource;
++  ByteBuffer createResource() {
++    var previousIndex = -1;
++
++    final entries = _storage.entries.toList()..sort(Comparing.on((c) => c.key));
++    final data = entries.fold<List<double>>([], (p, e) {
++      if (previousIndex + 1 != e.key) {
++        final field =
++            slot.fields.indexed.firstWhere((e) => e.$1 == previousIndex + 1);
++        throw StateError('Uniform ${slot.name}.${field.$2} was not set');
++      }
++      previousIndex = e.key;
++      return p..addAll(e.value.data);
++    });
++
++    return Float32List.fromList(data).buffer;
+   }
+ 
+   Float32List? operator [](String key) => _storage[slot.indexOf(key)]?.data;
+@@ -55,7 +50,7 @@ class UniformValue extends UniformInstance<String, ByteBuffer> {
+     _storage[index] = (data: data, hash: hash);
+ 
+     // Clear the cache.
+-    super.resource = null;
++    recreateResource = true;
+   }
+ 
+   @override
+diff --git a/packages/flame_3d/lib/src/resources/texture/texture.dart b/packages/flame_3d/lib/src/resources/texture/texture.dart
+index 8f4c840fea6..6bfc416cd89 100644
+--- a/packages/flame_3d/lib/src/resources/texture/texture.dart
++++ b/packages/flame_3d/lib/src/resources/texture/texture.dart
+@@ -8,29 +8,33 @@ import 'package:flutter_gpu/gpu.dart' as gpu;
+ /// Base texture [Resource], represents an image/texture on the GPU.
+ /// {@endtemplate}
+ class Texture extends Resource<gpu.Texture> {
++  final ByteData sourceData;
++  final int width;
++  final int height;
++  final PixelFormat format;
++
+   /// {@macro texture}
+   Texture(
+-    ByteData sourceData, {
+-    required int width,
+-    required int height,
+-    PixelFormat format = PixelFormat.rgba8888,
+-  }) : super(
+-          gpu.gpuContext.createTexture(
+-            gpu.StorageMode.hostVisible,
+-            width,
+-            height,
+-            format: switch (format) {
+-              PixelFormat.rgba8888 => gpu.PixelFormat.r8g8b8a8UNormInt,
+-              PixelFormat.bgra8888 => gpu.PixelFormat.b8g8r8a8UNormInt,
+-              PixelFormat.rgbaFloat32 => gpu.PixelFormat.r32g32b32a32Float,
+-            },
+-          )!
+-            ..overwrite(sourceData),
+-        );
+-
+-  int get width => resource.width;
++    this.sourceData, {
++    required this.width,
++    required this.height,
++    this.format = PixelFormat.rgba8888,
++  });
+ 
+-  int get height => resource.height;
++  @override
++  gpu.Texture createResource() {
++    return gpu.gpuContext.createTexture(
++      gpu.StorageMode.hostVisible,
++      width,
++      height,
++      format: switch (format) {
++        PixelFormat.rgba8888 => gpu.PixelFormat.r8g8b8a8UNormInt,
++        PixelFormat.bgra8888 => gpu.PixelFormat.b8g8r8a8UNormInt,
++        PixelFormat.rgbaFloat32 => gpu.PixelFormat.r32g32b32a32Float,
++      },
++    )!
++      ..overwrite(sourceData);
++  }
+ 
+   Image toImage() => resource.asImage();
+ 

@@ -1,0 +1,1076 @@
+diff --git a/.gitignore b/.gitignore
+index 7452d7de590..ef7cfdc1e28 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -37,6 +37,7 @@ desktop/
+ coverage/
+ pubspec.lock
+ pubspec_overrides.yaml
++.fvmrc
+ 
+ # Sphinx related
+ __pycache__/
+diff --git a/doc/flame/examples/lib/router.dart b/doc/flame/examples/lib/router.dart
+index 78e8de7d403..e0f4fb1c023 100644
+--- a/doc/flame/examples/lib/router.dart
++++ b/doc/flame/examples/lib/router.dart
+@@ -14,50 +14,22 @@ class RouterGame extends FlameGame {
+     add(
+       router = RouterComponent(
+         routes: {
+-          'splash': Route(SplashScreenPage.new),
+           'home': Route(StartPage.new),
+-          'level1': Route(Level1Page.new),
+-          'level2': Route(Level2Page.new),
++          'level1': WorldRoute(Level1Page.new),
++          'level2': WorldRoute(Level2Page.new, maintainState: false),
+           'pause': PauseRoute(),
+         },
+-        initialRoute: 'splash',
++        initialRoute: 'home',
+       ),
+     );
+   }
+ }
+ 
+-class SplashScreenPage extends Component
+-    with TapCallbacks, HasGameReference<RouterGame> {
+-  @override
+-  Future<void> onLoad() async {
+-    addAll([
+-      Background(const Color(0xff282828)),
+-      TextBoxComponent(
+-        text: '[Router demo]',
+-        textRenderer: TextPaint(
+-          style: const TextStyle(
+-            color: Color(0x66ffffff),
+-            fontSize: 16,
+-          ),
+-        ),
+-        align: Anchor.center,
+-        size: game.canvasSize,
+-      ),
+-    ]);
+-  }
+-
+-  @override
+-  bool containsLocalPoint(Vector2 point) => true;
+-
+-  @override
+-  void onTapUp(TapUpEvent event) => game.router.pushNamed('home');
+-}
+-
+ class StartPage extends Component with HasGameReference<RouterGame> {
+   StartPage() {
+     addAll([
+       _logo = TextComponent(
+-        text: 'Syzygy',
++        text: 'Your Game',
+         textRenderer: TextPaint(
+           style: const TextStyle(
+             fontSize: 64,
+@@ -231,22 +203,28 @@ class PauseButton extends SimpleButton with HasGameReference<RouterGame> {
+             ..lineTo(26, 30),
+           position: Vector2(60, 10),
+         );
++
++  bool isPaused = false;
++
+   @override
+-  void action() => game.router.pushNamed('pause');
++  void action() {
++    if (isPaused) {
++      game.router.pop();
++    } else {
++      game.router.pushNamed('pause');
++    }
++    isPaused = !isPaused;
++  }
+ }
+ 
+-class Level1Page extends Component {
++class Level1Page extends DecoratedWorld with HasGameReference {
+   @override
+   Future<void> onLoad() async {
+-    final game = findGame()!;
+     addAll([
+       Background(const Color(0xbb2a074f)),
+-      BackButton(),
+-      PauseButton(),
+       Planet(
+         radius: 25,
+         color: const Color(0xfffff188),
+-        position: game.size / 2,
+         children: [
+           Orbit(
+             radius: 110,
+@@ -267,20 +245,33 @@ class Level1Page extends Component {
+       ),
+     ]);
+   }
++
++  final hudComponents = <Component>[];
++
++  @override
++  void onMount() {
++    hudComponents.addAll([
++      BackButton(),
++      PauseButton(),
++    ]);
++    game.camera.viewport.addAll(hudComponents);
++  }
++
++  @override
++  void onRemove() {
++    game.camera.viewport.removeAll(hudComponents);
++    super.onRemove();
++  }
+ }
+ 
+-class Level2Page extends Component {
++class Level2Page extends DecoratedWorld with HasGameReference {
+   @override
+   Future<void> onLoad() async {
+-    final game = findGame()!;
+     addAll([
+       Background(const Color(0xff052b44)),
+-      BackButton(),
+-      PauseButton(),
+       Planet(
+         radius: 30,
+         color: const Color(0xFFFFFFff),
+-        position: game.size / 2,
+         children: [
+           Orbit(
+             radius: 60,
+@@ -311,6 +302,23 @@ class Level2Page extends Component {
+       ),
+     ]);
+   }
++
++  final hudComponents = <Component>[];
++
++  @override
++  void onMount() {
++    hudComponents.addAll([
++      BackButton(),
++      PauseButton(),
++    ]);
++    game.camera.viewport.addAll(hudComponents);
++  }
++
++  @override
++  void onRemove() {
++    game.camera.viewport.removeAll(hudComponents);
++    super.onRemove();
++  }
+ }
+ 
+ class Planet extends PositionComponent {
+@@ -367,18 +375,19 @@ class PauseRoute extends Route {
+ 
+   @override
+   void onPush(Route? previousRoute) {
+-    previousRoute!
+-      ..stopTime()
+-      ..addRenderEffect(
+-        PaintDecorator.grayscale(opacity: 0.5)..addBlur(3.0),
+-      );
++    if (previousRoute is WorldRoute && previousRoute.world is DecoratedWorld) {
++      (previousRoute.world! as DecoratedWorld).timeScale = 0;
++      (previousRoute.world! as DecoratedWorld).decorator =
++          PaintDecorator.grayscale(opacity: 0.5)..addBlur(3.0);
++    }
+   }
+ 
+   @override
+   void onPop(Route nextRoute) {
+-    nextRoute
+-      ..resumeTime()
+-      ..removeRenderEffect();
++    if (nextRoute is WorldRoute && nextRoute.world is DecoratedWorld) {
++      (nextRoute.world! as DecoratedWorld).timeScale = 1;
++      (nextRoute.world! as DecoratedWorld).decorator = null;
++    }
+   }
+ }
+ 
+@@ -412,3 +421,16 @@ class PausePage extends Component
+   @override
+   void onTapUp(TapUpEvent event) => game.router.pop();
+ }
++
++class DecoratedWorld extends World with HasTimeScale {
++  PaintDecorator? decorator;
++
++  @override
++  void renderFromCamera(Canvas canvas) {
++    if (decorator == null) {
++      super.renderFromCamera(canvas);
++    } else {
++      decorator!.applyChain(super.renderFromCamera, canvas);
++    }
++  }
++}
+diff --git a/doc/flame/router.md b/doc/flame/router.md
+index 626bdc9f1bb..7ee45937850 100644
+--- a/doc/flame/router.md
++++ b/doc/flame/router.md
+@@ -90,6 +90,46 @@ The current route can be replaced using `pushReplacementNamed` or `pushReplaceme
+ simply executes `pop` on the current route and then `pushNamed` or `pushRoute`.
+ 
+ 
++## WorldRoute
++
++The **WorldRoute** is a special route that allows setting active game worlds via the router. These
++Such routes can be used, for example, for swapping levels implemented as separate worlds in your
++game.
++
++By default, the `WorldRoute` will replace the current world with the new one and by default it will
++keep the state of the world after being popped from the stack. If you want the world to be recreated
++each time the route is activated, set `maintainState` to `false`.
++
++If you are not using the built-in `CameraComponent` you can pass in the camera that you want to use
++explicitly in the constructor.
++
++```dart
++final router = RouterComponent(
++  routes: {
++    'level1': WorldRoute(MyWorld1.new),
++    'level2': WorldRoute(MyWorld2.new, maintainState: false),
++  },
++);
++
++class MyWorld1 extends World {
++  @override
++  Future<void> onLoad() async {
++    add(BackgroundComponent());
++    add(PlayerComponent());
++  }
++}
++
++class MyWorld2 extends World {
++   @override
++   Future<void> onLoad() async {
++      add(BackgroundComponent());
++      add(PlayerComponent());
++      add(EnemyComponent());
++   }
++}
++```
++
++
+ ## OverlayRoute
+ 
+ The **OverlayRoute** is a special route that allows adding game overlays via the router. These
+diff --git a/examples/lib/main.dart b/examples/lib/main.dart
+index b7ac835fb15..f8037ef8d4d 100644
+--- a/examples/lib/main.dart
++++ b/examples/lib/main.dart
+@@ -30,6 +30,7 @@ import 'package:examples/stories/input/input.dart';
+ import 'package:examples/stories/layout/layout.dart';
+ import 'package:examples/stories/parallax/parallax.dart';
+ import 'package:examples/stories/rendering/rendering.dart';
++import 'package:examples/stories/router/router.dart';
+ import 'package:examples/stories/sprites/sprites.dart';
+ import 'package:examples/stories/structure/structure.dart';
+ import 'package:examples/stories/svg/svg.dart';
+@@ -88,6 +89,7 @@ void runAsDashbook() {
+   addLayoutStories(dashbook);
+   addParallaxStories(dashbook);
+   addRenderingStories(dashbook);
++  addRouterStories(dashbook);
+   addTiledStories(dashbook);
+   addSpritesStories(dashbook);
+   addSvgStories(dashbook);
+diff --git a/examples/lib/stories/router/router.dart b/examples/lib/stories/router/router.dart
+new file mode 100644
+index 00000000000..359bfdc4a8c
+--- /dev/null
++++ b/examples/lib/stories/router/router.dart
+@@ -0,0 +1,13 @@
++import 'package:dashbook/dashbook.dart';
++import 'package:examples/commons/commons.dart';
++import 'package:examples/stories/router/router_world_example.dart';
++import 'package:flame/game.dart';
++
++void addRouterStories(Dashbook dashbook) {
++  dashbook.storiesOf('Router').add(
++        'Router with multiple worlds',
++        (_) => GameWidget(game: RouterWorldExample()),
++        codeLink: baseLink('router/router_world_example.dart'),
++        info: RouterWorldExample.description,
++      );
++}
+diff --git a/examples/lib/stories/router/router_world_example.dart b/examples/lib/stories/router/router_world_example.dart
+new file mode 100644
+index 00000000000..bb54b9abd64
+--- /dev/null
++++ b/examples/lib/stories/router/router_world_example.dart
+@@ -0,0 +1,443 @@
++import 'package:flame/components.dart';
++import 'package:flame/effects.dart';
++import 'package:flame/events.dart';
++import 'package:flame/game.dart';
++import 'package:flame/geometry.dart';
++import 'package:flame/rendering.dart';
++import 'package:flutter/rendering.dart';
++
++class RouterWorldExample extends FlameGame {
++  static const description = '''
++  This example shows how to use the RouterComponent to navigate between
++  different worlds and pages.
++  ''';
++
++  late final RouterComponent router;
++
++  @override
++  Future<void> onLoad() async {
++    add(
++      router = RouterComponent(
++        routes: {
++          'home': Route(StartPage.new),
++          'level1': WorldRoute(Level1Page.new),
++          'level2': WorldRoute(Level2Page.new, maintainState: false),
++          'pause': PauseRoute(),
++        },
++        initialRoute: 'home',
++      ),
++    );
++  }
++}
++
++class StartPage extends Component with HasGameReference<RouterWorldExample> {
++  StartPage() {
++    addAll([
++      _logo = TextComponent(
++        text: 'Your Game',
++        textRenderer: TextPaint(
++          style: const TextStyle(
++            fontSize: 64,
++            color: Color(0xFFC8FFF5),
++            fontWeight: FontWeight.w800,
++          ),
++        ),
++        anchor: Anchor.center,
++      ),
++      _button1 = RoundedButton(
++        text: 'Level 1',
++        action: () => game.router.pushNamed('level1'),
++        color: const Color(0xffadde6c),
++        borderColor: const Color(0xffedffab),
++      ),
++      _button2 = RoundedButton(
++        text: 'Level 2',
++        action: () => game.router.pushNamed('level2'),
++        color: const Color(0xffdebe6c),
++        borderColor: const Color(0xfffff4c7),
++      ),
++    ]);
++  }
++
++  late final TextComponent _logo;
++  late final RoundedButton _button1;
++  late final RoundedButton _button2;
++
++  @override
++  void onGameResize(Vector2 size) {
++    super.onGameResize(size);
++    _logo.position = Vector2(size.x / 2, size.y / 3);
++    _button1.position = Vector2(size.x / 2, _logo.y + 80);
++    _button2.position = Vector2(size.x / 2, _logo.y + 140);
++  }
++}
++
++class Background extends Component {
++  Background(this.color);
++  final Color color;
++
++  @override
++  void render(Canvas canvas) {
++    canvas.drawColor(color, BlendMode.srcATop);
++  }
++}
++
++class RoundedButton extends PositionComponent with TapCallbacks {
++  RoundedButton({
++    required this.text,
++    required this.action,
++    required Color color,
++    required Color borderColor,
++    super.position,
++    super.anchor = Anchor.center,
++  }) : _textDrawable = TextPaint(
++          style: const TextStyle(
++            fontSize: 20,
++            color: Color(0xFF000000),
++            fontWeight: FontWeight.w800,
++          ),
++        ).toTextPainter(text) {
++    size = Vector2(150, 40);
++    _textOffset = Offset(
++      (size.x - _textDrawable.width) / 2,
++      (size.y - _textDrawable.height) / 2,
++    );
++    _rrect = RRect.fromLTRBR(0, 0, size.x, size.y, Radius.circular(size.y / 2));
++    _bgPaint = Paint()..color = color;
++    _borderPaint = Paint()
++      ..style = PaintingStyle.stroke
++      ..strokeWidth = 2
++      ..color = borderColor;
++  }
++
++  final String text;
++  final void Function() action;
++  final TextPainter _textDrawable;
++  late final Offset _textOffset;
++  late final RRect _rrect;
++  late final Paint _borderPaint;
++  late final Paint _bgPaint;
++
++  @override
++  void render(Canvas canvas) {
++    canvas.drawRRect(_rrect, _bgPaint);
++    canvas.drawRRect(_rrect, _borderPaint);
++    _textDrawable.paint(canvas, _textOffset);
++  }
++
++  @override
++  void onTapDown(TapDownEvent event) {
++    scale = Vector2.all(1.05);
++  }
++
++  @override
++  void onTapUp(TapUpEvent event) {
++    scale = Vector2.all(1.0);
++    action();
++  }
++
++  @override
++  void onTapCancel(TapCancelEvent event) {
++    scale = Vector2.all(1.0);
++  }
++}
++
++abstract class SimpleButton extends PositionComponent with TapCallbacks {
++  SimpleButton(this._iconPath, {super.position}) : super(size: Vector2.all(40));
++
++  final Paint _borderPaint = Paint()
++    ..style = PaintingStyle.stroke
++    ..color = const Color(0x66ffffff);
++  final Paint _iconPaint = Paint()
++    ..style = PaintingStyle.stroke
++    ..color = const Color(0xffaaaaaa)
++    ..strokeWidth = 7;
++  final Path _iconPath;
++
++  void action();
++
++  @override
++  void render(Canvas canvas) {
++    canvas.drawRRect(
++      RRect.fromRectAndRadius(size.toRect(), const Radius.circular(8)),
++      _borderPaint,
++    );
++    canvas.drawPath(_iconPath, _iconPaint);
++  }
++
++  @override
++  void onTapDown(TapDownEvent event) {
++    _iconPaint.color = const Color(0xffffffff);
++  }
++
++  @override
++  void onTapUp(TapUpEvent event) {
++    _iconPaint.color = const Color(0xffaaaaaa);
++    action();
++  }
++
++  @override
++  void onTapCancel(TapCancelEvent event) {
++    _iconPaint.color = const Color(0xffaaaaaa);
++  }
++}
++
++class BackButton extends SimpleButton
++    with HasGameReference<RouterWorldExample> {
++  BackButton()
++      : super(
++          Path()
++            ..moveTo(22, 8)
++            ..lineTo(10, 20)
++            ..lineTo(22, 32)
++            ..moveTo(12, 20)
++            ..lineTo(34, 20),
++          position: Vector2.all(10),
++        );
++
++  @override
++  void action() => game.router.pop();
++}
++
++class PauseButton extends SimpleButton
++    with HasGameReference<RouterWorldExample> {
++  PauseButton()
++      : super(
++          Path()
++            ..moveTo(14, 10)
++            ..lineTo(14, 30)
++            ..moveTo(26, 10)
++            ..lineTo(26, 30),
++          position: Vector2(60, 10),
++        );
++
++  bool isPaused = false;
++
++  @override
++  void action() {
++    if (isPaused) {
++      game.router.pop();
++    } else {
++      game.router.pushNamed('pause');
++    }
++    isPaused = !isPaused;
++  }
++}
++
++class Level1Page extends DecoratedWorld with HasGameReference {
++  @override
++  Future<void> onLoad() async {
++    addAll([
++      Background(const Color(0xbb2a074f)),
++      Planet(
++        radius: 25,
++        color: const Color(0xfffff188),
++        children: [
++          Orbit(
++            radius: 110,
++            revolutionPeriod: 6,
++            planet: Planet(
++              radius: 10,
++              color: const Color(0xff54d7b1),
++              children: [
++                Orbit(
++                  radius: 25,
++                  revolutionPeriod: 5,
++                  planet: Planet(radius: 3, color: const Color(0xFFcccccc)),
++                ),
++              ],
++            ),
++          ),
++        ],
++      ),
++    ]);
++  }
++
++  final hudComponents = <Component>[];
++
++  @override
++  void onMount() {
++    hudComponents.addAll([
++      BackButton(),
++      PauseButton(),
++    ]);
++    game.camera.viewport.addAll(hudComponents);
++  }
++
++  @override
++  void onRemove() {
++    game.camera.viewport.removeAll(hudComponents);
++    super.onRemove();
++  }
++}
++
++class Level2Page extends DecoratedWorld with HasGameReference {
++  @override
++  Future<void> onLoad() async {
++    addAll([
++      Background(const Color(0xff052b44)),
++      Planet(
++        radius: 30,
++        color: const Color(0xFFFFFFff),
++        children: [
++          Orbit(
++            radius: 60,
++            revolutionPeriod: 5,
++            planet: Planet(radius: 10, color: const Color(0xffc9ce0d)),
++          ),
++          Orbit(
++            radius: 110,
++            revolutionPeriod: 10,
++            planet: Planet(
++              radius: 14,
++              color: const Color(0xfff32727),
++              children: [
++                Orbit(
++                  radius: 26,
++                  revolutionPeriod: 3,
++                  planet: Planet(radius: 5, color: const Color(0xffffdb00)),
++                ),
++                Orbit(
++                  radius: 35,
++                  revolutionPeriod: 4,
++                  planet: Planet(radius: 3, color: const Color(0xffdc00ff)),
++                ),
++              ],
++            ),
++          ),
++        ],
++      ),
++    ]);
++  }
++
++  final hudComponents = <Component>[];
++
++  @override
++  void onMount() {
++    hudComponents.addAll([
++      BackButton(),
++      PauseButton(),
++    ]);
++    game.camera.viewport.addAll(hudComponents);
++  }
++
++  @override
++  void onRemove() {
++    game.camera.viewport.removeAll(hudComponents);
++    super.onRemove();
++  }
++}
++
++class Planet extends PositionComponent {
++  Planet({
++    required this.radius,
++    required this.color,
++    super.position,
++    super.children,
++  }) : _paint = Paint()..color = color;
++
++  final double radius;
++  final Color color;
++  final Paint _paint;
++
++  @override
++  void render(Canvas canvas) {
++    canvas.drawCircle(Offset.zero, radius, _paint);
++  }
++}
++
++class Orbit extends PositionComponent {
++  Orbit({
++    required this.radius,
++    required this.planet,
++    required this.revolutionPeriod,
++    double initialAngle = 0,
++  })  : _paint = Paint()
++          ..style = PaintingStyle.stroke
++          ..color = const Color(0x888888aa),
++        _angle = initialAngle {
++    add(planet);
++  }
++
++  final double radius;
++  final double revolutionPeriod;
++  final Planet planet;
++  final Paint _paint;
++  double _angle;
++
++  @override
++  void render(Canvas canvas) {
++    canvas.drawCircle(Offset.zero, radius, _paint);
++  }
++
++  @override
++  void update(double dt) {
++    _angle += dt / revolutionPeriod * tau;
++    planet.position = Vector2(radius, 0)..rotate(_angle);
++  }
++}
++
++class PauseRoute extends Route {
++  PauseRoute() : super(PausePage.new, transparent: true);
++
++  @override
++  void onPush(Route? previousRoute) {
++    if (previousRoute is WorldRoute && previousRoute.world is DecoratedWorld) {
++      (previousRoute.world! as DecoratedWorld).timeScale = 0;
++      (previousRoute.world! as DecoratedWorld).decorator =
++          PaintDecorator.grayscale(opacity: 0.5)..addBlur(3.0);
++    }
++  }
++
++  @override
++  void onPop(Route nextRoute) {
++    if (nextRoute is WorldRoute && nextRoute.world is DecoratedWorld) {
++      (nextRoute.world! as DecoratedWorld).timeScale = 1;
++      (nextRoute.world! as DecoratedWorld).decorator = null;
++    }
++  }
++}
++
++class PausePage extends Component
++    with TapCallbacks, HasGameReference<RouterWorldExample> {
++  @override
++  Future<void> onLoad() async {
++    final game = findGame()!;
++    addAll([
++      TextComponent(
++        text: 'PAUSED',
++        position: game.canvasSize / 2,
++        anchor: Anchor.center,
++        children: [
++          ScaleEffect.to(
++            Vector2.all(1.1),
++            EffectController(
++              duration: 0.3,
++              alternate: true,
++              infinite: true,
++            ),
++          ),
++        ],
++      ),
++    ]);
++  }
++
++  @override
++  bool containsLocalPoint(Vector2 point) => true;
++
++  @override
++  void onTapUp(TapUpEvent event) => game.router.pop();
++}
++
++class DecoratedWorld extends World with HasTimeScale {
++  PaintDecorator? decorator;
++
++  @override
++  void renderFromCamera(Canvas canvas) {
++    if (decorator == null) {
++      super.renderFromCamera(canvas);
++    } else {
++      decorator!.applyChain(super.renderFromCamera, canvas);
++    }
++  }
++}
+diff --git a/packages/flame/lib/game.dart b/packages/flame/lib/game.dart
+index b9f26f89876..9ca9c726187 100644
+--- a/packages/flame/lib/game.dart
++++ b/packages/flame/lib/game.dart
+@@ -3,10 +3,11 @@
+ library game;
+ 
+ export 'src/collisions/has_collision_detection.dart';
+-export 'src/components/overlay_route.dart' show OverlayRoute;
+-export 'src/components/route.dart' show Route;
+-export 'src/components/router_component.dart' show RouterComponent;
+-export 'src/components/value_route.dart' show ValueRoute;
++export 'src/components/router/overlay_route.dart' show OverlayRoute;
++export 'src/components/router/route.dart' show Route;
++export 'src/components/router/router_component.dart' show RouterComponent;
++export 'src/components/router/value_route.dart' show ValueRoute;
++export 'src/components/router/world_route.dart' show WorldRoute;
+ export 'src/extensions/vector2.dart';
+ export 'src/game/flame_game.dart';
+ export 'src/game/game.dart';
+diff --git a/packages/flame/lib/src/camera/world.dart b/packages/flame/lib/src/camera/world.dart
+index 34053704c92..a2a023ba0ca 100644
+--- a/packages/flame/lib/src/camera/world.dart
++++ b/packages/flame/lib/src/camera/world.dart
+@@ -3,7 +3,6 @@ import 'dart:ui';
+ import 'package:flame/src/camera/camera_component.dart';
+ import 'package:flame/src/components/core/component.dart';
+ import 'package:flame/src/components/mixins/coordinate_transform.dart';
+-import 'package:meta/meta.dart';
+ import 'package:vector_math/vector_math_64.dart';
+ 
+ /// The root component for all game world elements.
+@@ -25,8 +24,10 @@ class World extends Component implements CoordinateTransform {
+   @override
+   void renderTree(Canvas canvas) {}
+ 
+-  /// Internal rendering method invoked by the [CameraComponent].
+-  @internal
++  /// The rendering method invoked by the [CameraComponent].
++  ///
++  /// If you want to do changes to the rendering of the world, this is the
++  /// method that you want to override, not [renderTree].
+   void renderFromCamera(Canvas canvas) {
+     assert(CameraComponent.currentCamera != null);
+     super.renderTree(canvas);
+diff --git a/packages/flame/lib/src/components/overlay_route.dart b/packages/flame/lib/src/components/router/overlay_route.dart
+similarity index 97%
+rename from packages/flame/lib/src/components/overlay_route.dart
+rename to packages/flame/lib/src/components/router/overlay_route.dart
+index 0395571c2ad..e40383ce9b0 100644
+--- a/packages/flame/lib/src/components/overlay_route.dart
++++ b/packages/flame/lib/src/components/router/overlay_route.dart
+@@ -1,5 +1,5 @@
+ import 'package:flame/src/components/core/component.dart';
+-import 'package:flame/src/components/route.dart';
++import 'package:flame/src/components/router/route.dart';
+ import 'package:flame/src/game/game.dart';
+ import 'package:flutter/widgets.dart' hide Route;
+ import 'package:meta/meta.dart';
+diff --git a/packages/flame/lib/src/components/route.dart b/packages/flame/lib/src/components/router/route.dart
+similarity index 98%
+rename from packages/flame/lib/src/components/route.dart
+rename to packages/flame/lib/src/components/router/route.dart
+index 472a39b1081..e3ae8852399 100644
+--- a/packages/flame/lib/src/components/route.dart
++++ b/packages/flame/lib/src/components/router/route.dart
+@@ -1,7 +1,7 @@
+ import 'dart:ui';
+ 
+ import 'package:flame/components.dart';
+-import 'package:flame/src/components/router_component.dart';
++import 'package:flame/src/components/router/router_component.dart';
+ import 'package:flame/src/effects/effect.dart';
+ import 'package:flame/src/rendering/decorator.dart';
+ import 'package:meta/meta.dart';
+@@ -132,7 +132,7 @@ class Route extends PositionComponent
+   final Decorator _renderEffect;
+ 
+   /// Invoked by the [RouterComponent] when this route is pushed to the top
+-  /// of the navigation stack
++  /// of the navigation stack.
+   @internal
+   void didPush(Route? previousRoute) {
+     _page ??= build();
+diff --git a/packages/flame/lib/src/components/router_component.dart b/packages/flame/lib/src/components/router/router_component.dart
+similarity index 98%
+rename from packages/flame/lib/src/components/router_component.dart
+rename to packages/flame/lib/src/components/router/router_component.dart
+index 81d25fa2a61..1e3bffe9d1f 100644
+--- a/packages/flame/lib/src/components/router_component.dart
++++ b/packages/flame/lib/src/components/router/router_component.dart
+@@ -1,7 +1,7 @@
+ import 'package:flame/src/components/core/component.dart';
+-import 'package:flame/src/components/overlay_route.dart';
+-import 'package:flame/src/components/route.dart';
+-import 'package:flame/src/components/value_route.dart';
++import 'package:flame/src/components/router/overlay_route.dart';
++import 'package:flame/src/components/router/route.dart';
++import 'package:flame/src/components/router/value_route.dart';
+ import 'package:meta/meta.dart';
+ 
+ /// [RouterComponent] handles transitions between multiple pages of a game.
+diff --git a/packages/flame/lib/src/components/value_route.dart b/packages/flame/lib/src/components/router/value_route.dart
+similarity index 91%
+rename from packages/flame/lib/src/components/value_route.dart
+rename to packages/flame/lib/src/components/router/value_route.dart
+index c15ddbab150..5e7e4f936f2 100644
+--- a/packages/flame/lib/src/components/value_route.dart
++++ b/packages/flame/lib/src/components/router/value_route.dart
+@@ -1,7 +1,7 @@
+ import 'dart:async';
+ 
+-import 'package:flame/src/components/route.dart';
+-import 'package:flame/src/components/router_component.dart';
++import 'package:flame/src/components/router/route.dart';
++import 'package:flame/src/components/router/router_component.dart';
+ import 'package:meta/meta.dart';
+ 
+ /// [ValueRoute] is a special route that "returns a value" when popped.
+diff --git a/packages/flame/lib/src/components/router/world_route.dart b/packages/flame/lib/src/components/router/world_route.dart
+new file mode 100644
+index 00000000000..16940d01633
+--- /dev/null
++++ b/packages/flame/lib/src/components/router/world_route.dart
+@@ -0,0 +1,80 @@
++import 'package:flame/camera.dart';
++import 'package:flame/game.dart';
++import 'package:flame/rendering.dart';
++import 'package:meta/meta.dart';
++
++/// [WorldRoute] is a class that allows setting the world that a camera is
++/// looking at.
++class WorldRoute extends Route {
++  /// A world route that uses the specified [builder]. This builder will be
++  /// registered with the Game's map of world builders when this route is
++  /// first activated.
++  ///
++  /// The [camera] parameter is optional and can be used to set the camera
++  /// that will be used to render the world, if not provided the default camera
++  /// will be used.
++  WorldRoute(this.builder, {this.camera, super.maintainState}) : super(null);
++
++  final World Function() builder;
++  final CameraComponent? camera;
++  late World? _previousWorld;
++  World? world;
++
++  Game get game => findGame()!;
++
++  @override
++  String get name => super.name!;
++
++  @override
++  World build() {
++    if (!maintainState) {
++      world = builder();
++      return world!;
++    } else {
++      return world ??= builder();
++    }
++  }
++
++  @internal
++  @override
++  void didPush(Route? previousRoute) => onPush(previousRoute);
++
++  @mustCallSuper
++  @override
++  void onPush(Route? previousRoute) {
++    assert(
++      camera != null || game is FlameGame,
++      'You need to either provide a camera or use a FlameGame to use the '
++      'WorldRoute',
++    );
++    if (camera != null) {
++      _previousWorld = camera?.world;
++      camera?.world = build();
++    } else {
++      _previousWorld = (game as FlameGame).world;
++      (game as FlameGame).world = build();
++    }
++  }
++
++  @mustCallSuper
++  @override
++  void onPop(Route nextRoute) {
++    if (camera != null) {
++      camera?.world = _previousWorld;
++    } else {
++      (game as FlameGame).world = _previousWorld ?? World();
++    }
++  }
++
++  @override
++  @internal
++  void addRenderEffect(Decorator effect) => UnimplementedError(
++        'WorldRoute does not support render effects',
++      );
++
++  @override
++  @internal
++  void removeRenderEffect() => UnimplementedError(
++        'WorldRoute does not support render effects',
++      );
++}
+diff --git a/packages/flame/test/components/world_route_test.dart b/packages/flame/test/components/world_route_test.dart
+new file mode 100644
+index 00000000000..73655cc6d3a
+--- /dev/null
++++ b/packages/flame/test/components/world_route_test.dart
+@@ -0,0 +1,112 @@
++import 'package:flame/components.dart';
++import 'package:flame/game.dart';
++import 'package:flutter_test/flutter_test.dart';
++
++class _TestWorld1 extends World {
++  int value = 0;
++}
++
++class _TestWorld2 extends World {}
++
++void main() {
++  group('WorldRoute', () {
++    testWidgets('can set a new world', (tester) async {
++      final router = RouterComponent(
++        initialRoute: '/',
++        routes: {
++          '/': Route(Component.new),
++          '/world': WorldRoute(_TestWorld1.new),
++        },
++      );
++      final game = FlameGame(children: [router]);
++      await tester.pumpWidget(GameWidget(game: game));
++      await tester.pump();
++      await tester.pump();
++      expect(router.currentRoute.name, '/');
++      expect(game.world, isNot(isA<_TestWorld1>));
++
++      router.pushNamed('/world');
++      await tester.pump();
++      expect(router.currentRoute.name, '/world');
++      expect(game.world, isA<_TestWorld1>());
++    });
++
++    testWidgets('changes back to previous world on pop', (tester) async {
++      final router = RouterComponent(
++        initialRoute: '/world1',
++        routes: {
++          '/world1': WorldRoute(_TestWorld1.new),
++          '/world2': WorldRoute(_TestWorld2.new),
++        },
++      );
++      final game = FlameGame(children: [router]);
++      await tester.pumpWidget(GameWidget(game: game));
++      await tester.pump();
++      await tester.pump();
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++
++      router.pushNamed('/world2');
++      expect(router.currentRoute.name, '/world2');
++      expect(game.world, isA<_TestWorld2>());
++
++      router.pop();
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++    });
++
++    testWidgets('retains the state of the world', (tester) async {
++      final router = RouterComponent(
++        initialRoute: '/world1',
++        routes: {
++          '/world1': WorldRoute(_TestWorld1.new),
++          '/world2': WorldRoute(_TestWorld2.new),
++        },
++      );
++      final game = FlameGame(children: [router]);
++      await tester.pumpWidget(GameWidget(game: game));
++      await tester.pump();
++      await tester.pump();
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++      expect((game.world as _TestWorld1).value, isZero);
++      (game.world as _TestWorld1).value = 1;
++
++      router.pushReplacementNamed('/world2');
++      expect(router.currentRoute.name, '/world2');
++      expect(game.world, isA<_TestWorld2>());
++
++      router.pushReplacementNamed('/world1');
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++      expect((game.world as _TestWorld1).value, 1);
++    });
++
++    testWidgets('does not retain the state of world', (tester) async {
++      final router = RouterComponent(
++        initialRoute: '/world1',
++        routes: {
++          '/world1': WorldRoute(_TestWorld1.new, maintainState: false),
++          '/world2': WorldRoute(_TestWorld2.new),
++        },
++      );
++      final game = FlameGame(children: [router]);
++      await tester.pumpWidget(GameWidget(game: game));
++      await tester.pump();
++      await tester.pump();
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++      expect((game.world as _TestWorld1).value, isZero);
++      (game.world as _TestWorld1).value = 1;
++
++      router.pushReplacementNamed('/world2');
++      expect(router.currentRoute.name, '/world2');
++      expect(game.world, isA<_TestWorld2>());
++
++      router.pushReplacementNamed('/world1');
++      expect(router.currentRoute.name, '/world1');
++      expect(game.world, isA<_TestWorld1>());
++      expect((game.world as _TestWorld1).value, isZero);
++    });
++  });
++}

@@ -1,0 +1,579 @@
+diff --git a/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart b/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
+index 15e9bffc52..a72de9f852 100644
+--- a/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
++++ b/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
+@@ -542,12 +542,26 @@ class DatabaseConnection {
+   }
+ 
+   /// For most cases use the corresponding method in [Database] instead.
+-  Future<R> transaction<R>(TransactionFunction<R> transactionFunction) {
++  Future<R> transaction<R>(
++    TransactionFunction<R> transactionFunction, {
++    required TransactionSettings settings,
++  }) {
++    var pgTransactionSettings = pg.TransactionSettings(
++      isolationLevel: switch (settings.isolationLevel) {
++        IsolationLevel.readCommitted => pg.IsolationLevel.readCommitted,
++        IsolationLevel.readUncommitted => pg.IsolationLevel.readUncommitted,
++        IsolationLevel.repeatableRead => pg.IsolationLevel.repeatableRead,
++        IsolationLevel.serializable => pg.IsolationLevel.serializable,
++        null => null,
++      },
++    );
++
+     return _postgresConnection.runTx<R>(
+       (ctx) {
+         var transaction = _PostgresTransaction(ctx);
+         return transactionFunction(transaction);
+       },
++      settings: pgTransactionSettings,
+     );
+   }
+ 
+diff --git a/packages/serverpod/lib/src/database/concepts/transaction.dart b/packages/serverpod/lib/src/database/concepts/transaction.dart
+index 83e438a9f2..ab27f9338e 100644
+--- a/packages/serverpod/lib/src/database/concepts/transaction.dart
++++ b/packages/serverpod/lib/src/database/concepts/transaction.dart
+@@ -8,3 +8,49 @@ abstract interface class Transaction {
+   /// exception depending on driver.
+   Future<void> cancel();
+ }
++
++/// Isolation levels for transactions.
++enum IsolationLevel {
++  /// Allow transaction to see uncommitted changes made by other transactions.
++  /// Though in PostgreSQL, this behaves like read committed.
++  readUncommitted,
++
++  /// Each statement in the transaction sees a snapshot of the database as of
++  /// the beginning of the statement. This means each statement might observe
++  /// a different version of the database.
++  readCommitted,
++
++  /// The transaction transaction can only see rows committed before the first
++  /// statement was executed giving a consistent view of the database.
++  ///
++  /// If conflicting writes among concurrent transactions occur, an exception is
++  /// thrown and the transaction is rolled back.
++  ///
++  /// It is good to be prepared to retry transactions when using this isolation
++  /// level.
++  repeatableRead,
++
++  /// The transaction can only see rows committed before the first
++  /// statement was executed giving a consistent view of the database.
++  ///
++  /// If a read row is updated by another transaction, an exception is thrown
++  /// and the transaction is rolled back.
++  ///
++  /// If conflicting writes among concurrent transactions occur, an
++  /// exception is thrown and the transaction is rolled back.
++  ///
++  /// It is good to be prepared to retry transactions when using this isolation
++  /// level.
++  serializable,
++}
++
++/// Settings for a transaction.
++class TransactionSettings {
++  /// The isolation level of the transaction.
++  final IsolationLevel? isolationLevel;
++
++  /// Creates a new transaction settings object.
++  const TransactionSettings({
++    this.isolationLevel,
++  });
++}
+diff --git a/packages/serverpod/lib/src/database/database.dart b/packages/serverpod/lib/src/database/database.dart
+index f5121a98c7..5e56fbb4f1 100644
+--- a/packages/serverpod/lib/src/database/database.dart
++++ b/packages/serverpod/lib/src/database/database.dart
+@@ -316,9 +316,13 @@ class Database {
+   }
+ 
+   /// Executes a [Transaction].
+-  Future<R> transaction<R>(TransactionFunction<R> transactionFunction) async {
++  Future<R> transaction<R>(
++    TransactionFunction<R> transactionFunction, {
++    TransactionSettings? settings,
++  }) async {
+     return await _databaseConnection.transaction(
+       transactionFunction,
++      settings: settings ?? const TransactionSettings(),
+     );
+   }
+ 
+diff --git a/packages/serverpod_test/lib/src/test_database_proxy.dart b/packages/serverpod_test/lib/src/test_database_proxy.dart
+index 79f2a2ea9f..f8a8b1ece8 100644
+--- a/packages/serverpod_test/lib/src/test_database_proxy.dart
++++ b/packages/serverpod_test/lib/src/test_database_proxy.dart
+@@ -172,10 +172,11 @@ class TestDatabaseProxy implements Database {
+   @override
+   Future<R> transaction<R>(
+     TransactionFunction<R> transactionFunction, {
++    TransactionSettings? settings,
+     bool isUserCall = true,
+   }) async {
+     if (!isUserCall || _rollbackDatabase == RollbackDatabase.disabled) {
+-      return _db.transaction(transactionFunction);
++      return _db.transaction(transactionFunction, settings: settings);
+     }
+ 
+     var localTransaction = _transactionManager.currentTransaction;
+diff --git a/tests/serverpod_test_server/lib/test_util/test_tags.dart b/tests/serverpod_test_server/lib/test_util/test_tags.dart
+index f693d3ad70..553bf1fb1e 100644
+--- a/tests/serverpod_test_server/lib/test_util/test_tags.dart
++++ b/tests/serverpod_test_server/lib/test_util/test_tags.dart
+@@ -1 +1,3 @@
+-const concurrencyOneTestTag = 'concurrency_one';
++abstract final class TestTags {
++  static const concurrencyOneTestTag = 'concurrency_one';
++}
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart
+new file mode 100644
+index 0000000000..e917295529
+--- /dev/null
++++ b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart
+@@ -0,0 +1,330 @@
++import 'dart:async';
++
++import 'package:serverpod_test_server/src/generated/protocol.dart';
++import 'package:serverpod/serverpod.dart';
++import 'package:serverpod_test_server/test_util/test_tags.dart';
++import 'package:test/test.dart';
++
++import '../../test_tools/serverpod_test_tools.dart';
++
++void main() async {
++  withServerpod(
++    'Given read committed transaction isolation level and single row in database',
++    rollbackDatabase: RollbackDatabase.disabled,
++    testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
++    (sessionBuilder, _) {
++      var session = sessionBuilder.build();
++
++      tearDown(() async {
++        await SimpleData.db
++            .deleteWhere(session, where: (t) => Constant.bool(true));
++      });
++
++      group(
++          'Given read committed transaction isolation level and single row in database',
++          () {
++        var settings = TransactionSettings(
++          isolationLevel: IsolationLevel.readCommitted,
++        );
++
++        late SimpleData testData;
++        setUp(() async {
++          testData = await SimpleData.db.insertRow(
++            session,
++            SimpleData(num: 1),
++          );
++        });
++
++        test(
++            'when row is modified after first statement in transaction '
++            'then transaction observes the updated value.', () async {
++          var c1 = Completer();
++          var c2 = Completer();
++          var transactionFuture = session.db.transaction(
++            (t) async {
++              await SimpleData.db.findById(
++                session,
++                testData.id!,
++                transaction: t,
++              );
++
++              c1.complete();
++              await c2.future;
++
++              return await SimpleData.db.findById(
++                session,
++                testData.id!,
++                transaction: t,
++              );
++            },
++            settings: settings,
++          );
++
++          await c1.future;
++          await SimpleData.db.updateRow(
++            session,
++            testData.copyWith(num: 2),
++          );
++          c2.complete();
++
++          var transactionResult = await transactionFuture;
++          expect(transactionResult?.num, 2);
++        });
++      });
++    },
++  );
++
++  withServerpod(
++    'Given repeatable read transaction isolation level',
++    rollbackDatabase: RollbackDatabase.disabled,
++    testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
++    (sessionBuilder, _) {
++      var session = sessionBuilder.build();
++
++      tearDown(() async {
++        await SimpleData.db
++            .deleteWhere(session, where: (t) => Constant.bool(true));
++      });
++
++      var settings = TransactionSettings(
++        isolationLevel: IsolationLevel.repeatableRead,
++      );
++
++      test(
++          'when row is modified after first statement in transaction '
++          'then transaction does NOT observe the updated value.', () async {
++        var testData = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 1),
++        );
++
++        var c1 = Completer();
++        var c2 = Completer();
++        var transactionFuture = session.db.transaction(
++          (t) async {
++            await SimpleData.db.findById(
++              session,
++              testData.id!,
++              transaction: t,
++            );
++
++            c1.complete();
++            await c2.future;
++
++            return await SimpleData.db.findById(
++              session,
++              testData.id!,
++              transaction: t,
++            );
++          },
++          settings: settings,
++        );
++
++        await c1.future;
++        await SimpleData.db.updateRow(
++          session,
++          testData.copyWith(num: 2),
++        );
++        c2.complete();
++
++        var result = await transactionFuture;
++        expect(result?.num, 1);
++      });
++
++      test(
++          'when read row is concurrently modified by other transaction '
++          'then modifications are preserved', () async {
++        var testData1 = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 1),
++        );
++        var testData2 = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 2),
++        );
++        var c1 = Completer();
++        var c2 = Completer();
++
++        var transaction1 = session.db.transaction(
++          (t) async {
++            var data1 = await SimpleData.db.findById(
++              session,
++              testData1.id!,
++              transaction: t,
++            );
++
++            c1.complete();
++            await c2.future;
++
++            await SimpleData.db.updateRow(
++              session,
++              testData2.copyWith(num: data1!.num + 10),
++              transaction: t,
++            );
++          },
++          settings: settings,
++        );
++
++        var transaction2 = session.db.transaction(
++          (t) async {
++            var data2 = await SimpleData.db.findById(
++              session,
++              testData2.id!,
++              transaction: t,
++            );
++
++            await c1.future;
++
++            await SimpleData.db.updateRow(
++              session,
++              testData1.copyWith(num: data2!.num + 20),
++              transaction: t,
++            );
++            c2.complete();
++          },
++          settings: settings,
++        );
++
++        await Future.wait([transaction1, transaction2]);
++        var data1AfterTransaction = await SimpleData.db.findById(
++          session,
++          testData1.id!,
++        );
++        expect(data1AfterTransaction?.num, 22);
++        var data2AfterTransaction = await SimpleData.db.findById(
++          session,
++          testData2.id!,
++        );
++        expect(data2AfterTransaction?.num, 11);
++      });
++    },
++  );
++
++  withServerpod(
++    'Given serializable transaction isolation level',
++    rollbackDatabase: RollbackDatabase.disabled,
++    testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
++    (sessionBuilder, _) {
++      var session = sessionBuilder.build();
++
++      tearDown(() async {
++        await SimpleData.db
++            .deleteWhere(session, where: (t) => Constant.bool(true));
++      });
++
++      var settings = TransactionSettings(
++        isolationLevel: IsolationLevel.serializable,
++      );
++
++      test(
++          'when row is modified after first statement in transaction '
++          'then transaction does NOT observe the updated value.', () async {
++        var testData = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 1),
++        );
++        var c1 = Completer();
++        var c2 = Completer();
++        var transactionFuture = session.db.transaction(
++          (t) async {
++            await SimpleData.db.findById(
++              session,
++              testData.id!,
++              transaction: t,
++            );
++
++            c1.complete();
++            await c2.future;
++
++            return await SimpleData.db.findById(
++              session,
++              testData.id!,
++              transaction: t,
++            );
++          },
++          settings: settings,
++        );
++
++        await c1.future;
++        await SimpleData.db.updateRow(
++          session,
++          testData.copyWith(num: 2),
++        );
++        c2.complete();
++
++        var result = await transactionFuture;
++        expect(result?.num, 1);
++      });
++
++      test(
++          'when read row is concurrently modified by other transaction '
++          'then database exception is thrown for one transaction', () async {
++        var testData1 = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 1),
++        );
++        var testData2 = await SimpleData.db.insertRow(
++          session,
++          SimpleData(num: 2),
++        );
++        var c1 = Completer();
++        var c2 = Completer();
++
++        var transaction1 = session.db.transaction(
++          (t) async {
++            var data1 = await SimpleData.db.findById(
++              session,
++              testData1.id!,
++              transaction: t,
++            );
++
++            await Future.delayed(Duration(milliseconds: 100));
++
++            c1.complete();
++            await c2.future;
++
++            await SimpleData.db.updateRow(
++              session,
++              testData2.copyWith(num: data1!.num + 10),
++              transaction: t,
++            );
++          },
++          settings: settings,
++        );
++
++        var transaction2 = session.db.transaction(
++          (t) async {
++            var data2 = await SimpleData.db.findById(
++              session,
++              testData2.id!,
++              transaction: t,
++            );
++
++            await c1.future;
++
++            await SimpleData.db.updateRow(
++              session,
++              testData1.copyWith(num: data2!.num + 20),
++              transaction: t,
++            );
++            c2.complete();
++          },
++          settings: settings,
++        );
++
++        expectLater(transaction1, throwsA(isA<DatabaseException>()));
++        await transaction2;
++        var data1AfterTransaction = await SimpleData.db.findById(
++          session,
++          testData1.id!,
++        );
++        expect(data1AfterTransaction?.num, 22);
++        var data2AfterTransaction = await SimpleData.db.findById(
++          session,
++          testData2.id!,
++        );
++        expect(data2AfterTransaction?.num, 2);
++      });
++    },
++  );
++}
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_rollback_test.dart b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_rollback_test.dart
+index 33812627cb..84db7d8c2e 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_rollback_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_rollback_test.dart
+@@ -1,4 +1,4 @@
+-import 'package:serverpod/database.dart';
++import 'package:serverpod/serverpod.dart';
+ import 'package:serverpod_test_server/src/generated/protocol.dart';
+ import 'package:serverpod_test_server/test_util/test_serverpod.dart';
+ import 'package:test/test.dart';
+@@ -42,4 +42,8 @@ void main() async {
+     expect(fetchedData.elementAtOrNull(0)?.number, data.number);
+     expect(fetchedData.elementAtOrNull(1)?.number, data3.number);
+   });
++
++  tearDown(() async {
++    await UniqueData.db.deleteWhere(session, where: (t) => Constant.bool(true));
++  });
+ }
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+index 1467411c92..40155b8218 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+@@ -320,7 +320,7 @@ void main() {
+           });
+         },
+         rollbackDatabase: RollbackDatabase.disabled,
+-        testGroupTagsOverride: [concurrencyOneTestTag],
++        testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+       );
+ 
+       withServerpod(
+@@ -345,7 +345,7 @@ void main() {
+           });
+         },
+         rollbackDatabase: RollbackDatabase.disabled,
+-        testGroupTagsOverride: [concurrencyOneTestTag],
++        testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+       );
+     });
+ 
+@@ -370,7 +370,7 @@ void main() {
+           });
+         },
+         rollbackDatabase: RollbackDatabase.disabled,
+-        testGroupTagsOverride: [concurrencyOneTestTag],
++        testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+       );
+ 
+       withServerpod(
+@@ -392,7 +392,7 @@ void main() {
+           });
+         },
+         rollbackDatabase: RollbackDatabase.disabled,
+-        testGroupTagsOverride: [concurrencyOneTestTag],
++        testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+       );
+     });
+ 
+@@ -419,7 +419,7 @@ void main() {
+         });
+       },
+       rollbackDatabase: RollbackDatabase.disabled,
+-      testGroupTagsOverride: [concurrencyOneTestTag],
++      testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+     );
+   });
+ 
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/rollback_database_test.dart b/tests/serverpod_test_server/test_integration/test_tools/rollback_database_test.dart
+index b3cfab48b2..cd00865d94 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/rollback_database_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/rollback_database_test.dart
+@@ -341,7 +341,7 @@ void main() {
+         });
+       },
+       rollbackDatabase: RollbackDatabase.disabled,
+-      testGroupTagsOverride: [concurrencyOneTestTag],
++      testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+     );
+ 
+     withServerpod(
+@@ -365,7 +365,7 @@ void main() {
+         });
+       },
+       rollbackDatabase: RollbackDatabase.disabled,
+-      testGroupTagsOverride: [concurrencyOneTestTag],
++      testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+     );
+   });
+ }
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+index cb2c6a8373..b0bef886dc 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+@@ -189,7 +189,7 @@ void main() {
+   withServerpod(
+     'Given transaction calls when rollbacks are disabled',
+     rollbackDatabase: RollbackDatabase.disabled,
+-    testGroupTagsOverride: [concurrencyOneTestTag],
++    testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+     (sessionBuilder, endpoints) {
+       var session = sessionBuilder.build();
+ 
+@@ -306,7 +306,7 @@ void main() {
+         });
+       },
+       rollbackDatabase: RollbackDatabase.disabled,
+-      testGroupTagsOverride: [concurrencyOneTestTag],
++      testGroupTagsOverride: [TestTags.concurrencyOneTestTag],
+     );
+   });
+ }

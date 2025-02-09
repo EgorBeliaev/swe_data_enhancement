@@ -1,0 +1,234 @@
+diff --git a/lib/bean/card/network_img_layer.dart b/lib/bean/card/network_img_layer.dart
+index d6c6895e..9c258e55 100644
+--- a/lib/bean/card/network_img_layer.dart
++++ b/lib/bean/card/network_img_layer.dart
+@@ -1,5 +1,3 @@
+-import 'dart:ui';
+-
+ import 'package:cached_network_image/cached_network_image.dart';
+ import 'package:flutter/material.dart';
+ import 'package:kazumi/utils/constants.dart';
+diff --git a/lib/pages/player/player_item.dart b/lib/pages/player/player_item.dart
+index 2d8f5bb2..8f8516b0 100644
+--- a/lib/pages/player/player_item.dart
++++ b/lib/pages/player/player_item.dart
+@@ -132,14 +132,6 @@ class _PlayerItemState extends State<PlayerItem>
+     if (Utils.isDesktop()) {
+       handleFullscreen();
+     } else {
+-      if (playerController.showVideoController) {
+-        hideVideoController();
+-      } else {
+-        displayVideoController();
+-      }
+-      if (playerController.lockPanel) {
+-        return;
+-      }
+       playerController.playOrPause();
+     }
+   }
+@@ -746,9 +738,11 @@ class _PlayerItemState extends State<PlayerItem>
+                       onTap: () {
+                         _handleTap();
+                       },
+-                      onDoubleTap: () {
+-                        _handleDoubleTap();
+-                      },
++                      onDoubleTap: (playerController.lockPanel)
++                          ? null
++                          : () {
++                              _handleDoubleTap();
++                            },
+                       onLongPressStart: (_) {
+                         if (playerController.lockPanel) {
+                           return;
+@@ -838,14 +832,21 @@ class _PlayerItemState extends State<PlayerItem>
+                           ),
+                     // 播放器手势控制
+                     Positioned.fill(
+-                        left: 16,
+-                        top: 25,
+-                        right: 15,
+-                        bottom: 15,
+-                        child: (Utils.isDesktop() || playerController.lockPanel)
+-                            ? Container()
+-                            : GestureDetector(onHorizontalDragUpdate:
+-                                (DragUpdateDetails details) {
++                      left: 16,
++                      top: 25,
++                      right: 15,
++                      bottom: 15,
++                      child: (Utils.isDesktop() || playerController.lockPanel)
++                          ? Container()
++                          : GestureDetector(
++                              onHorizontalDragStart: (_) {
++                                if (!playerController.showVideoController) {
++                                  animationController?.forward();
++                                }
++                                playerController.canHidePlayerPanel = false;
++                              },
++                              onHorizontalDragUpdate:
++                                  (DragUpdateDetails details) {
+                                 playerController.showSeekTime = true;
+                                 playerTimer?.cancel();
+                                 playerController.pause();
+@@ -857,14 +858,23 @@ class _PlayerItemState extends State<PlayerItem>
+                                 ms = ms > 0 ? ms : 0;
+                                 playerController.currentPosition =
+                                     Duration(milliseconds: ms);
+-                              }, onHorizontalDragEnd: (DragEndDetails details) {
++                              },
++                              onHorizontalDragEnd: (_) {
+                                 playerController.play();
+                                 playerController
+                                     .seek(playerController.currentPosition);
++                                playerController.canHidePlayerPanel = true;
++                                if (!playerController.showVideoController) {
++                                  animationController?.reverse();
++                                } else {
++                                  hideTimer?.cancel();
++                                  startHideTimer();
++                                }
+                                 playerTimer = getPlayerTimer();
+                                 playerController.showSeekTime = false;
+-                              }, onVerticalDragUpdate:
+-                                (DragUpdateDetails details) async {
++                              },
++                              onVerticalDragUpdate:
++                                  (DragUpdateDetails details) async {
+                                 final double totalWidth =
+                                     MediaQuery.sizeOf(context).width;
+                                 final double totalHeight =
+@@ -895,7 +905,8 @@ class _PlayerItemState extends State<PlayerItem>
+                                       playerController.volume - delta / level;
+                                   playerController.setVolume(volume);
+                                 }
+-                              }, onVerticalDragEnd: (DragEndDetails details) {
++                              },
++                              onVerticalDragEnd: (_) {
+                                 if (playerController.volumeSeeking) {
+                                   playerController.volumeSeeking = false;
+                                   Future.delayed(const Duration(seconds: 1),
+@@ -909,7 +920,9 @@ class _PlayerItemState extends State<PlayerItem>
+                                 }
+                                 playerController.showVolume = false;
+                                 playerController.showBrightness = false;
+-                              })),
++                              },
++                            ),
++                    ),
+                   ]),
+                 ),
+               ),
+diff --git a/lib/pages/player/player_item_panel.dart b/lib/pages/player/player_item_panel.dart
+index e36babbd..c84ed3b7 100644
+--- a/lib/pages/player/player_item_panel.dart
++++ b/lib/pages/player/player_item_panel.dart
+@@ -720,7 +720,16 @@ class _PlayerItemPanelState extends State<PlayerItemPanel> {
+                         child: ProgressBar(
+                           thumbRadius: 8,
+                           thumbGlowRadius: 18,
+-                          timeLabelLocation: TimeLabelLocation.none,
++                          timeLabelLocation: Utils.isTablet()
++                              ? TimeLabelLocation.sides
++                              : TimeLabelLocation.none,
++                          timeLabelTextStyle: const TextStyle(
++                            color: Colors.white,
++                            fontSize: 12.0,
++                            fontFeatures: [
++                              FontFeature.tabularFigures(),
++                            ],
++                          ),
+                           progress: playerController.currentPosition,
+                           buffered: playerController.buffer,
+                           total: playerController.duration,
+@@ -782,7 +791,7 @@ class _PlayerItemPanelState extends State<PlayerItemPanel> {
+                                           videoPageController.currentRoad);
+                                 },
+                               ),
+-                            if (Utils.isDesktop() || Utils.isTablet())
++                            if (Utils.isDesktop())
+                               Container(
+                                 padding: const EdgeInsets.only(left: 10.0),
+                                 child: Text(
+diff --git a/lib/pages/video/video_page.dart b/lib/pages/video/video_page.dart
+index b641e714..9f8a1d2b 100644
+--- a/lib/pages/video/video_page.dart
++++ b/lib/pages/video/video_page.dart
+@@ -16,7 +16,6 @@ import 'package:flutter_mobx/flutter_mobx.dart';
+ import 'package:hive/hive.dart';
+ import 'package:kazumi/utils/storage.dart';
+ import 'package:kazumi/utils/utils.dart';
+-import 'package:flutter/services.dart';
+ import 'package:kazumi/bean/appbar/drag_to_move_bar.dart' as dtb;
+ import 'package:kazumi/bean/dialog/dialog_helper.dart';
+ import 'package:scrollview_observer/scrollview_observer.dart';
+diff --git a/lib/request/bangumi.dart b/lib/request/bangumi.dart
+index 043b2f09..98f8088f 100644
+--- a/lib/request/bangumi.dart
++++ b/lib/request/bangumi.dart
+@@ -233,7 +233,7 @@ class BangumiHTTP {
+   static Future<CharacterResponse> getCharatersByID(int id) async {
+     CharacterResponse characterResponse = CharacterResponse.fromTemplate();
+     try {
+-      final res = await Request().get(Api.bangumiInfoByID + id.toString() + '/characters',
++      final res = await Request().get('${Api.bangumiInfoByID}$id/characters',
+           options: Options(headers: bangumiHTTPHeader));
+       final jsonData = res.data;
+       characterResponse = CharacterResponse.fromJson(jsonData);
+diff --git a/pubspec.lock b/pubspec.lock
+index 5742e6a4..65869343 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -556,7 +556,7 @@ packages:
+     source: hosted
+     version: "2.0.1"
+   html:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: html
+       sha256: "1fc58edeaec4307368c60d59b7e15b9d658b57d7f3125098b6294153c75337ec"
+@@ -692,7 +692,7 @@ packages:
+     source: hosted
+     version: "0.12.16+1"
+   material_color_utilities:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: material_color_utilities
+       sha256: f7142bb1154231d7ea5f96bc7bde4bda2a0945d2806bb11670e30b850d56bdec
+@@ -876,7 +876,7 @@ packages:
+     source: hosted
+     version: "3.0.2"
+   path:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: path
+       sha256: "087ce49c3f0dc39180befefc60fdb4acd8f8620e5682fe2476afd0b3688bb4af"
+@@ -1044,7 +1044,7 @@ packages:
+     source: hosted
+     version: "2.1.1"
+   screen_brightness_platform_interface:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: screen_brightness_platform_interface
+       sha256: "737bd47b57746bc4291cab1b8a5843ee881af499514881b0247ec77447ee769c"
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 02150337..09031192 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -101,6 +101,11 @@ dependencies:
+       ref: main
+       path: ./libs/universal/media_kit_libs_video
+ 
++  html: any
++  material_color_utilities: any
++  path: any
++  screen_brightness_platform_interface: any
++
+ dependency_overrides:
+   media_kit:
+     git:

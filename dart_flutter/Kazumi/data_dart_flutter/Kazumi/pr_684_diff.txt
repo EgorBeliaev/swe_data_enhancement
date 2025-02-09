@@ -1,0 +1,1703 @@
+diff --git a/assets/bbcode/BBCode.g4 b/assets/bbcode/BBCode.g4
+new file mode 100644
+index 00000000..e9f16086
+--- /dev/null
++++ b/assets/bbcode/BBCode.g4
+@@ -0,0 +1,49 @@
++grammar BBCode;
++
++options { language=Dart; }
++
++document
++    : element* EOF
++    ;
++
++element
++    : tag
++    | plain
++    | bgm
++    | sticker
++    ;
++
++tag
++    : '[' tagName=STRING ('=' attr=STRING)? ']' content=element* '[/' STRING ']'
++    ;
++
++plain
++    : (STRING | '=' | '/' | '[' | ']' | '(' | ')')+
++    // workaround unless these will break tag reconginze
++    | '[来自Bangumi for android]'
++    | '[来自Bangumi for iOS]'
++    ;
++
++bgm
++    : ('(bgm' | '(BGM') id=STRING ')'
++    ;
++
++sticker
++    : '(=A=)'
++    | '(=w=)'
++    | '(-w=)'
++    | '(S_S)'
++    | '(=v=)'
++    | '(@_@)'
++    | '(=W=)'
++    | '(TAT)'
++    | '(T_T)'
++    | '(=\'=)'
++    | '(=3=)'
++    | '(= =\')'
++    | '(=///=)'
++    | '(=.,=)'
++    | '(:P)'
++    | '(LOL)';
++
++STRING : ~[=[\]()]+;
+diff --git a/lib/bbcode/README.md b/lib/bbcode/README.md
+new file mode 100644
+index 00000000..9d8a571d
+--- /dev/null
++++ b/lib/bbcode/README.md
+@@ -0,0 +1,60 @@
++# 基于 antlr4 的 BBCode 解析
++
++## 相关文件
++
++- [assets/bbcode/BBCode.g4](../../assets/bbcode/BBCode.g4): antlr4 语法文件
++- [lib/bbcode/generated](../../lib/bbcode/generated): antlr4 生成的 dart 代码所在文件夹
++
++## 关键文件
++
++- [lib/bbcode/bbcode_elements.dart](bbcode_elements.dart): BBCode 元素
++- [lib/bbcode/bbcode_base_listener.dart](bbcode_base_listener.dart): BBCode 解析器的入口文件
++- [lib/bbcode/bbcode_widget.dart](bbcode_widget.dart): BBCode 组件
++
++## 如何开发
++
++### 配置环境
++
++1. 根据[官方文档](https://github.com/antlr/antlr4/blob/dev/doc/dart-target.md)配置环境
++2. 在 IDE 中安装 `antlr v4` 插件
++
++### 开发
++
++1. 修改 [assets/bbcode/BBCode.g4](../../assets/bbcode/BBCode.g4) 文件，通过插件的 Preview 功能确定解析是否正确
++2. 通过该文件生成新的 dart 文件到 [lib/bbcode/generated](../../lib/bbcode/generated) 文件夹内，删除无用文件
++3. 参考文件内的注释进行修改
++
++### 测试 BBCode
++
++```dart
++import 'package:flutter/material.dart';
++import 'bbcode/bbcode_widget.dart';
++
++void main() {
++  runApp(MyApp());
++}
++
++class MyApp extends StatelessWidget {
++  @override
++  Widget build(BuildContext context) {
++    return MaterialApp(
++      home: Scaffold(
++        appBar: AppBar(title: const Text('BBCode Parser')),
++        body: Card(
++          color: Theme.of(context).colorScheme.secondaryContainer,
++          child: const Padding(
++            padding: EdgeInsets.all(8.0),
++            child: Padding(
++              padding: EdgeInsets.all(16),
++              child: BBCodeWidget(
++                bbcode:
++                '[quote][b]用户[/b]说：[s]测试表情和删除线(bgm35)[/s][/quote]\n[mask]测试特殊符号[]()测试字符表情(TAT)[/mask][url=https://bangumi.tv/blog/348736]测试链接[/url][url]https://bangumi.tv/blog/348736[/url][img]https://bangumi.tv/img/rc3/logo_2x.png[/img]\n\n[color=grey][size=10][来自Bangumi for android] [url=https://bgm.tv/group/topic/350677][color=grey]获取[/color][/url][/size][/color]',
++              ),
++            ),
++          ),
++        ),
++      ),
++    );
++  }
++}
++```
+diff --git a/lib/bbcode/bbcode_base_listener.dart b/lib/bbcode/bbcode_base_listener.dart
+new file mode 100644
+index 00000000..260c4751
+--- /dev/null
++++ b/lib/bbcode/bbcode_base_listener.dart
+@@ -0,0 +1,238 @@
++import 'package:flutter/material.dart';
++import 'package:antlr4/antlr4.dart';
++import 'package:logger/logger.dart';
++import 'package:kazumi/utils/logger.dart';
++import 'package:kazumi/bbcode/bbcode_elements.dart';
++
++import 'generated/BBCodeListener.dart';
++import 'generated/BBCodeParser.dart';
++
++class BBCodeBaseListener implements BBCodeListener {
++  final List<dynamic> bbcode = [];
++
++  /// 记录进入标签时的位置
++  void _enterTag(TagContext ctx) {
++    final tagName = ctx.tagName?.text;
++
++    switch (tagName) {
++      case 'URL':
++      case 'url':
++        bbCodeTag.link = bbcode.length;
++        break;
++      case 'USER':
++      case 'user':
++        bbCodeTag.link = bbcode.length;
++        break;
++      case 'QUOTE':
++      case 'quote':
++        bbCodeTag.quoted = bbcode.length;
++        break;
++      case 'B':
++      case 'b':
++        bbCodeTag.bold = bbcode.length;
++        break;
++      case 'I':
++      case 'i':
++        bbCodeTag.italic = bbcode.length;
++        break;
++      case 'S':
++      case 's':
++        bbCodeTag.strikeThrough = bbcode.length;
++        break;
++      case 'U':
++      case 'u':
++        bbCodeTag.underline = bbcode.length;
++        break;
++      case 'PHOTO':
++      case 'photo':
++      case 'IMG':
++      case 'img':
++        bbCodeTag.img = bbcode.length;
++        break;
++      case 'MASK':
++      case 'mask':
++        bbCodeTag.masked = bbcode.length;
++        break;
++      case 'SIZE':
++      case 'size':
++        bbCodeTag.size = bbcode.length;
++        break;
++      case 'COLOR':
++      case 'color':
++        bbCodeTag.color = bbcode.length;
++        break;
++      default:
++        KazumiLogger()
++            .log(Level.error, '未识别 Tag: ${ctx.text}, 请提交 issue 包含 log, 番剧及集数');
++        break;
++    }
++  }
++
++  /// 对标签内所有的 BBCodeText 叠加样式
++  void _exitTag(TagContext ctx) {
++    final tagName = ctx.tagName?.text;
++
++    switch (tagName) {
++      case 'URL':
++      case 'url':
++        if (bbcode.isNotEmpty && bbcode[bbCodeTag.link!] is BBCodeText) {
++          if (ctx.attr != null) {
++            bbcode[bbCodeTag.link!].link = ctx.attr!.text;
++          } else {
++            bbcode[bbCodeTag.link!].link = bbcode[bbCodeTag.link!].text;
++          }
++        }
++        break;
++      case 'USER':
++      case 'user':
++        if (bbcode.isNotEmpty &&
++            ctx.attr != null &&
++            bbcode[bbCodeTag.link!] is BBCodeText) {
++          bbcode[bbCodeTag.link!].link =
++              'https://bangumi.tv/user/${ctx.attr!.text}';
++          bbcode[bbCodeTag.link!].text = '@${bbcode[bbCodeTag.link!].text}';
++        }
++        break;
++      case 'QUOTE':
++      case 'quote':
++        for (int i = bbCodeTag.quoted!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].quoted = true;
++          }
++        }
++        // Add icon to the end of quoted text
++        bbcode.add(const Icon(Icons.format_quote));
++        break;
++      case 'B':
++      case 'b':
++        for (int i = bbCodeTag.bold!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].bold = true;
++          }
++        }
++        break;
++      case 'I':
++      case 'i':
++        for (int i = bbCodeTag.italic!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].italic = true;
++          }
++        }
++        break;
++      case 'S':
++      case 's':
++        for (int i = bbCodeTag.strikeThrough!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].strikeThrough = true;
++          }
++        }
++        break;
++      case 'U':
++      case 'u':
++        for (int i = bbCodeTag.underline!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].underline = true;
++          }
++        }
++        break;
++      case 'PHOTO':
++      case 'photo':
++      case 'IMG':
++      case 'img':
++        if (bbcode.isNotEmpty && bbcode[bbCodeTag.img!] is BBCodeText) {
++          bbcode[bbCodeTag.img!] =
++              BBCodeImg(imageUrl: bbcode[bbCodeTag.img!].text);
++        }
++        break;
++      case 'MASK':
++      case 'mask':
++        for (int i = bbCodeTag.masked!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].masked = true;
++          }
++        }
++        break;
++      case 'SIZE':
++      case 'size':
++        for (int i = bbCodeTag.size!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].size = int.parse(ctx.attr!.text!);
++          }
++        }
++        break;
++      case 'COLOR':
++      case 'color':
++        for (int i = bbCodeTag.color!; i < bbcode.length; i++) {
++          if (bbcode.isNotEmpty && bbcode[i] is BBCodeText) {
++            bbcode[i].color = ctx.attr?.text;
++          }
++        }
++        break;
++      default:
++        KazumiLogger()
++            .log(Level.error, '未识别 Tag: ${ctx.text}, 请提交 issue 包含 log, 番剧及集数');
++        break;
++    }
++  }
++
++  @override
++  void enterDocument(DocumentContext ctx) {}
++
++  @override
++  void exitDocument(DocumentContext ctx) {}
++
++  @override
++  void enterElement(ElementContext ctx) {}
++
++  @override
++  void exitElement(ElementContext ctx) {}
++
++  @override
++  void enterTag(TagContext ctx) {
++    _enterTag(ctx);
++  }
++
++  @override
++  void exitTag(TagContext ctx) {
++    _exitTag(ctx);
++  }
++
++  @override
++  void enterPlain(PlainContext ctx) {
++    bbcode.add(BBCodeText(text: ctx.text));
++  }
++
++  @override
++  void exitPlain(PlainContext ctx) {}
++
++  @override
++  void enterBgm(BgmContext ctx) {
++    /// 处理 (bgm35) 类型的表情
++    bbcode.add(BBCodeBgm(id: int.tryParse(ctx.id!.text!) ?? 0));
++  }
++
++  @override
++  void exitBgm(BgmContext ctx) {}
++
++  @override
++  void enterSticker(StickerContext ctx) {
++    /// 处理 (=A=) 类型的表情
++    /// ctx.start!.type 为 BBCode.tokens 内的 token 值
++    bbcode.add(BBCodeSticker(id: ctx.start!.type - 11));
++  }
++
++  @override
++  void exitSticker(StickerContext ctx) {}
++
++  @override
++  void enterEveryRule(ParserRuleContext ctx) {}
++
++  @override
++  void exitEveryRule(ParserRuleContext ctx) {}
++
++  @override
++  void visitTerminal(TerminalNode node) {}
++
++  @override
++  void visitErrorNode(ErrorNode node) {}
++}
+diff --git a/lib/bbcode/bbcode_elements.dart b/lib/bbcode/bbcode_elements.dart
+new file mode 100644
+index 00000000..45942b38
+--- /dev/null
++++ b/lib/bbcode/bbcode_elements.dart
+@@ -0,0 +1,78 @@
++// 记录进入 tag 时 list 所在位置
++class BBCodeTag {
++  int? bold;
++  int? italic;
++  int? underline;
++  int? strikeThrough;
++  int? masked;
++  int? quoted;
++  int? code;
++  int? size;
++  int? color;
++  int? link;
++  int? img;
++
++  void clear() {
++    bold = null;
++    italic = null;
++    underline = null;
++    strikeThrough = null;
++    masked = null;
++    quoted = null;
++    code = null;
++    size = null;
++    color = null;
++    link = null;
++    img = null;
++  }
++}
++
++class BBCodeText {
++  String text;
++
++  bool bold = false;
++  bool italic = false;
++  bool underline = false;
++  bool strikeThrough = false;
++  bool masked = false;
++  bool quoted = false;
++  bool code = false;
++
++  int size = 14;
++  String? color;
++  String? link;
++
++  BBCodeText({
++    required this.text,
++    this.bold = false,
++    this.italic = false,
++    this.underline = false,
++    this.strikeThrough = false,
++    this.masked = false,
++    this.quoted = false,
++    this.code = false,
++    this.size = 14,
++    this.color,
++    this.link,
++  });
++}
++
++class BBCodeBgm {
++  int id;
++
++  BBCodeBgm({required this.id});
++}
++
++class BBCodeSticker {
++  int id;
++
++  BBCodeSticker({required this.id});
++}
++
++class BBCodeImg {
++  String imageUrl;
++
++  BBCodeImg({required this.imageUrl});
++}
++
++BBCodeTag bbCodeTag = BBCodeTag();
+diff --git a/lib/bbcode/bbcode_widget.dart b/lib/bbcode/bbcode_widget.dart
+new file mode 100644
+index 00000000..ffad74c8
+--- /dev/null
++++ b/lib/bbcode/bbcode_widget.dart
+@@ -0,0 +1,175 @@
++import 'package:flutter/gestures.dart';
++import 'package:flutter/material.dart';
++import 'package:antlr4/antlr4.dart';
++import 'package:cached_network_image/cached_network_image.dart';
++import 'package:url_launcher/url_launcher.dart';
++
++import 'bbcode_base_listener.dart';
++import 'bbcode_elements.dart';
++import 'generated/BBCodeParser.dart';
++import 'generated/BBCodeLexer.dart';
++
++class BBCodeWidget extends StatefulWidget {
++  const BBCodeWidget({super.key, required this.bbcode});
++
++  final String bbcode;
++
++  @override
++  State<StatefulWidget> createState() => _BBCodeWidgetState();
++}
++
++class _BBCodeWidgetState extends State<BBCodeWidget> {
++  bool _isVisible = false;
++
++  /// color 可以为三种表现形式
++  ///
++  /// `ARGB: #FFFFFFFF`
++  ///
++  /// `RGB: #FFFFFF`
++  ///
++  /// `NAME: red`
++  ///
++  /// 若全部解析失败则返回 null 使用默认颜色
++  Color? _parseColor(String hex) {
++    if (hex.startsWith('#')) {
++      hex = hex.replaceFirst('#', '');
++      if (hex.length == 6) {
++        hex = "FF$hex";
++      }
++      if (hex.length == 8) {
++        return Color(int.parse(hex, radix: 16));
++      }
++    }
++    switch (hex) {
++      case 'red':
++        return Colors.red;
++      case 'blue':
++        return Colors.blue;
++      case 'orange':
++        return Colors.orange;
++      case 'green':
++        return Colors.green;
++      case 'grey':
++        return Colors.grey;
++      default:
++        return null;
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    BBCodeParser.checkVersion();
++    BBCodeParser.checkVersion();
++    final input = InputStream.fromString(widget.bbcode);
++    final lexer = BBCodeLexer(input);
++    final tokens = CommonTokenStream(lexer);
++    final parser = BBCodeParser(tokens);
++    final tree = parser.document();
++    final bbcodeBaseListener = BBCodeBaseListener();
++    ParseTreeWalker.DEFAULT.walk(bbcodeBaseListener, tree);
++    bbCodeTag.clear();
++
++    return Wrap(
++      children: [
++        SelectableText.rich(
++          TextSpan(
++            children: bbcodeBaseListener.bbcode.map((e) {
++              if (e is BBCodeText) {
++                return TextSpan(
++                  text: e.text,
++                  recognizer: TapGestureRecognizer()
++                    ..onTap = (e.link != null || e.masked)
++                        ? () {
++                            if (e.link != null) {
++                              launchUrl(Uri.parse(e.link!));
++                            } else if (e.masked) {
++                              setState(() {
++                                _isVisible = !_isVisible;
++                              });
++                            }
++                          }
++                        : null,
++                  style: TextStyle(
++                    fontWeight: (e.bold) ? FontWeight.bold : null,
++                    fontStyle: (e.italic) ? FontStyle.italic : null,
++                    decoration: (e.underline)
++                        ? TextDecoration.underline
++                        : (e.strikeThrough)
++                            ? TextDecoration.lineThrough
++                            : null,
++                    fontSize: e.size.toDouble(),
++                    color: (!_isVisible && e.masked)
++                        ? Colors.transparent
++                        : (e.link != null)
++                            ? Colors.blue
++                            : (e.quoted)
++                                ? Theme.of(context).colorScheme.outline
++                                : (e.color != null)
++                                    ? _parseColor(e.color!)
++                                    : null,
++                    backgroundColor: (!_isVisible && e.masked)
++                        ? Theme.of(context).colorScheme.outline
++                        : null,
++                  ),
++                );
++              } else if (e is BBCodeImg) {
++                return WidgetSpan(
++                  child: CachedNetworkImage(
++                    imageUrl: e.imageUrl,
++                    placeholder: (context, url) =>
++                        const SizedBox(width: 1, height: 1),
++                    errorWidget: (context, error, stackTrace) {
++                      return const Text('.');
++                    },
++                  ),
++                );
++              } else if (e is BBCodeBgm) {
++                String url;
++                if (e.id == 11 || e.id == 23) {
++                  url = 'https://bangumi.tv/img/smiles/bgm/${e.id}.gif';
++                }
++                if (e.id < 24) {
++                  url = 'https://bangumi.tv/img/smiles/bgm/${e.id}.png';
++                }
++                if (e.id < 33) {
++                  url = 'https://bangumi.tv/img/smiles/tv/0${e.id - 23}.gif';
++                }
++                url = 'https://bangumi.tv/img/smiles/tv/${e.id - 23}.gif';
++                return WidgetSpan(
++                  child: CachedNetworkImage(
++                    imageUrl: url,
++                    placeholder: (context, url) =>
++                        const SizedBox(width: 1, height: 1),
++                    errorWidget: (context, error, stackTrace) {
++                      return const Text('.');
++                    },
++                  ),
++                );
++              } else if (e is BBCodeSticker) {
++                return WidgetSpan(
++                  child: CachedNetworkImage(
++                    imageUrl: 'https://bangumi.tv/img/smiles/${e.id}.gif',
++                    placeholder: (context, url) =>
++                        const SizedBox(width: 1, height: 1),
++                    errorWidget: (context, error, stackTrace) {
++                      return const Text('.');
++                    },
++                  ),
++                );
++              } else {
++                // e is Icon
++                return WidgetSpan(
++                  child: Icon(
++                    (e as Icon).icon,
++                    color: Theme.of(context).colorScheme.outline,
++                  ),
++                  alignment: PlaceholderAlignment.top,
++                );
++              }
++            }).toList(),
++          ),
++        ),
++      ],
++    );
++  }
++}
+diff --git a/lib/bbcode/generated/BBCode.tokens b/lib/bbcode/generated/BBCode.tokens
+new file mode 100644
+index 00000000..da7b91df
+--- /dev/null
++++ b/lib/bbcode/generated/BBCode.tokens
+@@ -0,0 +1,55 @@
++T__0=1
++T__1=2
++T__2=3
++T__3=4
++T__4=5
++T__5=6
++T__6=7
++T__7=8
++T__8=9
++T__9=10
++T__10=11
++T__11=12
++T__12=13
++T__13=14
++T__14=15
++T__15=16
++T__16=17
++T__17=18
++T__18=19
++T__19=20
++T__20=21
++T__21=22
++T__22=23
++T__23=24
++T__24=25
++T__25=26
++T__26=27
++STRING=28
++'['=1
++'='=2
++']'=3
++'[/'=4
++'/'=5
++'('=6
++')'=7
++'[来自Bangumi for android]'=8
++'[来自Bangumi for iOS]'=9
++'(bgm'=10
++'(BGM'=11
++'(=A=)'=12
++'(=w=)'=13
++'(-w=)'=14
++'(S_S)'=15
++'(=v=)'=16
++'(@_@)'=17
++'(=W=)'=18
++'(TAT)'=19
++'(T_T)'=20
++'(=\'=)'=21
++'(=3=)'=22
++'(= =\')'=23
++'(=///=)'=24
++'(=.,=)'=25
++'(:P)'=26
++'(LOL)'=27
+diff --git a/lib/bbcode/generated/BBCodeLexer.dart b/lib/bbcode/generated/BBCodeLexer.dart
+new file mode 100644
+index 00000000..00dbc099
+--- /dev/null
++++ b/lib/bbcode/generated/BBCodeLexer.dart
+@@ -0,0 +1,148 @@
++import 'package:antlr4/antlr4.dart';
++
++
++class BBCodeLexer extends Lexer {
++  static final checkVersion = () => RuntimeMetaData.checkVersion('4.13.2', RuntimeMetaData.VERSION);
++
++  static final List<DFA> _decisionToDFA = List.generate(
++        _ATN.numberOfDecisions, (i) => DFA(_ATN.getDecisionState(i), i));
++  static final PredictionContextCache _sharedContextCache = PredictionContextCache();
++  static const int
++    TOKEN_T__0 = 1, TOKEN_T__1 = 2, TOKEN_T__2 = 3, TOKEN_T__3 = 4, TOKEN_T__4 = 5, 
++    TOKEN_T__5 = 6, TOKEN_T__6 = 7, TOKEN_T__7 = 8, TOKEN_T__8 = 9, TOKEN_T__9 = 10, 
++    TOKEN_T__10 = 11, TOKEN_T__11 = 12, TOKEN_T__12 = 13, TOKEN_T__13 = 14, 
++    TOKEN_T__14 = 15, TOKEN_T__15 = 16, TOKEN_T__16 = 17, TOKEN_T__17 = 18, 
++    TOKEN_T__18 = 19, TOKEN_T__19 = 20, TOKEN_T__20 = 21, TOKEN_T__21 = 22, 
++    TOKEN_T__22 = 23, TOKEN_T__23 = 24, TOKEN_T__24 = 25, TOKEN_T__25 = 26, 
++    TOKEN_T__26 = 27, TOKEN_STRING = 28;
++  @override
++  final List<String> channelNames = [
++    'DEFAULT_TOKEN_CHANNEL', 'HIDDEN'
++  ];
++
++  @override
++  final List<String> modeNames = [
++    'DEFAULT_MODE'
++  ];
++
++  @override
++  final List<String> ruleNames = [
++    'T__0', 'T__1', 'T__2', 'T__3', 'T__4', 'T__5', 'T__6', 'T__7', 'T__8', 
++    'T__9', 'T__10', 'T__11', 'T__12', 'T__13', 'T__14', 'T__15', 'T__16', 
++    'T__17', 'T__18', 'T__19', 'T__20', 'T__21', 'T__22', 'T__23', 'T__24', 
++    'T__25', 'T__26', 'STRING'
++  ];
++
++  static final List<String?> _LITERAL_NAMES = [
++      null, "'['", "'='", "']'", "'[/'", "'/'", "'('", "')'", "'[\\u6765\\u81EABangumi for android]'", 
++      "'[\\u6765\\u81EABangumi for iOS]'", "'(bgm'", "'(BGM'", "'(=A=)'", 
++      "'(=w=)'", "'(-w=)'", "'(S_S)'", "'(=v=)'", "'(@_@)'", "'(=W=)'", 
++      "'(TAT)'", "'(T_T)'", "'(='=)'", "'(=3=)'", "'(= =')'", "'(=///=)'", 
++      "'(=.,=)'", "'(:P)'", "'(LOL)'"
++  ];
++  static final List<String?> _SYMBOLIC_NAMES = [
++      null, null, null, null, null, null, null, null, null, null, null, 
++      null, null, null, null, null, null, null, null, null, null, null, 
++      null, null, null, null, null, null, "STRING"
++  ];
++  static final Vocabulary VOCABULARY = VocabularyImpl(_LITERAL_NAMES, _SYMBOLIC_NAMES);
++
++  @override
++  Vocabulary get vocabulary {
++    return VOCABULARY;
++  }
++
++
++  BBCodeLexer(CharStream input) : super(input) {
++    interpreter = LexerATNSimulator(_ATN, _decisionToDFA, _sharedContextCache, recog: this);
++  }
++
++  @override
++  List<int> get serializedATN => _serializedATN;
++
++  @override
++  String get grammarFileName => 'BBCode.g4';
++
++  @override
++  ATN getATN() { return _ATN; }
++
++  static const List<int> _serializedATN = [
++      4,0,28,230,6,-1,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,2,
++      6,7,6,2,7,7,7,2,8,7,8,2,9,7,9,2,10,7,10,2,11,7,11,2,12,7,12,2,13,7,
++      13,2,14,7,14,2,15,7,15,2,16,7,16,2,17,7,17,2,18,7,18,2,19,7,19,2,20,
++      7,20,2,21,7,21,2,22,7,22,2,23,7,23,2,24,7,24,2,25,7,25,2,26,7,26,2,
++      27,7,27,1,0,1,0,1,1,1,1,1,2,1,2,1,3,1,3,1,3,1,4,1,4,1,5,1,5,1,6,1,
++      6,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,
++      1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,7,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,
++      8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,8,1,9,1,9,1,9,1,9,1,9,
++      1,10,1,10,1,10,1,10,1,10,1,11,1,11,1,11,1,11,1,11,1,11,1,12,1,12,1,
++      12,1,12,1,12,1,12,1,13,1,13,1,13,1,13,1,13,1,13,1,14,1,14,1,14,1,14,
++      1,14,1,14,1,15,1,15,1,15,1,15,1,15,1,15,1,16,1,16,1,16,1,16,1,16,1,
++      16,1,17,1,17,1,17,1,17,1,17,1,17,1,18,1,18,1,18,1,18,1,18,1,18,1,19,
++      1,19,1,19,1,19,1,19,1,19,1,20,1,20,1,20,1,20,1,20,1,20,1,21,1,21,1,
++      21,1,21,1,21,1,21,1,22,1,22,1,22,1,22,1,22,1,22,1,22,1,23,1,23,1,23,
++      1,23,1,23,1,23,1,23,1,23,1,24,1,24,1,24,1,24,1,24,1,24,1,24,1,25,1,
++      25,1,25,1,25,1,25,1,26,1,26,1,26,1,26,1,26,1,26,1,27,4,27,227,8,27,
++      11,27,12,27,228,0,0,28,1,1,3,2,5,3,7,4,9,5,11,6,13,7,15,8,17,9,19,
++      10,21,11,23,12,25,13,27,14,29,15,31,16,33,17,35,18,37,19,39,20,41,
++      21,43,22,45,23,47,24,49,25,51,26,53,27,55,28,1,0,1,4,0,40,41,61,61,
++      91,91,93,93,230,0,1,1,0,0,0,0,3,1,0,0,0,0,5,1,0,0,0,0,7,1,0,0,0,0,
++      9,1,0,0,0,0,11,1,0,0,0,0,13,1,0,0,0,0,15,1,0,0,0,0,17,1,0,0,0,0,19,
++      1,0,0,0,0,21,1,0,0,0,0,23,1,0,0,0,0,25,1,0,0,0,0,27,1,0,0,0,0,29,1,
++      0,0,0,0,31,1,0,0,0,0,33,1,0,0,0,0,35,1,0,0,0,0,37,1,0,0,0,0,39,1,0,
++      0,0,0,41,1,0,0,0,0,43,1,0,0,0,0,45,1,0,0,0,0,47,1,0,0,0,0,49,1,0,0,
++      0,0,51,1,0,0,0,0,53,1,0,0,0,0,55,1,0,0,0,1,57,1,0,0,0,3,59,1,0,0,0,
++      5,61,1,0,0,0,7,63,1,0,0,0,9,66,1,0,0,0,11,68,1,0,0,0,13,70,1,0,0,0,
++      15,72,1,0,0,0,17,96,1,0,0,0,19,116,1,0,0,0,21,121,1,0,0,0,23,126,1,
++      0,0,0,25,132,1,0,0,0,27,138,1,0,0,0,29,144,1,0,0,0,31,150,1,0,0,0,
++      33,156,1,0,0,0,35,162,1,0,0,0,37,168,1,0,0,0,39,174,1,0,0,0,41,180,
++      1,0,0,0,43,186,1,0,0,0,45,192,1,0,0,0,47,199,1,0,0,0,49,207,1,0,0,
++      0,51,214,1,0,0,0,53,219,1,0,0,0,55,226,1,0,0,0,57,58,5,91,0,0,58,2,
++      1,0,0,0,59,60,5,61,0,0,60,4,1,0,0,0,61,62,5,93,0,0,62,6,1,0,0,0,63,
++      64,5,91,0,0,64,65,5,47,0,0,65,8,1,0,0,0,66,67,5,47,0,0,67,10,1,0,0,
++      0,68,69,5,40,0,0,69,12,1,0,0,0,70,71,5,41,0,0,71,14,1,0,0,0,72,73,
++      5,91,0,0,73,74,5,26469,0,0,74,75,5,33258,0,0,75,76,5,66,0,0,76,77,
++      5,97,0,0,77,78,5,110,0,0,78,79,5,103,0,0,79,80,5,117,0,0,80,81,5,109,
++      0,0,81,82,5,105,0,0,82,83,5,32,0,0,83,84,5,102,0,0,84,85,5,111,0,0,
++      85,86,5,114,0,0,86,87,5,32,0,0,87,88,5,97,0,0,88,89,5,110,0,0,89,90,
++      5,100,0,0,90,91,5,114,0,0,91,92,5,111,0,0,92,93,5,105,0,0,93,94,5,
++      100,0,0,94,95,5,93,0,0,95,16,1,0,0,0,96,97,5,91,0,0,97,98,5,26469,
++      0,0,98,99,5,33258,0,0,99,100,5,66,0,0,100,101,5,97,0,0,101,102,5,110,
++      0,0,102,103,5,103,0,0,103,104,5,117,0,0,104,105,5,109,0,0,105,106,
++      5,105,0,0,106,107,5,32,0,0,107,108,5,102,0,0,108,109,5,111,0,0,109,
++      110,5,114,0,0,110,111,5,32,0,0,111,112,5,105,0,0,112,113,5,79,0,0,
++      113,114,5,83,0,0,114,115,5,93,0,0,115,18,1,0,0,0,116,117,5,40,0,0,
++      117,118,5,98,0,0,118,119,5,103,0,0,119,120,5,109,0,0,120,20,1,0,0,
++      0,121,122,5,40,0,0,122,123,5,66,0,0,123,124,5,71,0,0,124,125,5,77,
++      0,0,125,22,1,0,0,0,126,127,5,40,0,0,127,128,5,61,0,0,128,129,5,65,
++      0,0,129,130,5,61,0,0,130,131,5,41,0,0,131,24,1,0,0,0,132,133,5,40,
++      0,0,133,134,5,61,0,0,134,135,5,119,0,0,135,136,5,61,0,0,136,137,5,
++      41,0,0,137,26,1,0,0,0,138,139,5,40,0,0,139,140,5,45,0,0,140,141,5,
++      119,0,0,141,142,5,61,0,0,142,143,5,41,0,0,143,28,1,0,0,0,144,145,5,
++      40,0,0,145,146,5,83,0,0,146,147,5,95,0,0,147,148,5,83,0,0,148,149,
++      5,41,0,0,149,30,1,0,0,0,150,151,5,40,0,0,151,152,5,61,0,0,152,153,
++      5,118,0,0,153,154,5,61,0,0,154,155,5,41,0,0,155,32,1,0,0,0,156,157,
++      5,40,0,0,157,158,5,64,0,0,158,159,5,95,0,0,159,160,5,64,0,0,160,161,
++      5,41,0,0,161,34,1,0,0,0,162,163,5,40,0,0,163,164,5,61,0,0,164,165,
++      5,87,0,0,165,166,5,61,0,0,166,167,5,41,0,0,167,36,1,0,0,0,168,169,
++      5,40,0,0,169,170,5,84,0,0,170,171,5,65,0,0,171,172,5,84,0,0,172,173,
++      5,41,0,0,173,38,1,0,0,0,174,175,5,40,0,0,175,176,5,84,0,0,176,177,
++      5,95,0,0,177,178,5,84,0,0,178,179,5,41,0,0,179,40,1,0,0,0,180,181,
++      5,40,0,0,181,182,5,61,0,0,182,183,5,39,0,0,183,184,5,61,0,0,184,185,
++      5,41,0,0,185,42,1,0,0,0,186,187,5,40,0,0,187,188,5,61,0,0,188,189,
++      5,51,0,0,189,190,5,61,0,0,190,191,5,41,0,0,191,44,1,0,0,0,192,193,
++      5,40,0,0,193,194,5,61,0,0,194,195,5,32,0,0,195,196,5,61,0,0,196,197,
++      5,39,0,0,197,198,5,41,0,0,198,46,1,0,0,0,199,200,5,40,0,0,200,201,
++      5,61,0,0,201,202,5,47,0,0,202,203,5,47,0,0,203,204,5,47,0,0,204,205,
++      5,61,0,0,205,206,5,41,0,0,206,48,1,0,0,0,207,208,5,40,0,0,208,209,
++      5,61,0,0,209,210,5,46,0,0,210,211,5,44,0,0,211,212,5,61,0,0,212,213,
++      5,41,0,0,213,50,1,0,0,0,214,215,5,40,0,0,215,216,5,58,0,0,216,217,
++      5,80,0,0,217,218,5,41,0,0,218,52,1,0,0,0,219,220,5,40,0,0,220,221,
++      5,76,0,0,221,222,5,79,0,0,222,223,5,76,0,0,223,224,5,41,0,0,224,54,
++      1,0,0,0,225,227,8,0,0,0,226,225,1,0,0,0,227,228,1,0,0,0,228,226,1,
++      0,0,0,228,229,1,0,0,0,229,56,1,0,0,0,2,0,228,0
++  ];
++
++  static final ATN _ATN =
++      ATNDeserializer().deserialize(_serializedATN);
++}
+\ No newline at end of file
+diff --git a/lib/bbcode/generated/BBCodeListener.dart b/lib/bbcode/generated/BBCodeListener.dart
+new file mode 100644
+index 00000000..3c994659
+--- /dev/null
++++ b/lib/bbcode/generated/BBCodeListener.dart
+@@ -0,0 +1,49 @@
++import 'package:antlr4/antlr4.dart';
++
++import 'BBCodeParser.dart';
++
++/// This abstract class defines a complete listener for a parse tree produced by
++/// [BBCodeParser].
++abstract class BBCodeListener extends ParseTreeListener {
++  /// Enter a parse tree produced by [BBCodeParser.document].
++  /// [ctx] the parse tree
++  void enterDocument(DocumentContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.document].
++  /// [ctx] the parse tree
++  void exitDocument(DocumentContext ctx);
++
++  /// Enter a parse tree produced by [BBCodeParser.element].
++  /// [ctx] the parse tree
++  void enterElement(ElementContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.element].
++  /// [ctx] the parse tree
++  void exitElement(ElementContext ctx);
++
++  /// Enter a parse tree produced by [BBCodeParser.tag].
++  /// [ctx] the parse tree
++  void enterTag(TagContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.tag].
++  /// [ctx] the parse tree
++  void exitTag(TagContext ctx);
++
++  /// Enter a parse tree produced by [BBCodeParser.plain].
++  /// [ctx] the parse tree
++  void enterPlain(PlainContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.plain].
++  /// [ctx] the parse tree
++  void exitPlain(PlainContext ctx);
++
++  /// Enter a parse tree produced by [BBCodeParser.bgm].
++  /// [ctx] the parse tree
++  void enterBgm(BgmContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.bgm].
++  /// [ctx] the parse tree
++  void exitBgm(BgmContext ctx);
++
++  /// Enter a parse tree produced by [BBCodeParser.sticker].
++  /// [ctx] the parse tree
++  void enterSticker(StickerContext ctx);
++  /// Exit a parse tree produced by [BBCodeParser.sticker].
++  /// [ctx] the parse tree
++  void exitSticker(StickerContext ctx);
++}
+\ No newline at end of file
+diff --git a/lib/bbcode/generated/BBCodeParser.dart b/lib/bbcode/generated/BBCodeParser.dart
+new file mode 100644
+index 00000000..f0e75d53
+--- /dev/null
++++ b/lib/bbcode/generated/BBCodeParser.dart
+@@ -0,0 +1,420 @@
++import 'package:antlr4/antlr4.dart';
++
++import 'BBCodeListener.dart';
++const int RULE_document = 0, RULE_element = 1, RULE_tag = 2, RULE_plain = 3, 
++          RULE_bgm = 4, RULE_sticker = 5;
++class BBCodeParser extends Parser {
++  static final checkVersion = () => RuntimeMetaData.checkVersion('4.13.2', RuntimeMetaData.VERSION);
++  static const int TOKEN_EOF = IntStream.EOF;
++
++  static final List<DFA> _decisionToDFA = List.generate(
++      _ATN.numberOfDecisions, (i) => DFA(_ATN.getDecisionState(i), i));
++  static final PredictionContextCache _sharedContextCache = PredictionContextCache();
++  static const int TOKEN_T__0 = 1, TOKEN_T__1 = 2, TOKEN_T__2 = 3, TOKEN_T__3 = 4, 
++                   TOKEN_T__4 = 5, TOKEN_T__5 = 6, TOKEN_T__6 = 7, TOKEN_T__7 = 8, 
++                   TOKEN_T__8 = 9, TOKEN_T__9 = 10, TOKEN_T__10 = 11, TOKEN_T__11 = 12, 
++                   TOKEN_T__12 = 13, TOKEN_T__13 = 14, TOKEN_T__14 = 15, 
++                   TOKEN_T__15 = 16, TOKEN_T__16 = 17, TOKEN_T__17 = 18, 
++                   TOKEN_T__18 = 19, TOKEN_T__19 = 20, TOKEN_T__20 = 21, 
++                   TOKEN_T__21 = 22, TOKEN_T__22 = 23, TOKEN_T__23 = 24, 
++                   TOKEN_T__24 = 25, TOKEN_T__25 = 26, TOKEN_T__26 = 27, 
++                   TOKEN_STRING = 28;
++
++  @override
++  final List<String> ruleNames = [
++    'document', 'element', 'tag', 'plain', 'bgm', 'sticker'
++  ];
++
++  static final List<String?> _LITERAL_NAMES = [
++      null, "'['", "'='", "']'", "'[/'", "'/'", "'('", "')'", "'[\\u6765\\u81EABangumi for android]'", 
++      "'[\\u6765\\u81EABangumi for iOS]'", "'(bgm'", "'(BGM'", "'(=A=)'", 
++      "'(=w=)'", "'(-w=)'", "'(S_S)'", "'(=v=)'", "'(@_@)'", "'(=W=)'", 
++      "'(TAT)'", "'(T_T)'", "'(='=)'", "'(=3=)'", "'(= =')'", "'(=///=)'", 
++      "'(=.,=)'", "'(:P)'", "'(LOL)'"
++  ];
++  static final List<String?> _SYMBOLIC_NAMES = [
++      null, null, null, null, null, null, null, null, null, null, null, 
++      null, null, null, null, null, null, null, null, null, null, null, 
++      null, null, null, null, null, null, "STRING"
++  ];
++  static final Vocabulary VOCABULARY = VocabularyImpl(_LITERAL_NAMES, _SYMBOLIC_NAMES);
++
++  @override
++  Vocabulary get vocabulary {
++    return VOCABULARY;
++  }
++
++  @override
++  String get grammarFileName => 'BBCode.g4';
++
++  @override
++  List<int> get serializedATN => _serializedATN;
++
++  @override
++  ATN getATN() {
++   return _ATN;
++  }
++
++  BBCodeParser(TokenStream input) : super(input) {
++    interpreter = ParserATNSimulator(this, _ATN, _decisionToDFA, _sharedContextCache);
++  }
++
++  DocumentContext document() {
++    dynamic _localctx = DocumentContext(context, state);
++    enterRule(_localctx, 0, RULE_document);
++    int _la;
++    try {
++      enterOuterAlt(_localctx, 1);
++      state = 15;
++      errorHandler.sync(this);
++      _la = tokenStream.LA(1)!;
++      while ((((_la) & ~0x3f) == 0 && ((1 << _la) & 536870894) != 0)) {
++        state = 12;
++        element();
++        state = 17;
++        errorHandler.sync(this);
++        _la = tokenStream.LA(1)!;
++      }
++      state = 18;
++      match(TOKEN_EOF);
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  ElementContext element() {
++    dynamic _localctx = ElementContext(context, state);
++    enterRule(_localctx, 2, RULE_element);
++    try {
++      state = 24;
++      errorHandler.sync(this);
++      switch (interpreter!.adaptivePredict(tokenStream, 1, context)) {
++      case 1:
++        enterOuterAlt(_localctx, 1);
++        state = 20;
++        tag();
++        break;
++      case 2:
++        enterOuterAlt(_localctx, 2);
++        state = 21;
++        plain();
++        break;
++      case 3:
++        enterOuterAlt(_localctx, 3);
++        state = 22;
++        bgm();
++        break;
++      case 4:
++        enterOuterAlt(_localctx, 4);
++        state = 23;
++        sticker();
++        break;
++      }
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  TagContext tag() {
++    dynamic _localctx = TagContext(context, state);
++    enterRule(_localctx, 4, RULE_tag);
++    int _la;
++    try {
++      enterOuterAlt(_localctx, 1);
++      state = 26;
++      match(TOKEN_T__0);
++      state = 27;
++      _localctx.tagName = match(TOKEN_STRING);
++      state = 30;
++      errorHandler.sync(this);
++      _la = tokenStream.LA(1)!;
++      if (_la == TOKEN_T__1) {
++        state = 28;
++        match(TOKEN_T__1);
++        state = 29;
++        _localctx.attr = match(TOKEN_STRING);
++      }
++
++      state = 32;
++      match(TOKEN_T__2);
++      state = 36;
++      errorHandler.sync(this);
++      _la = tokenStream.LA(1)!;
++      while ((((_la) & ~0x3f) == 0 && ((1 << _la) & 536870894) != 0)) {
++        state = 33;
++        _localctx.content = element();
++        state = 38;
++        errorHandler.sync(this);
++        _la = tokenStream.LA(1)!;
++      }
++      state = 39;
++      match(TOKEN_T__3);
++      state = 40;
++      match(TOKEN_STRING);
++      state = 41;
++      match(TOKEN_T__2);
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  PlainContext plain() {
++    dynamic _localctx = PlainContext(context, state);
++    enterRule(_localctx, 6, RULE_plain);
++    int _la;
++    try {
++      int _alt;
++      state = 50;
++      errorHandler.sync(this);
++      switch (tokenStream.LA(1)!) {
++      case TOKEN_T__0:
++      case TOKEN_T__1:
++      case TOKEN_T__2:
++      case TOKEN_T__4:
++      case TOKEN_T__5:
++      case TOKEN_T__6:
++      case TOKEN_STRING:
++        enterOuterAlt(_localctx, 1);
++        state = 44; 
++        errorHandler.sync(this);
++        _alt = 1;
++        do {
++          switch (_alt) {
++          case 1:
++            state = 43;
++            _la = tokenStream.LA(1)!;
++            if (!((((_la) & ~0x3f) == 0 && ((1 << _la) & 268435694) != 0))) {
++            errorHandler.recoverInline(this);
++            } else {
++              if ( tokenStream.LA(1)! == IntStream.EOF ) matchedEOF = true;
++              errorHandler.reportMatch(this);
++              consume();
++            }
++            break;
++          default:
++            throw NoViableAltException(this);
++          }
++          state = 46; 
++          errorHandler.sync(this);
++          _alt = interpreter!.adaptivePredict(tokenStream, 4, context);
++        } while (_alt != 2 && _alt != ATN.INVALID_ALT_NUMBER);
++        break;
++      case TOKEN_T__7:
++        enterOuterAlt(_localctx, 2);
++        state = 48;
++        match(TOKEN_T__7);
++        break;
++      case TOKEN_T__8:
++        enterOuterAlt(_localctx, 3);
++        state = 49;
++        match(TOKEN_T__8);
++        break;
++      default:
++        throw NoViableAltException(this);
++      }
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  BgmContext bgm() {
++    dynamic _localctx = BgmContext(context, state);
++    enterRule(_localctx, 8, RULE_bgm);
++    int _la;
++    try {
++      enterOuterAlt(_localctx, 1);
++      state = 52;
++      _la = tokenStream.LA(1)!;
++      if (!(_la == TOKEN_T__9 || _la == TOKEN_T__10)) {
++      errorHandler.recoverInline(this);
++      } else {
++        if ( tokenStream.LA(1)! == IntStream.EOF ) matchedEOF = true;
++        errorHandler.reportMatch(this);
++        consume();
++      }
++      state = 53;
++      _localctx.id = match(TOKEN_STRING);
++      state = 54;
++      match(TOKEN_T__6);
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  StickerContext sticker() {
++    dynamic _localctx = StickerContext(context, state);
++    enterRule(_localctx, 10, RULE_sticker);
++    int _la;
++    try {
++      enterOuterAlt(_localctx, 1);
++      state = 56;
++      _la = tokenStream.LA(1)!;
++      if (!((((_la) & ~0x3f) == 0 && ((1 << _la) & 268431360) != 0))) {
++      errorHandler.recoverInline(this);
++      } else {
++        if ( tokenStream.LA(1)! == IntStream.EOF ) matchedEOF = true;
++        errorHandler.reportMatch(this);
++        consume();
++      }
++    } on RecognitionException catch (re) {
++      _localctx.exception = re;
++      errorHandler.reportError(this, re);
++      errorHandler.recover(this, re);
++    } finally {
++      exitRule();
++    }
++    return _localctx;
++  }
++
++  static const List<int> _serializedATN = [
++      4,1,28,59,2,0,7,0,2,1,7,1,2,2,7,2,2,3,7,3,2,4,7,4,2,5,7,5,1,0,5,0,
++      14,8,0,10,0,12,0,17,9,0,1,0,1,0,1,1,1,1,1,1,1,1,3,1,25,8,1,1,2,1,2,
++      1,2,1,2,3,2,31,8,2,1,2,1,2,5,2,35,8,2,10,2,12,2,38,9,2,1,2,1,2,1,2,
++      1,2,1,3,4,3,45,8,3,11,3,12,3,46,1,3,1,3,3,3,51,8,3,1,4,1,4,1,4,1,4,
++      1,5,1,5,1,5,0,0,6,0,2,4,6,8,10,0,3,3,0,1,3,5,7,28,28,1,0,10,11,1,0,
++      12,27,61,0,15,1,0,0,0,2,24,1,0,0,0,4,26,1,0,0,0,6,50,1,0,0,0,8,52,
++      1,0,0,0,10,56,1,0,0,0,12,14,3,2,1,0,13,12,1,0,0,0,14,17,1,0,0,0,15,
++      13,1,0,0,0,15,16,1,0,0,0,16,18,1,0,0,0,17,15,1,0,0,0,18,19,5,0,0,1,
++      19,1,1,0,0,0,20,25,3,4,2,0,21,25,3,6,3,0,22,25,3,8,4,0,23,25,3,10,
++      5,0,24,20,1,0,0,0,24,21,1,0,0,0,24,22,1,0,0,0,24,23,1,0,0,0,25,3,1,
++      0,0,0,26,27,5,1,0,0,27,30,5,28,0,0,28,29,5,2,0,0,29,31,5,28,0,0,30,
++      28,1,0,0,0,30,31,1,0,0,0,31,32,1,0,0,0,32,36,5,3,0,0,33,35,3,2,1,0,
++      34,33,1,0,0,0,35,38,1,0,0,0,36,34,1,0,0,0,36,37,1,0,0,0,37,39,1,0,
++      0,0,38,36,1,0,0,0,39,40,5,4,0,0,40,41,5,28,0,0,41,42,5,3,0,0,42,5,
++      1,0,0,0,43,45,7,0,0,0,44,43,1,0,0,0,45,46,1,0,0,0,46,44,1,0,0,0,46,
++      47,1,0,0,0,47,51,1,0,0,0,48,51,5,8,0,0,49,51,5,9,0,0,50,44,1,0,0,0,
++      50,48,1,0,0,0,50,49,1,0,0,0,51,7,1,0,0,0,52,53,7,1,0,0,53,54,5,28,
++      0,0,54,55,5,7,0,0,55,9,1,0,0,0,56,57,7,2,0,0,57,11,1,0,0,0,6,15,24,
++      30,36,46,50
++  ];
++
++  static final ATN _ATN =
++      ATNDeserializer().deserialize(_serializedATN);
++}
++class DocumentContext extends ParserRuleContext {
++  TerminalNode? EOF() => getToken(BBCodeParser.TOKEN_EOF, 0);
++  List<ElementContext> elements() => getRuleContexts<ElementContext>();
++  ElementContext? element(int i) => getRuleContext<ElementContext>(i);
++  DocumentContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_document;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterDocument(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitDocument(this);
++  }
++}
++
++class ElementContext extends ParserRuleContext {
++  TagContext? tag() => getRuleContext<TagContext>(0);
++  PlainContext? plain() => getRuleContext<PlainContext>(0);
++  BgmContext? bgm() => getRuleContext<BgmContext>(0);
++  StickerContext? sticker() => getRuleContext<StickerContext>(0);
++  ElementContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_element;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterElement(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitElement(this);
++  }
++}
++
++class TagContext extends ParserRuleContext {
++  Token? tagName;
++  Token? attr;
++  ElementContext? content;
++  List<TerminalNode> STRINGs() => getTokens(BBCodeParser.TOKEN_STRING);
++  TerminalNode? STRING(int i) => getToken(BBCodeParser.TOKEN_STRING, i);
++  List<ElementContext> elements() => getRuleContexts<ElementContext>();
++  ElementContext? element(int i) => getRuleContext<ElementContext>(i);
++  TagContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_tag;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterTag(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitTag(this);
++  }
++}
++
++class PlainContext extends ParserRuleContext {
++  List<TerminalNode> STRINGs() => getTokens(BBCodeParser.TOKEN_STRING);
++  TerminalNode? STRING(int i) => getToken(BBCodeParser.TOKEN_STRING, i);
++  PlainContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_plain;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterPlain(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitPlain(this);
++  }
++}
++
++class BgmContext extends ParserRuleContext {
++  Token? id;
++  TerminalNode? STRING() => getToken(BBCodeParser.TOKEN_STRING, 0);
++  BgmContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_bgm;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterBgm(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitBgm(this);
++  }
++}
++
++class StickerContext extends ParserRuleContext {
++  StickerContext([ParserRuleContext? parent, int? invokingState]) : super(parent, invokingState);
++  @override
++  int get ruleIndex => RULE_sticker;
++  @override
++  void enterRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.enterSticker(this);
++  }
++  @override
++  void exitRule(ParseTreeListener listener) {
++    if (listener is BBCodeListener) listener.exitSticker(this);
++  }
++}
++
+diff --git a/lib/bean/card/episode_comments_card.dart b/lib/bean/card/episode_comments_card.dart
+index 13582072..fe1642e8 100644
+--- a/lib/bean/card/episode_comments_card.dart
++++ b/lib/bean/card/episode_comments_card.dart
+@@ -1,10 +1,7 @@
+-import 'package:cached_network_image/cached_network_image.dart';
+ import 'package:flutter/material.dart';
+-import 'package:flutter/services.dart';
+-import 'package:kazumi/bean/dialog/dialog_helper.dart';
++import 'package:kazumi/bbcode/bbcode_widget.dart';
+ import 'package:kazumi/modules/comments/comment_item.dart';
+ import 'package:kazumi/utils/utils.dart';
+-import 'package:styled_text/styled_text.dart';
+ 
+ class EpisodeCommentsCard extends StatelessWidget {
+   const EpisodeCommentsCard({
+@@ -20,143 +17,71 @@ class EpisodeCommentsCard extends StatelessWidget {
+       color: Theme.of(context).colorScheme.secondaryContainer,
+       child: Padding(
+         padding: const EdgeInsets.all(8.0),
+-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+-          Row(
+-            children: [
+-              CircleAvatar(
+-                backgroundImage:
+-                    NetworkImage(commentItem.comment.user.avatar.large),
+-              ),
+-              const SizedBox(width: 8),
+-              Column(
+-                crossAxisAlignment: CrossAxisAlignment.start,
+-                children: [
+-                  Text(commentItem.comment.user.nickname),
+-                  Text(Utils.dateFormat(commentItem.comment.createdAt)),
+-                ],
+-              ),
+-            ],
+-          ),
+-          const SizedBox(height: 8),
+-          commentsWithStyledText(Utils.richTextParser(commentItem.comment.comment), context),
+-          (commentItem.replies.isNotEmpty)
+-              ? ListView.builder(
+-                  physics: const NeverScrollableScrollPhysics(),
+-                  shrinkWrap: true,
+-                  itemCount: commentItem.replies.length,
+-                  itemBuilder: (context, index) {
+-                    return Padding(
+-                      padding: const EdgeInsets.only(left: 48),
+-                      child: Column(
+-                          crossAxisAlignment: CrossAxisAlignment.start,
+-                          children: <Widget>[
+-                            Divider(color: Theme.of(context).dividerColor.withAlpha(60)),
+-                            Row(
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Row(
++              children: [
++                CircleAvatar(
++                  backgroundImage:
++                      NetworkImage(commentItem.comment.user.avatar.large),
++                ),
++                const SizedBox(width: 8),
++                Column(
++                  crossAxisAlignment: CrossAxisAlignment.start,
++                  children: [
++                    Text(commentItem.comment.user.nickname),
++                    Text(Utils.dateFormat(commentItem.comment.createdAt)),
++                  ],
++                ),
++              ],
++            ),
++            const SizedBox(height: 8),
++            BBCodeWidget(bbcode: commentItem.comment.comment),
++            if (commentItem.replies.isNotEmpty)
++              ListView.builder(
++                physics: const NeverScrollableScrollPhysics(),
++                shrinkWrap: true,
++                itemCount: commentItem.replies.length,
++                itemBuilder: (context, index) {
++                  return Padding(
++                    padding: const EdgeInsets.only(left: 48),
++                    child: Column(
++                      crossAxisAlignment: CrossAxisAlignment.start,
++                      children: <Widget>[
++                        Divider(
++                          color: Theme.of(context).dividerColor.withAlpha(60),
++                        ),
++                        Row(
++                          children: [
++                            CircleAvatar(
++                              backgroundImage: NetworkImage(
++                                  commentItem.replies[index].user.avatar.large),
++                            ),
++                            const SizedBox(width: 8),
++                            Column(
++                              crossAxisAlignment: CrossAxisAlignment.start,
+                               children: [
+-                                CircleAvatar(
+-                                  backgroundImage: NetworkImage(commentItem
+-                                      .replies[index].user.avatar.large),
+-                                ),
+-                                const SizedBox(width: 8),
+-                                Column(
+-                                  crossAxisAlignment: CrossAxisAlignment.start,
+-                                  children: [
+-                                    Text(commentItem
+-                                        .replies[index].user.nickname),
+-                                    Text(Utils.dateFormat(
+-                                        commentItem.replies[index].createdAt)),
+-                                  ],
++                                Text(commentItem.replies[index].user.nickname),
++                                Text(
++                                  Utils.dateFormat(
++                                      commentItem.replies[index].createdAt),
+                                 ),
+                               ],
+                             ),
+-                            const SizedBox(height: 8),
+-                            commentsWithStyledText(Utils.richTextParser(commentItem.replies[index].comment), context),
+-                          ]),
+-                    );
+-                  })
+-              : Container()
+-        ]),
++                          ],
++                        ),
++                        const SizedBox(height: 8),
++                        BBCodeWidget(
++                            bbcode: commentItem.replies[index].comment),
++                      ],
++                    ),
++                  );
++                },
++              ),
++          ],
++        ),
+       ),
+     );
+   }
+-
+-  Widget commentsWithStyledText(String comment, BuildContext context) {
+-    return StyledText(text: comment, tags: {
+-      'b': StyledTextTag(
+-        style: const TextStyle(fontWeight: FontWeight.bold),
+-      ),
+-      'i': StyledTextTag(
+-        style: const TextStyle(fontStyle: FontStyle.italic),
+-      ),
+-      'q': StyledTextTag(
+-        style: TextStyle(color: Theme.of(context).colorScheme.outline),
+-      ),
+-      'format_quote': StyledTextIconTag(
+-        Icons.format_quote,
+-        color: Theme.of(context).colorScheme.outline,
+-        alignment: PlaceholderAlignment.top
+-      ),
+-      's': StyledTextTag(
+-        style: const TextStyle(decoration: TextDecoration.lineThrough),
+-      ),
+-      'u': StyledTextTag(
+-        style: const TextStyle(decoration: TextDecoration.underline),
+-      ),
+-      'image': StyledTextWidgetBuilderTag(
+-        (_, attributes, textContent) {
+-          return CachedNetworkImage(
+-            imageUrl: textContent!,
+-            placeholder: (context, url) => const SizedBox(
+-              width: 14,
+-              height: 14,
+-            ),
+-            errorWidget: (context, error, stackTrace) {
+-              return const Text('.');
+-            },
+-          );
+-        },
+-      ),
+-      'link': StyledTextActionTag(
+-            (_, attrs) {
+-              _copyLink(attrs);
+-            },
+-        style: const TextStyle(color: Colors.blue),
+-      ),
+-      'color': StyledTextCustomTag(
+-        baseStyle: const TextStyle(fontStyle: FontStyle.normal),
+-        parse: (baseStyle, attributes) {
+-          if (attributes.containsKey('color')) {
+-            final String color = attributes['color']!;
+-            switch (color) {
+-              case 'red': return baseStyle?.copyWith(color: Colors.red);
+-              case 'blue': return baseStyle?.copyWith(color: Colors.blue);
+-              case 'orange': return baseStyle?.copyWith(color: Colors.orange);
+-              case 'green': return baseStyle?.copyWith(color: Colors.green);
+-              case 'grey': return baseStyle?.copyWith(color: Colors.grey);
+-              default: return baseStyle;
+-            }
+-          } else {
+-            return baseStyle;
+-          }
+-        }
+-      ),
+-      'size': StyledTextCustomTag(
+-        baseStyle: const TextStyle(fontStyle: FontStyle.normal),
+-        parse: (baseStyle, attributes) {
+-          if (attributes.containsKey('size')) {
+-            double size = double.tryParse(attributes['size']!) ?? 14;
+-            return baseStyle?.copyWith(fontSize: size);
+-          } else {
+-            return baseStyle;
+-          }
+-        }
+-      ),
+-    });
+-  }
+-
+-  Future<void> _copyLink(Map<String?, String?> attrs) async {
+-    final String? link = attrs['href'];
+-    await Clipboard.setData(ClipboardData(text: link!));
+-    KazumiDialog.showToast(message: '已复制链接到剪贴板');
+-  }
+ }
+diff --git a/lib/utils/utils.dart b/lib/utils/utils.dart
+index 517d27b5..475a8b18 100644
+--- a/lib/utils/utils.dart
++++ b/lib/utils/utils.dart
+@@ -308,81 +308,6 @@ class Utils {
+     return 0;
+   }
+ 
+-  static String richTextParser(String input) {
+-    RegExp bgmEmoji = RegExp(r'\(bgm(\d+)\)');
+-    input = input.replaceAllMapped(bgmEmoji, (match) {
+-      if (match.group(1) == '11' || match.group(1) == '23') {
+-        return '<image>https://bangumi.tv/img/smiles/bgm/${match.group(1)}.gif</image>';
+-      }
+-      int num = int.tryParse(match.group(1)!) ?? 0;
+-      if (num < 24) {
+-        return '<image>https://bangumi.tv/img/smiles/bgm/${match.group(1)}.png</image>';
+-      }
+-      if (num < 33) {
+-        return '<image>https://bangumi.tv/img/smiles/tv/0${num - 23}.gif</image>';
+-      }
+-      return '<image>https://bangumi.tv/img/smiles/tv/${num - 23}.gif</image>';
+-    });
+-
+-    RegExp quote = RegExp(r'\[quote\]([\s\S]*?)\[/quote\]');
+-    input = input.replaceAllMapped(quote, (match) {
+-      return '<q>${match.group(1)}</q><format_quote/>';
+-    });
+-
+-    RegExp bold = RegExp(r'\[b\]([\s\S]*?)\[/b\]');
+-    input = input.replaceAllMapped(bold, (match) {
+-      return '<b>${match.group(1)}</b>';
+-    });
+-
+-    RegExp img = RegExp(r'\[img([\s\S]*?)\]([\s\S]*?)\[/img\]');
+-    input = input.replaceAllMapped(img, (match) {
+-      return '<image>${match.group(2)}</image>';
+-    });
+-
+-    RegExp strikeThrough = RegExp(r'\[s\]([\s\S]*?)\[/s\]');
+-    input = input.replaceAllMapped(strikeThrough, (match) {
+-      return '<s>${match.group(1)}</s>';
+-    });
+-
+-    RegExp underLine = RegExp(r'\[u\]([\s\S]*?)\[/u\]');
+-    input = input.replaceAllMapped(underLine, (match) {
+-      return '<u>${match.group(1)}</u>';
+-    });
+-
+-    RegExp italic = RegExp(r'\[i\]([\s\S]*?)\[/i\]');
+-    input = input.replaceAllMapped(italic, (match) {
+-      return '<i>${match.group(1)}</i>';
+-    });
+-
+-    RegExp ignore = RegExp(r'\[(mask|code)\]([\s\S]*?)\[/\1\]');
+-    input = input.replaceAllMapped(ignore, (match) {
+-      return '${match.group(2)}';
+-    });
+-
+-    RegExp link = RegExp(r'\[url=([\s\S]*?)\]([\s\S]*?)\[/url\]');
+-    input = input.replaceAllMapped(link, (match) {
+-      return '<link href="${match.group(1)}">${match.group(2)}</link>';
+-    });
+-
+-    RegExp color = RegExp(r'\[color=([\s\S]*?)\]([\s\S]*?)\[/color\]');
+-    input = input.replaceAllMapped(color, (match) {
+-      return '<color color="${match.group(1)}">${match.group(2)}</color>';
+-    });
+-
+-    RegExp size = RegExp(r'\[size=(\d+)\]([\s\S]*?)\[/size\]');
+-    input = input.replaceAllMapped(size, (match) {
+-      return '<size size="${match.group(1)}">${match.group(2)}</size>';
+-    });
+-
+-    // 为了解决一些特殊情况再执行一次
+-    RegExp secondColor = RegExp(r'\[color=([\s\S]*?)\]([\s\S]*?)\[/color\]');
+-    input = input.replaceAllMapped(secondColor, (match) {
+-      return '<color color="${match.group(1)}">${match.group(2)}</color>';
+-    });
+-
+-    return input;
+-  }
+-
+   /// 判断是否为桌面设备
+   static bool isDesktop() {
+     return Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+diff --git a/pubspec.lock b/pubspec.lock
+index 33d19879..8c10e035 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -30,6 +30,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "2.0.3"
++  antlr4:
++    dependency: "direct main"
++    description:
++      name: antlr4
++      sha256: "752b4a6e4ad97953652a2b2bbf5377f46c94b579d3372b50080c7e5858234a05"
++      url: "https://pub.dev"
++    source: hosted
++    version: "4.13.2"
+   archive:
+     dependency: transitive
+     description:
+@@ -1256,14 +1264,6 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.3.0"
+-  styled_text:
+-    dependency: "direct main"
+-    description:
+-      name: styled_text
+-      sha256: fd624172cf629751b4f171dd0ecf9acf02a06df3f8a81bb56c0caa4f1df706c3
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "8.1.0"
+   synchronized:
+     dependency: transitive
+     description:
+@@ -1569,14 +1569,6 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "6.5.0"
+-  xmlstream:
+-    dependency: transitive
+-    description:
+-      name: xmlstream
+-      sha256: cfc14e3f256997897df9481ae630d94c2d85ada5187ebeb868bb1aabc2c977b4
+-      url: "https://pub.dev"
+-    source: hosted
+-    version: "1.1.1"
+   xpath_selector:
+     dependency: "direct main"
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index a5e0b9f3..1a93cceb 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -75,7 +75,6 @@ dependencies:
+   logger: ^2.4.0
+   flutter_rating_bar: ^4.0.1
+   scrollview_observer: ^1.22.0
+-  styled_text: ^8.1.0
+   saver_gallery: ^4.0.0
+   webview_windows:
+     git:
+@@ -105,6 +104,7 @@ dependencies:
+   material_color_utilities: any
+   path: any
+   screen_brightness_platform_interface: any
++  antlr4: ^4.13.2
+ 
+ dependency_overrides:
+   media_kit:

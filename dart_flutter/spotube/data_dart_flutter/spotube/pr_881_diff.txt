@@ -1,0 +1,3864 @@
+diff --git a/lib/components/library/user_downloads/download_item.dart b/lib/components/library/user_downloads/download_item.dart
+index ae8a2513a..10dec4104 100644
+--- a/lib/components/library/user_downloads/download_item.dart
++++ b/lib/components/library/user_downloads/download_item.dart
+@@ -5,9 +5,9 @@ import 'package:spotify/spotify.dart';
+ import 'package:spotube/collections/spotube_icons.dart';
+ import 'package:spotube/components/shared/image/universal_image.dart';
+ import 'package:spotube/extensions/context.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/download_manager_provider.dart';
+ import 'package:spotube/services/download_manager/download_status.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+ class DownloadItem extends HookConsumerWidget {
+@@ -24,25 +24,25 @@ class DownloadItem extends HookConsumerWidget {
+     final taskStatus = useState<DownloadStatus?>(null);
+ 
+     useEffect(() {
+-      if (track is! SpotubeTrack) return null;
+-      final notifier = downloadManager.getStatusNotifier(track as SpotubeTrack);
++      if (track is! SourcedTrack) return null;
++      final notifier = downloadManager.getStatusNotifier(track as SourcedTrack);
+ 
+       taskStatus.value = notifier?.value;
+-      listener() {
++
++      void listener() {
+         taskStatus.value = notifier?.value;
+       }
+ 
+-      downloadManager
+-          .getStatusNotifier(track as SpotubeTrack)
+-          ?.addListener(listener);
++      notifier?.addListener(listener);
+ 
+       return () {
+-        downloadManager
+-            .getStatusNotifier(track as SpotubeTrack)
+-            ?.removeListener(listener);
++        notifier?.removeListener(listener);
+       };
+     }, [track]);
+ 
++    final isQueryingSourceInfo =
++        taskStatus.value == null || track is! SourcedTrack;
++
+     return ListTile(
+       leading: Padding(
+         padding: const EdgeInsets.symmetric(horizontal: 5),
+@@ -63,7 +63,7 @@ class DownloadItem extends HookConsumerWidget {
+         track.artists ?? <Artist>[],
+         mainAxisAlignment: WrapAlignment.start,
+       ),
+-      trailing: taskStatus.value == null || track is! SpotubeTrack
++      trailing: isQueryingSourceInfo
+           ? Text(
+               context.l10n.querying_info,
+               style: Theme.of(context).textTheme.labelMedium,
+@@ -72,7 +72,7 @@ class DownloadItem extends HookConsumerWidget {
+               DownloadStatus.downloading => HookBuilder(builder: (context) {
+                   final taskProgress = useListenable(useMemoized(
+                     () => downloadManager
+-                        .getProgressNotifier(track as SpotubeTrack),
++                        .getProgressNotifier(track as SourcedTrack),
+                     [track],
+                   ));
+                   return SizedBox(
+@@ -86,13 +86,13 @@ class DownloadItem extends HookConsumerWidget {
+                         IconButton(
+                             icon: const Icon(SpotubeIcons.pause),
+                             onPressed: () {
+-                              downloadManager.pause(track as SpotubeTrack);
++                              downloadManager.pause(track as SourcedTrack);
+                             }),
+                         const SizedBox(width: 10),
+                         IconButton(
+                             icon: const Icon(SpotubeIcons.close),
+                             onPressed: () {
+-                              downloadManager.cancel(track as SpotubeTrack);
++                              downloadManager.cancel(track as SourcedTrack);
+                             }),
+                       ],
+                     ),
+@@ -104,13 +104,13 @@ class DownloadItem extends HookConsumerWidget {
+                     IconButton(
+                         icon: const Icon(SpotubeIcons.play),
+                         onPressed: () {
+-                          downloadManager.resume(track as SpotubeTrack);
++                          downloadManager.resume(track as SourcedTrack);
+                         }),
+                     const SizedBox(width: 10),
+                     IconButton(
+                         icon: const Icon(SpotubeIcons.close),
+                         onPressed: () {
+-                          downloadManager.cancel(track as SpotubeTrack);
++                          downloadManager.cancel(track as SourcedTrack);
+                         })
+                   ],
+                 ),
+@@ -126,7 +126,7 @@ class DownloadItem extends HookConsumerWidget {
+                       IconButton(
+                         icon: const Icon(SpotubeIcons.refresh),
+                         onPressed: () {
+-                          downloadManager.retry(track as SpotubeTrack);
++                          downloadManager.retry(track as SourcedTrack);
+                         },
+                       ),
+                     ],
+@@ -137,7 +137,7 @@ class DownloadItem extends HookConsumerWidget {
+               DownloadStatus.queued => IconButton(
+                   icon: const Icon(SpotubeIcons.close),
+                   onPressed: () {
+-                    downloadManager.removeFromQueue(track as SpotubeTrack);
++                    downloadManager.removeFromQueue(track as SourcedTrack);
+                   }),
+             },
+     );
+diff --git a/lib/components/player/sibling_tracks_sheet.dart b/lib/components/player/sibling_tracks_sheet.dart
+index ee8d9719a..cf1429b9f 100644
+--- a/lib/components/player/sibling_tracks_sheet.dart
++++ b/lib/components/player/sibling_tracks_sheet.dart
+@@ -1,5 +1,6 @@
+ import 'dart:ui';
+ 
++import 'package:collection/collection.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:hooks_riverpod/hooks_riverpod.dart';
+@@ -12,13 +13,13 @@ import 'package:spotube/extensions/constrains.dart';
+ import 'package:spotube/extensions/context.dart';
+ import 'package:spotube/extensions/duration.dart';
+ import 'package:spotube/hooks/utils/use_debounce.dart';
+-import 'package:spotube/models/matched_track.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/provider/youtube_provider.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/video_info.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
++import 'package:spotube/services/sourced_track/sources/youtube.dart';
+ import 'package:spotube/utils/service_utils.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+@@ -35,7 +36,6 @@ class SiblingTracksSheet extends HookConsumerWidget {
+     final playlist = ref.watch(ProxyPlaylistNotifier.provider);
+     final playlistNotifier = ref.watch(ProxyPlaylistNotifier.notifier);
+     final preferences = ref.watch(userPreferencesProvider);
+-    final youtube = ref.watch(youtubeProvider);
+ 
+     final isSearching = useState(false);
+     final searchMode = useState(preferences.searchMode);
+@@ -61,18 +61,31 @@ class SiblingTracksSheet extends HookConsumerWidget {
+ 
+     final searchRequest = useMemoized(() async {
+       if (searchTerm.trim().isEmpty) {
+-        return <YoutubeVideoInfo>[];
++        return <SourceInfo>[];
+       }
+ 
+-      return youtube.search(searchTerm.trim());
++      final results = await youtubeClient.search.search(searchTerm.trim());
++
++      return await Future.wait(
++        results.map(YoutubeVideoInfo.fromVideo).mapIndexed((i, video) async {
++          final siblingType = await YoutubeSourcedTrack.toSiblingType(i, video);
++          return siblingType.info;
++        }),
++      );
+     }, [
+       searchTerm,
+       searchMode.value,
+     ]);
+ 
+-    final siblings = playlist.isFetching == false
+-        ? (playlist.activeTrack as SpotubeTrack).siblings
+-        : <YoutubeVideoInfo>[];
++    final siblings = useMemoized(
++      () => playlist.isFetching == false
++          ? [
++              (playlist.activeTrack as SourcedTrack).sourceInfo,
++              ...(playlist.activeTrack as SourcedTrack).siblings,
++            ]
++          : <SourceInfo>[],
++      [playlist.isFetching, playlist.activeTrack],
++    );
+ 
+     final borderRadius = floating
+         ? BorderRadius.circular(10)
+@@ -82,21 +95,21 @@ class SiblingTracksSheet extends HookConsumerWidget {
+           );
+ 
+     useEffect(() {
+-      if (playlist.activeTrack is SpotubeTrack &&
+-          (playlist.activeTrack as SpotubeTrack).siblings.isEmpty) {
++      if (playlist.activeTrack is SourcedTrack &&
++          (playlist.activeTrack as SourcedTrack).siblings.isEmpty) {
+         playlistNotifier.populateSibling();
+       }
+       return null;
+     }, [playlist.activeTrack]);
+ 
+     final itemBuilder = useCallback(
+-      (YoutubeVideoInfo video) {
++      (SourceInfo sourceInfo) {
+         return ListTile(
+-          title: Text(video.title),
++          title: Text(sourceInfo.title),
+           leading: Padding(
+             padding: const EdgeInsets.all(8.0),
+             child: UniversalImage(
+-              path: video.thumbnailUrl,
++              path: sourceInfo.thumbnail,
+               height: 60,
+               width: 60,
+             ),
+@@ -104,16 +117,18 @@ class SiblingTracksSheet extends HookConsumerWidget {
+           shape: RoundedRectangleBorder(
+             borderRadius: BorderRadius.circular(5),
+           ),
+-          trailing: Text(video.duration.toHumanReadableString()),
+-          subtitle: Text(video.channelName),
++          trailing: Text(sourceInfo.duration.toHumanReadableString()),
++          subtitle: Text(sourceInfo.artist),
+           enabled: playlist.isFetching != true,
+           selected: playlist.isFetching != true &&
+-              video.id == (playlist.activeTrack as SpotubeTrack).ytTrack.id,
++              sourceInfo.id ==
++                  (playlist.activeTrack as SourcedTrack).sourceInfo.id,
+           selectedTileColor: theme.popupMenuTheme.color,
+           onTap: () {
+             if (playlist.isFetching == false &&
+-                video.id != (playlist.activeTrack as SpotubeTrack).ytTrack.id) {
+-              playlistNotifier.swapSibling(video);
++                sourceInfo.id !=
++                    (playlist.activeTrack as SourcedTrack).sourceInfo.id) {
++              playlistNotifier.swapSibling(sourceInfo);
+               Navigator.of(context).pop();
+             }
+           },
+@@ -175,7 +190,7 @@ class SiblingTracksSheet extends HookConsumerWidget {
+                         },
+                       )
+                     else ...[
+-                      if (preferences.youtubeApiType == YoutubeApiType.piped)
++                      if (preferences.audioSource == AudioSource.piped)
+                         PopupMenuButton(
+                           icon: const Icon(SpotubeIcons.filter, size: 18),
+                           onSelected: (SearchMode mode) {
+diff --git a/lib/components/shared/dialogs/track_details_dialog.dart b/lib/components/shared/dialogs/track_details_dialog.dart
+index 9e29c32d0..8634776f5 100644
+--- a/lib/components/shared/dialogs/track_details_dialog.dart
++++ b/lib/components/shared/dialogs/track_details_dialog.dart
+@@ -6,8 +6,7 @@ import 'package:spotube/components/shared/links/hyper_link.dart';
+ import 'package:spotube/components/shared/links/link_text.dart';
+ import 'package:spotube/extensions/constrains.dart';
+ import 'package:spotube/extensions/context.dart';
+-import 'package:spotube/models/spotube_track.dart';
+-import 'package:spotube/utils/primitive_utils.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ import 'package:spotube/extensions/duration.dart';
+ 
+@@ -37,8 +36,8 @@ class TrackDetailsDialog extends HookWidget {
+         overflow: TextOverflow.ellipsis,
+         style: const TextStyle(color: Colors.blue),
+       ),
+-      context.l10n.duration: (track is SpotubeTrack
+-              ? (track as SpotubeTrack).ytTrack.duration
++      context.l10n.duration: (track is SourcedTrack
++              ? (track as SourcedTrack).sourceInfo.duration
+               : track.duration!)
+           .toHumanReadableString(),
+       if (track.album!.releaseDate != null)
+@@ -46,33 +45,27 @@ class TrackDetailsDialog extends HookWidget {
+       context.l10n.popularity: track.popularity?.toString() ?? "0",
+     };
+ 
+-    final ytTrack =
+-        track is SpotubeTrack ? (track as SpotubeTrack).ytTrack : null;
++    final sourceInfo =
++        track is SourcedTrack ? (track as SourcedTrack).sourceInfo : null;
+ 
+-    final ytTracksDetailsMap = ytTrack == null
++    final ytTracksDetailsMap = sourceInfo == null
+         ? {}
+         : {
+             context.l10n.youtube: Hyperlink(
+-              "https://piped.video/watch?v=${ytTrack.id}",
+-              "https://piped.video/watch?v=${ytTrack.id}",
++              "https://piped.video/watch?v=${sourceInfo.id}",
++              "https://piped.video/watch?v=${sourceInfo.id}",
+               maxLines: 2,
+               overflow: TextOverflow.ellipsis,
+             ),
+             context.l10n.channel: Hyperlink(
+-              ytTrack.channelName,
+-              "https://youtube.com${ytTrack.channelName}",
++              sourceInfo.artist,
++              sourceInfo.artistUrl,
+               maxLines: 2,
+               overflow: TextOverflow.ellipsis,
+             ),
+-            context.l10n.likes:
+-                PrimitiveUtils.toReadableNumber(ytTrack.likes.toDouble()),
+-            context.l10n.dislikes:
+-                PrimitiveUtils.toReadableNumber(ytTrack.dislikes.toDouble()),
+-            context.l10n.views:
+-                PrimitiveUtils.toReadableNumber(ytTrack.views.toDouble()),
+             context.l10n.streamUrl: Hyperlink(
+-              (track as SpotubeTrack).ytUri,
+-              (track as SpotubeTrack).ytUri,
++              (track as SourcedTrack).url,
++              (track as SourcedTrack).url,
+               maxLines: 2,
+               overflow: TextOverflow.ellipsis,
+             ),
+diff --git a/lib/components/shared/track_table/track_options.dart b/lib/components/shared/track_table/track_options.dart
+index 96bd8b603..b0633d34a 100644
+--- a/lib/components/shared/track_table/track_options.dart
++++ b/lib/components/shared/track_table/track_options.dart
+@@ -110,7 +110,7 @@ class TrackOptions extends HookConsumerWidget {
+     ]);
+ 
+     final progressNotifier = useMemoized(() {
+-      final spotubeTrack = downloadManager.mapToSpotubeTrack(track);
++      final spotubeTrack = downloadManager.mapToSourcedTrack(track);
+       if (spotubeTrack == null) return null;
+       return downloadManager.getProgressNotifier(spotubeTrack);
+     });
+diff --git a/lib/components/shared/track_table/tracks_table_view.dart b/lib/components/shared/track_table/tracks_table_view.dart
+index 14a4f1a91..003662f52 100644
+--- a/lib/components/shared/track_table/tracks_table_view.dart
++++ b/lib/components/shared/track_table/tracks_table_view.dart
+@@ -60,7 +60,7 @@ class TracksTableView extends HookConsumerWidget {
+     ref.watch(downloadManagerProvider);
+     final downloader = ref.watch(downloadManagerProvider.notifier);
+     final apiType =
+-        ref.watch(userPreferencesProvider.select((s) => s.youtubeApiType));
++        ref.watch(userPreferencesProvider.select((s) => s.audioSource));
+     const tableHeadStyle = TextStyle(fontWeight: FontWeight.bold, fontSize: 16);
+ 
+     final selected = useState<List<String>>([]);
+@@ -195,7 +195,7 @@ class TracksTableView extends HookConsumerWidget {
+                       switch (action) {
+                         case "download":
+                           {
+-                            final confirmed = apiType == YoutubeApiType.piped ||
++                            final confirmed = apiType == AudioSource.piped ||
+                                 await showDialog(
+                                   context: context,
+                                   builder: (context) {
+diff --git a/lib/main.dart b/lib/main.dart
+index f46f02c12..5d7ae2a75 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -18,8 +18,8 @@ import 'package:spotube/hooks/configurators/use_disable_battery_optimizations.da
+ import 'package:spotube/hooks/configurators/use_get_storage_perms.dart';
+ import 'package:spotube/l10n/l10n.dart';
+ import 'package:spotube/models/logger.dart';
+-import 'package:spotube/models/matched_track.dart';
+ import 'package:spotube/models/skip_segment.dart';
++import 'package:spotube/models/source_match.dart';
+ import 'package:spotube/provider/palette_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+ import 'package:spotube/services/audio_player/audio_player.dart';
+@@ -71,16 +71,18 @@ Future<void> main(List<String> rawArgs) async {
+     cacheDir: hiveCacheDir,
+     connectivity: FlQueryInternetConnectionCheckerAdapter(),
+   );
+-  Hive.registerAdapter(MatchedTrackAdapter());
++
+   Hive.registerAdapter(SkipSegmentAdapter());
+-  Hive.registerAdapter(SearchModeAdapter());
++
++  Hive.registerAdapter(SourceMatchAdapter());
++  Hive.registerAdapter(SourceTypeAdapter());
+ 
+   // Cache versioning entities with Adapter
+-  MatchedTrack.version = 'v1';
++  SourceMatch.version = 'v1';
+   SkipSegment.version = 'v1';
+ 
+-  await Hive.openLazyBox<MatchedTrack>(
+-    MatchedTrack.boxName,
++  await Hive.openLazyBox<SourceMatch>(
++    SourceMatch.boxName,
+     path: hiveCacheDir,
+   );
+   await Hive.openLazyBox(
+diff --git a/lib/models/current_playlist.dart b/lib/models/current_playlist.dart
+index 1c3f8e167..53ea2799b 100644
+--- a/lib/models/current_playlist.dart
++++ b/lib/models/current_playlist.dart
+@@ -1,6 +1,7 @@
++import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:spotify/spotify.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/extensions/track.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ class CurrentPlaylist {
+   List<Track>? _tempTrack;
+@@ -18,13 +19,13 @@ class CurrentPlaylist {
+     this.isLocal = false,
+   });
+ 
+-  static CurrentPlaylist fromJson(Map<String, dynamic> map) {
++  static CurrentPlaylist fromJson(Map<String, dynamic> map, Ref ref) {
+     return CurrentPlaylist(
+       id: map["id"],
+       tracks: List.castFrom<dynamic, Track>(map["tracks"]
+           .map(
+             (track) => map["isLocal"] == true
+-                ? SpotubeTrack.fromJson(track)
++                ? SourcedTrack.fromJson(track, ref: ref)
+                 : Track.fromJson(track),
+           )
+           .toList()),
+@@ -66,7 +67,7 @@ class CurrentPlaylist {
+       "name": name,
+       "tracks": tracks
+           .map((track) =>
+-              track is SpotubeTrack ? track.toJson() : track.toJson())
++              track is SourcedTrack ? track.toJson() : track.toJson())
+           .toList(),
+       "thumbnail": thumbnail,
+       "isLocal": isLocal,
+diff --git a/lib/models/matched_track.dart b/lib/models/matched_track.dart
+deleted file mode 100644
+index b7cc0a3fd..000000000
+--- a/lib/models/matched_track.dart
++++ /dev/null
+@@ -1,69 +0,0 @@
+-import "package:hive/hive.dart";
+-part "matched_track.g.dart";
+-
+-@HiveType(typeId: 1)
+-class MatchedTrack {
+-  @HiveField(0)
+-  String youtubeId;
+-  @HiveField(1)
+-  String spotifyId;
+-  @HiveField(2)
+-  SearchMode searchMode;
+-
+-  String? id;
+-  DateTime? createdAt;
+-
+-  bool get isSynced => id != null;
+-
+-  static String version = 'v1';
+-  static final boxName = "oss.krtirtho.spotube.matched_tracks.$version";
+-
+-  static LazyBox<MatchedTrack> get box => Hive.lazyBox<MatchedTrack>(boxName);
+-
+-  MatchedTrack({
+-    required this.youtubeId,
+-    required this.spotifyId,
+-    required this.searchMode,
+-    this.id,
+-    this.createdAt,
+-  });
+-
+-  factory MatchedTrack.fromJson(Map<String, dynamic> json) {
+-    return MatchedTrack(
+-      searchMode: SearchMode.fromString(json["searchMode"]),
+-      youtubeId: json["youtube_id"],
+-      spotifyId: json["spotify_id"],
+-      id: json["id"],
+-      createdAt: DateTime.parse(json["created_at"]),
+-    );
+-  }
+-
+-  Map<String, dynamic> toJson() {
+-    return {
+-      "youtube_id": youtubeId,
+-      "spotify_id": spotifyId,
+-      "id": id,
+-      "searchMode": searchMode.name,
+-      "created_at": createdAt?.toString()
+-    }..removeWhere((key, value) => value == null);
+-  }
+-}
+-
+-@HiveType(typeId: 4)
+-enum SearchMode {
+-  @HiveField(0)
+-  youtube._internal('YouTube'),
+-  @HiveField(1)
+-  youtubeMusic._internal('YouTube Music');
+-
+-  final String label;
+-
+-  const SearchMode._internal(this.label);
+-
+-  factory SearchMode.fromString(String value) {
+-    return SearchMode.values.firstWhere(
+-      (element) => element.name == value,
+-      orElse: () => SearchMode.youtube,
+-    );
+-  }
+-}
+diff --git a/lib/models/matched_track.g.dart b/lib/models/matched_track.g.dart
+deleted file mode 100644
+index dd166e77d..000000000
+--- a/lib/models/matched_track.g.dart
++++ /dev/null
+@@ -1,86 +0,0 @@
+-// GENERATED CODE - DO NOT MODIFY BY HAND
+-
+-part of 'matched_track.dart';
+-
+-// **************************************************************************
+-// TypeAdapterGenerator
+-// **************************************************************************
+-
+-class MatchedTrackAdapter extends TypeAdapter<MatchedTrack> {
+-  @override
+-  final int typeId = 1;
+-
+-  @override
+-  MatchedTrack read(BinaryReader reader) {
+-    final numOfFields = reader.readByte();
+-    final fields = <int, dynamic>{
+-      for (int i = 0; i < numOfFields; i++) reader.readByte(): reader.read(),
+-    };
+-    return MatchedTrack(
+-      youtubeId: fields[0] as String,
+-      spotifyId: fields[1] as String,
+-      searchMode: fields[2] as SearchMode,
+-    );
+-  }
+-
+-  @override
+-  void write(BinaryWriter writer, MatchedTrack obj) {
+-    writer
+-      ..writeByte(3)
+-      ..writeByte(0)
+-      ..write(obj.youtubeId)
+-      ..writeByte(1)
+-      ..write(obj.spotifyId)
+-      ..writeByte(2)
+-      ..write(obj.searchMode);
+-  }
+-
+-  @override
+-  int get hashCode => typeId.hashCode;
+-
+-  @override
+-  bool operator ==(Object other) =>
+-      identical(this, other) ||
+-      other is MatchedTrackAdapter &&
+-          runtimeType == other.runtimeType &&
+-          typeId == other.typeId;
+-}
+-
+-class SearchModeAdapter extends TypeAdapter<SearchMode> {
+-  @override
+-  final int typeId = 4;
+-
+-  @override
+-  SearchMode read(BinaryReader reader) {
+-    switch (reader.readByte()) {
+-      case 0:
+-        return SearchMode.youtube;
+-      case 1:
+-        return SearchMode.youtubeMusic;
+-      default:
+-        return SearchMode.youtube;
+-    }
+-  }
+-
+-  @override
+-  void write(BinaryWriter writer, SearchMode obj) {
+-    switch (obj) {
+-      case SearchMode.youtube:
+-        writer.writeByte(0);
+-        break;
+-      case SearchMode.youtubeMusic:
+-        writer.writeByte(1);
+-        break;
+-    }
+-  }
+-
+-  @override
+-  int get hashCode => typeId.hashCode;
+-
+-  @override
+-  bool operator ==(Object other) =>
+-      identical(this, other) ||
+-      other is SearchModeAdapter &&
+-          runtimeType == other.runtimeType &&
+-          typeId == other.typeId;
+-}
+diff --git a/lib/models/source_match.dart b/lib/models/source_match.dart
+new file mode 100644
+index 000000000..57a9f9634
+--- /dev/null
++++ b/lib/models/source_match.dart
+@@ -0,0 +1,54 @@
++import 'package:hive/hive.dart';
++import 'package:json_annotation/json_annotation.dart';
++
++part 'source_match.g.dart';
++
++@JsonEnum()
++@HiveType(typeId: 5)
++enum SourceType {
++  @HiveField(0)
++  youtube._("YouTube"),
++
++  @HiveField(1)
++  youtubeMusic._("YouTube Music"),
++
++  @HiveField(2)
++  jiosaavn._("JioSaavn");
++
++  final String label;
++
++  const SourceType._(this.label);
++}
++
++@JsonSerializable()
++@HiveType(typeId: 6)
++class SourceMatch {
++  @HiveField(0)
++  String id;
++
++  @HiveField(1)
++  String sourceId;
++
++  @HiveField(2)
++  SourceType sourceType;
++
++  @HiveField(3)
++  DateTime createdAt;
++
++  SourceMatch({
++    required this.id,
++    required this.sourceId,
++    required this.sourceType,
++    required this.createdAt,
++  });
++
++  factory SourceMatch.fromJson(Map<String, dynamic> json) =>
++      _$SourceMatchFromJson(json);
++
++  Map<String, dynamic> toJson() => _$SourceMatchToJson(this);
++
++  static String version = 'v1';
++  static final boxName = "oss.krtirtho.spotube.source_matches.$version";
++
++  static LazyBox<SourceMatch> get box => Hive.lazyBox<SourceMatch>(boxName);
++}
+diff --git a/lib/models/source_match.g.dart b/lib/models/source_match.g.dart
+new file mode 100644
+index 000000000..11f34bf34
+--- /dev/null
++++ b/lib/models/source_match.g.dart
+@@ -0,0 +1,119 @@
++// GENERATED CODE - DO NOT MODIFY BY HAND
++
++part of 'source_match.dart';
++
++// **************************************************************************
++// TypeAdapterGenerator
++// **************************************************************************
++
++class SourceMatchAdapter extends TypeAdapter<SourceMatch> {
++  @override
++  final int typeId = 6;
++
++  @override
++  SourceMatch read(BinaryReader reader) {
++    final numOfFields = reader.readByte();
++    final fields = <int, dynamic>{
++      for (int i = 0; i < numOfFields; i++) reader.readByte(): reader.read(),
++    };
++    return SourceMatch(
++      id: fields[0] as String,
++      sourceId: fields[1] as String,
++      sourceType: fields[2] as SourceType,
++      createdAt: fields[3] as DateTime,
++    );
++  }
++
++  @override
++  void write(BinaryWriter writer, SourceMatch obj) {
++    writer
++      ..writeByte(4)
++      ..writeByte(0)
++      ..write(obj.id)
++      ..writeByte(1)
++      ..write(obj.sourceId)
++      ..writeByte(2)
++      ..write(obj.sourceType)
++      ..writeByte(3)
++      ..write(obj.createdAt);
++  }
++
++  @override
++  int get hashCode => typeId.hashCode;
++
++  @override
++  bool operator ==(Object other) =>
++      identical(this, other) ||
++      other is SourceMatchAdapter &&
++          runtimeType == other.runtimeType &&
++          typeId == other.typeId;
++}
++
++class SourceTypeAdapter extends TypeAdapter<SourceType> {
++  @override
++  final int typeId = 5;
++
++  @override
++  SourceType read(BinaryReader reader) {
++    switch (reader.readByte()) {
++      case 0:
++        return SourceType.youtube;
++      case 1:
++        return SourceType.youtubeMusic;
++      case 2:
++        return SourceType.jiosaavn;
++      default:
++        return SourceType.youtube;
++    }
++  }
++
++  @override
++  void write(BinaryWriter writer, SourceType obj) {
++    switch (obj) {
++      case SourceType.youtube:
++        writer.writeByte(0);
++        break;
++      case SourceType.youtubeMusic:
++        writer.writeByte(1);
++        break;
++      case SourceType.jiosaavn:
++        writer.writeByte(2);
++        break;
++    }
++  }
++
++  @override
++  int get hashCode => typeId.hashCode;
++
++  @override
++  bool operator ==(Object other) =>
++      identical(this, other) ||
++      other is SourceTypeAdapter &&
++          runtimeType == other.runtimeType &&
++          typeId == other.typeId;
++}
++
++// **************************************************************************
++// JsonSerializableGenerator
++// **************************************************************************
++
++SourceMatch _$SourceMatchFromJson(Map<String, dynamic> json) => SourceMatch(
++      id: json['id'] as String,
++      sourceId: json['sourceId'] as String,
++      sourceType: $enumDecode(_$SourceTypeEnumMap, json['sourceType']),
++      createdAt: DateTime.parse(json['createdAt'] as String),
++    );
++
++Map<String, dynamic> _$SourceMatchToJson(SourceMatch instance) =>
++    <String, dynamic>{
++      'id': instance.id,
++      'sourceId': instance.sourceId,
++      'sourceType': _$SourceTypeEnumMap[instance.sourceType]!,
++      'createdAt': instance.createdAt.toIso8601String(),
++    };
++
++const _$SourceTypeEnumMap = {
++  SourceType.youtube: 'youtube',
++  SourceType.youtubeMusic: 'youtubeMusic',
++  SourceType.jiosaavn: 'jiosaavn',
++};
+diff --git a/lib/models/spotube_track.dart b/lib/models/spotube_track.dart
+deleted file mode 100644
+index 67b09ad87..000000000
+--- a/lib/models/spotube_track.dart
++++ /dev/null
+@@ -1,274 +0,0 @@
+-import 'dart:async';
+-
+-import 'package:spotify/spotify.dart';
+-import 'package:spotube/extensions/track.dart';
+-import 'package:spotube/models/matched_track.dart';
+-import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
+-import 'package:spotube/utils/service_utils.dart';
+-import 'package:collection/collection.dart';
+-
+-final officialMusicRegex = RegExp(
+-  r"official\s(video|audio|music\svideo|lyric\svideo|visualizer)",
+-  caseSensitive: false,
+-);
+-
+-class TrackNotFoundException implements Exception {
+-  factory TrackNotFoundException(Track track) {
+-    throw Exception("Failed to find any results for ${track.name}");
+-  }
+-}
+-
+-class SpotubeTrack extends Track {
+-  final YoutubeVideoInfo ytTrack;
+-  final String ytUri;
+-  final MusicCodec codec;
+-
+-  final List<YoutubeVideoInfo> siblings;
+-
+-  SpotubeTrack(
+-    this.ytTrack,
+-    this.ytUri,
+-    this.siblings,
+-    this.codec,
+-  ) : super();
+-
+-  SpotubeTrack.fromTrack({
+-    required Track track,
+-    required this.ytTrack,
+-    required this.ytUri,
+-    required this.siblings,
+-    required this.codec,
+-  }) : super() {
+-    album = track.album;
+-    artists = track.artists;
+-    availableMarkets = track.availableMarkets;
+-    discNumber = track.discNumber;
+-    durationMs = track.durationMs;
+-    explicit = track.explicit;
+-    externalIds = track.externalIds;
+-    externalUrls = track.externalUrls;
+-    href = track.href;
+-    id = track.id;
+-    isPlayable = track.isPlayable;
+-    linkedFrom = track.linkedFrom;
+-    name = track.name;
+-    popularity = track.popularity;
+-    previewUrl = track.previewUrl;
+-    trackNumber = track.trackNumber;
+-    type = track.type;
+-    uri = track.uri;
+-  }
+-
+-  static Future<List<YoutubeVideoInfo>> fetchSiblings(
+-    Track track,
+-    YoutubeEndpoints client,
+-  ) async {
+-    final artists = (track.artists ?? [])
+-        .map((ar) => ar.name)
+-        .toList()
+-        .whereNotNull()
+-        .toList();
+-
+-    final title = ServiceUtils.getTitle(
+-      track.name!,
+-      artists: artists,
+-      onlyCleanArtist: true,
+-    ).trim();
+-
+-    final query = "$title - ${artists.join(", ")}";
+-    final List<YoutubeVideoInfo> siblings = await client.search(query).then(
+-      (res) {
+-        final isYoutubeApi =
+-            client.preferences.youtubeApiType == YoutubeApiType.youtube;
+-        final siblings = isYoutubeApi ||
+-                client.preferences.searchMode == SearchMode.youtube
+-            ? ServiceUtils.onlyContainsEnglish(query)
+-                ? res
+-                : res
+-                    .sorted((a, b) => b.views.compareTo(a.views))
+-                    .map((sibling) {
+-                      int score = 0;
+-
+-                      for (final artist in artists) {
+-                        final isSameChannelArtist =
+-                            sibling.channelName.toLowerCase() ==
+-                                artist.toLowerCase();
+-                        final channelContainsArtist = sibling.channelName
+-                            .toLowerCase()
+-                            .contains(artist.toLowerCase());
+-
+-                        if (isSameChannelArtist || channelContainsArtist) {
+-                          score += 1;
+-                        }
+-
+-                        final titleContainsArtist = sibling.title
+-                            .toLowerCase()
+-                            .contains(artist.toLowerCase());
+-
+-                        if (titleContainsArtist) {
+-                          score += 1;
+-                        }
+-                      }
+-
+-                      final titleContainsTrackName = sibling.title
+-                          .toLowerCase()
+-                          .contains(track.name!.toLowerCase());
+-
+-                      final hasOfficialFlag = officialMusicRegex
+-                          .hasMatch(sibling.title.toLowerCase());
+-
+-                      if (titleContainsTrackName) {
+-                        score += 3;
+-                      }
+-
+-                      if (hasOfficialFlag) {
+-                        score += 1;
+-                      }
+-
+-                      if (hasOfficialFlag && titleContainsTrackName) {
+-                        score += 2;
+-                      }
+-
+-                      return (sibling: sibling, score: score);
+-                    })
+-                    .sorted((a, b) => b.score.compareTo(a.score))
+-                    .map((e) => e.sibling)
+-            : res.sorted((a, b) => b.views.compareTo(a.views)).where((item) {
+-                return artists.any(
+-                  (artist) =>
+-                      artist.toLowerCase() == item.channelName.toLowerCase(),
+-                );
+-              });
+-
+-        return siblings.take(10).toList();
+-      },
+-    );
+-
+-    return siblings;
+-  }
+-
+-  static Future<SpotubeTrack> fetchFromTrack(
+-    Track track,
+-    YoutubeEndpoints client,
+-    MusicCodec codec,
+-  ) async {
+-    final matchedCachedTrack = await MatchedTrack.box.get(track.id!);
+-    var siblings = <YoutubeVideoInfo>[];
+-    YoutubeVideoInfo ytVideo;
+-    String ytStreamUrl;
+-    if (matchedCachedTrack != null &&
+-        matchedCachedTrack.searchMode == client.preferences.searchMode) {
+-      (ytVideo, ytStreamUrl) = await client.video(
+-          matchedCachedTrack.youtubeId, matchedCachedTrack.searchMode, codec);
+-    } else {
+-      siblings = await fetchSiblings(track, client);
+-      if (siblings.isEmpty) {
+-        throw TrackNotFoundException(track);
+-      }
+-      (ytVideo, ytStreamUrl) = await client.video(
+-        siblings.first.id,
+-        siblings.first.searchMode,
+-        codec,
+-      );
+-
+-      await MatchedTrack.box.put(
+-        track.id!,
+-        MatchedTrack(
+-          youtubeId: ytVideo.id,
+-          spotifyId: track.id!,
+-          searchMode: siblings.first.searchMode,
+-        ),
+-      );
+-    }
+-
+-    return SpotubeTrack.fromTrack(
+-      track: track,
+-      ytTrack: ytVideo,
+-      ytUri: ytStreamUrl,
+-      siblings: siblings,
+-      codec: codec,
+-    );
+-  }
+-
+-  Future<SpotubeTrack?> swappedCopy(
+-    YoutubeVideoInfo video,
+-    YoutubeEndpoints client,
+-  ) async {
+-    // sibling tracks that were manually searched and swapped
+-    final isStepSibling = siblings.none((element) => element.id == video.id);
+-
+-    final (ytVideo, ytStreamUrl) = await client.video(
+-      video.id,
+-      siblings.first.searchMode,
+-      // siblings are always swapped when streaming
+-      client.preferences.streamMusicCodec,
+-    );
+-
+-    if (!isStepSibling) {
+-      await MatchedTrack.box.put(
+-        id!,
+-        MatchedTrack(
+-          youtubeId: video.id,
+-          spotifyId: id!,
+-          searchMode: siblings.first.searchMode,
+-        ),
+-      );
+-    }
+-
+-    return SpotubeTrack.fromTrack(
+-      track: this,
+-      ytTrack: ytVideo,
+-      ytUri: ytStreamUrl,
+-      siblings: [
+-        video,
+-        ...siblings.where((element) => element.id != video.id),
+-      ],
+-      codec: client.preferences.streamMusicCodec,
+-    );
+-  }
+-
+-  static SpotubeTrack fromJson(Map<String, dynamic> map) {
+-    return SpotubeTrack.fromTrack(
+-      track: Track.fromJson(map),
+-      ytTrack: YoutubeVideoInfo.fromJson(map["ytTrack"]),
+-      ytUri: map["ytUri"],
+-      siblings: List.castFrom<dynamic, Map<String, dynamic>>(map["siblings"])
+-          .map((sibling) => YoutubeVideoInfo.fromJson(sibling))
+-          .toList(),
+-      codec: MusicCodec.values.firstWhere(
+-        (element) => element.name == map["codec"],
+-        orElse: () => MusicCodec.m4a,
+-      ),
+-    );
+-  }
+-
+-  Future<SpotubeTrack> populatedCopy(YoutubeEndpoints client) async {
+-    if (this.siblings.isNotEmpty) return this;
+-
+-    final siblings = await fetchSiblings(
+-      this,
+-      client,
+-    );
+-
+-    return SpotubeTrack.fromTrack(
+-      track: this,
+-      ytTrack: ytTrack,
+-      ytUri: ytUri,
+-      siblings: siblings,
+-      codec: codec,
+-    );
+-  }
+-
+-  Map<String, dynamic> toJson() {
+-    return {
+-      // super values
+-      ...TrackJson.trackToJson(this),
+-      // this values
+-      "ytTrack": ytTrack.toJson(),
+-      "ytUri": ytUri,
+-      "siblings": siblings.map((sibling) => sibling.toJson()).toList(),
+-      "codec": codec.name,
+-    };
+-  }
+-}
+diff --git a/lib/pages/album/album.dart b/lib/pages/album/album.dart
+index a585c9e52..5674e721d 100644
+--- a/lib/pages/album/album.dart
++++ b/lib/pages/album/album.dart
+@@ -8,9 +8,9 @@ import 'package:spotube/components/shared/track_table/track_collection_view/trac
+ import 'package:spotube/components/shared/track_table/track_collection_view/track_collection_view.dart';
+ import 'package:spotube/components/shared/track_table/tracks_table_view.dart';
+ import 'package:spotube/extensions/constrains.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/services/queries/queries.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/service_utils.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+@@ -68,7 +68,7 @@ class AlbumPage extends HookConsumerWidget {
+       () =>
+           tracksSnapshot.data?.any((s) => s.id! == playlist.activeTrack?.id!) ==
+               true &&
+-          playlist.activeTrack is SpotubeTrack,
++          playlist.activeTrack is SourcedTrack,
+       [playlist.activeTrack, tracksSnapshot.data],
+     );
+ 
+diff --git a/lib/pages/playlist/playlist.dart b/lib/pages/playlist/playlist.dart
+index 1623195b7..6a3ec9b9a 100644
+--- a/lib/pages/playlist/playlist.dart
++++ b/lib/pages/playlist/playlist.dart
+@@ -11,9 +11,9 @@ import 'package:spotube/extensions/constrains.dart';
+ import 'package:spotube/models/logger.dart';
+ import 'package:flutter/material.dart';
+ import 'package:spotify/spotify.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/services/queries/queries.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ import 'package:spotube/utils/service_utils.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+@@ -59,7 +59,7 @@ class PlaylistView extends HookConsumerWidget {
+           tracksSnapshot.data
+                   ?.any((s) => s.id! == proxyPlaylist.activeTrack?.id!) ==
+               true &&
+-          proxyPlaylist.activeTrack is SpotubeTrack,
++          proxyPlaylist.activeTrack is SourcedTrack,
+       [proxyPlaylist.activeTrack, tracksSnapshot.data],
+     );
+ 
+diff --git a/lib/pages/settings/sections/playback.dart b/lib/pages/settings/sections/playback.dart
+index 5e0002315..a0316b33e 100644
+--- a/lib/pages/settings/sections/playback.dart
++++ b/lib/pages/settings/sections/playback.dart
+@@ -8,10 +8,10 @@ import 'package:spotube/collections/spotube_icons.dart';
+ import 'package:spotube/components/settings/section_card_with_heading.dart';
+ import 'package:spotube/components/shared/adaptive/adaptive_select_tile.dart';
+ import 'package:spotube/extensions/context.dart';
+-import 'package:spotube/models/matched_track.dart';
+ import 'package:spotube/provider/piped_instances_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
+ 
+ class SettingsPlaybackSection extends HookConsumerWidget {
+   const SettingsPlaybackSection({Key? key}) : super(key: key);
+@@ -25,17 +25,21 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+     return SectionCardWithHeading(
+       heading: context.l10n.playback,
+       children: [
+-        AdaptiveSelectTile<AudioQuality>(
++        AdaptiveSelectTile<SourceQualities>(
+           secondary: const Icon(SpotubeIcons.audioQuality),
+           title: Text(context.l10n.audio_quality),
+           value: preferences.audioQuality,
+           options: [
+             DropdownMenuItem(
+-              value: AudioQuality.high,
++              value: SourceQualities.high,
+               child: Text(context.l10n.high),
+             ),
+             DropdownMenuItem(
+-              value: AudioQuality.low,
++              value: SourceQualities.medium,
++              child: Text(context.l10n.medium),
++            ),
++            DropdownMenuItem(
++              value: SourceQualities.low,
+               child: Text(context.l10n.low),
+             ),
+           ],
+@@ -45,11 +49,11 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+             }
+           },
+         ),
+-        AdaptiveSelectTile<YoutubeApiType>(
++        AdaptiveSelectTile<AudioSource>(
+           secondary: const Icon(SpotubeIcons.api),
+           title: Text(context.l10n.youtube_api_type),
+-          value: preferences.youtubeApiType,
+-          options: YoutubeApiType.values
++          value: preferences.audioSource,
++          options: AudioSource.values
+               .map((e) => DropdownMenuItem(
+                     value: e,
+                     child: Text(e.label),
+@@ -57,12 +61,12 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+               .toList(),
+           onChanged: (value) {
+             if (value == null) return;
+-            preferencesNotifier.setYoutubeApiType(value);
++            preferencesNotifier.setAudioSource(value);
+           },
+         ),
+         AnimatedSwitcher(
+           duration: const Duration(milliseconds: 300),
+-          child: preferences.youtubeApiType == YoutubeApiType.youtube
++          child: preferences.audioSource != AudioSource.piped
+               ? const SizedBox.shrink()
+               : Consumer(builder: (context, ref, child) {
+                   final instanceList = ref.watch(pipedInstancesFutureProvider);
+@@ -129,7 +133,7 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+         ),
+         AnimatedSwitcher(
+           duration: const Duration(milliseconds: 300),
+-          child: preferences.youtubeApiType == YoutubeApiType.youtube
++          child: preferences.audioSource != AudioSource.piped
+               ? const SizedBox.shrink()
+               : AdaptiveSelectTile<SearchMode>(
+                   secondary: const Icon(SpotubeIcons.search),
+@@ -149,17 +153,18 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+         ),
+         AnimatedSwitcher(
+           duration: const Duration(milliseconds: 300),
+-          child: preferences.searchMode == SearchMode.youtubeMusic &&
+-                  preferences.youtubeApiType == YoutubeApiType.piped
+-              ? const SizedBox.shrink()
+-              : SwitchListTile(
++          child: preferences.searchMode == SearchMode.youtube &&
++                  (preferences.audioSource == AudioSource.piped ||
++                      preferences.audioSource == AudioSource.youtube)
++              ? SwitchListTile(
+                   secondary: const Icon(SpotubeIcons.skip),
+                   title: Text(context.l10n.skip_non_music),
+                   value: preferences.skipNonMusic,
+                   onChanged: (state) {
+                     preferencesNotifier.setSkipNonMusic(state);
+                   },
+-                ),
++                )
++              : const SizedBox.shrink(),
+         ),
+         ListTile(
+           leading: const Icon(SpotubeIcons.playlistRemove),
+@@ -176,44 +181,46 @@ class SettingsPlaybackSection extends HookConsumerWidget {
+           value: preferences.normalizeAudio,
+           onChanged: preferencesNotifier.setNormalizeAudio,
+         ),
+-        AdaptiveSelectTile<MusicCodec>(
+-          secondary: const Icon(SpotubeIcons.stream),
+-          title: Text(context.l10n.streaming_music_codec),
+-          value: preferences.streamMusicCodec,
+-          showValueWhenUnfolded: false,
+-          options: MusicCodec.values
+-              .map((e) => DropdownMenuItem(
+-                    value: e,
+-                    child: Text(
+-                      e.label,
+-                      style: theme.textTheme.labelMedium,
+-                    ),
+-                  ))
+-              .toList(),
+-          onChanged: (value) {
+-            if (value == null) return;
+-            preferencesNotifier.setStreamMusicCodec(value);
+-          },
+-        ),
+-        AdaptiveSelectTile<MusicCodec>(
+-          secondary: const Icon(SpotubeIcons.file),
+-          title: Text(context.l10n.download_music_codec),
+-          value: preferences.downloadMusicCodec,
+-          showValueWhenUnfolded: false,
+-          options: MusicCodec.values
+-              .map((e) => DropdownMenuItem(
+-                    value: e,
+-                    child: Text(
+-                      e.label,
+-                      style: theme.textTheme.labelMedium,
+-                    ),
+-                  ))
+-              .toList(),
+-          onChanged: (value) {
+-            if (value == null) return;
+-            preferencesNotifier.setDownloadMusicCodec(value);
+-          },
+-        ),
++        if (preferences.audioSource != AudioSource.jiosaavn)
++          AdaptiveSelectTile<SourceCodecs>(
++            secondary: const Icon(SpotubeIcons.stream),
++            title: Text(context.l10n.streaming_music_codec),
++            value: preferences.streamMusicCodec,
++            showValueWhenUnfolded: false,
++            options: SourceCodecs.values
++                .map((e) => DropdownMenuItem(
++                      value: e,
++                      child: Text(
++                        e.label,
++                        style: theme.textTheme.labelMedium,
++                      ),
++                    ))
++                .toList(),
++            onChanged: (value) {
++              if (value == null) return;
++              preferencesNotifier.setStreamMusicCodec(value);
++            },
++          ),
++        if (preferences.audioSource != AudioSource.jiosaavn)
++          AdaptiveSelectTile<SourceCodecs>(
++            secondary: const Icon(SpotubeIcons.file),
++            title: Text(context.l10n.download_music_codec),
++            value: preferences.downloadMusicCodec,
++            showValueWhenUnfolded: false,
++            options: SourceCodecs.values
++                .map((e) => DropdownMenuItem(
++                      value: e,
++                      child: Text(
++                        e.label,
++                        style: theme.textTheme.labelMedium,
++                      ),
++                    ))
++                .toList(),
++            onChanged: (value) {
++              if (value == null) return;
++              preferencesNotifier.setDownloadMusicCodec(value);
++            },
++          ),
+       ],
+     );
+   }
+diff --git a/lib/provider/download_manager_provider.dart b/lib/provider/download_manager_provider.dart
+index 889641f4a..691a1385c 100644
+--- a/lib/provider/download_manager_provider.dart
++++ b/lib/provider/download_manager_provider.dart
+@@ -9,25 +9,23 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:metadata_god/metadata_god.dart';
+ import 'package:path/path.dart';
+ import 'package:spotify/spotify.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+-import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/provider/youtube_provider.dart';
+ import 'package:spotube/services/download_manager/download_manager.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/primitive_utils.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+ class DownloadManagerProvider extends ChangeNotifier {
+   DownloadManagerProvider({required this.ref})
+-      : $history = <SpotubeTrack>{},
++      : $history = <SourcedTrack>{},
+         $backHistory = <Track>{},
+         dl = DownloadManager() {
+     dl.statusStream.listen((event) async {
+       final (:request, :status) = event;
+ 
+       final track = $history.firstWhereOrNull(
+-        (element) => element.ytUri == request.url,
++        (element) => element.url == request.url,
+       );
+       if (track == null) return;
+ 
+@@ -45,7 +43,7 @@ class DownloadManagerProvider extends ChangeNotifier {
+           //? WebA audiotagging is not supported yet
+           //? Although in future by converting weba to opus & then tagging it
+           //? is possible using vorbis comments
+-          downloadCodec == MusicCodec.weba) return;
++          downloadCodec == SourceCodecs.weba) return;
+ 
+       final file = File(request.path);
+ 
+@@ -91,10 +89,9 @@ class DownloadManagerProvider extends ChangeNotifier {
+ 
+   final Ref<DownloadManagerProvider> ref;
+ 
+-  YoutubeEndpoints get yt => ref.read(youtubeProvider);
+   String get downloadDirectory =>
+       ref.read(userPreferencesProvider.select((s) => s.downloadLocation));
+-  MusicCodec get downloadCodec =>
++  SourceCodecs get downloadCodec =>
+       ref.read(userPreferencesProvider.select((s) => s.downloadMusicCodec));
+ 
+   int get $downloadCount => dl
+@@ -107,7 +104,7 @@ class DownloadManagerProvider extends ChangeNotifier {
+       )
+       .length;
+ 
+-  final Set<SpotubeTrack> $history;
++  final Set<SourcedTrack> $history;
+   // these are the tracks which metadata hasn't been fetched yet
+   final Set<Track> $backHistory;
+   final DownloadManager dl;
+@@ -144,9 +141,9 @@ class DownloadManagerProvider extends ChangeNotifier {
+   bool isActive(Track track) {
+     if ($backHistory.contains(track)) return true;
+ 
+-    final spotubeTrack = mapToSpotubeTrack(track);
++    final sourcedTrack = mapToSourcedTrack(track);
+ 
+-    if (spotubeTrack == null) return false;
++    if (sourcedTrack == null) return false;
+ 
+     return dl
+         .getAllDownloads()
+@@ -157,7 +154,7 @@ class DownloadManagerProvider extends ChangeNotifier {
+               download.status.value == DownloadStatus.queued,
+         )
+         .map((e) => e.request.url)
+-        .contains(spotubeTrack.ytUri);
++        .contains(sourcedTrack.getUrlOfCodec(downloadCodec));
+   }
+ 
+   /// For singular downloads
+@@ -173,21 +170,27 @@ class DownloadManagerProvider extends ChangeNotifier {
+       await oldFile.rename("$savePath.old");
+     }
+ 
+-    if (track is SpotubeTrack && track.codec == downloadCodec) {
+-      final downloadTask = await dl.addDownload(track.ytUri, savePath);
++    if (track is SourcedTrack && track.codec == downloadCodec) {
++      final downloadTask =
++          await dl.addDownload(track.getUrlOfCodec(downloadCodec), savePath);
+       if (downloadTask != null) {
+         $history.add(track);
+       }
+     } else {
+       $backHistory.add(track);
+-      final spotubeTrack =
+-          await SpotubeTrack.fetchFromTrack(track, yt, downloadCodec).then((d) {
++      final sourcedTrack = await SourcedTrack.fetchFromTrack(
++        ref: ref,
++        track: track,
++      ).then((d) {
+         $backHistory.remove(track);
+         return d;
+       });
+-      final downloadTask = await dl.addDownload(spotubeTrack.ytUri, savePath);
++      final downloadTask = await dl.addDownload(
++        sourcedTrack.getUrlOfCodec(downloadCodec),
++        savePath,
++      );
+       if (downloadTask != null) {
+-        $history.add(spotubeTrack);
++        $history.add(sourcedTrack);
+       }
+     }
+ 
+@@ -196,7 +199,7 @@ class DownloadManagerProvider extends ChangeNotifier {
+ 
+   Future<void> batchAddToQueue(List<Track> tracks) async {
+     $backHistory.addAll(
+-      tracks.where((element) => element is! SpotubeTrack),
++      tracks.where((element) => element is! SourcedTrack),
+     );
+     notifyListeners();
+     for (final track in tracks) {
+@@ -216,25 +219,25 @@ class DownloadManagerProvider extends ChangeNotifier {
+     }
+   }
+ 
+-  Future<void> removeFromQueue(SpotubeTrack track) async {
+-    await dl.removeDownload(track.ytUri);
++  Future<void> removeFromQueue(SourcedTrack track) async {
++    await dl.removeDownload(track.getUrlOfCodec(downloadCodec));
+     $history.remove(track);
+   }
+ 
+-  Future<void> pause(SpotubeTrack track) {
+-    return dl.pauseDownload(track.ytUri);
++  Future<void> pause(SourcedTrack track) {
++    return dl.pauseDownload(track.getUrlOfCodec(downloadCodec));
+   }
+ 
+-  Future<void> resume(SpotubeTrack track) {
+-    return dl.resumeDownload(track.ytUri);
++  Future<void> resume(SourcedTrack track) {
++    return dl.resumeDownload(track.getUrlOfCodec(downloadCodec));
+   }
+ 
+-  Future<void> retry(SpotubeTrack track) {
++  Future<void> retry(SourcedTrack track) {
+     return addToQueue(track);
+   }
+ 
+-  void cancel(SpotubeTrack track) {
+-    dl.cancelDownload(track.ytUri);
++  void cancel(SourcedTrack track) {
++    dl.cancelDownload(track.getUrlOfCodec(downloadCodec));
+   }
+ 
+   void cancelAll() {
+@@ -244,20 +247,20 @@ class DownloadManagerProvider extends ChangeNotifier {
+     }
+   }
+ 
+-  SpotubeTrack? mapToSpotubeTrack(Track track) {
+-    if (track is SpotubeTrack) {
++  SourcedTrack? mapToSourcedTrack(Track track) {
++    if (track is SourcedTrack) {
+       return track;
+     } else {
+       return $history.firstWhereOrNull((element) => element.id == track.id);
+     }
+   }
+ 
+-  ValueNotifier<DownloadStatus>? getStatusNotifier(SpotubeTrack track) {
+-    return dl.getDownload(track.ytUri)?.status;
++  ValueNotifier<DownloadStatus>? getStatusNotifier(SourcedTrack track) {
++    return dl.getDownload(track.getUrlOfCodec(downloadCodec))?.status;
+   }
+ 
+-  ValueNotifier<double>? getProgressNotifier(SpotubeTrack track) {
+-    return dl.getDownload(track.ytUri)?.progress;
++  ValueNotifier<double>? getProgressNotifier(SourcedTrack track) {
++    return dl.getDownload(track.getUrlOfCodec(downloadCodec))?.progress;
+   }
+ }
+ 
+diff --git a/lib/provider/piped_instances_provider.dart b/lib/provider/piped_instances_provider.dart
+index 290ad2c49..264b70480 100644
+--- a/lib/provider/piped_instances_provider.dart
++++ b/lib/provider/piped_instances_provider.dart
+@@ -1,10 +1,11 @@
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:piped_client/piped_client.dart';
+-import 'package:spotube/provider/youtube_provider.dart';
++import 'package:spotube/services/sourced_track/sources/piped.dart';
+ 
+ final pipedInstancesFutureProvider = FutureProvider<List<PipedInstance>>(
+   (ref) async {
+-    final youtube = ref.watch(youtubeProvider);
+-    return await youtube.piped?.instanceList() ?? [];
++    final pipedClient = ref.watch(pipedProvider);
++
++    return await pipedClient.instanceList();
+   },
+ );
+diff --git a/lib/provider/proxy_playlist/next_fetcher_mixin.dart b/lib/provider/proxy_playlist/next_fetcher_mixin.dart
+index b447f1ef7..1d2cfde8c 100644
+--- a/lib/provider/proxy_playlist/next_fetcher_mixin.dart
++++ b/lib/provider/proxy_playlist/next_fetcher_mixin.dart
+@@ -3,36 +3,30 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:spotify/spotify.dart';
+ import 'package:spotube/models/local_track.dart';
+ import 'package:spotube/models/logger.dart';
+-import 'package:spotube/models/matched_track.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist.dart';
+-import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/services/supabase.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ final logger = getLogger("NextFetcherMixin");
+ 
+ mixin NextFetcher on StateNotifier<ProxyPlaylist> {
+-  Future<List<SpotubeTrack>> fetchTracks(
+-    UserPreferences preferences,
+-    YoutubeEndpoints youtube, {
++  Future<List<SourcedTrack>> fetchTracks(
++    Ref ref, {
+     int count = 3,
+     int offset = 0,
+   }) async {
+-    /// get [count] [state.tracks] that are not [SpotubeTrack] and [LocalTrack]
++    /// get [count] [state.tracks] that are not [SourcedTrack] and [LocalTrack]
+ 
+     final bareTracks = state.tracks
+         .skip(offset)
+-        .where((element) => element is! SpotubeTrack && element is! LocalTrack)
++        .where((element) => element is! SourcedTrack && element is! LocalTrack)
+         .take(count);
+ 
+     /// fetch [bareTracks] one by one with 100ms delay
+     final fetchedTracks = await Future.wait(
+       bareTracks.mapIndexed((i, track) async {
+-        final future = SpotubeTrack.fetchFromTrack(
+-          track,
+-          youtube,
+-          preferences.streamMusicCodec,
++        final future = SourcedTrack.fetchFromTrack(
++          ref: ref,
++          track: track,
+         );
+         if (i == 0) {
+           return await future;
+@@ -47,9 +41,9 @@ mixin NextFetcher on StateNotifier<ProxyPlaylist> {
+     return fetchedTracks;
+   }
+ 
+-  /// Merges List of [SpotubeTrack]s with [Track]s and outputs a mixed List
++  /// Merges List of [SourcedTrack]s with [Track]s and outputs a mixed List
+   Set<Track> mergeTracks(
+-    Iterable<SpotubeTrack> fetchTracks,
++    Iterable<SourcedTrack> fetchTracks,
+     Iterable<Track> tracks,
+   ) {
+     return tracks.map((track) {
+@@ -80,12 +74,12 @@ mixin NextFetcher on StateNotifier<ProxyPlaylist> {
+ 
+   /// Returns appropriate Media source for [Track]
+   ///
+-  /// * If [Track] is [SpotubeTrack] then return [SpotubeTrack.ytUri]
++  /// * If [Track] is [SourcedTrack] then return [SourcedTrack.ytUri]
+   /// * If [Track] is [LocalTrack] then return [LocalTrack.path]
+   /// * If [Track] is [Track] then return [Track.id] with [isUnPlayable] source
+   String makeAppropriateSource(Track track) {
+-    if (track is SpotubeTrack) {
+-      return track.ytUri;
++    if (track is SourcedTrack) {
++      return track.url;
+     } else if (track is LocalTrack) {
+       return track.path;
+     } else {
+@@ -103,7 +97,7 @@ mixin NextFetcher on StateNotifier<ProxyPlaylist> {
+           final track = state.tracks.firstWhereOrNull(
+             (track) =>
+                 trackToUnplayableSource(track) == source ||
+-                (track is SpotubeTrack && track.ytUri == source) ||
++                (track is SourcedTrack && track.url == source) ||
+                 (track is LocalTrack && track.path == source),
+           );
+           return track;
+@@ -111,23 +105,4 @@ mixin NextFetcher on StateNotifier<ProxyPlaylist> {
+         .whereNotNull()
+         .toList();
+   }
+-
+-  /// This method must be called after any playback operation as
+-  /// it can increase the latency
+-  Future<void> storeTrack(Track track, SpotubeTrack spotubeTrack) async {
+-    try {
+-      if (track is! SpotubeTrack) {
+-        await supabase.insertTrack(
+-          MatchedTrack(
+-            youtubeId: spotubeTrack.ytTrack.id,
+-            spotifyId: spotubeTrack.id!,
+-            searchMode: spotubeTrack.ytTrack.searchMode,
+-          ),
+-        );
+-      }
+-    } catch (e, stackTrace) {
+-      logger.e(e.toString());
+-      logger.t(stackTrace);
+-    }
+-  }
+ }
+diff --git a/lib/provider/proxy_playlist/proxy_playlist.dart b/lib/provider/proxy_playlist/proxy_playlist.dart
+index e5dfa7e8b..026b34037 100644
+--- a/lib/provider/proxy_playlist/proxy_playlist.dart
++++ b/lib/provider/proxy_playlist/proxy_playlist.dart
+@@ -1,8 +1,9 @@
+ import 'package:collection/collection.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:spotify/spotify.dart';
+ import 'package:spotube/extensions/track.dart';
+ import 'package:spotube/models/local_track.dart';
+-import 'package:spotube/models/spotube_track.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ class ProxyPlaylist {
+   final Set<Track> tracks;
+@@ -11,11 +12,14 @@ class ProxyPlaylist {
+ 
+   ProxyPlaylist(this.tracks, [this.active, this.collections = const {}]);
+ 
+-  factory ProxyPlaylist.fromJson(Map<String, dynamic> json) {
++  factory ProxyPlaylist.fromJson(
++    Map<String, dynamic> json,
++    Ref ref,
++  ) {
+     return ProxyPlaylist(
+       List.castFrom<dynamic, Map<String, dynamic>>(
+         json['tracks'] ?? <Map<String, dynamic>>[],
+-      ).map(_makeAppropriateTrack).toSet(),
++      ).map((t) => _makeAppropriateTrack(t, ref)).toSet(),
+       json['active'] as int?,
+       json['collections'] == null
+           ? {}
+@@ -28,7 +32,7 @@ class ProxyPlaylist {
+ 
+   bool get isFetching =>
+       activeTrack != null &&
+-      activeTrack is! SpotubeTrack &&
++      activeTrack is! SourcedTrack &&
+       activeTrack is! LocalTrack;
+ 
+   bool containsCollection(String collection) {
+@@ -44,9 +48,9 @@ class ProxyPlaylist {
+     return tracks.every(containsTrack);
+   }
+ 
+-  static Track _makeAppropriateTrack(Map<String, dynamic> track) {
++  static Track _makeAppropriateTrack(Map<String, dynamic> track, Ref ref) {
+     if (track.containsKey("ytUri")) {
+-      return SpotubeTrack.fromJson(track);
++      return SourcedTrack.fromJson(track, ref: ref);
+     } else if (track.containsKey("path")) {
+       return LocalTrack.fromJson(track);
+     } else {
+@@ -59,7 +63,7 @@ class ProxyPlaylist {
+   static Map<String, dynamic> _makeAppropriateTrackJson(Track track) {
+     return switch (track.runtimeType) {
+       LocalTrack => track.toJson(),
+-      SpotubeTrack => track.toJson(),
++      SourcedTrack => track.toJson(),
+       _ => track.toJson(),
+     };
+   }
+diff --git a/lib/provider/proxy_playlist/proxy_playlist_provider.dart b/lib/provider/proxy_playlist/proxy_playlist_provider.dart
+index 500246619..bd3934a7a 100644
+--- a/lib/provider/proxy_playlist/proxy_playlist_provider.dart
++++ b/lib/provider/proxy_playlist/proxy_playlist_provider.dart
+@@ -12,9 +12,10 @@ import 'package:spotify/spotify.dart';
+ import 'package:spotube/components/shared/image/universal_image.dart';
+ import 'package:spotube/models/local_track.dart';
+ import 'package:spotube/models/logger.dart';
+-import 'package:spotube/models/matched_track.dart';
++
+ import 'package:spotube/models/skip_segment.dart';
+-import 'package:spotube/models/spotube_track.dart';
++import 'package:spotube/models/source_match.dart';
++
+ import 'package:spotube/provider/blacklist_provider.dart';
+ import 'package:spotube/provider/palette_provider.dart';
+ import 'package:spotube/provider/proxy_playlist/next_fetcher_mixin.dart';
+@@ -22,17 +23,20 @@ import 'package:spotube/provider/proxy_playlist/proxy_playlist.dart';
+ import 'package:spotube/provider/scrobbler_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/provider/youtube_provider.dart';
+ import 'package:spotube/services/audio_player/audio_player.dart';
+ import 'package:spotube/services/audio_services/audio_services.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
++import 'package:spotube/services/sourced_track/exceptions.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
++import 'package:spotube/services/supabase.dart';
++
+ import 'package:spotube/utils/persisted_state_notifier.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+ /// Things implemented:
+ /// * [x] Sponsor-Block skip
+-/// * [x] Prefetch next track as [SpotubeTrack] on 80% of current track
+-/// * [x] Mixed Queue containing both [SpotubeTrack] and [LocalTrack]
++/// * [x] Prefetch next track as [SourcedTrack] on 80% of current track
++/// * [x] Mixed Queue containing both [SourcedTrack] and [LocalTrack]
+ /// * [x] Modification of the Queue
+ ///       * [x] Add track at the end
+ ///       * [x] Add track at the beginning
+@@ -56,7 +60,6 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+ 
+   ScrobblerNotifier get scrobbler => ref.read(scrobblerProvider.notifier);
+   UserPreferences get preferences => ref.read(userPreferencesProvider);
+-  YoutubeEndpoints get youtube => ref.read(youtubeProvider);
+   ProxyPlaylist get playlist => state;
+   BlackListNotifier get blacklist =>
+       ref.read(BlackListNotifier.provider.notifier);
+@@ -168,11 +171,11 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+           return;
+         }
+         try {
+-          final isYTMusicMode =
+-              preferences.youtubeApiType == YoutubeApiType.piped &&
+-                  preferences.searchMode == SearchMode.youtubeMusic;
++          final isNotYTMode = preferences.audioSource != AudioSource.youtube ||
++              (preferences.audioSource == AudioSource.piped &&
++                  preferences.searchMode == SearchMode.youtubeMusic);
+ 
+-          if (isYTMusicMode || !preferences.skipNonMusic) return;
++          if (isNotYTMode || !preferences.skipNonMusic) return;
+ 
+           final isNotSameSegmentId =
+               currentSegments.value?.source != audioPlayer.currentSource;
+@@ -184,7 +187,7 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+               currentSegments.value = (
+                 source: audioPlayer.currentSource!,
+                 segments: await getAndCacheSkipSegments(
+-                  (state.activeTrack as SpotubeTrack).ytTrack.id,
++                  (state.activeTrack as SourcedTrack).sourceInfo.id,
+                 ),
+               );
+             } catch (e) {
+@@ -237,7 +240,7 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+     }();
+   }
+ 
+-  Future<SpotubeTrack?> ensureSourcePlayable(String source) async {
++  Future<SourcedTrack?> ensureSourcePlayable(String source) async {
+     if (isPlayable(source)) return null;
+ 
+     final track = mapSourcesToTracks([source]).firstOrNull;
+@@ -247,17 +250,13 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+     }
+ 
+     final nthFetchedTrack = switch (track.runtimeType) {
+-      SpotubeTrack => track as SpotubeTrack,
+-      _ => await SpotubeTrack.fetchFromTrack(
+-          track,
+-          youtube,
+-          preferences.streamMusicCodec,
+-        ),
++      SourcedTrack => track as SourcedTrack,
++      _ => await SourcedTrack.fetchFromTrack(ref: ref, track: track),
+     };
+ 
+     await audioPlayer.replaceSource(
+       source,
+-      nthFetchedTrack.ytUri,
++      nthFetchedTrack.url,
+     );
+ 
+     return nthFetchedTrack;
+@@ -335,15 +334,13 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+       );
+       await notificationService.addTrack(indexTrack);
+     } else {
+-      final addableTrack = await SpotubeTrack.fetchFromTrack(
+-        tracks.elementAtOrNull(initialIndex) ?? tracks.first,
+-        youtube,
+-        preferences.streamMusicCodec,
++      final addableTrack = await SourcedTrack.fetchFromTrack(
++        ref: ref,
++        track: tracks.elementAtOrNull(initialIndex) ?? tracks.first,
+       ).catchError((e, stackTrace) {
+-        return SpotubeTrack.fetchFromTrack(
+-          tracks.elementAtOrNull(initialIndex + 1) ?? tracks.first,
+-          youtube,
+-          preferences.streamMusicCodec,
++        return SourcedTrack.fetchFromTrack(
++          ref: ref,
++          track: tracks.elementAtOrNull(initialIndex + 1) ?? tracks.first,
+         );
+       });
+ 
+@@ -437,9 +434,9 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+   }
+ 
+   Future<void> populateSibling() async {
+-    if (state.activeTrack is SpotubeTrack) {
++    if (state.activeTrack is SourcedTrack) {
+       final activeTrackWithSiblingsForSure =
+-          await (state.activeTrack as SpotubeTrack).populatedCopy(youtube);
++          await (state.activeTrack as SourcedTrack).copyWithSibling();
+ 
+       state = state.copyWith(
+         tracks: mergeTracks([activeTrackWithSiblingsForSure], state.tracks),
+@@ -449,11 +446,11 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+     }
+   }
+ 
+-  Future<void> swapSibling(YoutubeVideoInfo video) async {
+-    if (state.activeTrack is SpotubeTrack) {
++  Future<void> swapSibling(SourceInfo sibling) async {
++    if (state.activeTrack is SourcedTrack) {
+       await populateSibling();
+       final newTrack =
+-          await (state.activeTrack as SpotubeTrack).swappedCopy(video, youtube);
++          await (state.activeTrack as SourcedTrack).swapWithSibling(sibling);
+       if (newTrack == null) return;
+       state = state.copyWith(
+         tracks: mergeTracks([newTrack], state.tracks),
+@@ -564,7 +561,7 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+ 
+   Future<List<SkipSegment>> getAndCacheSkipSegments(String id) async {
+     if (!preferences.skipNonMusic ||
+-        (preferences.youtubeApiType == YoutubeApiType.piped &&
++        (preferences.audioSource == AudioSource.piped &&
+             preferences.searchMode == SearchMode.youtubeMusic)) return [];
+ 
+     try {
+@@ -628,6 +625,30 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+     }
+   }
+ 
++  /// This method must be called after any playback operation as
++  /// it can increase the latency
++  Future<void> storeTrack(Track track, SourcedTrack sourcedTrack) async {
++    try {
++      if (track is! SourcedTrack) {
++        await supabase.insertTrack(
++          SourceMatch(
++            id: sourcedTrack.id!,
++            createdAt: DateTime.now(),
++            sourceId: sourcedTrack.sourceInfo.id,
++            sourceType: preferences.audioSource == AudioSource.jiosaavn
++                ? SourceType.jiosaavn
++                : preferences.searchMode == SearchMode.youtube
++                    ? SourceType.youtube
++                    : SourceType.youtubeMusic,
++          ),
++        );
++      }
++    } catch (e, stackTrace) {
++      logger.e(e.toString());
++      logger.t(stackTrace);
++    }
++  }
++
+   @override
+   set state(state) {
+     super.state = state;
+@@ -652,7 +673,7 @@ class ProxyPlaylistNotifier extends PersistedStateNotifier<ProxyPlaylist>
+ 
+   @override
+   FutureOr<ProxyPlaylist> fromJson(Map<String, dynamic> json) {
+-    return ProxyPlaylist.fromJson(json);
++    return ProxyPlaylist.fromJson(json, ref);
+   }
+ 
+   @override
+diff --git a/lib/provider/user_preferences/user_preferences_provider.dart b/lib/provider/user_preferences/user_preferences_provider.dart
+index db4b73dc8..88a0df2ee 100644
+--- a/lib/provider/user_preferences/user_preferences_provider.dart
++++ b/lib/provider/user_preferences/user_preferences_provider.dart
+@@ -6,11 +6,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:path_provider/path_provider.dart';
+ import 'package:spotify/spotify.dart';
+ import 'package:spotube/components/settings/color_scheme_picker_dialog.dart';
+-import 'package:spotube/models/matched_track.dart';
+ import 'package:spotube/provider/palette_provider.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+ import 'package:spotube/services/audio_player/audio_player.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
+ 
+ import 'package:spotube/utils/persisted_state_notifier.dart';
+ import 'package:spotube/utils/platform.dart';
+@@ -26,11 +26,11 @@ class UserPreferencesNotifier extends PersistedStateNotifier<UserPreferences> {
+     state = UserPreferences.withDefaults();
+   }
+ 
+-  void setStreamMusicCodec(MusicCodec codec) {
++  void setStreamMusicCodec(SourceCodecs codec) {
+     state = state.copyWith(streamMusicCodec: codec);
+   }
+ 
+-  void setDownloadMusicCodec(MusicCodec codec) {
++  void setDownloadMusicCodec(SourceCodecs codec) {
+     state = state.copyWith(downloadMusicCodec: codec);
+   }
+ 
+@@ -60,7 +60,7 @@ class UserPreferencesNotifier extends PersistedStateNotifier<UserPreferences> {
+     state = state.copyWith(checkUpdate: check);
+   }
+ 
+-  void setAudioQuality(AudioQuality quality) {
++  void setAudioQuality(SourceQualities quality) {
+     state = state.copyWith(audioQuality: quality);
+   }
+ 
+@@ -97,8 +97,8 @@ class UserPreferencesNotifier extends PersistedStateNotifier<UserPreferences> {
+     state = state.copyWith(skipNonMusic: skip);
+   }
+ 
+-  void setYoutubeApiType(YoutubeApiType type) {
+-    state = state.copyWith(youtubeApiType: type);
++  void setAudioSource(AudioSource type) {
++    state = state.copyWith(audioSource: type);
+   }
+ 
+   void setSystemTitleBar(bool isSystemTitleBar) {
+diff --git a/lib/provider/user_preferences/user_preferences_state.dart b/lib/provider/user_preferences/user_preferences_state.dart
+index ff98fa8e6..b3d7fe8a9 100644
+--- a/lib/provider/user_preferences/user_preferences_state.dart
++++ b/lib/provider/user_preferences/user_preferences_state.dart
+@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
+ import 'package:json_annotation/json_annotation.dart';
+ import 'package:spotify/spotify.dart';
+ import 'package:spotube/components/settings/color_scheme_picker_dialog.dart';
+-import 'package:spotube/models/matched_track.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
+ 
+ part 'user_preferences_state.g.dart';
+ 
+@@ -15,12 +15,6 @@ enum LayoutMode {
+   adaptive,
+ }
+ 
+-@JsonEnum()
+-enum AudioQuality {
+-  high,
+-  low,
+-}
+-
+ @JsonEnum()
+ enum CloseBehavior {
+   minimizeToTray,
+@@ -28,9 +22,10 @@ enum CloseBehavior {
+ }
+ 
+ @JsonEnum()
+-enum YoutubeApiType {
++enum AudioSource {
+   youtube,
+-  piped;
++  piped,
++  jiosaavn;
+ 
+   String get label => name[0].toUpperCase() + name.substring(1);
+ }
+@@ -44,13 +39,27 @@ enum MusicCodec {
+   const MusicCodec._(this.label);
+ }
+ 
++@JsonEnum()
++enum SearchMode {
++  youtube._("YouTube"),
++  youtubeMusic._("YouTube Music");
++
++  final String label;
++
++  const SearchMode._(this.label);
++
++  factory SearchMode.fromString(String key) {
++    return SearchMode.values.firstWhere((e) => e.name == key);
++  }
++}
++
+ @JsonSerializable()
+ final class UserPreferences {
+   @JsonKey(
+-    defaultValue: AudioQuality.high,
+-    unknownEnumValue: AudioQuality.high,
++    defaultValue: SourceQualities.high,
++    unknownEnumValue: SourceQualities.high,
+   )
+-  final AudioQuality audioQuality;
++  final SourceQualities audioQuality;
+ 
+   @JsonKey(defaultValue: true)
+   final bool albumColorSync;
+@@ -172,22 +181,22 @@ final class UserPreferences {
+   final ThemeMode themeMode;
+ 
+   @JsonKey(
+-    defaultValue: YoutubeApiType.youtube,
+-    unknownEnumValue: YoutubeApiType.youtube,
++    defaultValue: AudioSource.youtube,
++    unknownEnumValue: AudioSource.youtube,
+   )
+-  final YoutubeApiType youtubeApiType;
++  final AudioSource audioSource;
+ 
+   @JsonKey(
+-    defaultValue: MusicCodec.weba,
+-    unknownEnumValue: MusicCodec.weba,
++    defaultValue: SourceCodecs.weba,
++    unknownEnumValue: SourceCodecs.weba,
+   )
+-  final MusicCodec streamMusicCodec;
++  final SourceCodecs streamMusicCodec;
+ 
+   @JsonKey(
+-    defaultValue: MusicCodec.m4a,
+-    unknownEnumValue: MusicCodec.m4a,
++    defaultValue: SourceCodecs.m4a,
++    unknownEnumValue: SourceCodecs.m4a,
+   )
+-  final MusicCodec downloadMusicCodec;
++  final SourceCodecs downloadMusicCodec;
+ 
+   UserPreferences({
+     required this.audioQuality,
+@@ -207,7 +216,7 @@ final class UserPreferences {
+     required this.downloadLocation,
+     required this.pipedInstance,
+     required this.themeMode,
+-    required this.youtubeApiType,
++    required this.audioSource,
+     required this.streamMusicCodec,
+     required this.downloadMusicCodec,
+   });
+@@ -229,7 +238,7 @@ final class UserPreferences {
+     SpotubeColor? accentColorScheme,
+     bool? albumColorSync,
+     bool? checkUpdate,
+-    AudioQuality? audioQuality,
++    SourceQualities? audioQuality,
+     String? downloadLocation,
+     LayoutMode? layoutMode,
+     CloseBehavior? closeBehavior,
+@@ -238,13 +247,13 @@ final class UserPreferences {
+     String? pipedInstance,
+     SearchMode? searchMode,
+     bool? skipNonMusic,
+-    YoutubeApiType? youtubeApiType,
++    AudioSource? audioSource,
+     Market? recommendationMarket,
+     bool? saveTrackLyrics,
+     bool? amoledDarkTheme,
+     bool? normalizeAudio,
+-    MusicCodec? downloadMusicCodec,
+-    MusicCodec? streamMusicCodec,
++    SourceCodecs? downloadMusicCodec,
++    SourceCodecs? streamMusicCodec,
+     bool? systemTitleBar,
+   }) {
+     return UserPreferences(
+@@ -261,7 +270,7 @@ final class UserPreferences {
+       pipedInstance: pipedInstance ?? this.pipedInstance,
+       searchMode: searchMode ?? this.searchMode,
+       skipNonMusic: skipNonMusic ?? this.skipNonMusic,
+-      youtubeApiType: youtubeApiType ?? this.youtubeApiType,
++      audioSource: audioSource ?? this.audioSource,
+       recommendationMarket: recommendationMarket ?? this.recommendationMarket,
+       amoledDarkTheme: amoledDarkTheme ?? this.amoledDarkTheme,
+       downloadMusicCodec: downloadMusicCodec ?? this.downloadMusicCodec,
+diff --git a/lib/provider/user_preferences/user_preferences_state.g.dart b/lib/provider/user_preferences/user_preferences_state.g.dart
+index 9e3eeee92..54cd3aa2d 100644
+--- a/lib/provider/user_preferences/user_preferences_state.g.dart
++++ b/lib/provider/user_preferences/user_preferences_state.g.dart
+@@ -9,9 +9,9 @@ part of 'user_preferences_state.dart';
+ UserPreferences _$UserPreferencesFromJson(Map<String, dynamic> json) =>
+     UserPreferences(
+       audioQuality: $enumDecodeNullable(
+-              _$AudioQualityEnumMap, json['audioQuality'],
+-              unknownValue: AudioQuality.high) ??
+-          AudioQuality.high,
++              _$SourceQualitiesEnumMap, json['audioQuality'],
++              unknownValue: SourceQualities.high) ??
++          SourceQualities.high,
+       albumColorSync: json['albumColorSync'] as bool? ?? true,
+       amoledDarkTheme: json['amoledDarkTheme'] as bool? ?? false,
+       checkUpdate: json['checkUpdate'] as bool? ?? true,
+@@ -51,23 +51,23 @@ UserPreferences _$UserPreferencesFromJson(Map<String, dynamic> json) =>
+       themeMode: $enumDecodeNullable(_$ThemeModeEnumMap, json['themeMode'],
+               unknownValue: ThemeMode.system) ??
+           ThemeMode.system,
+-      youtubeApiType: $enumDecodeNullable(
+-              _$YoutubeApiTypeEnumMap, json['youtubeApiType'],
+-              unknownValue: YoutubeApiType.youtube) ??
+-          YoutubeApiType.youtube,
++      audioSource: $enumDecodeNullable(
++              _$AudioSourceEnumMap, json['audioSource'],
++              unknownValue: AudioSource.youtube) ??
++          AudioSource.youtube,
+       streamMusicCodec: $enumDecodeNullable(
+-              _$MusicCodecEnumMap, json['streamMusicCodec'],
+-              unknownValue: MusicCodec.weba) ??
+-          MusicCodec.weba,
++              _$SourceCodecsEnumMap, json['streamMusicCodec'],
++              unknownValue: SourceCodecs.weba) ??
++          SourceCodecs.weba,
+       downloadMusicCodec: $enumDecodeNullable(
+-              _$MusicCodecEnumMap, json['downloadMusicCodec'],
+-              unknownValue: MusicCodec.m4a) ??
+-          MusicCodec.m4a,
++              _$SourceCodecsEnumMap, json['downloadMusicCodec'],
++              unknownValue: SourceCodecs.m4a) ??
++          SourceCodecs.m4a,
+     );
+ 
+ Map<String, dynamic> _$UserPreferencesToJson(UserPreferences instance) =>
+     <String, dynamic>{
+-      'audioQuality': _$AudioQualityEnumMap[instance.audioQuality]!,
++      'audioQuality': _$SourceQualitiesEnumMap[instance.audioQuality]!,
+       'albumColorSync': instance.albumColorSync,
+       'amoledDarkTheme': instance.amoledDarkTheme,
+       'checkUpdate': instance.checkUpdate,
+@@ -85,14 +85,15 @@ Map<String, dynamic> _$UserPreferencesToJson(UserPreferences instance) =>
+       'downloadLocation': instance.downloadLocation,
+       'pipedInstance': instance.pipedInstance,
+       'themeMode': _$ThemeModeEnumMap[instance.themeMode]!,
+-      'youtubeApiType': _$YoutubeApiTypeEnumMap[instance.youtubeApiType]!,
+-      'streamMusicCodec': _$MusicCodecEnumMap[instance.streamMusicCodec]!,
+-      'downloadMusicCodec': _$MusicCodecEnumMap[instance.downloadMusicCodec]!,
++      'audioSource': _$AudioSourceEnumMap[instance.audioSource]!,
++      'streamMusicCodec': _$SourceCodecsEnumMap[instance.streamMusicCodec]!,
++      'downloadMusicCodec': _$SourceCodecsEnumMap[instance.downloadMusicCodec]!,
+     };
+ 
+-const _$AudioQualityEnumMap = {
+-  AudioQuality.high: 'high',
+-  AudioQuality.low: 'low',
++const _$SourceQualitiesEnumMap = {
++  SourceQualities.high: 'high',
++  SourceQualities.medium: 'medium',
++  SourceQualities.low: 'low',
+ };
+ 
+ const _$CloseBehaviorEnumMap = {
+@@ -370,12 +371,13 @@ const _$ThemeModeEnumMap = {
+   ThemeMode.dark: 'dark',
+ };
+ 
+-const _$YoutubeApiTypeEnumMap = {
+-  YoutubeApiType.youtube: 'youtube',
+-  YoutubeApiType.piped: 'piped',
++const _$AudioSourceEnumMap = {
++  AudioSource.youtube: 'youtube',
++  AudioSource.piped: 'piped',
++  AudioSource.jiosaavn: 'jiosaavn',
+ };
+ 
+-const _$MusicCodecEnumMap = {
+-  MusicCodec.m4a: 'm4a',
+-  MusicCodec.weba: 'weba',
++const _$SourceCodecsEnumMap = {
++  SourceCodecs.m4a: 'm4a',
++  SourceCodecs.weba: 'weba',
+ };
+diff --git a/lib/provider/youtube_provider.dart b/lib/provider/youtube_provider.dart
+deleted file mode 100644
+index 33e0496f1..000000000
+--- a/lib/provider/youtube_provider.dart
++++ /dev/null
+@@ -1,8 +0,0 @@
+-import 'package:hooks_riverpod/hooks_riverpod.dart';
+-import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
+-import 'package:spotube/services/youtube/youtube.dart';
+-
+-final youtubeProvider = Provider<YoutubeEndpoints>((ref) {
+-  final preferences = ref.watch(userPreferencesProvider);
+-  return YoutubeEndpoints(preferences);
+-});
+diff --git a/lib/services/audio_player/audio_player.dart b/lib/services/audio_player/audio_player.dart
+index c944004c6..b39579645 100644
+--- a/lib/services/audio_player/audio_player.dart
++++ b/lib/services/audio_player/audio_player.dart
+@@ -5,9 +5,9 @@ import 'dart:async';
+ 
+ import 'package:media_kit/media_kit.dart' as mk;
+ 
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/services/audio_player/loop_mode.dart';
+ import 'package:spotube/services/audio_player/playback_state.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ part 'audio_players_streams_mixin.dart';
+ part 'audio_player_impl.dart';
+diff --git a/lib/services/audio_player/audio_player_impl.dart b/lib/services/audio_player/audio_player_impl.dart
+index 4576ce8da..2af94dd75 100644
+--- a/lib/services/audio_player/audio_player_impl.dart
++++ b/lib/services/audio_player/audio_player_impl.dart
+@@ -121,11 +121,13 @@ class SpotubeAudioPlayer extends AudioPlayerInterface
+     // }
+   }
+ 
+-  List<SpotubeTrack> resolveTracksForSource(List<SpotubeTrack> tracks) {
+-    return tracks.where((e) => sources.contains(e.ytUri)).toList();
++  // TODO: Make sure audio player soruces are also
++  // TODO: changed when preferences sources are changed
++  List<SourcedTrack> resolveTracksForSource(List<SourcedTrack> tracks) {
++    return tracks.where((e) => sources.contains(e.url)).toList();
+   }
+ 
+-  bool tracksExistsInPlaylist(List<SpotubeTrack> tracks) {
++  bool tracksExistsInPlaylist(List<SourcedTrack> tracks) {
+     return resolveTracksForSource(tracks).length == tracks.length;
+   }
+ 
+diff --git a/lib/services/audio_services/audio_services.dart b/lib/services/audio_services/audio_services.dart
+index 645548fbc..a6ecac3f1 100644
+--- a/lib/services/audio_services/audio_services.dart
++++ b/lib/services/audio_services/audio_services.dart
+@@ -2,10 +2,10 @@ import 'package:audio_service/audio_service.dart';
+ import 'package:flutter_desktop_tools/flutter_desktop_tools.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:spotify/spotify.dart';
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/services/audio_services/mobile_audio_service.dart';
+ import 'package:spotube/services/audio_services/windows_audio_service.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+ 
+ class AudioServices {
+@@ -47,8 +47,8 @@ class AudioServices {
+       album: track.album?.name ?? "",
+       title: track.name!,
+       artist: TypeConversionUtils.artists_X_String(track.artists ?? <Artist>[]),
+-      duration: track is SpotubeTrack
+-          ? track.ytTrack.duration
++      duration: track is SourcedTrack
++          ? track.sourceInfo.duration
+           : Duration(milliseconds: track.durationMs ?? 0),
+       artUri: Uri.parse(TypeConversionUtils.image_X_UrlString(
+         track.album?.images ?? <Image>[],
+diff --git a/lib/services/audio_services/linux_audio_service.dart b/lib/services/audio_services/linux_audio_service.dart
+index bfe022d65..436627e6f 100644
+--- a/lib/services/audio_services/linux_audio_service.dart
++++ b/lib/services/audio_services/linux_audio_service.dart
+@@ -3,13 +3,12 @@ import 'dart:io';
+ import 'package:dbus/dbus.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ 
+-import 'package:spotube/models/spotube_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/services/audio_player/audio_player.dart';
+ import 'package:spotube/services/audio_player/loop_mode.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/type_conversion_utils.dart';
+-import 'package:window_manager/window_manager.dart';
+ 
+ final dbus = DBusClient.session();
+ 
+@@ -321,8 +320,8 @@ class _MprisMediaPlayer2Player extends DBusObject {
+         ),
+         "xesam:title": DBusString(playlist.activeTrack!.name!),
+         "xesam:url": DBusString(
+-          playlist.activeTrack is SpotubeTrack
+-              ? (playlist.activeTrack as SpotubeTrack).ytUri
++          playlist.activeTrack is SourcedTrack
++              ? (playlist.activeTrack as SourcedTrack).url
+               : playlist.activeTrack!.previewUrl ?? "",
+         ),
+         "xesam:genre": const DBusString("Unknown"),
+diff --git a/lib/services/queries/lyrics.dart b/lib/services/queries/lyrics.dart
+index b51016b4d..faa5bdecb 100644
+--- a/lib/services/queries/lyrics.dart
++++ b/lib/services/queries/lyrics.dart
+@@ -8,7 +8,7 @@ import 'package:spotify/spotify.dart';
+ import 'package:spotube/extensions/map.dart';
+ import 'package:spotube/hooks/spotify/use_spotify_query.dart';
+ import 'package:spotube/models/lyrics.dart';
+-import 'package:spotube/models/spotube_track.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ import 'package:spotube/utils/service_utils.dart';
+ import 'package:http/http.dart' as http;
+ 
+@@ -44,7 +44,7 @@ class LyricsQueries {
+     return useQuery<SubtitleSimple, dynamic>(
+       "synced-lyrics/${track?.id}}",
+       () async {
+-        if (track == null || track is! SpotubeTrack) {
++        if (track == null || track is! SourcedTrack) {
+           throw "No track currently";
+         }
+         final timedLyrics = await ServiceUtils.getTimedLyrics(track);
+diff --git a/lib/services/sourced_track/enums.dart b/lib/services/sourced_track/enums.dart
+new file mode 100644
+index 000000000..48ce1cbdd
+--- /dev/null
++++ b/lib/services/sourced_track/enums.dart
+@@ -0,0 +1,18 @@
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/source_map.dart';
++
++enum SourceCodecs {
++  m4a._("M4a (Best for downloaded music)"),
++  weba._("WebA (Best for streamed music)\nDoesn't support audio metadata");
++
++  final String label;
++  const SourceCodecs._(this.label);
++}
++
++enum SourceQualities {
++  high,
++  medium,
++  low,
++}
++
++typedef SiblingType = ({SourceInfo info, SourceMap? source});
+diff --git a/lib/services/sourced_track/exceptions.dart b/lib/services/sourced_track/exceptions.dart
+new file mode 100644
+index 000000000..517d6ba4d
+--- /dev/null
++++ b/lib/services/sourced_track/exceptions.dart
+@@ -0,0 +1,7 @@
++import 'package:spotify/spotify.dart';
++
++class TrackNotFoundException implements Exception {
++  factory TrackNotFoundException(Track track) {
++    throw Exception("Failed to find any results for ${track.name}");
++  }
++}
+diff --git a/lib/services/sourced_track/models/source_info.dart b/lib/services/sourced_track/models/source_info.dart
+new file mode 100644
+index 000000000..4ba903556
+--- /dev/null
++++ b/lib/services/sourced_track/models/source_info.dart
+@@ -0,0 +1,33 @@
++import 'package:json_annotation/json_annotation.dart';
++
++part 'source_info.g.dart';
++
++@JsonSerializable()
++class SourceInfo {
++  final String id;
++  final String title;
++  final String artist;
++  final String artistUrl;
++  final String? album;
++
++  final String thumbnail;
++  final String pageUrl;
++
++  final Duration duration;
++
++  SourceInfo({
++    required this.id,
++    required this.title,
++    required this.artist,
++    required this.thumbnail,
++    required this.pageUrl,
++    required this.duration,
++    required this.artistUrl,
++    this.album,
++  });
++
++  factory SourceInfo.fromJson(Map<String, dynamic> json) =>
++      _$SourceInfoFromJson(json);
++
++  Map<String, dynamic> toJson() => _$SourceInfoToJson(this);
++}
+diff --git a/lib/services/sourced_track/models/source_info.g.dart b/lib/services/sourced_track/models/source_info.g.dart
+new file mode 100644
+index 000000000..1ec9f75f7
+--- /dev/null
++++ b/lib/services/sourced_track/models/source_info.g.dart
+@@ -0,0 +1,30 @@
++// GENERATED CODE - DO NOT MODIFY BY HAND
++
++part of 'source_info.dart';
++
++// **************************************************************************
++// JsonSerializableGenerator
++// **************************************************************************
++
++SourceInfo _$SourceInfoFromJson(Map<String, dynamic> json) => SourceInfo(
++      id: json['id'] as String,
++      title: json['title'] as String,
++      artist: json['artist'] as String,
++      thumbnail: json['thumbnail'] as String,
++      pageUrl: json['pageUrl'] as String,
++      duration: Duration(microseconds: json['duration'] as int),
++      artistUrl: json['artistUrl'] as String,
++      album: json['album'] as String?,
++    );
++
++Map<String, dynamic> _$SourceInfoToJson(SourceInfo instance) =>
++    <String, dynamic>{
++      'id': instance.id,
++      'title': instance.title,
++      'artist': instance.artist,
++      'artistUrl': instance.artistUrl,
++      'album': instance.album,
++      'thumbnail': instance.thumbnail,
++      'pageUrl': instance.pageUrl,
++      'duration': instance.duration.inMicroseconds,
++    };
+diff --git a/lib/services/sourced_track/models/source_map.dart b/lib/services/sourced_track/models/source_map.dart
+new file mode 100644
+index 000000000..f99f95e42
+--- /dev/null
++++ b/lib/services/sourced_track/models/source_map.dart
+@@ -0,0 +1,58 @@
++import 'package:json_annotation/json_annotation.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++
++part 'source_map.g.dart';
++
++@JsonSerializable()
++class SourceQualityMap {
++  final String high;
++  final String medium;
++  final String low;
++
++  const SourceQualityMap({
++    required this.high,
++    required this.medium,
++    required this.low,
++  });
++
++  factory SourceQualityMap.fromJson(Map<String, dynamic> json) =>
++      _$SourceQualityMapFromJson(json);
++
++  Map<String, dynamic> toJson() => _$SourceQualityMapToJson(this);
++
++  operator [](SourceQualities key) {
++    switch (key) {
++      case SourceQualities.high:
++        return high;
++      case SourceQualities.medium:
++        return medium;
++      case SourceQualities.low:
++        return low;
++    }
++  }
++}
++
++@JsonSerializable()
++class SourceMap {
++  final SourceQualityMap? weba;
++  final SourceQualityMap? m4a;
++
++  const SourceMap({
++    this.weba,
++    this.m4a,
++  });
++
++  factory SourceMap.fromJson(Map<String, dynamic> json) =>
++      _$SourceMapFromJson(json);
++
++  Map<String, dynamic> toJson() => _$SourceMapToJson(this);
++
++  operator [](SourceCodecs key) {
++    switch (key) {
++      case SourceCodecs.weba:
++        return weba;
++      case SourceCodecs.m4a:
++        return m4a;
++    }
++  }
++}
+diff --git a/lib/services/sourced_track/models/source_map.g.dart b/lib/services/sourced_track/models/source_map.g.dart
+new file mode 100644
+index 000000000..e1085aa81
+--- /dev/null
++++ b/lib/services/sourced_track/models/source_map.g.dart
+@@ -0,0 +1,35 @@
++// GENERATED CODE - DO NOT MODIFY BY HAND
++
++part of 'source_map.dart';
++
++// **************************************************************************
++// JsonSerializableGenerator
++// **************************************************************************
++
++SourceQualityMap _$SourceQualityMapFromJson(Map<String, dynamic> json) =>
++    SourceQualityMap(
++      high: json['high'] as String,
++      medium: json['medium'] as String,
++      low: json['low'] as String,
++    );
++
++Map<String, dynamic> _$SourceQualityMapToJson(SourceQualityMap instance) =>
++    <String, dynamic>{
++      'high': instance.high,
++      'medium': instance.medium,
++      'low': instance.low,
++    };
++
++SourceMap _$SourceMapFromJson(Map<String, dynamic> json) => SourceMap(
++      weba: json['weba'] == null
++          ? null
++          : SourceQualityMap.fromJson(json['weba'] as Map<String, dynamic>),
++      m4a: json['m4a'] == null
++          ? null
++          : SourceQualityMap.fromJson(json['m4a'] as Map<String, dynamic>),
++    );
++
++Map<String, dynamic> _$SourceMapToJson(SourceMap instance) => <String, dynamic>{
++      'weba': instance.weba,
++      'm4a': instance.m4a,
++    };
+diff --git a/lib/services/sourced_track/models/video_info.dart b/lib/services/sourced_track/models/video_info.dart
+new file mode 100644
+index 000000000..031a8943b
+--- /dev/null
++++ b/lib/services/sourced_track/models/video_info.dart
+@@ -0,0 +1,114 @@
++import 'package:piped_client/piped_client.dart';
++import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
++import 'package:youtube_explode_dart/youtube_explode_dart.dart';
++
++class YoutubeVideoInfo {
++  final SearchMode searchMode;
++  final String title;
++  final Duration duration;
++  final String thumbnailUrl;
++  final String id;
++  final int likes;
++  final int dislikes;
++  final int views;
++  final String channelName;
++  final String channelId;
++  final DateTime publishedAt;
++
++  YoutubeVideoInfo({
++    required this.searchMode,
++    required this.title,
++    required this.duration,
++    required this.thumbnailUrl,
++    required this.id,
++    required this.likes,
++    required this.dislikes,
++    required this.views,
++    required this.channelName,
++    required this.publishedAt,
++    required this.channelId,
++  });
++
++  YoutubeVideoInfo.fromJson(Map<String, dynamic> json)
++      : title = json['title'],
++        searchMode = SearchMode.fromString(json['searchMode']),
++        duration = Duration(seconds: json['duration']),
++        thumbnailUrl = json['thumbnailUrl'],
++        id = json['id'],
++        likes = json['likes'],
++        dislikes = json['dislikes'],
++        views = json['views'],
++        channelName = json['channelName'],
++        channelId = json['channelId'],
++        publishedAt = DateTime.tryParse(json['publishedAt']) ?? DateTime.now();
++
++  Map<String, dynamic> toJson() => {
++        'title': title,
++        'duration': duration.inSeconds,
++        'thumbnailUrl': thumbnailUrl,
++        'id': id,
++        'likes': likes,
++        'dislikes': dislikes,
++        'views': views,
++        'channelName': channelName,
++        'channelId': channelId,
++        'publishedAt': publishedAt.toIso8601String(),
++        'searchMode': searchMode.name,
++      };
++
++  factory YoutubeVideoInfo.fromVideo(Video video) {
++    return YoutubeVideoInfo(
++      searchMode: SearchMode.youtube,
++      title: video.title,
++      duration: video.duration ?? Duration.zero,
++      thumbnailUrl: video.thumbnails.mediumResUrl,
++      id: video.id.value,
++      likes: video.engagement.likeCount ?? 0,
++      dislikes: video.engagement.dislikeCount ?? 0,
++      views: video.engagement.viewCount,
++      channelName: video.author,
++      channelId: '/c/${video.channelId.value}',
++      publishedAt: video.uploadDate ?? DateTime(2003, 9, 9),
++    );
++  }
++
++  factory YoutubeVideoInfo.fromSearchItemStream(
++    PipedSearchItemStream searchItem,
++    SearchMode searchMode,
++  ) {
++    return YoutubeVideoInfo(
++      searchMode: searchMode,
++      title: searchItem.title,
++      duration: searchItem.duration,
++      thumbnailUrl: searchItem.thumbnail,
++      id: searchItem.id,
++      likes: 0,
++      dislikes: 0,
++      views: searchItem.views,
++      channelName: searchItem.uploaderName,
++      channelId: searchItem.uploaderUrl ?? "",
++      publishedAt: searchItem.uploadedDate != null
++          ? DateTime.tryParse(searchItem.uploadedDate!) ?? DateTime(2003, 9, 9)
++          : DateTime(2003, 9, 9),
++    );
++  }
++
++  factory YoutubeVideoInfo.fromStreamResponse(
++      PipedStreamResponse stream, SearchMode searchMode) {
++    return YoutubeVideoInfo(
++      searchMode: searchMode,
++      title: stream.title,
++      duration: stream.duration,
++      thumbnailUrl: stream.thumbnailUrl,
++      id: stream.id,
++      likes: stream.likes,
++      dislikes: stream.dislikes,
++      views: stream.views,
++      channelName: stream.uploader,
++      publishedAt: stream.uploadedDate != null
++          ? DateTime.tryParse(stream.uploadedDate!) ?? DateTime(2003, 9, 9)
++          : DateTime(2003, 9, 9),
++      channelId: stream.uploaderUrl,
++    );
++  }
++}
+diff --git a/lib/services/sourced_track/sourced_track.dart b/lib/services/sourced_track/sourced_track.dart
+new file mode 100644
+index 000000000..d2dd6f592
+--- /dev/null
++++ b/lib/services/sourced_track/sourced_track.dart
+@@ -0,0 +1,171 @@
++import 'package:collection/collection.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:spotify/spotify.dart';
++import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
++import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/source_map.dart';
++import 'package:spotube/services/sourced_track/sources/jiosaavn.dart';
++import 'package:spotube/services/sourced_track/sources/piped.dart';
++import 'package:spotube/services/sourced_track/sources/youtube.dart';
++import 'package:spotube/utils/service_utils.dart';
++
++abstract class SourcedTrack extends Track {
++  final SourceMap source;
++  final List<SourceInfo> siblings;
++  final SourceInfo sourceInfo;
++  final Ref ref;
++
++  SourcedTrack({
++    required this.ref,
++    required this.source,
++    required this.siblings,
++    required this.sourceInfo,
++    required Track track,
++  }) {
++    id = track.id;
++    name = track.name;
++    artists = track.artists;
++    album = track.album;
++    durationMs = track.durationMs;
++    discNumber = track.discNumber;
++    explicit = track.explicit;
++    externalIds = track.externalIds;
++    href = track.href;
++    isPlayable = track.isPlayable;
++    linkedFrom = track.linkedFrom;
++    popularity = track.popularity;
++    previewUrl = track.previewUrl;
++    trackNumber = track.trackNumber;
++    type = track.type;
++    uri = track.uri;
++  }
++
++  static SourcedTrack fromJson(
++    Map<String, dynamic> json, {
++    required Ref ref,
++  }) {
++    final preferences = ref.read(userPreferencesProvider);
++
++    final sourceInfo = SourceInfo.fromJson(json);
++    final source = SourceMap.fromJson(json);
++    final track = Track.fromJson(json);
++    final siblings = (json["siblings"] as List)
++        .map((sibling) => SourceInfo.fromJson(sibling))
++        .toList()
++        .cast<SourceInfo>();
++
++    return switch (preferences.audioSource) {
++      AudioSource.youtube => YoutubeSourcedTrack(
++          ref: ref,
++          source: source,
++          siblings: siblings,
++          sourceInfo: sourceInfo,
++          track: track,
++        ),
++      AudioSource.piped => PipedSourcedTrack(
++          ref: ref,
++          source: source,
++          siblings: siblings,
++          sourceInfo: sourceInfo,
++          track: track,
++        ),
++      AudioSource.jiosaavn => JioSaavnSourcedTrack(
++          ref: ref,
++          source: source,
++          siblings: siblings,
++          sourceInfo: sourceInfo,
++          track: track,
++        ),
++    };
++  }
++
++  static String getSearchTerm(Track track) {
++    final artists = (track.artists ?? [])
++        .map((ar) => ar.name)
++        .toList()
++        .whereNotNull()
++        .toList();
++
++    final title = ServiceUtils.getTitle(
++      track.name!,
++      artists: artists,
++      onlyCleanArtist: true,
++    ).trim();
++
++    return "$title - ${artists.join(", ")}";
++  }
++
++  static Future<SourcedTrack> fetchFromTrack({
++    required Track track,
++    required Ref ref,
++  }) async {
++    try {
++      final preferences = ref.read(userPreferencesProvider);
++
++      return switch (preferences.audioSource) {
++        AudioSource.piped =>
++          await PipedSourcedTrack.fetchFromTrack(track: track, ref: ref),
++        AudioSource.youtube =>
++          await YoutubeSourcedTrack.fetchFromTrack(track: track, ref: ref),
++        AudioSource.jiosaavn =>
++          await JioSaavnSourcedTrack.fetchFromTrack(track: track, ref: ref),
++      };
++    } catch (e) {
++      print("Got error: $e");
++      return YoutubeSourcedTrack.fetchFromTrack(track: track, ref: ref);
++    }
++  }
++
++  static Future<List<SiblingType>> fetchSiblings({
++    required Track track,
++    required Ref ref,
++  }) {
++    final preferences = ref.read(userPreferencesProvider);
++
++    return switch (preferences.audioSource) {
++      AudioSource.piped =>
++        PipedSourcedTrack.fetchSiblings(track: track, ref: ref),
++      AudioSource.youtube =>
++        YoutubeSourcedTrack.fetchSiblings(track: track, ref: ref),
++      AudioSource.jiosaavn =>
++        JioSaavnSourcedTrack.fetchSiblings(track: track, ref: ref),
++    };
++  }
++
++  Future<SourcedTrack> copyWithSibling();
++
++  Future<SourcedTrack?> swapWithSibling(SourceInfo sibling);
++
++  Future<SourcedTrack?> swapWithSiblingOfIndex(int index) {
++    return swapWithSibling(siblings[index]);
++  }
++
++  String get url {
++    final preferences = ref.read(userPreferencesProvider);
++
++    final codec = preferences.audioSource == AudioSource.jiosaavn
++        ? SourceCodecs.m4a
++        : preferences.streamMusicCodec;
++
++    return getUrlOfCodec(codec);
++  }
++
++  String getUrlOfCodec(SourceCodecs codec) {
++    final preferences = ref.read(userPreferencesProvider);
++
++    return source[codec]?[preferences.audioQuality] ??
++        // this will ensure playback doesn't break
++        source[codec == SourceCodecs.m4a ? SourceCodecs.weba : SourceCodecs.m4a]
++            [preferences.audioQuality];
++  }
++
++  SourceCodecs get codec {
++    final preferences = ref.read(userPreferencesProvider);
++
++    return preferences.audioSource == AudioSource.jiosaavn
++        ? SourceCodecs.m4a
++        : preferences.streamMusicCodec;
++  }
++}
+diff --git a/lib/services/sourced_track/sources/jiosaavn.dart b/lib/services/sourced_track/sources/jiosaavn.dart
+new file mode 100644
+index 000000000..b25eca3b8
+--- /dev/null
++++ b/lib/services/sourced_track/sources/jiosaavn.dart
+@@ -0,0 +1,159 @@
++import 'package:collection/collection.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:spotify/spotify.dart';
++import 'package:spotube/models/source_match.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++import 'package:spotube/services/sourced_track/exceptions.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/source_map.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
++import 'package:jiosaavn/jiosaavn.dart';
++
++final jiosaavnClient = JioSaavnClient();
++
++class JioSaavnSourcedTrack extends SourcedTrack {
++  JioSaavnSourcedTrack({
++    required super.ref,
++    required super.source,
++    required super.siblings,
++    required super.sourceInfo,
++    required super.track,
++  });
++
++  static Future<SourcedTrack> fetchFromTrack({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final cachedSource = await SourceMatch.box.get(track.id);
++
++    if (cachedSource == null ||
++        cachedSource.sourceType != SourceType.jiosaavn) {
++      final siblings = await fetchSiblings(ref: ref, track: track);
++
++      if (siblings.isEmpty) {
++        throw TrackNotFoundException(track);
++      }
++
++      await SourceMatch.box.put(
++        track.id!,
++        SourceMatch(
++          id: track.id!,
++          sourceType: SourceType.jiosaavn,
++          createdAt: DateTime.now(),
++          sourceId: siblings.first.info.id,
++        ),
++      );
++
++      return JioSaavnSourcedTrack(
++        ref: ref,
++        siblings: siblings.map((s) => s.info).skip(1).toList(),
++        source: siblings.first.source!,
++        sourceInfo: siblings.first.info,
++        track: track,
++      );
++    }
++
++    final [item] =
++        await jiosaavnClient.songs.detailsById([cachedSource.sourceId]);
++
++    final (:info, :source) = toSiblingType(item);
++
++    return JioSaavnSourcedTrack(
++      ref: ref,
++      siblings: [],
++      source: source!,
++      sourceInfo: info,
++      track: track,
++    );
++  }
++
++  static SiblingType toSiblingType(SongResponse result) {
++    final SiblingType sibling = (
++      info: SourceInfo(
++        artist: [
++          result.primaryArtists,
++          if (result.featuredArtists.isNotEmpty) ", ",
++          result.featuredArtists
++        ].join("").replaceAll("&amp;", "&"),
++        artistUrl:
++            "https://www.jiosaavn.com/artist/${result.primaryArtistsId.split(",").firstOrNull ?? ""}",
++        duration: Duration(seconds: int.parse(result.duration)),
++        id: result.id,
++        pageUrl: result.url,
++        thumbnail: result.image?.last.link ?? "",
++        title: result.name!,
++        album: result.album.name,
++      ),
++      source: SourceMap(
++        m4a: SourceQualityMap(
++          high: result.downloadUrl!
++              .firstWhere((element) => element.quality == "320kbps")
++              .link,
++          medium: result.downloadUrl!
++              .firstWhere((element) => element.quality == "160kbps")
++              .link,
++          low: result.downloadUrl!
++              .firstWhere((element) => element.quality == "96kbps")
++              .link,
++        ),
++      ),
++    );
++
++    return sibling;
++  }
++
++  static Future<List<SiblingType>> fetchSiblings({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final query = SourcedTrack.getSearchTerm(track);
++
++    final SongSearchResponse(:results) =
++        await jiosaavnClient.search.songs(query, limit: 20);
++
++    return results.map(toSiblingType).toList();
++  }
++
++  @override
++  Future<JioSaavnSourcedTrack> copyWithSibling() async {
++    if (siblings.isNotEmpty) {
++      return this;
++    }
++    final fetchedSiblings = await fetchSiblings(ref: ref, track: this);
++
++    return JioSaavnSourcedTrack(
++      ref: ref,
++      siblings: fetchedSiblings
++          .where((s) => s.info.id != sourceInfo.id)
++          .map((s) => s.info)
++          .toList(),
++      source: source,
++      sourceInfo: sourceInfo,
++      track: this,
++    );
++  }
++
++  @override
++  Future<JioSaavnSourcedTrack?> swapWithSibling(SourceInfo sibling) async {
++    if (sibling.id == sourceInfo.id ||
++        siblings.none((s) => s.id == sibling.id)) {
++      return null;
++    }
++
++    final newSourceInfo = siblings.firstWhere((s) => s.id == sibling.id);
++    final newSiblings = siblings.where((s) => s.id != sibling.id).toList()
++      ..insert(0, sourceInfo);
++
++    final [item] = await jiosaavnClient.songs.detailsById([newSourceInfo.id]);
++
++    final (:info, :source) = toSiblingType(item);
++
++    return JioSaavnSourcedTrack(
++      ref: ref,
++      siblings: newSiblings,
++      source: source!,
++      sourceInfo: info,
++      track: this,
++    );
++  }
++}
+diff --git a/lib/services/sourced_track/sources/piped.dart b/lib/services/sourced_track/sources/piped.dart
+new file mode 100644
+index 000000000..0778a7cf2
+--- /dev/null
++++ b/lib/services/sourced_track/sources/piped.dart
+@@ -0,0 +1,257 @@
++import 'package:collection/collection.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:piped_client/piped_client.dart';
++import 'package:spotify/spotify.dart';
++import 'package:spotube/models/source_match.dart';
++import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
++import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++import 'package:spotube/services/sourced_track/exceptions.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/source_map.dart';
++import 'package:spotube/services/sourced_track/models/video_info.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
++import 'package:spotube/services/sourced_track/sources/youtube.dart';
++import 'package:spotube/utils/service_utils.dart';
++
++final pipedProvider = Provider<PipedClient>(
++  (ref) {
++    final instance =
++        ref.watch(userPreferencesProvider.select((s) => s.pipedInstance));
++    return PipedClient(instance: instance);
++  },
++);
++
++class PipedSourcedTrack extends SourcedTrack {
++  PipedSourcedTrack({
++    required super.ref,
++    required super.source,
++    required super.siblings,
++    required super.sourceInfo,
++    required super.track,
++  });
++
++  static Future<SourcedTrack> fetchFromTrack({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final cachedSource = await SourceMatch.box.get(track.id);
++    final preferences = ref.read(userPreferencesProvider);
++    final pipedClient = ref.read(pipedProvider);
++
++    if (cachedSource == null) {
++      final siblings = await fetchSiblings(ref: ref, track: track);
++      if (siblings.isEmpty) {
++        throw TrackNotFoundException(track);
++      }
++
++      await SourceMatch.box.put(
++        track.id!,
++        SourceMatch(
++          id: track.id!,
++          sourceType: preferences.searchMode == SearchMode.youtube
++              ? SourceType.youtube
++              : SourceType.youtubeMusic,
++          createdAt: DateTime.now(),
++          sourceId: siblings.first.info.id,
++        ),
++      );
++
++      return PipedSourcedTrack(
++        ref: ref,
++        siblings: siblings.map((s) => s.info).skip(1).toList(),
++        source: siblings.first.source as SourceMap,
++        sourceInfo: siblings.first.info,
++        track: track,
++      );
++    } else {
++      final manifest = await pipedClient.streams(cachedSource.sourceId);
++
++      return PipedSourcedTrack(
++        ref: ref,
++        siblings: [],
++        source: toSourceMap(manifest),
++        sourceInfo: SourceInfo(
++          id: manifest.id,
++          artist: manifest.uploader,
++          artistUrl: manifest.uploaderUrl,
++          pageUrl: "https://www.youtube.com/watch?v=${manifest.id}",
++          thumbnail: manifest.thumbnailUrl,
++          title: manifest.title,
++          duration: manifest.duration,
++          album: null,
++        ),
++        track: track,
++      );
++    }
++  }
++
++  static SourceMap toSourceMap(PipedStreamResponse manifest) {
++    final m4a = manifest.audioStreams
++        .where((audio) => audio.format == PipedAudioStreamFormat.m4a)
++        .sorted((a, b) => a.bitrate.compareTo(b.bitrate));
++
++    final weba = manifest.audioStreams
++        .where((audio) => audio.format == PipedAudioStreamFormat.webm)
++        .sorted((a, b) => a.bitrate.compareTo(b.bitrate));
++
++    return SourceMap(
++      m4a: SourceQualityMap(
++        high: m4a.first.url.toString(),
++        medium: (m4a.elementAtOrNull(m4a.length ~/ 2) ?? m4a[1]).url.toString(),
++        low: m4a.last.url.toString(),
++      ),
++      weba: SourceQualityMap(
++        high: weba.first.url.toString(),
++        medium:
++            (weba.elementAtOrNull(weba.length ~/ 2) ?? weba[1]).url.toString(),
++        low: weba.last.url.toString(),
++      ),
++    );
++  }
++
++  static Future<SiblingType> toSiblingType(
++    int index,
++    YoutubeVideoInfo item,
++    PipedClient pipedClient,
++  ) async {
++    SourceMap? sourceMap;
++    if (index == 0) {
++      final manifest = await pipedClient.streams(item.id);
++      sourceMap = toSourceMap(manifest);
++    }
++
++    final SiblingType sibling = (
++      info: SourceInfo(
++        id: item.id,
++        artist: item.channelName,
++        artistUrl: "https://www.youtube.com/${item.channelId}",
++        pageUrl: "https://www.youtube.com/watch?v=${item.id}",
++        thumbnail: item.thumbnailUrl,
++        title: item.title,
++        duration: item.duration,
++        album: null,
++      ),
++      source: sourceMap,
++    );
++
++    return sibling;
++  }
++
++  static Future<List<SiblingType>> fetchSiblings({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final pipedClient = ref.read(pipedProvider);
++    final preference = ref.read(userPreferencesProvider);
++    final query = SourcedTrack.getSearchTerm(track);
++
++    final PipedSearchResult(items: searchResults) = await pipedClient.search(
++      query,
++      preference.searchMode == SearchMode.youtube
++          ? PipedFilter.video
++          : PipedFilter.musicSongs,
++    );
++
++    final isYouTubeMusic = preference.searchMode == SearchMode.youtubeMusic;
++
++    if (isYouTubeMusic) {
++      final artists = (track.artists ?? [])
++          .map((ar) => ar.name)
++          .toList()
++          .whereNotNull()
++          .toList();
++
++      return await Future.wait(
++        searchResults
++            .map(
++              (result) => YoutubeVideoInfo.fromSearchItemStream(
++                result as PipedSearchItemStream,
++                preference.searchMode,
++              ),
++            )
++            .sorted((a, b) => b.views.compareTo(a.views))
++            .where(
++              (item) => artists.any(
++                (artist) =>
++                    artist.toLowerCase() == item.channelName.toLowerCase(),
++              ),
++            )
++            .mapIndexed((i, r) => toSiblingType(i, r, pipedClient)),
++      );
++    }
++
++    if (ServiceUtils.onlyContainsEnglish(query)) {
++      return await Future.wait(
++        searchResults
++            .whereType<PipedSearchItemStream>()
++            .map(
++              (result) => YoutubeVideoInfo.fromSearchItemStream(
++                result,
++                preference.searchMode,
++              ),
++            )
++            .mapIndexed((i, r) => toSiblingType(i, r, pipedClient)),
++      );
++    }
++
++    final rankedSiblings = YoutubeSourcedTrack.rankResults(
++      searchResults
++          .map(
++            (result) => YoutubeVideoInfo.fromSearchItemStream(
++              result as PipedSearchItemStream,
++              preference.searchMode,
++            ),
++          )
++          .toList(),
++      track,
++    );
++
++    return await Future.wait(
++      rankedSiblings.mapIndexed((i, r) => toSiblingType(i, r, pipedClient)),
++    );
++  }
++
++  @override
++  Future<SourcedTrack> copyWithSibling() async {
++    if (siblings.isNotEmpty) {
++      return this;
++    }
++    final fetchedSiblings = await fetchSiblings(ref: ref, track: this);
++
++    return PipedSourcedTrack(
++      ref: ref,
++      siblings: fetchedSiblings
++          .where((s) => s.info.id != sourceInfo.id)
++          .map((s) => s.info)
++          .toList(),
++      source: source,
++      sourceInfo: sourceInfo,
++      track: this,
++    );
++  }
++
++  @override
++  Future<SourcedTrack?> swapWithSibling(SourceInfo sibling) async {
++    if (sibling.id == sourceInfo.id ||
++        siblings.none((s) => s.id == sibling.id)) {
++      return null;
++    }
++
++    final newSourceInfo = siblings.firstWhere((s) => s.id == sibling.id);
++    final newSiblings = siblings.where((s) => s.id != sibling.id).toList()
++      ..insert(0, sourceInfo);
++
++    final pipedClient = ref.read(pipedProvider);
++
++    final manifest = await pipedClient.streams(newSourceInfo.id);
++
++    return PipedSourcedTrack(
++      ref: ref,
++      siblings: newSiblings,
++      source: toSourceMap(manifest),
++      sourceInfo: newSourceInfo,
++      track: this,
++    );
++  }
++}
+diff --git a/lib/services/sourced_track/sources/youtube.dart b/lib/services/sourced_track/sources/youtube.dart
+new file mode 100644
+index 000000000..096de2d47
+--- /dev/null
++++ b/lib/services/sourced_track/sources/youtube.dart
+@@ -0,0 +1,256 @@
++import 'package:collection/collection.dart';
++import 'package:flutter_riverpod/flutter_riverpod.dart';
++import 'package:spotify/spotify.dart';
++import 'package:spotube/models/source_match.dart';
++import 'package:spotube/services/sourced_track/enums.dart';
++import 'package:spotube/services/sourced_track/exceptions.dart';
++import 'package:spotube/services/sourced_track/models/source_info.dart';
++import 'package:spotube/services/sourced_track/models/source_map.dart';
++import 'package:spotube/services/sourced_track/models/video_info.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
++import 'package:spotube/utils/service_utils.dart';
++import 'package:youtube_explode_dart/youtube_explode_dart.dart';
++
++final youtubeClient = YoutubeExplode();
++final officialMusicRegex = RegExp(
++  r"official\s(video|audio|music\svideo|lyric\svideo|visualizer)",
++  caseSensitive: false,
++);
++
++class YoutubeSourcedTrack extends SourcedTrack {
++  YoutubeSourcedTrack({
++    required super.source,
++    required super.siblings,
++    required super.sourceInfo,
++    required super.track,
++    required super.ref,
++  });
++
++  static Future<YoutubeSourcedTrack> fetchFromTrack({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final cachedSource = await SourceMatch.box.get(track.id);
++
++    if (cachedSource == null || cachedSource.sourceType != SourceType.youtube) {
++      final siblings = await fetchSiblings(ref: ref, track: track);
++      if (siblings.isEmpty) {
++        throw TrackNotFoundException(track);
++      }
++
++      await SourceMatch.box.put(
++        track.id!,
++        SourceMatch(
++          id: track.id!,
++          sourceType: SourceType.youtube,
++          createdAt: DateTime.now(),
++          sourceId: siblings.first.info.id,
++        ),
++      );
++
++      return YoutubeSourcedTrack(
++        ref: ref,
++        siblings: siblings.map((s) => s.info).skip(1).toList(),
++        source: siblings.first.source as SourceMap,
++        sourceInfo: siblings.first.info,
++        track: track,
++      );
++    }
++    final item = await youtubeClient.videos.get(cachedSource.sourceId);
++    final manifest = await youtubeClient.videos.streamsClient.getManifest(
++      cachedSource.sourceId,
++    );
++    return YoutubeSourcedTrack(
++      ref: ref,
++      siblings: [],
++      source: toSourceMap(manifest),
++      sourceInfo: SourceInfo(
++        id: item.id.value,
++        artist: item.author,
++        artistUrl: "https://www.youtube.com/channel/${item.channelId}",
++        pageUrl: item.url,
++        thumbnail: item.thumbnails.highResUrl,
++        title: item.title,
++        duration: item.duration ?? Duration.zero,
++        album: null,
++      ),
++      track: track,
++    );
++  }
++
++  static SourceMap toSourceMap(StreamManifest manifest) {
++    final m4a = manifest.audioOnly
++        .where((audio) => audio.codec.mimeType == "audio/mp4")
++        .sortByBitrate();
++
++    final weba = manifest.audioOnly
++        .where((audio) => audio.codec.mimeType == "audio/webm")
++        .sortByBitrate();
++
++    return SourceMap(
++      m4a: SourceQualityMap(
++        high: m4a.first.url.toString(),
++        medium: (m4a.elementAtOrNull(m4a.length ~/ 2) ?? m4a[1]).url.toString(),
++        low: m4a.last.url.toString(),
++      ),
++      weba: SourceQualityMap(
++        high: weba.first.url.toString(),
++        medium:
++            (weba.elementAtOrNull(weba.length ~/ 2) ?? weba[1]).url.toString(),
++        low: weba.last.url.toString(),
++      ),
++    );
++  }
++
++  static Future<SiblingType> toSiblingType(
++    int index,
++    YoutubeVideoInfo item,
++  ) async {
++    SourceMap? sourceMap;
++    if (index == 0) {
++      final manifest =
++          await youtubeClient.videos.streamsClient.getManifest(item.id);
++      sourceMap = toSourceMap(manifest);
++    }
++
++    final SiblingType sibling = (
++      info: SourceInfo(
++        id: item.id,
++        artist: item.channelName,
++        artistUrl: "https://www.youtube.com/channel/${item.channelId}",
++        pageUrl: "https://www.youtube.com/watch?v=${item.id}",
++        thumbnail: item.thumbnailUrl,
++        title: item.title,
++        duration: item.duration,
++        album: null,
++      ),
++      source: sourceMap,
++    );
++
++    return sibling;
++  }
++
++  static List<YoutubeVideoInfo> rankResults(
++      List<YoutubeVideoInfo> results, Track track) {
++    final artists = (track.artists ?? [])
++        .map((ar) => ar.name)
++        .toList()
++        .whereNotNull()
++        .toList();
++
++    return results
++        .sorted((a, b) => b.views.compareTo(a.views))
++        .map((sibling) {
++          int score = 0;
++
++          for (final artist in artists) {
++            final isSameChannelArtist =
++                sibling.channelName.toLowerCase() == artist.toLowerCase();
++            final channelContainsArtist = sibling.channelName
++                .toLowerCase()
++                .contains(artist.toLowerCase());
++
++            if (isSameChannelArtist || channelContainsArtist) {
++              score += 1;
++            }
++
++            final titleContainsArtist =
++                sibling.title.toLowerCase().contains(artist.toLowerCase());
++
++            if (titleContainsArtist) {
++              score += 1;
++            }
++          }
++
++          final titleContainsTrackName =
++              sibling.title.toLowerCase().contains(track.name!.toLowerCase());
++
++          final hasOfficialFlag =
++              officialMusicRegex.hasMatch(sibling.title.toLowerCase());
++
++          if (titleContainsTrackName) {
++            score += 3;
++          }
++
++          if (hasOfficialFlag) {
++            score += 1;
++          }
++
++          if (hasOfficialFlag && titleContainsTrackName) {
++            score += 2;
++          }
++
++          return (sibling: sibling, score: score);
++        })
++        .sorted((a, b) => b.score.compareTo(a.score))
++        .map((e) => e.sibling)
++        .toList();
++  }
++
++  static Future<List<SiblingType>> fetchSiblings({
++    required Track track,
++    required Ref ref,
++  }) async {
++    final query = SourcedTrack.getSearchTerm(track);
++
++    final searchResults = await youtubeClient.search.search(
++      query,
++      filter: TypeFilters.video,
++    );
++
++    if (ServiceUtils.onlyContainsEnglish(query)) {
++      return await Future.wait(searchResults
++          .map(YoutubeVideoInfo.fromVideo)
++          .mapIndexed(toSiblingType));
++    }
++
++    final rankedSiblings = rankResults(
++      searchResults.map(YoutubeVideoInfo.fromVideo).toList(),
++      track,
++    );
++
++    return await Future.wait(rankedSiblings.mapIndexed(toSiblingType));
++  }
++
++  @override
++  Future<YoutubeSourcedTrack?> swapWithSibling(SourceInfo sibling) async {
++    if (sibling.id == sourceInfo.id ||
++        siblings.none((s) => s.id == sibling.id)) {
++      return null;
++    }
++
++    final newSourceInfo = siblings.firstWhere((s) => s.id == sibling.id);
++    final newSiblings = siblings.where((s) => s.id != sibling.id).toList()
++      ..insert(0, sourceInfo);
++
++    final manifest =
++        await youtubeClient.videos.streamsClient.getManifest(newSourceInfo.id);
++
++    return YoutubeSourcedTrack(
++      ref: ref,
++      siblings: newSiblings,
++      source: toSourceMap(manifest),
++      sourceInfo: newSourceInfo,
++      track: this,
++    );
++  }
++
++  @override
++  Future<YoutubeSourcedTrack> copyWithSibling() async {
++    if (siblings.isNotEmpty) {
++      return this;
++    }
++    final fetchedSiblings = await fetchSiblings(ref: ref, track: this);
++
++    return YoutubeSourcedTrack(
++      ref: ref,
++      siblings: fetchedSiblings
++          .where((s) => s.info.id != sourceInfo.id)
++          .map((s) => s.info)
++          .toList(),
++      source: source,
++      sourceInfo: sourceInfo,
++      track: this,
++    );
++  }
++}
+diff --git a/lib/services/supabase.dart b/lib/services/supabase.dart
+index d42d8eebc..ef3fa87cc 100644
+--- a/lib/services/supabase.dart
++++ b/lib/services/supabase.dart
+@@ -1,5 +1,5 @@
+ import 'package:spotube/collections/env.dart';
+-import 'package:spotube/models/matched_track.dart';
++import 'package:spotube/models/source_match.dart';
+ import 'package:supabase/supabase.dart';
+ 
+ class SupabaseService {
+@@ -8,7 +8,9 @@ class SupabaseService {
+     Env.supabaseAnonKey ?? "",
+   );
+ 
+-  Future<void> insertTrack(MatchedTrack track) async {
++  Future<void> insertTrack(SourceMatch track) async {
++    return null;
++    // TODO: Fix this
+     await api.from("tracks").insert(track.toJson());
+   }
+ }
+diff --git a/lib/services/youtube/youtube.dart b/lib/services/youtube/youtube.dart
+deleted file mode 100644
+index 2b52864b4..000000000
+--- a/lib/services/youtube/youtube.dart
++++ /dev/null
+@@ -1,248 +0,0 @@
+-import 'package:dio/dio.dart';
+-import 'package:flutter/material.dart';
+-import 'package:piped_client/piped_client.dart';
+-import 'package:spotube/collections/routes.dart';
+-import 'package:spotube/components/shared/dialogs/piped_down_dialog.dart';
+-import 'package:spotube/models/matched_track.dart';
+-import 'package:spotube/provider/user_preferences/user_preferences_state.dart';
+-import 'package:spotube/utils/primitive_utils.dart';
+-import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+-
+-class YoutubeVideoInfo {
+-  final SearchMode searchMode;
+-  final String title;
+-  final Duration duration;
+-  final String thumbnailUrl;
+-  final String id;
+-  final int likes;
+-  final int dislikes;
+-  final int views;
+-  final String channelName;
+-  final String channelId;
+-  final DateTime publishedAt;
+-
+-  YoutubeVideoInfo({
+-    required this.searchMode,
+-    required this.title,
+-    required this.duration,
+-    required this.thumbnailUrl,
+-    required this.id,
+-    required this.likes,
+-    required this.dislikes,
+-    required this.views,
+-    required this.channelName,
+-    required this.publishedAt,
+-    required this.channelId,
+-  });
+-
+-  YoutubeVideoInfo.fromJson(Map<String, dynamic> json)
+-      : title = json['title'],
+-        searchMode = SearchMode.fromString(json['searchMode']),
+-        duration = Duration(seconds: json['duration']),
+-        thumbnailUrl = json['thumbnailUrl'],
+-        id = json['id'],
+-        likes = json['likes'],
+-        dislikes = json['dislikes'],
+-        views = json['views'],
+-        channelName = json['channelName'],
+-        channelId = json['channelId'],
+-        publishedAt = DateTime.tryParse(json['publishedAt']) ?? DateTime.now();
+-
+-  Map<String, dynamic> toJson() => {
+-        'title': title,
+-        'duration': duration.inSeconds,
+-        'thumbnailUrl': thumbnailUrl,
+-        'id': id,
+-        'likes': likes,
+-        'dislikes': dislikes,
+-        'views': views,
+-        'channelName': channelName,
+-        'channelId': channelId,
+-        'publishedAt': publishedAt.toIso8601String(),
+-        'searchMode': searchMode.name,
+-      };
+-
+-  factory YoutubeVideoInfo.fromVideo(Video video) {
+-    return YoutubeVideoInfo(
+-      searchMode: SearchMode.youtube,
+-      title: video.title,
+-      duration: video.duration ?? Duration.zero,
+-      thumbnailUrl: video.thumbnails.mediumResUrl,
+-      id: video.id.value,
+-      likes: video.engagement.likeCount ?? 0,
+-      dislikes: video.engagement.dislikeCount ?? 0,
+-      views: video.engagement.viewCount,
+-      channelName: video.author,
+-      channelId: '/c/${video.channelId.value}',
+-      publishedAt: video.uploadDate ?? DateTime(2003, 9, 9),
+-    );
+-  }
+-
+-  factory YoutubeVideoInfo.fromSearchItemStream(
+-    PipedSearchItemStream searchItem,
+-    SearchMode searchMode,
+-  ) {
+-    return YoutubeVideoInfo(
+-      searchMode: searchMode,
+-      title: searchItem.title,
+-      duration: searchItem.duration,
+-      thumbnailUrl: searchItem.thumbnail,
+-      id: searchItem.id,
+-      likes: 0,
+-      dislikes: 0,
+-      views: searchItem.views,
+-      channelName: searchItem.uploaderName,
+-      channelId: searchItem.uploaderUrl ?? "",
+-      publishedAt: searchItem.uploadedDate != null
+-          ? DateTime.tryParse(searchItem.uploadedDate!) ?? DateTime(2003, 9, 9)
+-          : DateTime(2003, 9, 9),
+-    );
+-  }
+-
+-  factory YoutubeVideoInfo.fromStreamResponse(
+-      PipedStreamResponse stream, SearchMode searchMode) {
+-    return YoutubeVideoInfo(
+-      searchMode: searchMode,
+-      title: stream.title,
+-      duration: stream.duration,
+-      thumbnailUrl: stream.thumbnailUrl,
+-      id: stream.id,
+-      likes: stream.likes,
+-      dislikes: stream.dislikes,
+-      views: stream.views,
+-      channelName: stream.uploader,
+-      publishedAt: stream.uploadedDate != null
+-          ? DateTime.tryParse(stream.uploadedDate!) ?? DateTime(2003, 9, 9)
+-          : DateTime(2003, 9, 9),
+-      channelId: stream.uploaderUrl,
+-    );
+-  }
+-}
+-
+-class YoutubeEndpoints {
+-  PipedClient? piped;
+-  YoutubeExplode? youtube;
+-
+-  final UserPreferences preferences;
+-
+-  YoutubeEndpoints(this.preferences) {
+-    switch (preferences.youtubeApiType) {
+-      case YoutubeApiType.youtube:
+-        youtube = YoutubeExplode();
+-        break;
+-      case YoutubeApiType.piped:
+-        piped = PipedClient(instance: preferences.pipedInstance);
+-        break;
+-    }
+-  }
+-
+-  Future<void> showPipedErrorDialog(Exception e) async {
+-    if (e is DioException && (e.response?.statusCode ?? 0) >= 500) {
+-      final context = rootNavigatorKey?.currentContext;
+-      if (context != null) {
+-        await showDialog(
+-          context: context,
+-          builder: (context) => const PipedDownDialog(),
+-        );
+-      }
+-    }
+-  }
+-
+-  Future<List<YoutubeVideoInfo>> search(String query) async {
+-    if (youtube != null) {
+-      final res = await youtube!.search(
+-        query,
+-        filter: TypeFilters.video,
+-      );
+-
+-      return res.map(YoutubeVideoInfo.fromVideo).toList();
+-    } else {
+-      try {
+-        final res = await piped!.search(
+-          query,
+-          switch (preferences.searchMode) {
+-            SearchMode.youtube => PipedFilter.video,
+-            SearchMode.youtubeMusic => PipedFilter.musicSongs,
+-          },
+-        );
+-        return res.items
+-            .whereType<PipedSearchItemStream>()
+-            .map(
+-              (e) => YoutubeVideoInfo.fromSearchItemStream(
+-                e,
+-                preferences.searchMode,
+-              ),
+-            )
+-            .toList();
+-      } on Exception catch (e) {
+-        await showPipedErrorDialog(e);
+-        rethrow;
+-      }
+-    }
+-  }
+-
+-  String _pipedStreamResponseToStreamUrl(
+-    PipedStreamResponse stream,
+-    MusicCodec codec,
+-  ) {
+-    final pipedStreamFormat = switch (codec) {
+-      MusicCodec.m4a => PipedAudioStreamFormat.m4a,
+-      MusicCodec.weba => PipedAudioStreamFormat.webm,
+-    };
+-
+-    return switch (preferences.audioQuality) {
+-      AudioQuality.high =>
+-        stream.highestBitrateAudioStreamOfFormat(pipedStreamFormat)!.url,
+-      AudioQuality.low =>
+-        stream.lowestBitrateAudioStreamOfFormat(pipedStreamFormat)!.url,
+-    };
+-  }
+-
+-  Future<String> streamingUrl(String id, MusicCodec codec) async {
+-    if (youtube != null) {
+-      final res = await PrimitiveUtils.raceMultiple(
+-        () => youtube!.videos.streams.getManifest(id),
+-      );
+-      final audioOnlyManifests = res.audioOnly.where((info) {
+-        return switch (codec) {
+-          MusicCodec.m4a => info.codec.mimeType == "audio/mp4",
+-          MusicCodec.weba => info.codec.mimeType == "audio/webm",
+-        };
+-      });
+-
+-      return switch (preferences.audioQuality) {
+-        AudioQuality.high =>
+-          audioOnlyManifests.withHighestBitrate().url.toString(),
+-        AudioQuality.low =>
+-          audioOnlyManifests.sortByBitrate().last.url.toString(),
+-      };
+-    } else {
+-      return _pipedStreamResponseToStreamUrl(await piped!.streams(id), codec);
+-    }
+-  }
+-
+-  Future<(YoutubeVideoInfo info, String streamingUrl)> video(
+-    String id,
+-    SearchMode searchMode,
+-    MusicCodec codec,
+-  ) async {
+-    if (youtube != null) {
+-      final res = await youtube!.videos.get(id);
+-      return (
+-        YoutubeVideoInfo.fromVideo(res),
+-        await streamingUrl(id, codec),
+-      );
+-    } else {
+-      try {
+-        final res = await piped!.streams(id);
+-        return (
+-          YoutubeVideoInfo.fromStreamResponse(res, searchMode),
+-          _pipedStreamResponseToStreamUrl(res, codec),
+-        );
+-      } on Exception catch (e) {
+-        await showPipedErrorDialog(e);
+-        rethrow;
+-      }
+-    }
+-  }
+-}
+diff --git a/lib/utils/service_utils.dart b/lib/utils/service_utils.dart
+index 0be1dd979..9e3b58934 100644
+--- a/lib/utils/service_utils.dart
++++ b/lib/utils/service_utils.dart
+@@ -8,7 +8,7 @@ import 'package:spotube/components/library/user_local_tracks.dart';
+ import 'package:spotube/models/logger.dart';
+ import 'package:http/http.dart' as http;
+ import 'package:spotube/models/lyrics.dart';
+-import 'package:spotube/models/spotube_track.dart';
++import 'package:spotube/services/sourced_track/sourced_track.dart';
+ 
+ import 'package:spotube/utils/primitive_utils.dart';
+ import 'package:collection/collection.dart';
+@@ -171,7 +171,7 @@ abstract class ServiceUtils {
+   static const baseUri = "https://www.rentanadviser.com/subtitles";
+ 
+   @Deprecated("In favor spotify lyrics api, this isn't needed anymore")
+-  static Future<SubtitleSimple?> getTimedLyrics(SpotubeTrack track) async {
++  static Future<SubtitleSimple?> getTimedLyrics(SourcedTrack track) async {
+     final artistNames =
+         track.artists?.map((artist) => artist.name!).toList() ?? [];
+     final query = getTitle(
+@@ -199,7 +199,7 @@ abstract class ServiceUtils {
+           false;
+       final hasTrackName = title.contains(track.name!.toLowerCase());
+       final isNotLive = !PrimitiveUtils.containsTextInBracket(title, "live");
+-      final exactYtMatch = title == track.ytTrack.title.toLowerCase();
++      final exactYtMatch = title == track.sourceInfo.title.toLowerCase();
+       if (exactYtMatch) points = 7;
+       for (final criteria in [hasTrackName, hasAllArtists, isNotLive]) {
+         if (criteria) points++;
+diff --git a/pubspec.lock b/pubspec.lock
+index 39e920280..54f6d934f 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -385,6 +385,14 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.0.3"
++  dart_des:
++    dependency: transitive
++    description:
++      name: dart_des
++      sha256: "0a66afb8883368c824497fd2a1fd67bdb1a785965a3956728382c03d40747c33"
++      url: "https://pub.dev"
++    source: hosted
++    version: "1.0.2"
+   dart_style:
+     dependency: transitive
+     description:
+@@ -1174,6 +1182,15 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "1.0.4"
++  jiosaavn:
++    dependency: "direct main"
++    description:
++      path: "."
++      ref: HEAD
++      resolved-ref: "8a7cda9b8b687cde28e0f7fcb10adb0d4fde1007"
++      url: "https://github.com/KRTirtho/jiosaavn.git"
++    source: git
++    version: "0.1.0"
+   js:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 590aaae41..b3fd3c3e3 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -106,6 +106,9 @@ dependencies:
+   simple_icons: ^7.10.0
+   audio_service_mpris: ^0.1.0
+   file_picker: ^6.0.0
++  jiosaavn:
++    git:
++      url: https://github.com/KRTirtho/jiosaavn.git
+   draggable_scrollbar:
+     git:
+       url: https://github.com/thielepaul/flutter-draggable-scrollbar.git

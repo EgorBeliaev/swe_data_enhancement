@@ -1,0 +1,802 @@
+diff --git a/packages/serverpod/lib/database.dart b/packages/serverpod/lib/database.dart
+index dfc1d6d610..ff85201b5f 100644
+--- a/packages/serverpod/lib/database.dart
++++ b/packages/serverpod/lib/database.dart
+@@ -1,13 +1,14 @@
+ export 'src/database/concepts/columns.dart';
+ export 'src/database/concepts/database_result.dart';
++export 'src/database/concepts/exceptions.dart';
+ export 'src/database/concepts/expressions.dart';
+ export 'src/database/concepts/includes.dart';
+ export 'src/database/concepts/many_relation.dart';
+ export 'src/database/concepts/order.dart';
+ export 'src/database/concepts/table.dart';
+ export 'src/database/concepts/transaction.dart';
+-export 'src/database/exceptions.dart';
+ export 'src/database/query_parameters.dart';
++export 'src/database/postgres_error_codes.dart';
+ export 'src/database/database_accessor.dart';
+ export 'src/database/database.dart' show Database;
+ export 'src/generated/database/enum_serialization.dart';
+diff --git a/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart b/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
+index 0562573c5a..47fbf3ff46 100644
+--- a/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
++++ b/packages/serverpod/lib/src/database/adapters/postgres/database_connection.dart
+@@ -5,11 +5,12 @@ import 'package:postgres/postgres.dart' as pg;
+ import 'package:serverpod/src/database/adapters/postgres/postgres_database_result.dart';
+ import 'package:serverpod/src/database/adapters/postgres/postgres_result_parser.dart';
+ import 'package:serverpod/src/database/concepts/columns.dart';
++import 'package:serverpod/src/database/concepts/exceptions.dart';
+ import 'package:serverpod/src/database/concepts/includes.dart';
+ import 'package:serverpod/src/database/concepts/order.dart';
+ import 'package:serverpod/src/database/concepts/table_relation.dart';
+ import 'package:serverpod/src/database/concepts/transaction.dart';
+-import 'package:serverpod/src/database/exceptions.dart';
++import 'package:serverpod/src/database/postgres_error_codes.dart';
+ import 'package:serverpod/src/database/sql_query_builder.dart';
+ import 'package:uuid/uuid.dart';
+ 
+@@ -20,6 +21,8 @@ import '../../concepts/table.dart';
+ import '../../database_pool_manager.dart';
+ import '../../query_parameters.dart';
+ 
++part 'postgres_exceptions.dart';
++
+ /// A connection to the database. In most cases the [Database] db object in
+ /// the [Session] object should be used when connecting with the database.
+ @internal
+@@ -158,7 +161,7 @@ class DatabaseConnection {
+     );
+ 
+     if (result.length != 1) {
+-      throw DatabaseInsertRowException(
++      throw _PgDatabaseInsertRowException(
+         'Failed to insert row, updated number of rows is ${result.length} != 1',
+       );
+     }
+@@ -223,7 +226,7 @@ class DatabaseConnection {
+     );
+ 
+     if (updated.isEmpty) {
+-      throw DatabaseUpdateRowException(
++      throw _PgDatabaseUpdateRowException(
+         'Failed to update row, no rows updated',
+       );
+     }
+@@ -264,7 +267,7 @@ class DatabaseConnection {
+     );
+ 
+     if (result.isEmpty) {
+-      throw DatabaseDeleteRowException(
++      throw _PgDatabaseDeleteRowException(
+         'Failed to delete row, no rows deleted.',
+       );
+     }
+@@ -394,37 +397,37 @@ class DatabaseConnection {
+         numRowsAffected: result.affectedRows,
+       );
+       return result;
+-    } catch (exception, trace) {
+-      if (exception is pg.ServerException) {
+-        var message = switch (exception.code) {
+-          ('42P01') =>
+-            'Table not found, have you applied the database migration? (${exception.message})',
+-          (_) => exception.message,
+-        };
+-
+-        var serverpodException = DatabaseException(message);
+-        _logQuery(
+-          session,
+-          query,
+-          startTime,
+-          exception: serverpodException,
+-          trace: trace,
+-        );
+-        throw serverpodException;
+-      }
+-
+-      if (exception is pg.PgException) {
+-        var serverpodException = DatabaseException(exception.message);
+-        _logQuery(
+-          session,
+-          query,
+-          startTime,
+-          exception: serverpodException,
+-          trace: trace,
+-        );
+-        throw serverpodException;
+-      }
++    } on pg.ServerException catch (exception, trace) {
++      var message = switch (exception.code) {
++        (PgErrorCode.undefinedTable) =>
++          'Table not found, have you applied the database migration? (${exception.message})',
++        (_) => exception.message,
++      };
++
++      var serverpodException = _PgDatabaseQueryException.fromServerException(
++        exception,
++        messageOverride: message,
++      );
+ 
++      _logQuery(
++        session,
++        query,
++        startTime,
++        exception: serverpodException,
++        trace: trace,
++      );
++      throw serverpodException;
++    } on pg.PgException catch (exception, trace) {
++      var serverpodException = _PgDatabaseQueryException(exception.message);
++      _logQuery(
++        session,
++        query,
++        startTime,
++        exception: serverpodException,
++        trace: trace,
++      );
++      throw serverpodException;
++    } catch (exception, trace) {
+       _logQuery(session, query, startTime, exception: exception, trace: trace);
+       rethrow;
+     }
+diff --git a/packages/serverpod/lib/src/database/adapters/postgres/postgres_exceptions.dart b/packages/serverpod/lib/src/database/adapters/postgres/postgres_exceptions.dart
+new file mode 100644
+index 0000000000..322333a254
+--- /dev/null
++++ b/packages/serverpod/lib/src/database/adapters/postgres/postgres_exceptions.dart
+@@ -0,0 +1,72 @@
++part of 'database_connection.dart';
++
++final class _PgDatabaseQueryException implements DatabaseQueryException {
++  @override
++  final String message;
++  @override
++  final String? code;
++  @override
++  final String? detail;
++  @override
++  final String? hint;
++  @override
++  final String? tableName;
++  @override
++  final String? columnName;
++  @override
++  final String? constraintName;
++  @override
++  final int? position;
++
++  _PgDatabaseQueryException(
++    this.message, {
++    this.code,
++    this.detail,
++    this.hint,
++    this.tableName,
++    this.columnName,
++    this.constraintName,
++    this.position,
++  });
++
++  factory _PgDatabaseQueryException.fromServerException(
++    pg.ServerException e, {
++    String? messageOverride,
++  }) {
++    var message = messageOverride ?? e.message;
++    return _PgDatabaseQueryException(
++      message,
++      code: e.code,
++      detail: e.detail,
++      hint: e.hint,
++      tableName: e.tableName,
++      columnName: e.columnName,
++      constraintName: e.constraintName,
++      position: e.position,
++    );
++  }
++}
++
++final class _PgDatabaseInsertRowException
++    implements DatabaseInsertRowException {
++  @override
++  final String message;
++
++  _PgDatabaseInsertRowException(this.message);
++}
++
++final class _PgDatabaseUpdateRowException
++    implements DatabaseUpdateRowException {
++  @override
++  final String message;
++
++  _PgDatabaseUpdateRowException(this.message);
++}
++
++final class _PgDatabaseDeleteRowException
++    implements DatabaseDeleteRowException {
++  @override
++  final String message;
++
++  _PgDatabaseDeleteRowException(this.message);
++}
+diff --git a/packages/serverpod/lib/src/database/concepts/exceptions.dart b/packages/serverpod/lib/src/database/concepts/exceptions.dart
+new file mode 100644
+index 0000000000..7422bbbb34
+--- /dev/null
++++ b/packages/serverpod/lib/src/database/concepts/exceptions.dart
+@@ -0,0 +1,68 @@
++/// Exception thrown when an error occurs in the database.
++abstract interface class DatabaseException implements Exception {
++  /// Returns the message of the exception.
++  String get message;
++
++  @override
++  String toString() => 'DatabaseException: $message';
++}
++
++/// Exception thrown when an exception occurs during a database query.
++abstract interface class DatabaseQueryException implements DatabaseException {
++  /// Returns the error code of the exception.
++  String? get code;
++
++  /// Additional details if provided by the database.
++  String? get detail;
++
++  /// A hint on how to remedy an error, if provided by the database.
++  String? get hint;
++
++  /// Returns the name of the table where the error occurred.
++  String? get tableName;
++
++  /// Returns the name of the column where the error occurred.
++  String? get columnName;
++
++  /// Returns the name of the constraint that was violated.
++  String? get constraintName;
++
++  /// Returns the position in the query where the error occurred.
++  int? get position;
++
++  @override
++  String toString() {
++    var details = [
++      'message: $message',
++      if (code != null) 'code: $code',
++      if (detail != null) 'detail: $detail',
++      if (hint != null) 'hint: $hint',
++      if (tableName != null) 'table: $tableName',
++      if (columnName != null) 'column: $columnName',
++      if (constraintName != null) 'constraint: $constraintName',
++      if (position != null) 'position: $position',
++    ].join(', ');
++    return 'DatabaseQueryException: { $details }';
++  }
++}
++
++/// Exception thrown when an insert row operation fails.
++abstract interface class DatabaseInsertRowException
++    implements DatabaseException {
++  @override
++  String toString() => 'DatabaseInsertRowException: $message';
++}
++
++/// Exception thrown when an update row operation fails.
++abstract interface class DatabaseUpdateRowException
++    implements DatabaseException {
++  @override
++  String toString() => 'DatabaseUpdateRowException: $message';
++}
++
++/// Exception thrown when a delete row operation fails.
++abstract interface class DatabaseDeleteRowException
++    implements DatabaseException {
++  @override
++  String toString() => 'DatabaseDeleteRowException: $message';
++}
+diff --git a/packages/serverpod/lib/src/database/exceptions.dart b/packages/serverpod/lib/src/database/exceptions.dart
+deleted file mode 100644
+index 4d23a87f9b..0000000000
+--- a/packages/serverpod/lib/src/database/exceptions.dart
++++ /dev/null
+@@ -1,31 +0,0 @@
+-/// Exception thrown when an error occurs during a database operation.
+-class DatabaseException implements Exception {
+-  /// A message indicating the error.
+-  final String message;
+-
+-  /// Creates a new [DatabaseException].
+-  DatabaseException(this.message);
+-
+-  @override
+-  String toString() {
+-    return 'DatabaseException: $message';
+-  }
+-}
+-
+-/// Exception thrown when no row is inserted when inserting a row.
+-class DatabaseInsertRowException extends DatabaseException {
+-  /// Creates a new [DatabaseInsertRowException].
+-  DatabaseInsertRowException(super.message);
+-}
+-
+-/// Exception thrown when no rows is updated when updating a row.
+-class DatabaseUpdateRowException extends DatabaseException {
+-  /// Creates a new [DatabaseUpdateRowException].
+-  DatabaseUpdateRowException(super.message);
+-}
+-
+-/// Exception thrown when no rows is deleted when deleting a row.
+-class DatabaseDeleteRowException extends DatabaseException {
+-  /// Creates a new [DatabaseDeleteRowException].
+-  DatabaseDeleteRowException(super.message);
+-}
+diff --git a/packages/serverpod/lib/src/database/postgres_error_codes.dart b/packages/serverpod/lib/src/database/postgres_error_codes.dart
+new file mode 100644
+index 0000000000..bfbe374334
+--- /dev/null
++++ b/packages/serverpod/lib/src/database/postgres_error_codes.dart
+@@ -0,0 +1,344 @@
++// ignore_for_file: public_member_api_docs
++
++/// A class containing constants for PostgreSQL error codes.
++///
++/// These error codes are defined in the PostgreSQL documentation at:
++/// https://www.postgresql.org/docs/current/errcodes-appendix.html
++abstract final class PgErrorCode {
++  // Class 00 — Successful Completion
++  static const successfulCompletion = '00000';
++
++  // Class 01 — Warning
++  static const warning = '01000';
++  static const dynamicResultSetsReturned = '0100C';
++  static const implicitZeroBitPadding = '01008';
++  static const nullValueEliminatedInSetFunction = '01003';
++  static const privilegeNotGranted = '01007';
++  static const privilegeNotRevoked = '01006';
++  static const stringDataRightTruncationWarning = '01004';
++  static const deprecatedFeature = '01P01';
++
++  // Class 02 — No Data (this is also a warning class per the SQL standard)
++  static const noData = '02000';
++  static const noAdditionalDynamicResultSetsReturned = '02001';
++
++  // Class 03 — SQL Statement Not Yet Complete
++  static const sqlStatementNotYetComplete = '03000';
++
++  // Class 08 — Connection Exception
++  static const connectionException = '08000';
++  static const connectionDoesNotExist = '08003';
++  static const connectionFailure = '08006';
++  static const sqlclientUnableToEstablishSqlconnection = '08001';
++  static const sqlserverRejectedEstablishmentOfSqlconnection = '08004';
++  static const transactionResolutionUnknown = '08007';
++  static const protocolViolation = '08P01';
++
++  // Class 09 — Triggered Action Exception
++  static const triggeredActionException = '09000';
++
++  // Class 0A — Feature Not Supported
++  static const featureNotSupported = '0A000';
++
++  // Class 0B — Invalid Transaction Initiation
++  static const invalidTransactionInitiation = '0B000';
++
++  // Class 0F — Locator Exception
++  static const locatorException = '0F000';
++  static const invalidLocatorSpecification = '0F001';
++
++  // Class 0L — Invalid Grantor
++  static const invalidGrantor = '0L000';
++  static const invalidGrantOperation = '0LP01';
++
++  // Class 0P — Invalid Role Specification
++  static const invalidRoleSpecification = '0P000';
++
++  // Class 0Z — Diagnostics Exception
++  static const diagnosticsException = '0Z000';
++  static const stackedDiagnosticsAccessedWithoutActiveHandler = '0Z002';
++
++  // Class 20 — Case Not Found
++  static const caseNotFound = '20000';
++
++  // Class 21 — Cardinality Violation
++  static const cardinalityViolation = '21000';
++
++  // Class 22 — Data Exception
++  static const dataException = '22000';
++  static const arraySubscriptError = '2202E';
++  static const characterNotInRepertoire = '22021';
++  static const datetimeFieldOverflow = '22008';
++  static const divisionByZero = '22012';
++  static const errorInAssignment = '22005';
++  static const escapeCharacterConflict = '2200B';
++  static const indicatorOverflow = '22022';
++  static const intervalFieldOverflow = '22015';
++  static const invalidArgumentForLogarithm = '2201E';
++  static const invalidArgumentForNtileFunction = '22014';
++  static const invalidArgumentForNthValueFunction = '22016';
++  static const invalidArgumentForPowerFunction = '2201F';
++  static const invalidArgumentForWidthBucketFunction = '2201G';
++  static const invalidCharacterValueForCast = '22018';
++  static const invalidDatetimeFormat = '22007';
++  static const invalidEscapeCharacter = '22019';
++  static const invalidEscapeOctet = '2200D';
++  static const invalidEscapeSequence = '22025';
++  static const nonstandardUseOfEscapeCharacter = '22P06';
++  static const invalidIndicatorParameterValue = '22010';
++  static const invalidParameterValue = '22023';
++  static const invalidRegularExpression = '2201B';
++  static const invalidRowCountInLimitClause = '2201W';
++  static const invalidRowCountInResultOffsetClause = '2201X';
++  static const invalidTablesampleArgument = '2202H';
++  static const invalidTablesampleRepeat = '2202G';
++  static const invalidTimeZoneDisplacementValue = '22009';
++  static const invalidUseOfEscapeCharacter = '2200C';
++  static const mostSpecificTypeMismatch = '2200G';
++  static const nullValueNotAllowed = '22004';
++  static const nullValueNoIndicatorParameter = '22002';
++  static const numericValueOutOfRange = '22003';
++  static const sequenceGeneratorLimitExceeded = '2200H';
++  static const stringDataLengthMismatch = '22026';
++  static const stringDataRightTruncation = '22001';
++  static const substringError = '22011';
++  static const trimError = '22027';
++  static const unterminatedCString = '22024';
++  static const zeroLengthCharacterString = '2200F';
++  static const floatingPointException = '22P01';
++  static const invalidTextRepresentation = '22P02';
++  static const invalidBinaryRepresentation = '22P03';
++  static const badCopyFileFormat = '22P04';
++  static const untranslatableCharacter = '22P05';
++  static const notAnXmlDocument = '2200L';
++  static const invalidXmlDocument = '2200M';
++  static const invalidXmlContent = '2200N';
++  static const invalidXmlComment = '2200S';
++  static const invalidXmlProcessingInstruction = '2200T';
++  static const duplicateJsonObjectKey = '22030';
++  static const invalidArgumentForJsonDatetimeFunction = '22031';
++  static const invalidJsonText = '22032';
++  static const invalidSqlJsonSubscript = '22033';
++  static const moreThanOneSqlJsonItem = '22034';
++  static const noSqlJsonItem = '22035';
++  static const nonNumericSqlJsonItem = '22036';
++  static const nonUniqueKeysInJsonObject = '22037';
++  static const singletonSqlJsonItemRequired = '22038';
++  static const sqlJsonArrayNotFound = '22039';
++  static const sqlJsonMemberNotFound = '2203A';
++  static const sqlJsonNumberNotFound = '2203B';
++  static const sqlJsonObjectNotFound = '2203C';
++  static const tooManyJsonArrayElements = '2203D';
++  static const tooManyJsonObjectMembers = '2203E';
++  static const sqlJsonScalarRequired = '2203F';
++  static const sqlJasonItemCannotBeCastToTargetType = '2203G';
++
++  // Class 23 — Integrity Constraint Violation
++  static const integrityConstraintViolation = '23000';
++  static const restrictViolation = '23001';
++  static const notNullViolation = '23502';
++  static const foreignKeyViolation = '23503';
++  static const uniqueViolation = '23505';
++  static const checkViolation = '23514';
++  static const exclusionViolation = '23P01';
++
++  // Class 24 — Invalid Cursor State
++  static const invalidCursorState = '24000';
++
++  // Class 25 — Invalid Transaction State
++  static const invalidTransactionState = '25000';
++  static const activeSqlTransaction = '25001';
++  static const branchTransactionAlreadyActive = '25002';
++  static const heldCursorRequiresSameIsolationLevel = '25008';
++  static const inappropriateAccessModeForBranchTransaction = '25003';
++  static const inappropriateIsolationLevelForBranchTransaction = '25004';
++  static const noActiveSqlTransactionForBranchTransaction = '25005';
++  static const readOnlySqlTransaction = '25006';
++  static const schemaAndDataStatementMixingNotSupported = '25007';
++  static const noActiveSqlTransaction = '25P01';
++  static const inFailedSqlTransaction = '25P02';
++  static const idleInTransactionSessionTimeout = '25P03';
++  static const transactionTimeout = '25P04';
++
++  // Class 26 — Invalid SQL Statement Name
++  static const invalidSqlStatementName = '26000';
++
++  // Class 27 — Triggered Data Change Violation
++  static const triggeredDataChangeViolation = '27000';
++
++  // Class 28 — Invalid Authorization Specification
++  static const invalidAuthorizationSpecification = '28000';
++  static const invalidPassword = '28P01';
++
++  // Class 2B — Dependent Privilege Descriptors Still Exist
++  static const dependentPrivilegeDescriptorsStillExist = '2B000';
++  static const dependentObjectsStillExist = '2BP01';
++
++  // Class 2D — Invalid Transaction Termination
++  static const invalidTransactionTermination = '2D000';
++
++  // Class 2F — SQL Routine Exception
++  static const sqlRoutineException = '2F000';
++  static const functionExecutedNoReturnStatement = '2F005';
++  static const modifyingSqlDataNotPermitted = '2F002';
++  static const prohibitedSqlStatementAttempted = '2F003';
++  static const readingSqlDataNotPermitted = '2F004';
++
++  // Class 34 — Invalid Cursor Name
++  static const invalidCursorName = '34000';
++
++  // Class 38 — External Routine Exception
++  static const externalRoutineException = '38000';
++  static const containingSqlNotPermitted = '38001';
++  static const modifyingSqlDataNotPermittedExternal = '38002';
++  static const prohibitedSqlStatementAttemptedExternal = '38003';
++  static const readingSqlDataNotPermittedExternal = '38004';
++
++  // Class 39 — External Routine Invocation Exception
++  static const externalRoutineInvocationException = '39000';
++  static const invalidSqlstateReturned = '39001';
++  static const nullValueNotAllowedExternal = '39004';
++  static const triggerProtocolViolated = '39P01';
++  static const srfProtocolViolated = '39P02';
++  static const eventTriggerProtocolViolated = '39P03';
++
++  // Class 3B — Savepoint Exception
++  static const savepointException = '3B000';
++  static const invalidSavepointSpecification = '3B001';
++
++  // Class 40 — Transaction Rollback
++  static const transactionRollback = '40000';
++  static const serializationFailure = '40001';
++  static const transactionIntegrityConstraintViolation = '40002';
++  static const statementCompletionUnknown = '40003';
++  static const deadlockDetected = '40P01';
++
++  // Class 42 — Syntax Error or Access Rule Violation
++  static const syntaxErrorOrAccessRuleViolation = '42000';
++  static const syntaxError = '42601';
++  static const insufficientPrivilege = '42501';
++  static const cannotCoerce = '42846';
++  static const groupingError = '42803';
++  static const windowingError = '42P20';
++  static const invalidRecursion = '42P19';
++  static const invalidForeignKey = '42830';
++  static const invalidName = '42602';
++  static const nameTooLong = '42622';
++  static const reservedName = '42939';
++  static const datatypeMismatch = '42804';
++  static const indeterminateDatatype = '42P18';
++  static const collationMismatch = '42P21';
++  static const indeterminateCollation = '42P22';
++  static const wrongObjectType = '42809';
++  static const generatedAlways = '428C9';
++  static const undefinedColumn = '42703';
++  static const undefinedFunction = '42883';
++  static const undefinedTable = '42P01';
++  static const undefinedParameter = '42P02';
++  static const undefinedObject = '42704';
++  static const duplicateColumn = '42701';
++  static const duplicateCursor = '42P03';
++  static const duplicateDatabase = '42P04';
++  static const duplicateFunction = '42723';
++  static const duplicatePreparedStatement = '42P05';
++  static const duplicateSchema = '42P06';
++  static const duplicateTable = '42P07';
++  static const duplicateAlias = '42712';
++  static const duplicateObject = '42710';
++  static const ambiguousColumn = '42702';
++  static const ambiguousFunction = '42725';
++  static const ambiguousParameter = '42P08';
++  static const ambiguousAlias = '42P09';
++  static const invalidColumnReference = '42P10';
++  static const invalidColumnDefinition = '42611';
++  static const invalidCursorDefinition = '42P11';
++  static const invalidDatabaseDefinition = '42P12';
++  static const invalidFunctionDefinition = '42P13';
++  static const invalidPreparedStatementDefinition = '42P14';
++  static const invalidSchemaDefinition = '42P15';
++  static const invalidTableDefinition = '42P16';
++  static const invalidObjectDefinition = '42P17';
++
++  // Class 44 — WITH CHECK OPTION Violation
++  static const withCheckOptionViolation = '44000';
++
++  // Class 53 — Insufficient Resources
++  static const insufficientResources = '53000';
++  static const diskFull = '53100';
++  static const outOfMemory = '53200';
++  static const tooManyConnections = '53300';
++  static const configurationLimitExceeded = '53400';
++
++  // Class 54 — Program Limit Exceeded
++  static const programLimitExceeded = '54000';
++  static const statementTooComplex = '54001';
++  static const tooManyColumns = '54011';
++  static const tooManyArguments = '54023';
++
++  // Class 55 — Object Not In Prerequisite State
++  static const objectNotInPrerequisiteState = '55000';
++  static const objectInUse = '55006';
++  static const cantChangeRuntimeParam = '55P02';
++  static const lockNotAvailable = '55P03';
++  static const unsafeNewEnumValueUsage = '55P04';
++
++  // Class 57 — Operator Intervention
++  static const operatorIntervention = '57000';
++  static const queryCanceled = '57014';
++  static const adminShutdown = '57P01';
++  static const crashShutdown = '57P02';
++  static const cannotConnectNow = '57P03';
++  static const databaseDropped = '57P04';
++  static const idleSessionTimeout = '57P05';
++
++  // Class 58 — System Error
++  static const systemError = '58000';
++  static const ioError = '58030';
++  static const undefinedFile = '58P01';
++  static const duplicateFile = '58P02';
++
++  // Class F0 — Configuration File Error
++  static const configurationFileError = 'F0000';
++  static const lockFileExists = 'F0001';
++
++  // Class HV — Foreign Data Wrapper Error (SQL/MED)
++  static const fdwError = 'HV000';
++  static const fdwColumnNameNotFound = 'HV005';
++  static const fdwDynamicParameterValueNeeded = 'HV002';
++  static const fdwFunctionSequenceError = 'HV010';
++  static const fdwInconsistentDescriptorInformation = 'HV021';
++  static const fdwInvalidAttributeValue = 'HV024';
++  static const fdwInvalidColumnName = 'HV007';
++  static const fdwInvalidColumnNumber = 'HV008';
++  static const fdwInvalidDataType = 'HV004';
++  static const fdwInvalidDataTypeDescriptors = 'HV006';
++  static const fdwInvalidDescriptorFieldIdentifier = 'HV091';
++  static const fdwInvalidHandle = 'HV00B';
++  static const fdwInvalidOptionIndex = 'HV00C';
++  static const fdwInvalidOptionName = 'HV00D';
++  static const fdwInvalidStringLengthOrBufferLength = 'HV090';
++  static const fdwInvalidStringFormat = 'HV00A';
++  static const fdwInvalidUseOfNullPointer = 'HV009';
++  static const fdwTooManyHandles = 'HV014';
++  static const fdwOutOfMemory = 'HV001';
++  static const fdwNoSchemas = 'HV00P';
++  static const fdwOptionNameNotFound = 'HV00J';
++  static const fdwReplyHandle = 'HV00K';
++  static const fdwSchemaNotFound = 'HV00Q';
++  static const fdwTableNotFound = 'HV00R';
++  static const fdwUnableToCreateExecution = 'HV00L';
++  static const fdwUnableToCreateReply = 'HV00M';
++  static const fdwUnableToEstablishConnection = 'HV00N';
++
++  // Class P0 — PL/pgSQL Error
++  static const plpgsqlError = 'P0000';
++  static const raiseException = 'P0001';
++  static const noDataFound = 'P0002';
++  static const tooManyRows = 'P0003';
++  static const assertFailure = 'P0004';
++
++  // Class XX — Internal Error
++  static const internalError = 'XX000';
++  static const dataCorrupted = 'XX001';
++  static const indexCorrupted = 'XX002';
++}
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/crud/create_test.dart b/tests/serverpod_test_server/test_integration/database_operations/crud/create_test.dart
+index 83096f5ece..f965edfddc 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/crud/create_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/crud/create_test.dart
+@@ -43,7 +43,8 @@ void main() async {
+ 
+       expect(
+         UniqueData.db.insert(session, data),
+-        throwsA(isA<DatabaseException>()),
++        throwsA(isA<DatabaseQueryException>()
++            .having((e) => e.code, 'code', PgErrorCode.uniqueViolation)),
+       );
+ 
+       var first = await UniqueData.db.findFirstRow(session,
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/crud/delete_test.dart b/tests/serverpod_test_server/test_integration/database_operations/crud/delete_test.dart
+index a7061c11a9..f22db2e7f2 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/crud/delete_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/crud/delete_test.dart
+@@ -241,7 +241,8 @@ void main() async {
+ 
+       expect(
+         () async => await UniqueData.db.delete(session, inserted),
+-        throwsA(isA<DatabaseException>()),
++        throwsA(isA<DatabaseQueryException>()
++            .having((e) => e.code, 'code', PgErrorCode.foreignKeyViolation)),
+       );
+ 
+       var first = await UniqueData.db.findById(session, inserted.first.id!);
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/exceptions/missing_table_test.dart b/tests/serverpod_test_server/test_integration/database_operations/exceptions/missing_table_test.dart
+index 0f57a3d174..091dd926ae 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/exceptions/missing_table_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/exceptions/missing_table_test.dart
+@@ -13,8 +13,9 @@ void main() async {
+       session.db.unsafeQuery('SELECT * FROM $randomName'),
+       throwsA(
+         allOf(
+-          isA<DatabaseException>(),
+-          predicate<DatabaseException>(
++          isA<DatabaseQueryException>()
++              .having((e) => e.code, 'code', PgErrorCode.undefinedTable),
++          predicate<DatabaseQueryException>(
+             (e) => e.message.contains(
+                 'Table not found, have you applied the database migration? ('),
+           ),
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/transactions/savepoint_test.dart b/tests/serverpod_test_server/test_integration/database_operations/transactions/savepoint_test.dart
+index c7247d9bc9..f1ef874444 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/transactions/savepoint_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/transactions/savepoint_test.dart
+@@ -122,7 +122,11 @@ void main() async {
+     });
+ 
+     test('then database exception is thrown', () async {
+-      await expectLater(transactionFuture, throwsA(isA<DatabaseException>()));
++      await expectLater(
++        transactionFuture,
++        throwsA(isA<DatabaseQueryException>().having(
++            (e) => e.code, 'code', PgErrorCode.invalidSavepointSpecification)),
++      );
+     });
+ 
+     test('then no data is persisted in the database', () async {
+@@ -155,7 +159,11 @@ void main() async {
+     });
+ 
+     test('then database exception is thrown', () async {
+-      await expectLater(transactionFuture, throwsA(isA<DatabaseException>()));
++      await expectLater(
++        transactionFuture,
++        throwsA(isA<DatabaseQueryException>().having(
++            (e) => e.code, 'code', PgErrorCode.invalidSavepointSpecification)),
++      );
+     });
+ 
+     test('then no data is persisted in the database', () async {
+diff --git a/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart
+index e917295529..8b67399949 100644
+--- a/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart
++++ b/tests/serverpod_test_server/test_integration/database_operations/transactions/transaction_isolatation_level_test.dart
+@@ -312,7 +312,10 @@ void main() async {
+           settings: settings,
+         );
+ 
+-        expectLater(transaction1, throwsA(isA<DatabaseException>()));
++        expectLater(
++            transaction1,
++            throwsA(isA<DatabaseQueryException>().having(
++                (e) => e.code, 'code', PgErrorCode.serializationFailure)));
+         await transaction2;
+         var data1AfterTransaction = await SimpleData.db.findById(
+           session,
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+index 40155b8218..3b785661c4 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/database_operations_test.dart
+@@ -447,7 +447,8 @@ void main() {
+             failingInsert,
+             throwsA(
+               allOf(
+-                isA<DatabaseException>(),
++                isA<DatabaseQueryException>()
++                    .having((e) => e.code, 'code', PgErrorCode.uniqueViolation),
+               ),
+             ),
+           );
+diff --git a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+index b0bef886dc..77f4a9a291 100644
+--- a/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
++++ b/tests/serverpod_test_server/test_integration/test_tools/transaction_correctness_test.dart
+@@ -173,7 +173,11 @@ void main() {
+         // If the top level transaction error is not caught this test will fail.
+         // Therefore, this test validates that the exception is caught on the top level
+         // and does not fail the dart test runner.
+-        await expectLater(future, throwsA(isA<DatabaseException>()));
++        await expectLater(
++          future,
++          throwsA(isA<DatabaseQueryException>()
++              .having((e) => e.code, 'code', PgErrorCode.uniqueViolation)),
++        );
+       });
+ 
+       test(

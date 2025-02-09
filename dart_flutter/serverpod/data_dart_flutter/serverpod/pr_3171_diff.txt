@@ -1,0 +1,221 @@
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/checker/analyze_checker.dart b/tools/serverpod_cli/lib/src/analyzer/models/checker/analyze_checker.dart
+index 737a8d5ef0..2313b2d15e 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/checker/analyze_checker.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/checker/analyze_checker.dart
+@@ -19,6 +19,11 @@ class AnalyzeChecker {
+     return node.containsKey(Keyword.optional);
+   }
+ 
++  static bool isFieldDefined(dynamic node) {
++    if (node is! YamlMap) return false;
++    return node.containsKey(Keyword.field);
++  }
++
+   static List<SerializableModelFieldDefinition> filterRelationByName(
+     ClassDefinition classDefinition,
+     ClassDefinition foreignClass,
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart b/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
+index 836d6cb3d4..2557542ca4 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
+@@ -748,6 +748,17 @@ class Restrictions {
+       ));
+     }
+ 
++    if (!AnalyzeChecker.isFieldDefined(content)) {
++      var isOptional = AnalyzeChecker.isOptionalDefined(content);
++      var isServerOnly = field.scope == ModelFieldScopeDefinition.serverOnly;
++      if (isServerOnly && !isOptional) {
++        errors.add(SourceSpanSeverityException(
++          'The relation with scope "${field.scope.name}" requires the relation to be optional.',
++          span,
++        ));
++      }
++    }
++
+     return errors;
+   }
+ 
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/yaml_definitions/class_yaml_definition.dart b/tools/serverpod_cli/lib/src/analyzer/models/yaml_definitions/class_yaml_definition.dart
+index 0c8338576d..5979afc184 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/yaml_definitions/class_yaml_definition.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/yaml_definitions/class_yaml_definition.dart
+@@ -121,6 +121,9 @@ class ClassYamlDefinition {
+                     Keyword.optional,
+                     keyRestriction: restrictions.validateOptionalKey,
+                     valueRestriction: BooleanValueRestriction().validate,
++                    mutuallyExclusiveKeys: {
++                      Keyword.field,
++                    },
+                   ),
+                   ValidateNode(
+                     Keyword.name,
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_relation_scope_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_relation_scope_test.dart
+new file mode 100644
+index 0000000000..eb2b3c4dd5
+--- /dev/null
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_relation_scope_test.dart
+@@ -0,0 +1,112 @@
++import 'package:serverpod_cli/src/analyzer/code_analysis_collector.dart';
++import 'package:serverpod_cli/src/analyzer/models/stateful_analyzer.dart';
++import 'package:serverpod_cli/src/generator/code_generation_collector.dart';
++import 'package:serverpod_cli/src/test_util/builders/generator_config_builder.dart';
++import 'package:serverpod_cli/src/test_util/builders/model_source_builder.dart';
++import 'package:test/test.dart';
++
++void main() {
++  var config = GeneratorConfigBuilder().build();
++
++  var parentClassModel = ModelSourceBuilder()
++      .withYaml(
++        '''
++        class: Post
++        table: post
++        fields:
++          title: String
++        ''',
++      )
++      .withFileName('post_class')
++      .build();
++
++  group('Given a class with a non-optional relation and "serverOnly" scope',
++      () {
++    test(
++      'when analyzed then an error is generated for an object relation',
++      () {
++        var models = [
++          parentClassModel,
++          ModelSourceBuilder()
++              .withYaml(
++                '''
++                class: Comment
++                table: comment
++                fields:
++                  post: Post?, relation, scope=serverOnly
++                ''',
++              )
++              .withFileName('comment_class')
++              .build(),
++        ];
++
++        var collector = CodeGenerationCollector();
++        StatefulAnalyzer(config, models, onErrorsCollector(collector))
++            .validateAll();
++
++        expect(collector.errors, isNotEmpty);
++
++        var error = collector.errors.first as SourceSpanSeverityException;
++        expect(error.severity, SourceSpanSeverity.error);
++        expect(
++          error.message,
++          'The relation with scope "serverOnly" requires the relation to be optional.',
++        );
++      },
++    );
++
++    test(
++      'when analyzed then no errors are generated for a manual field relation',
++      () {
++        var models = [
++          parentClassModel,
++          ModelSourceBuilder()
++              .withYaml(
++                '''
++                class: Comment
++                table: comment
++                fields:
++                  postId: int,
++                  post: Post?, relation(field=postId), scope=serverOnly
++                ''',
++              )
++              .withFileName('comment_class')
++              .build(),
++        ];
++
++        var collector = CodeGenerationCollector();
++        StatefulAnalyzer(config, models, onErrorsCollector(collector))
++            .validateAll();
++
++        expect(collector.errors, isEmpty);
++      },
++    );
++  });
++
++  test(
++    'Given a class with an optional relation and "serverOnly" scope '
++    'when analyzed then no errors are generated for an object relation',
++    () {
++      var models = [
++        parentClassModel,
++        ModelSourceBuilder()
++            .withYaml(
++              '''
++                class: Comment
++                table: comment
++                fields:
++                  post: Post?, relation(optional), scope=serverOnly
++                ''',
++            )
++            .withFileName('comment_class')
++            .build(),
++      ];
++
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer(config, models, onErrorsCollector(collector))
++          .validateAll();
++
++      expect(collector.errors, isEmpty);
++    },
++  );
++}
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/relation/relation_manual_field_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/relation/relation_manual_field_test.dart
+index 72389b9019..2c89f0de1f 100644
+--- a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/relation/relation_manual_field_test.dart
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/relation/relation_manual_field_test.dart
+@@ -297,6 +297,46 @@ fields:
+     }, skip: errors.isEmpty);
+   });
+ 
++  group(
++    'Given a class with an optional relation pointing to a field ',
++    () {
++      var models = [
++        ModelSourceBuilder()
++            .withYaml(
++              '''
++                class: Example
++                table: example
++                fields:
++                  manualId: int
++                  relationObject: Example?, relation(optional, field=manualId), scope=serverOnly
++                ''',
++            )
++            .withFileName('example_class')
++            .build(),
++      ];
++
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer(config, models, onErrorsCollector(collector))
++          .validateAll();
++
++      var errors = collector.errors;
++
++      test('then an error was collected.', () {
++        expect(errors, isNotEmpty);
++      });
++
++      test(
++          'then the error message reports that the "optional" property '
++          'is mutually exclusive with the "field" property.', () {
++        var error = errors.first;
++        expect(
++          error.message,
++          'The "optional" property is mutually exclusive with the "field" property.',
++        );
++      });
++    },
++  );
++
+   group(
+       'Given two classes with a named relation with a defined field name that holds the relation',
+       () {

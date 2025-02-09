@@ -1,0 +1,194 @@
+diff --git a/packages/flame/lib/src/devtools/connectors/overlay_navigation_connector.dart b/packages/flame/lib/src/devtools/connectors/overlay_navigation_connector.dart
+new file mode 100644
+index 00000000000..b5c64a3e5fc
+--- /dev/null
++++ b/packages/flame/lib/src/devtools/connectors/overlay_navigation_connector.dart
+@@ -0,0 +1,51 @@
++import 'dart:convert';
++import 'dart:developer';
++
++import 'package:flame/src/devtools/dev_tools_connector.dart';
++
++/// The [OverlayNavigationConnector] is responsible of getting the names of all
++/// registered overlays and navigating to the overlay with the given name.
++class OverlayNavigationConnector extends DevToolsConnector {
++  @override
++  void init() {
++    // Get the names of all registered overlays
++    registerExtension(
++      'ext.flame_devtools.getOverlays',
++      (method, parameters) async {
++        return ServiceExtensionResponse.result(
++          json.encode({
++            'overlays': game.overlays.registeredOverlays,
++          }),
++        );
++      },
++    );
++
++    // Navigate to the overlay with the given name
++    registerExtension(
++      'ext.flame_devtools.navigateToOverlay',
++      (method, parameters) async {
++        const invalidParamsError = -32602;
++
++        final overlayName = parameters['overlay'];
++
++        if (overlayName == null) {
++          return ServiceExtensionResponse.error(
++            invalidParamsError,
++            'Missing overlay parameter',
++          );
++        }
++
++        if (!game.overlays.registeredOverlays.contains(overlayName)) {
++          return ServiceExtensionResponse.error(
++            invalidParamsError,
++            'Unknown overlay: $overlayName',
++          );
++        }
++
++        game.overlays.clear();
++        game.overlays.add(overlayName);
++        return ServiceExtensionResponse.result(json.encode({'success': true}));
++      },
++    );
++  }
++}
+diff --git a/packages/flame/lib/src/devtools/dev_tools_service.dart b/packages/flame/lib/src/devtools/dev_tools_service.dart
+index 8cdbd067e74..8e3adb1cdb6 100644
+--- a/packages/flame/lib/src/devtools/dev_tools_service.dart
++++ b/packages/flame/lib/src/devtools/dev_tools_service.dart
+@@ -4,6 +4,7 @@ import 'package:flame/src/devtools/connectors/component_snapshot_connector.dart'
+ import 'package:flame/src/devtools/connectors/component_tree_connector.dart';
+ import 'package:flame/src/devtools/connectors/debug_mode_connector.dart';
+ import 'package:flame/src/devtools/connectors/game_loop_connector.dart';
++import 'package:flame/src/devtools/connectors/overlay_navigation_connector.dart';
+ import 'package:flame/src/devtools/connectors/position_component_attributes_connector.dart';
+ import 'package:flame/src/devtools/dev_tools_connector.dart';
+ 
+@@ -39,6 +40,7 @@ class DevToolsService {
+     GameLoopConnector(),
+     ComponentSnapshotConnector(),
+     PositionComponentAttributesConnector(),
++    OverlayNavigationConnector(),
+   ];
+ 
+   /// This method is called every time a new game is set in the service and it
+diff --git a/packages/flame/lib/src/game/overlay_manager.dart b/packages/flame/lib/src/game/overlay_manager.dart
+index 66f27dd2f9d..8b31edce850 100644
+--- a/packages/flame/lib/src/game/overlay_manager.dart
++++ b/packages/flame/lib/src/game/overlay_manager.dart
+@@ -19,6 +19,11 @@ class OverlayManager {
+     return UnmodifiableListView(_activeOverlays.map((overlay) => overlay.name));
+   }
+ 
++  /// The names of all registered overlays
++  UnmodifiableListView<String> get registeredOverlays {
++    return UnmodifiableListView(_builders.keys);
++  }
++
+   /// Returns if the given [overlayName] is active
+   bool isActive(String overlayName) =>
+       _activeOverlays.any((overlay) => overlay.name == overlayName);
+diff --git a/packages/flame_devtools/lib/main.dart b/packages/flame_devtools/lib/main.dart
+index 982d4b2f44d..66407901ff8 100644
+--- a/packages/flame_devtools/lib/main.dart
++++ b/packages/flame_devtools/lib/main.dart
+@@ -2,6 +2,7 @@ import 'package:devtools_extensions/devtools_extensions.dart';
+ import 'package:flame_devtools/widgets/component_tree.dart';
+ import 'package:flame_devtools/widgets/debug_mode_button.dart';
+ import 'package:flame_devtools/widgets/game_loop_controls.dart';
++import 'package:flame_devtools/widgets/overlay_navigation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ 
+@@ -26,6 +27,7 @@ class FlameDevTools extends StatelessWidget {
+               ].withSpacing(),
+             ),
+             const Expanded(child: ComponentTree()),
++            const Flexible(child: OverlayNavigation()),
+           ].withSpacing(),
+         ),
+       ),
+diff --git a/packages/flame_devtools/lib/repository.dart b/packages/flame_devtools/lib/repository.dart
+index b0c411bc899..7a69bcf6dda 100644
+--- a/packages/flame_devtools/lib/repository.dart
++++ b/packages/flame_devtools/lib/repository.dart
+@@ -22,6 +22,21 @@ sealed class Repository {
+     );
+   }
+ 
++  static Future<List<String>> getOverlays() async {
++    final overlaysResponse =
++        await serviceManager.callServiceExtensionOnMainIsolate(
++      'ext.flame_devtools.getOverlays',
++    );
++    return List<String>.from(overlaysResponse.json!['overlays'] as List);
++  }
++
++  static Future<void> navigateToOverlay(String overlay) async {
++    await serviceManager.callServiceExtensionOnMainIsolate(
++      'ext.flame_devtools.navigateToOverlay',
++      args: {'overlay': overlay},
++    );
++  }
++
+   static Future<bool> swapDebugMode({int? id}) async {
+     final nextDebugMode = !(await getDebugMode(id: id));
+     await serviceManager.callServiceExtensionOnMainIsolate(
+diff --git a/packages/flame_devtools/lib/widgets/overlay_navigation.dart b/packages/flame_devtools/lib/widgets/overlay_navigation.dart
+new file mode 100644
+index 00000000000..46a78439e29
+--- /dev/null
++++ b/packages/flame_devtools/lib/widgets/overlay_navigation.dart
+@@ -0,0 +1,49 @@
++import 'package:devtools_app_shared/ui.dart' as devtools_ui;
++import 'package:flame_devtools/repository.dart';
++import 'package:flutter/material.dart';
++
++class OverlayNavigation extends StatefulWidget {
++  const OverlayNavigation({super.key});
++
++  @override
++  State<OverlayNavigation> createState() => _OverlayNavigationState();
++}
++
++class _OverlayNavigationState extends State<OverlayNavigation> {
++  Future<List<String>>? _overlays;
++
++  @override
++  void initState() {
++    _overlays = Repository.getOverlays();
++    super.initState();
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return FutureBuilder<List<String>>(
++      future: _overlays,
++      builder: (context, snapshot) {
++        if (!snapshot.hasData || snapshot.data!.isEmpty) {
++          return const SizedBox();
++        }
++
++        return devtools_ui.RoundedOutlinedBorder(
++          child: Column(
++            mainAxisSize: MainAxisSize.min,
++            crossAxisAlignment: CrossAxisAlignment.start,
++            children: [
++              const devtools_ui.AreaPaneHeader(title: Text('Overlays')),
++              for (final overlay in snapshot.data!)
++                ListTile(
++                  dense: true,
++                  leading: const Icon(Icons.layers, size: 20),
++                  title: Text(overlay),
++                  onTap: () => Repository.navigateToOverlay(overlay),
++                ),
++            ],
++          ),
++        );
++      },
++    );
++  }
++}

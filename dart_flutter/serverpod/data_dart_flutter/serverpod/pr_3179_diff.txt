@@ -1,0 +1,478 @@
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/definitions.dart b/tools/serverpod_cli/lib/src/analyzer/models/definitions.dart
+index 210a516d3e..cc8f5268d7 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/definitions.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/definitions.dart
+@@ -5,7 +5,6 @@ import 'package:serverpod_service_client/serverpod_service_client.dart';
+ /// An abstract representation of a yaml file in the
+ /// protocol directory.
+ sealed class SerializableModelDefinition {
+-  final String moduleAlias;
+   final String fileName;
+   final String sourceFileName;
+   final String className;
+@@ -14,7 +13,6 @@ sealed class SerializableModelDefinition {
+   final TypeDefinition type;
+ 
+   SerializableModelDefinition({
+-    required this.moduleAlias,
+     required this.fileName,
+     required this.sourceFileName,
+     required this.className,
+@@ -71,7 +69,6 @@ class ClassDefinition extends SerializableModelDefinition {
+ 
+   /// Create a new [ClassDefinition].
+   ClassDefinition({
+-    required super.moduleAlias,
+     required super.fileName,
+     required super.sourceFileName,
+     required super.className,
+@@ -324,7 +321,6 @@ class EnumDefinition extends SerializableModelDefinition {
+ 
+   /// Create a new [EnumDefinition].
+   EnumDefinition({
+-    required super.moduleAlias,
+     required super.fileName,
+     required super.sourceFileName,
+     required super.className,
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/entity_dependency_resolver.dart b/tools/serverpod_cli/lib/src/analyzer/models/entity_dependency_resolver.dart
+index 5059fd6474..4d2e1033a3 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/entity_dependency_resolver.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/entity_dependency_resolver.dart
+@@ -94,7 +94,7 @@ class ModelDependencyResolver {
+     var enumDefinitionList = modelDefinitions.whereType<EnumDefinition>().where(
+         (e) =>
+             e.className == typeDefinition.className &&
+-            e.moduleAlias == typeDefinition.moduleAlias);
++            e.type.moduleAlias == typeDefinition.moduleAlias);
+ 
+     if (enumDefinitionList.isEmpty) return;
+ 
+@@ -114,7 +114,7 @@ class ModelDependencyResolver {
+         .firstWhere(
+             (model) =>
+                 model?.className == fieldDefinition.type.className &&
+-                model?.moduleAlias == fieldDefinition.type.moduleAlias,
++                model?.type.moduleAlias == fieldDefinition.type.moduleAlias,
+             orElse: () => null);
+ 
+     if (referenceClass is! ClassDefinition) return;
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/model_parser/model_parser.dart b/tools/serverpod_cli/lib/src/analyzer/models/model_parser/model_parser.dart
+index 690191b29c..6ed00e9b21 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/model_parser/model_parser.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/model_parser/model_parser.dart
+@@ -39,7 +39,7 @@ class ModelParser {
+     var extendsClass = _parseExtendsClass(documentContents);
+ 
+     var classType = parseType(
+-      '$defaultModuleAlias:$className',
++      '${protocolSource.moduleAlias}:$className',
+       extraClasses: extraClasses,
+     );
+ 
+@@ -59,7 +59,6 @@ class ModelParser {
+     var manageMigration = _parseBool(migrationValue) ?? true;
+ 
+     return ClassDefinition(
+-      moduleAlias: protocolSource.moduleAlias,
+       className: className,
+       isSealed: isSealed,
+       extendsClass: extendsClass,
+@@ -94,12 +93,11 @@ class ModelParser {
+     var serializeAs = _parseSerializedAs(documentContents);
+     var values = _parseEnumValues(documentContents, docsExtractor);
+     var enumType = parseType(
+-      '$defaultModuleAlias:$className',
++      '${protocolSource.moduleAlias}:$className',
+       extraClasses: [],
+     );
+ 
+     var enumDef = EnumDefinition(
+-      moduleAlias: protocolSource.moduleAlias,
+       fileName: outFileName,
+       sourceFileName: protocolSource.yamlSourceUri.path,
+       className: className,
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
+index 89821d1528..d0c3005903 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/validation/model_relations.dart
+@@ -21,7 +21,7 @@ class ParsedModelsCollection {
+         modelWithPath,
+   ) {
+     var models = modelWithPath.map((e) => e.model).toList();
+-    modules = models.map((e) => e.moduleAlias).toSet();
++    modules = models.map((e) => e.type.moduleAlias).nonNulls.toSet();
+     classNames = _createClassNameMap(models);
+     tableNames = _createTableNameMap(models);
+     indexNames = _createIndexNameMap(models);
+@@ -92,8 +92,8 @@ class ParsedModelsCollection {
+     List<ModelWithDocumentPath> models,
+   ) {
+     Map<String, List<ModelWithDocumentPath>> filePaths = {};
+-    for (var (:documentPath, :model)
+-        in models.where((e) => e.model.moduleAlias == defaultModuleAlias)) {
++    for (var (:documentPath, :model) in models
++        .where((e) => e.model.type.moduleAlias == defaultModuleAlias)) {
+       filePaths.update(
+         _buildGeneratedFilePath(model),
+         (value) => value..add((documentPath: documentPath, model: model)),
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart b/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
+index 2557542ca4..7b2b1960eb 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/validation/restrictions.dart
+@@ -182,8 +182,8 @@ class Restrictions {
+       ];
+     }
+ 
+-    var classesByName = parsedModels.classNames[className]?.where(
+-        (model) => model.moduleAlias == documentDefinition?.moduleAlias);
++    var classesByName = parsedModels.classNames[className]?.where((model) =>
++        model.type.moduleAlias == documentDefinition?.type.moduleAlias);
+ 
+     if (classesByName != null && classesByName.length > 1) {
+       return [
+@@ -300,7 +300,7 @@ class Restrictions {
+       ];
+     }
+ 
+-    if (parentClass.moduleAlias != defaultModuleAlias) {
++    if (parentClass.type.moduleAlias != defaultModuleAlias) {
+       return [
+         SourceSpanSeverityException(
+           'You can only extend classes from your own project.',
+@@ -1066,7 +1066,7 @@ class Restrictions {
+           .firstOrNull;
+ 
+       if (referenceClass != null &&
+-          referenceClass.moduleAlias != definition.moduleAlias) {
++          referenceClass.type.moduleAlias != definition.type.moduleAlias) {
+         return [
+           SourceSpanSeverityException(
+             'A List relation is not allowed on module tables.',
+@@ -1398,7 +1398,7 @@ class Restrictions {
+ 
+     if (referenceClasses.isNotEmpty) {
+       var moduleAlias = type.moduleAlias;
+-      return referenceClasses.any((e) => e.moduleAlias == moduleAlias);
++      return referenceClasses.any((e) => e.type.moduleAlias == moduleAlias);
+     }
+ 
+     return true;
+diff --git a/tools/serverpod_cli/lib/src/generator/types.dart b/tools/serverpod_cli/lib/src/generator/types.dart
+index d73923db91..f85dd73154 100644
+--- a/tools/serverpod_cli/lib/src/generator/types.dart
++++ b/tools/serverpod_cli/lib/src/generator/types.dart
+@@ -13,6 +13,8 @@ import 'package:serverpod_shared/serverpod_shared.dart';
+ import '../config/config.dart';
+ 
+ const _moduleRef = 'module:';
++const _projectRef = 'project:';
++const _packageRef = 'package:';
+ 
+ /// Contains information about the type of fields, arguments and return values.
+ class TypeDefinition {
+@@ -77,7 +79,13 @@ class TypeDefinition {
+     if (url?.startsWith(_moduleRef) ?? false) {
+       return url?.substring(_moduleRef.length);
+     }
+-    return null;
++    if (url?.startsWith(_projectRef) ?? false) {
++      return null;
++    }
++    if (url?.startsWith(_packageRef) ?? false) {
++      return null;
++    }
++    return url;
+   }
+ 
+   /// Creates an [TypeDefinition] from [mixed] where the [url]
+@@ -437,7 +445,7 @@ class TypeDefinition {
+   ) {
+     var modelDefinition = classDefinitions
+         .where((c) => c.className == className)
+-        .where((c) => c.moduleAlias == defaultModuleAlias)
++        .where((c) => c.type.moduleAlias == defaultModuleAlias)
+         .firstOrNull;
+     bool isProjectModel =
+         url == defaultModuleAlias || (url == null && modelDefinition != null);
+diff --git a/tools/serverpod_cli/lib/src/test_util/builders/class_definition_builder.dart b/tools/serverpod_cli/lib/src/test_util/builders/class_definition_builder.dart
+index 41ed35ca0b..7d1a1e91f1 100644
+--- a/tools/serverpod_cli/lib/src/test_util/builders/class_definition_builder.dart
++++ b/tools/serverpod_cli/lib/src/test_util/builders/class_definition_builder.dart
+@@ -3,14 +3,12 @@ import 'package:serverpod_cli/src/analyzer/models/definitions.dart';
+ import 'package:serverpod_cli/src/generator/types.dart';
+ import 'package:serverpod_cli/src/test_util/builders/foreign_relation_definition_builder.dart';
+ import 'package:serverpod_cli/src/test_util/builders/type_definition_builder.dart';
+-import 'package:serverpod_cli/src/util/model_helper.dart';
+ 
+ import 'serializable_entity_field_definition_builder.dart';
+ 
+ typedef _FieldBuilder = SerializableModelFieldDefinition Function();
+ 
+ class ClassDefinitionBuilder {
+-  String _moduleAlias;
+   String _fileName;
+   String _sourceFileName;
+   String _className;
+@@ -27,8 +25,7 @@ class ClassDefinitionBuilder {
+   InheritanceDefinition? _extendsClass;
+ 
+   ClassDefinitionBuilder()
+-      : _moduleAlias = defaultModuleAlias,
+-        _fileName = 'example',
++      : _fileName = 'example',
+         _sourceFileName = 'example.yaml',
+         _className = 'Example',
+         _fields = [],
+@@ -54,7 +51,6 @@ class ClassDefinitionBuilder {
+     }
+ 
+     return ClassDefinition(
+-      moduleAlias: _moduleAlias,
+       fileName: _fileName,
+       sourceFileName: _sourceFileName,
+       className: _className,
+@@ -73,11 +69,6 @@ class ClassDefinitionBuilder {
+     );
+   }
+ 
+-  ClassDefinitionBuilder withModuleAlias(String moduleAlias) {
+-    _moduleAlias = moduleAlias;
+-    return this;
+-  }
+-
+   ClassDefinitionBuilder withFileName(String fileName) {
+     _fileName = fileName;
+     return this;
+diff --git a/tools/serverpod_cli/lib/src/test_util/builders/enum_definition_builder.dart b/tools/serverpod_cli/lib/src/test_util/builders/enum_definition_builder.dart
+index 0890bec1b5..b0802ef152 100644
+--- a/tools/serverpod_cli/lib/src/test_util/builders/enum_definition_builder.dart
++++ b/tools/serverpod_cli/lib/src/test_util/builders/enum_definition_builder.dart
+@@ -1,10 +1,8 @@
+ import 'package:serverpod_cli/src/analyzer/models/definitions.dart';
+ import 'package:serverpod_cli/src/test_util/builders/type_definition_builder.dart';
+-import 'package:serverpod_cli/src/util/model_helper.dart';
+ import 'package:serverpod_service_client/serverpod_service_client.dart';
+ 
+ class EnumDefinitionBuilder {
+-  String _moduleAlias;
+   String _fileName;
+   String _sourceFileName;
+   String _className;
+@@ -16,8 +14,7 @@ class EnumDefinitionBuilder {
+   List<String>? _documentation;
+ 
+   EnumDefinitionBuilder()
+-      : _moduleAlias = defaultModuleAlias,
+-        _fileName = 'example',
++      : _fileName = 'example',
+         _sourceFileName = 'example.yaml',
+         _className = 'Example',
+         _serialized = EnumSerialization.byIndex,
+@@ -32,7 +29,6 @@ class EnumDefinitionBuilder {
+ 
+   EnumDefinition build() {
+     var enumDefinition = EnumDefinition(
+-      moduleAlias: _moduleAlias,
+       fileName: _fileName,
+       sourceFileName: _sourceFileName,
+       className: _className,
+@@ -47,11 +43,6 @@ class EnumDefinitionBuilder {
+     return enumDefinition;
+   }
+ 
+-  EnumDefinitionBuilder withModuleAlias(String moduleAlias) {
+-    _moduleAlias = moduleAlias;
+-    return this;
+-  }
+-
+   EnumDefinitionBuilder withFileName(String fileName) {
+     _fileName = fileName;
+     return this;
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_datatype_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_datatype_test.dart
+index 6d9a199ab9..4691ba9676 100644
+--- a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_datatype_test.dart
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/field/field_datatype_test.dart
+@@ -171,7 +171,7 @@ fields:
+       test('then field projectModelDefinition type is the project model', () {
+         expect(
+           testClassDefinition
+-              ?.fields.first.type.projectModelDefinition?.moduleAlias,
++              ?.fields.first.type.projectModelDefinition?.type.moduleAlias,
+           'protocol',
+         );
+ 
+@@ -1144,60 +1144,110 @@ fields:
+     );
+   });
+ 
+-  test(
+-      'Given a class with a type starting with package: then do no type checking on the type and no errors are reported.',
+-      () {
+-    var models = [
+-      ModelSourceBuilder().withYaml(
+-        '''
++  group('Given a class with a type starting with package: ', () {
++    test('then do no type checking on the type and no errors are reported.',
++        () {
++      var models = [
++        ModelSourceBuilder().withYaml(
++          '''
+           class: Example
+           fields:
+             name: package:serverpod_cli/src/lib/example.dart:Example
+           ''',
+-      ).build()
+-    ];
++        ).build()
++      ];
+ 
+-    var collector = CodeGenerationCollector();
+-    StatefulAnalyzer analyzer = StatefulAnalyzer(
+-      config,
+-      models,
+-      onErrorsCollector(collector),
+-    );
+-    analyzer.validateAll();
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer analyzer = StatefulAnalyzer(
++        config,
++        models,
++        onErrorsCollector(collector),
++      );
++      analyzer.validateAll();
+ 
+-    expect(
+-      collector.errors,
+-      isEmpty,
+-      reason: 'Expected no errors, but one was generated.',
+-    );
++      expect(
++        collector.errors,
++        isEmpty,
++        reason: 'Expected no errors, but one was generated.',
++      );
++    });
++
++    test('then the field type moduleAlias is set to null.', () {
++      var models = [
++        ModelSourceBuilder().withYaml(
++          '''
++          class: Example
++          fields:
++            name: package:serverpod_cli/src/lib/example.dart:Example
++          ''',
++        ).build()
++      ];
++
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer analyzer = StatefulAnalyzer(
++        config,
++        models,
++        onErrorsCollector(collector),
++      );
++      var parsedModels = analyzer.validateAll();
++      var model = parsedModels.first as ClassDefinition;
++      var field = model.fields.first;
++
++      expect(field.type.moduleAlias, null);
++    });
+   });
+ 
+-  test(
+-      'Given a class with a type starting with project: then do no type checking on the type and no errors are reported.',
+-      () {
+-    var models = [
+-      ModelSourceBuilder().withYaml(
+-        '''
++  group('Given a class with a type starting with project: ', () {
++    test('then do no type checking on the type and no errors are reported.',
++        () {
++      var models = [
++        ModelSourceBuilder().withYaml(
++          '''
+           class: Example
+           fields:
+             name: project:src/lib/example.dart:Example
+           ''',
+-      ).build()
+-    ];
++        ).build()
++      ];
+ 
+-    var collector = CodeGenerationCollector();
+-    StatefulAnalyzer analyzer = StatefulAnalyzer(
+-      config,
+-      models,
+-      onErrorsCollector(collector),
+-    );
+-    analyzer.validateAll();
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer analyzer = StatefulAnalyzer(
++        config,
++        models,
++        onErrorsCollector(collector),
++      );
++      analyzer.validateAll();
+ 
+-    expect(
+-      collector.errors,
+-      isEmpty,
+-      reason: 'Expected no errors, but one was generated.',
+-    );
++      expect(
++        collector.errors,
++        isEmpty,
++        reason: 'Expected no errors, but one was generated.',
++      );
++    });
++
++    test('then the field type moduleAlias is set to null.', () {
++      var models = [
++        ModelSourceBuilder().withYaml(
++          '''
++          class: Example
++          fields:
++            name: project:src/lib/example.dart:Example
++          ''',
++        ).build()
++      ];
++
++      var collector = CodeGenerationCollector();
++      StatefulAnalyzer analyzer = StatefulAnalyzer(
++        config,
++        models,
++        onErrorsCollector(collector),
++      );
++      var parsedModels = analyzer.validateAll();
++      var model = parsedModels.first as ClassDefinition;
++      var field = model.fields.first;
++
++      expect(field.type.moduleAlias, null);
++    });
+   });
+ 
+   group('Given a class with a type set to the class name of a custom type', () {
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/model_name_conflict_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/model_name_conflict_test.dart
+index 19f044221b..7e3cdf2b1e 100644
+--- a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/model_name_conflict_test.dart
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/model_validation/model_name_conflict_test.dart
+@@ -63,7 +63,8 @@ void main() {
+ 
+       expect(enumField.type.enumDefinition, isA<EnumDefinition>());
+ 
+-      expect(enumField.type.enumDefinition?.moduleAlias, defaultModuleAlias);
++      expect(
++          enumField.type.enumDefinition?.type.moduleAlias, defaultModuleAlias);
+     });
+ 
+     test(
+@@ -117,7 +118,8 @@ void main() {
+ 
+       expect(enumField.type.enumDefinition, isA<EnumDefinition>());
+ 
+-      expect(enumField.type.enumDefinition?.moduleAlias, secondModuleAlias);
++      expect(
++          enumField.type.enumDefinition?.type.moduleAlias, secondModuleAlias);
+     });
+   });
+ 

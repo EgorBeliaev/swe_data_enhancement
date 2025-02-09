@@ -1,0 +1,1266 @@
+diff --git a/lib/collections/routes.dart b/lib/collections/routes.dart
+index 080cbd8a2..340b816ab 100644
+--- a/lib/collections/routes.dart
++++ b/lib/collections/routes.dart
+@@ -14,6 +14,7 @@ import 'package:spotube/pages/home/genres/genre_playlists.dart';
+ import 'package:spotube/pages/home/genres/genres.dart';
+ import 'package:spotube/pages/home/home.dart';
+ import 'package:spotube/pages/lastfm_login/lastfm_login.dart';
++import 'package:spotube/pages/library/local_folder.dart';
+ import 'package:spotube/pages/library/playlist_generate/playlist_generate.dart';
+ import 'package:spotube/pages/library/playlist_generate/playlist_generate_result.dart';
+ import 'package:spotube/pages/lyrics/mini_lyrics.dart';
+@@ -113,6 +114,17 @@ final routerProvider = Provider((ref) {
+                         ),
+                       ),
+                     ]),
++                GoRoute(
++                  path: "local",
++                  pageBuilder: (context, state) {
++                    assert(state.extra is String);
++                    return SpotubePage(
++                      child: LocalLibraryPage(state.extra as String,
++                        isDownloads: state.uri.queryParameters["downloads"] != null
++                      ),
++                    );
++                  },
++                ),
+               ]),
+           GoRoute(
+             path: "/lyrics",
+diff --git a/lib/collections/spotube_icons.dart b/lib/collections/spotube_icons.dart
+index 6de212840..2da09f528 100644
+--- a/lib/collections/spotube_icons.dart
++++ b/lib/collections/spotube_icons.dart
+@@ -121,4 +121,6 @@ abstract class SpotubeIcons {
+   static const monitor = FeatherIcons.monitor;
+   static const power = FeatherIcons.power;
+   static const bluetooth = FeatherIcons.bluetooth;
++  static const folderAdd = FeatherIcons.folderPlus;
++  static const folderRemove = FeatherIcons.folderMinus;
+ }
+diff --git a/lib/components/library/user_local_tracks.dart b/lib/components/library/user_local_tracks.dart
+index a7b2102b8..d5115aaaa 100644
+--- a/lib/components/library/user_local_tracks.dart
++++ b/lib/components/library/user_local_tracks.dart
+@@ -1,11 +1,14 @@
+ import 'dart:io';
+ 
+ import 'package:catcher_2/catcher_2.dart';
++import 'package:file_picker/file_picker.dart';
++import 'package:file_selector/file_selector.dart';
+ import 'package:flutter/foundation.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:collection/collection.dart';
+ import 'package:fuzzywuzzy/fuzzywuzzy.dart';
++import 'package:go_router/go_router.dart';
+ import 'package:hooks_riverpod/hooks_riverpod.dart';
+ import 'package:metadata_god/metadata_god.dart';
+ import 'package:mime/mime.dart';
+@@ -27,6 +30,7 @@ import 'package:spotube/extensions/track.dart';
+ import 'package:spotube/models/local_track.dart';
+ import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
+ import 'package:spotube/provider/user_preferences/user_preferences_provider.dart';
++import 'package:spotube/utils/platform.dart';
+ import 'package:spotube/utils/service_utils.dart';
+ // ignore: depend_on_referenced_packages
+ import 'package:flutter_rust_bridge/flutter_rust_bridge.dart' show FfiException;
+@@ -59,116 +63,125 @@ enum SortBy {
+   album,
+ }
+ 
+-final localTracksProvider = FutureProvider<List<LocalTrack>>((ref) async {
++final localTracksProvider = FutureProvider<Map<String, List<LocalTrack>>>((ref) async {
+   try {
+-    if (kIsWeb) return [];
++    if (kIsWeb) return {};
++    final Map<String, List<LocalTrack>> tracks = {};
++
+     final downloadLocation = ref.watch(
+       userPreferencesProvider.select((s) => s.downloadLocation),
+     );
+-    if (downloadLocation.isEmpty) return [];
+     final downloadDir = Directory(downloadLocation);
+     if (!await downloadDir.exists()) {
+       await downloadDir.create(recursive: true);
+-      return [];
+     }
+-    final entities = downloadDir.listSync(recursive: true);
+-
+-    final filesWithMetadata = (await Future.wait(
+-      entities.map((e) => File(e.path)).where((file) {
+-        final mimetype = lookupMimeType(file.path);
+-        return mimetype != null && supportedAudioTypes.contains(mimetype);
+-      }).map(
+-        (file) async {
+-          try {
+-            final metadata = await MetadataGod.readMetadata(file: file.path);
++    final localLibraryLocations = ref.watch(
++      userPreferencesProvider.select((s) => s.localLibraryLocation),
++    );
+ 
+-            final imageFile = File(join(
+-              (await getTemporaryDirectory()).path,
+-              "spotube",
+-              basenameWithoutExtension(file.path) +
+-                  imgMimeToExt[metadata.picture?.mimeType ?? "image/jpeg"]!,
+-            ));
+-            if (!await imageFile.exists() && metadata.picture != null) {
+-              await imageFile.create(recursive: true);
+-              await imageFile.writeAsBytes(
+-                metadata.picture?.data ?? [],
+-                mode: FileMode.writeOnly,
+-              );
+-            }
++    for (var location in [downloadLocation, ...localLibraryLocations]) {
++      if (location.isEmpty) continue;
++      final entities = <FileSystemEntity>[];
++      final dir = Directory(location);
++      if (await Directory(location).exists()) {
++        entities.addAll(Directory(location).listSync(recursive: true));
++      }
++
++      final filesWithMetadata = (await Future.wait(
++        entities.map((e) => File(e.path)).where((file) {
++          final mimetype = lookupMimeType(file.path);
++          return mimetype != null && supportedAudioTypes.contains(mimetype);
++        }).map(
++          (file) async {
++            try {
++              final metadata = await MetadataGod.readMetadata(file: file.path);
++
++              final imageFile = File(join(
++                (await getTemporaryDirectory()).path,
++                "spotube",
++                basenameWithoutExtension(file.path) +
++                    imgMimeToExt[metadata.picture?.mimeType ?? "image/jpeg"]!,
++              ));
++              if (!await imageFile.exists() && metadata.picture != null) {
++                await imageFile.create(recursive: true);
++                await imageFile.writeAsBytes(
++                  metadata.picture?.data ?? [],
++                  mode: FileMode.writeOnly,
++                );
++              }
+ 
+-            return {"metadata": metadata, "file": file, "art": imageFile.path};
+-          } catch (e, stack) {
+-            if (e is FfiException) {
+-              return {"file": file};
++              return {"metadata": metadata, "file": file, "art": imageFile.path};
++            } catch (e, stack) {
++              if (e is FfiException) {
++                return {"file": file};
++              }
++              Catcher2.reportCheckedError(e, stack);
++              return {};
+             }
+-            Catcher2.reportCheckedError(e, stack);
+-            return {};
+-          }
+-        },
+-      ),
+-    ))
+-        .where((e) => e.isNotEmpty)
+-        .toList();
+-
+-    final tracks = filesWithMetadata
+-        .map(
+-          (fileWithMetadata) => LocalTrack.fromTrack(
+-            track: Track().fromFile(
+-              fileWithMetadata["file"],
+-              metadata: fileWithMetadata["metadata"],
+-              art: fileWithMetadata["art"],
++          },
++        ),
++      ))
++          .where((e) => e.isNotEmpty)
++          .toList();
++
++      // ignore: no_leading_underscores_for_local_identifiers
++      final _tracks = filesWithMetadata
++          .map(
++            (fileWithMetadata) => LocalTrack.fromTrack(
++              track: Track().fromFile(
++                fileWithMetadata["file"],
++                metadata: fileWithMetadata["metadata"],
++                art: fileWithMetadata["art"],
++              ),
++              path: fileWithMetadata["file"].path,
+             ),
+-            path: fileWithMetadata["file"].path,
+-          ),
+-        )
+-        .toList();
++          )
++          .toList();
+ 
++      tracks[location] = _tracks;
++    }
+     return tracks;
+   } catch (e, stack) {
+     Catcher2.reportCheckedError(e, stack);
+-    return [];
++    return {};
+   }
+ });
+ 
+ class UserLocalTracks extends HookConsumerWidget {
+   const UserLocalTracks({super.key});
+ 
+-  Future<void> playLocalTracks(
+-    WidgetRef ref,
+-    List<LocalTrack> tracks, {
+-    LocalTrack? currentTrack,
+-  }) async {
+-    final playlist = ref.read(proxyPlaylistProvider);
+-    final playback = ref.read(proxyPlaylistProvider.notifier);
+-    currentTrack ??= tracks.first;
+-    final isPlaylistPlaying = playlist.containsTracks(tracks);
+-    if (!isPlaylistPlaying) {
+-      await playback.load(
+-        tracks,
+-        initialIndex: tracks.indexWhere((s) => s.id == currentTrack?.id),
+-        autoPlay: true,
+-      );
+-    } else if (isPlaylistPlaying &&
+-        currentTrack.id != null &&
+-        currentTrack.id != playlist.activeTrack?.id) {
+-      await playback.jumpToTrack(currentTrack);
+-    }
+-  }
+-
+   @override
+   Widget build(BuildContext context, ref) {
+-    final sortBy = useState<SortBy>(SortBy.none);
+-    final playlist = ref.watch(proxyPlaylistProvider);
+-    final trackSnapshot = ref.watch(localTracksProvider);
+-    final isPlaylistPlaying =
+-        playlist.containsTracks(trackSnapshot.asData?.value ?? []);
+-
+-    final searchController = useTextEditingController();
+-    useValueListenable(searchController);
+-    final searchFocus = useFocusNode();
+-    final isFiltering = useState(false);
+ 
+-    final controller = useScrollController();
++    final preferencesNotifier = ref.watch(userPreferencesProvider.notifier);
++    final preferences = ref.watch(userPreferencesProvider);
++
++    final addLocalLibraryLocation = useCallback(() async {
++      if (kIsMobile || kIsMacOS) {
++        final dirStr = await FilePicker.platform.getDirectoryPath(
++          initialDirectory: preferences.downloadLocation,
++        );
++        if (dirStr == null) return;
++        if (preferences.localLibraryLocation.contains(dirStr)) return;
++        preferencesNotifier.setLocalLibraryLocation([...preferences.localLibraryLocation, dirStr]);
++      } else {
++        String? dirStr = await getDirectoryPath(
++          initialDirectory: preferences.downloadLocation,
++        );
++        if (dirStr == null) return;
++        if (preferences.localLibraryLocation.contains(dirStr)) return;
++        preferencesNotifier.setLocalLibraryLocation([...preferences.localLibraryLocation, dirStr]);
++      }
++    }, [preferences.localLibraryLocation]);
++
++    final removeLocalLibraryLocation = useCallback((String location) {
++      if (!preferences.localLibraryLocation.contains(location)) return;
++      preferencesNotifier.setLocalLibraryLocation([...preferences.localLibraryLocation]..remove(location));
++    }, [preferences.localLibraryLocation]);
++
++    // This is just to pre-load the tracks.
++    // For now, this gets all of them.
++    ref.watch(localTracksProvider);
+ 
+     return Column(
+       children: [
+@@ -177,155 +190,42 @@ class UserLocalTracks extends HookConsumerWidget {
+           child: Row(
+             children: [
+               const SizedBox(width: 5),
+-              FilledButton(
+-                onPressed: trackSnapshot.asData?.value != null
+-                    ? () async {
+-                        if (trackSnapshot.asData?.value.isNotEmpty == true) {
+-                          if (!isPlaylistPlaying) {
+-                            await playLocalTracks(
+-                              ref,
+-                              trackSnapshot.asData!.value,
+-                            );
+-                          }
+-                        }
+-                      }
+-                    : null,
+-                child: Row(
+-                  children: [
+-                    Text(context.l10n.play),
+-                    Icon(
+-                      isPlaylistPlaying ? SpotubeIcons.stop : SpotubeIcons.play,
+-                    )
+-                  ],
+-                ),
+-              ),
+-              const Spacer(),
+-              ExpandableSearchButton(
+-                isFiltering: isFiltering.value,
+-                onPressed: (value) => isFiltering.value = value,
+-                searchFocus: searchFocus,
+-              ),
+-              const SizedBox(width: 10),
+-              SortTracksDropdown(
+-                value: sortBy.value,
+-                onChanged: (value) {
+-                  sortBy.value = value;
+-                },
+-              ),
+-              const SizedBox(width: 5),
+-              FilledButton(
+-                child: const Icon(SpotubeIcons.refresh),
+-                onPressed: () {
+-                  ref.invalidate(localTracksProvider);
+-                },
++              TextButton.icon(
++                icon: const Icon(SpotubeIcons.folderAdd),
++                label: Text(context.l10n.add_library_location),
++                onPressed: addLocalLibraryLocation,
+               )
+-            ],
+-          ),
++            ]
++          )
+         ),
+-        ExpandableSearchField(
+-          searchController: searchController,
+-          searchFocus: searchFocus,
+-          isFiltering: isFiltering.value,
+-          onChangeFiltering: (value) => isFiltering.value = value,
+-        ),
+-        trackSnapshot.when(
+-          data: (tracks) {
+-            final sortedTracks = useMemoized(() {
+-              return ServiceUtils.sortTracks(tracks, sortBy.value);
+-            }, [sortBy.value, tracks]);
+-
+-            final filteredTracks = useMemoized(() {
+-              if (searchController.text.isEmpty) {
+-                return sortedTracks;
++        Expanded(
++          child: ListView.builder(
++            itemCount: preferences.localLibraryLocation.length+1,
++            itemBuilder: (context, index) {
++              late final String location;
++              if (index == 0) {
++                location = preferences.downloadLocation;
++              } else {
++                location = preferences.localLibraryLocation[index-1];
+               }
+-              return sortedTracks
+-                  .map((e) => (
+-                        weightedRatio(
+-                          "${e.name} - ${e.artists?.asString() ?? ""}",
+-                          searchController.text,
+-                        ),
+-                        e,
+-                      ))
+-                  .toList()
+-                  .sorted(
+-                    (a, b) => b.$1.compareTo(a.$1),
+-                  )
+-                  .where((e) => e.$1 > 50)
+-                  .map((e) => e.$2)
+-                  .toList()
+-                  .toList();
+-            }, [searchController.text, sortedTracks]);
+-
+-            if (!trackSnapshot.isLoading && filteredTracks.isEmpty) {
+-              return const Expanded(
+-                child: Row(
+-                  mainAxisAlignment: MainAxisAlignment.center,
+-                  children: [NotFound()],
+-                ),
++              return ListTile(
++                title: preferences.downloadLocation != location ? Text(location)
++                : Text(context.l10n.downloads),
++                trailing: preferences.downloadLocation != location ? Tooltip(
++                  message: context.l10n.remove_library_location,
++                  child: IconButton(
++                    icon: Icon(SpotubeIcons.folderRemove, color: Colors.red[400]),
++                    onPressed: () => removeLocalLibraryLocation(location),
++                  ),
++                ) : null,
++                onTap: () async {
++                  context.go("/library/local${location == preferences.downloadLocation ? "?downloads=1" : ""}", extra: location);
++                }
+               );
+             }
+-
+-            return Expanded(
+-              child: RefreshIndicator(
+-                onRefresh: () async {
+-                  ref.invalidate(localTracksProvider);
+-                },
+-                child: InterScrollbar(
+-                  controller: controller,
+-                  child: Skeletonizer(
+-                    enabled: trackSnapshot.isLoading,
+-                    child: ListView.builder(
+-                      controller: controller,
+-                      physics: const AlwaysScrollableScrollPhysics(),
+-                      itemCount:
+-                          trackSnapshot.isLoading ? 5 : filteredTracks.length,
+-                      itemBuilder: (context, index) {
+-                        if (trackSnapshot.isLoading) {
+-                          return TrackTile(
+-                            playlist: playlist,
+-                            track: FakeData.track,
+-                            index: index,
+-                          );
+-                        }
+-
+-                        final track = filteredTracks[index];
+-                        return TrackTile(
+-                          index: index,
+-                          playlist: playlist,
+-                          track: track,
+-                          userPlaylist: false,
+-                          onTap: () async {
+-                            await playLocalTracks(
+-                              ref,
+-                              sortedTracks,
+-                              currentTrack: track,
+-                            );
+-                          },
+-                        );
+-                      },
+-                    ),
+-                  ),
+-                ),
+-              ),
+-            );
+-          },
+-          loading: () => Expanded(
+-            child: Skeletonizer(
+-              enabled: true,
+-              child: ListView.builder(
+-                itemCount: 5,
+-                itemBuilder: (context, index) => TrackTile(
+-                  track: FakeData.track,
+-                  index: index,
+-                  playlist: playlist,
+-                ),
+-              ),
+-            ),
+           ),
+-          error: (error, stackTrace) =>
+-              Text(error.toString() + stackTrace.toString()),
+-        )
+-      ],
++        ),
++      ]
+     );
+   }
+ }
+diff --git a/lib/l10n/app_en.arb b/lib/l10n/app_en.arb
+index 832862c01..a90fd35e9 100644
+--- a/lib/l10n/app_en.arb
++++ b/lib/l10n/app_en.arb
+@@ -107,6 +107,9 @@
+   "always_on_top": "Always on top",
+   "exit_mini_player": "Exit Mini player",
+   "download_location": "Download location",
++  "local_library": "Local library",
++  "add_library_location": "Add to library",
++  "remove_library_location": "Remove from library",
+   "account": "Account",
+   "login_with_spotify": "Login with your Spotify account",
+   "connect_with_spotify": "Connect with Spotify",
+@@ -295,6 +298,7 @@
+   "delete_playlist": "Delete Playlist",
+   "delete_playlist_confirmation": "Are you sure you want to delete this playlist?",
+   "local_tracks": "Local Tracks",
++  "local_tab": "Local",
+   "song_link": "Song Link",
+   "skip_this_nonsense": "Skip this nonsense",
+   "freedom_of_music": "“Freedom of Music”",
+@@ -321,4 +325,4 @@
+   "connect_client_alert": "You're being controlled by {client}",
+   "this_device": "This Device",
+   "remote": "Remote"
+-}
+\ No newline at end of file
++}
+diff --git a/lib/pages/library/library.dart b/lib/pages/library/library.dart
+index ccdb6a352..eff30348f 100644
+--- a/lib/pages/library/library.dart
++++ b/lib/pages/library/library.dart
+@@ -27,7 +27,7 @@ class LibraryPage extends HookConsumerWidget {
+             leading: ThemedButtonsTabBar(
+               tabs: [
+                 Tab(text: "  ${context.l10n.playlists}  "),
+-                Tab(text: "  ${context.l10n.local_tracks}  "),
++                Tab(text: "  ${context.l10n.local_tab}  "),
+                 Tab(
+                   child: Badge(
+                     isLabelVisible: downloadingCount > 0,
+diff --git a/lib/pages/library/local_folder.dart b/lib/pages/library/local_folder.dart
+new file mode 100644
+index 000000000..89d70e09c
+--- /dev/null
++++ b/lib/pages/library/local_folder.dart
+@@ -0,0 +1,236 @@
++import 'package:collection/collection.dart';
++import 'package:flutter/foundation.dart';
++import 'package:flutter/material.dart';
++import 'package:flutter_hooks/flutter_hooks.dart';
++import 'package:fuzzywuzzy/fuzzywuzzy.dart';
++import 'package:hooks_riverpod/hooks_riverpod.dart';
++import 'package:skeletonizer/skeletonizer.dart';
++import 'package:spotube/collections/fake.dart';
++import 'package:spotube/collections/spotube_icons.dart';
++import 'package:spotube/components/library/user_local_tracks.dart';
++import 'package:spotube/components/shared/expandable_search/expandable_search.dart';
++import 'package:spotube/components/shared/fallbacks/not_found.dart';
++import 'package:spotube/components/shared/inter_scrollbar/inter_scrollbar.dart';
++import 'package:spotube/components/shared/page_window_title_bar.dart';
++import 'package:spotube/components/shared/sort_tracks_dropdown.dart';
++import 'package:spotube/components/shared/track_tile/track_tile.dart';
++import 'package:spotube/extensions/artist_simple.dart';
++import 'package:spotube/extensions/context.dart';
++import 'package:spotube/models/local_track.dart';
++import 'package:spotube/provider/proxy_playlist/proxy_playlist_provider.dart';
++import 'package:spotube/utils/service_utils.dart';
++
++class LocalLibraryPage extends HookConsumerWidget {
++  final String location;
++  final bool isDownloads;
++  const LocalLibraryPage(this.location, {super.key, this.isDownloads = false});
++
++  Future<void> playLocalTracks(
++    WidgetRef ref,
++    List<LocalTrack> tracks, {
++    LocalTrack? currentTrack,
++  }) async {
++    final playlist = ref.read(proxyPlaylistProvider);
++    final playback = ref.read(proxyPlaylistProvider.notifier);
++    currentTrack ??= tracks.first;
++    final isPlaylistPlaying = playlist.containsTracks(tracks);
++    if (!isPlaylistPlaying) {
++      await playback.load(
++        tracks,
++        initialIndex: tracks.indexWhere((s) => s.id == currentTrack?.id),
++        autoPlay: true,
++      );
++    } else if (isPlaylistPlaying &&
++        currentTrack.id != null &&
++        currentTrack.id != playlist.activeTrack?.id) {
++      await playback.jumpToTrack(currentTrack);
++    }
++  }
++  
++  @override
++  Widget build(BuildContext context, ref) {
++    final sortBy = useState<SortBy>(SortBy.none);
++    final playlist = ref.watch(proxyPlaylistProvider);
++    final trackSnapshot = ref.watch(localTracksProvider);
++    final isPlaylistPlaying =
++        playlist.containsTracks(trackSnapshot.asData?.value.values.flattened.toList() ?? []);
++
++    final searchController = useTextEditingController();
++    useValueListenable(searchController);
++    final searchFocus = useFocusNode();
++    final isFiltering = useState(false);
++
++    final controller = useScrollController();
++    
++    return SafeArea(
++      bottom: false,
++      child: Scaffold(
++        appBar: PageWindowTitleBar(
++          leading: const BackButton(),
++          centerTitle: true,
++          title: Text(isDownloads ? context.l10n.downloads : location),
++          backgroundColor: Colors.transparent,
++        ),
++        extendBodyBehindAppBar: true,
++        body: Column(
++          children: [
++            const SizedBox(height: 56),
++            Padding(
++              padding: const EdgeInsets.all(8.0),
++              child: Row(
++                children: [
++                  const SizedBox(width: 5),
++                  FilledButton(
++                    onPressed: trackSnapshot.asData?.value != null
++                        ? () async {
++                            if (trackSnapshot.asData?.value.isNotEmpty == true) {
++                              if (!isPlaylistPlaying) {
++                                await playLocalTracks(
++                                  ref,
++                                  trackSnapshot.asData!.value[location] ?? [],
++                                );
++                              }
++                            }
++                          }
++                        : null,
++                    child: Row(
++                      children: [
++                        Text(context.l10n.play),
++                        Icon(
++                          isPlaylistPlaying ? SpotubeIcons.stop : SpotubeIcons.play,
++                        )
++                      ],
++                    ),
++                  ),
++                  const Spacer(),
++                  ExpandableSearchButton(
++                    isFiltering: isFiltering.value,
++                    onPressed: (value) => isFiltering.value = value,
++                    searchFocus: searchFocus,
++                  ),
++                  const SizedBox(width: 10),
++                  SortTracksDropdown(
++                    value: sortBy.value,
++                    onChanged: (value) {
++                      sortBy.value = value;
++                    },
++                  ),
++                  const SizedBox(width: 5),
++                  FilledButton(
++                    child: const Icon(SpotubeIcons.refresh),
++                    onPressed: () {
++                      ref.invalidate(localTracksProvider);
++                    },
++                  )
++                ],
++              ),
++            ),
++            ExpandableSearchField(
++              searchController: searchController,
++              searchFocus: searchFocus,
++              isFiltering: isFiltering.value,
++              onChangeFiltering: (value) => isFiltering.value = value,
++            ),
++            trackSnapshot.when(
++              data: (tracks) {
++                final sortedTracks = useMemoized(() {
++                  return ServiceUtils.sortTracks(tracks[location] ?? <LocalTrack>[], sortBy.value);
++                }, [sortBy.value, tracks]);
++
++                final filteredTracks = useMemoized(() {
++                  if (searchController.text.isEmpty) {
++                    return sortedTracks;
++                  }
++                  return sortedTracks
++                      .map((e) => (
++                            weightedRatio(
++                              "${e.name} - ${e.artists?.asString() ?? ""}",
++                              searchController.text,
++                            ),
++                            e,
++                          ))
++                      .toList()
++                      .sorted(
++                        (a, b) => b.$1.compareTo(a.$1),
++                      )
++                      .where((e) => e.$1 > 50)
++                      .map((e) => e.$2)
++                      .toList()
++                      .toList();
++                }, [searchController.text, sortedTracks]);
++
++                if (!trackSnapshot.isLoading && filteredTracks.isEmpty) {
++                  return const Expanded(
++                    child: Row(
++                      mainAxisAlignment: MainAxisAlignment.center,
++                      children: [NotFound()],
++                    ),
++                  );
++                }
++
++                return Expanded(
++                  child: RefreshIndicator(
++                    onRefresh: () async {
++                      ref.invalidate(localTracksProvider);
++                    },
++                    child: InterScrollbar(
++                      controller: controller,
++                      child: Skeletonizer(
++                        enabled: trackSnapshot.isLoading,
++                        child: ListView.builder(
++                          controller: controller,
++                          physics: const AlwaysScrollableScrollPhysics(),
++                          itemCount:
++                              trackSnapshot.isLoading ? 5 : filteredTracks.length,
++                          itemBuilder: (context, index) {
++                            if (trackSnapshot.isLoading) {
++                              return TrackTile(
++                                playlist: playlist,
++                                track: FakeData.track,
++                                index: index,
++                              );
++                            }
++
++                            final track = filteredTracks[index];
++                            return TrackTile(
++                              index: index,
++                              playlist: playlist,
++                              track: track,
++                              userPlaylist: false,
++                              onTap: () async {
++                                await playLocalTracks(
++                                  ref,
++                                  sortedTracks,
++                                  currentTrack: track,
++                                );
++                              },
++                            );
++                          },
++                        ),
++                      ),
++                    ),
++                  ),
++                );
++              },
++              loading: () => Expanded(
++                child: Skeletonizer(
++                  enabled: true,
++                  child: ListView.builder(
++                    itemCount: 5,
++                    itemBuilder: (context, index) => TrackTile(
++                      track: FakeData.track,
++                      index: index,
++                      playlist: playlist,
++                    ),
++                  ),
++                ),
++              ),
++              error: (error, stackTrace) =>
++                  Text(error.toString() + stackTrace.toString()),
++            )
++          ],
++        ) 
++      ),
++    );
++  }
++}
+diff --git a/lib/pages/settings/sections/downloads.dart b/lib/pages/settings/sections/downloads.dart
+index 76ef8e3e9..3092ed03f 100644
+--- a/lib/pages/settings/sections/downloads.dart
++++ b/lib/pages/settings/sections/downloads.dart
+@@ -3,6 +3,7 @@ import 'package:file_selector/file_selector.dart';
+ import 'package:flutter/material.dart';
+ import 'package:flutter_hooks/flutter_hooks.dart';
+ import 'package:hooks_riverpod/hooks_riverpod.dart';
++import 'package:go_router/go_router.dart';
+ import 'package:spotube/collections/spotube_icons.dart';
+ import 'package:spotube/components/settings/section_card_with_heading.dart';
+ import 'package:spotube/extensions/context.dart';
+diff --git a/lib/provider/user_preferences/user_preferences_provider.dart b/lib/provider/user_preferences/user_preferences_provider.dart
+index a537038e2..d34586f33 100644
+--- a/lib/provider/user_preferences/user_preferences_provider.dart
++++ b/lib/provider/user_preferences/user_preferences_provider.dart
+@@ -69,6 +69,11 @@ class UserPreferencesNotifier extends PersistedStateNotifier<UserPreferences> {
+     state = state.copyWith(downloadLocation: downloadDir);
+   }
+ 
++  void setLocalLibraryLocation(List<String> localLibraryDirs) {
++    //if (localLibraryDir.isEmpty) return;
++    state = state.copyWith(localLibraryLocation: localLibraryDirs);
++  }
++
+   void setLayoutMode(LayoutMode mode) {
+     state = state.copyWith(layoutMode: mode);
+   }
+diff --git a/lib/provider/user_preferences/user_preferences_state.dart b/lib/provider/user_preferences/user_preferences_state.dart
+index 67eb18a24..56f66375e 100644
+--- a/lib/provider/user_preferences/user_preferences_state.dart
++++ b/lib/provider/user_preferences/user_preferences_state.dart
+@@ -84,6 +84,7 @@ class UserPreferences with _$UserPreferences {
+     @Default(Market.US) Market recommendationMarket,
+     @Default(SearchMode.youtube) SearchMode searchMode,
+     @Default("") String downloadLocation,
++    @Default([]) List<String> localLibraryLocation,
+     @Default("https://pipedapi.kavin.rocks") String pipedInstance,
+     @Default(ThemeMode.system) ThemeMode themeMode,
+     @Default(AudioSource.youtube) AudioSource audioSource,
+diff --git a/lib/provider/user_preferences/user_preferences_state.freezed.dart b/lib/provider/user_preferences/user_preferences_state.freezed.dart
+index 94015d37d..89c7210a3 100644
+--- a/lib/provider/user_preferences/user_preferences_state.freezed.dart
++++ b/lib/provider/user_preferences/user_preferences_state.freezed.dart
+@@ -43,6 +43,7 @@ mixin _$UserPreferences {
+   Market get recommendationMarket => throw _privateConstructorUsedError;
+   SearchMode get searchMode => throw _privateConstructorUsedError;
+   String get downloadLocation => throw _privateConstructorUsedError;
++  List<String> get localLibraryLocation => throw _privateConstructorUsedError;
+   String get pipedInstance => throw _privateConstructorUsedError;
+   ThemeMode get themeMode => throw _privateConstructorUsedError;
+   AudioSource get audioSource => throw _privateConstructorUsedError;
+@@ -88,6 +89,7 @@ abstract class $UserPreferencesCopyWith<$Res> {
+       Market recommendationMarket,
+       SearchMode searchMode,
+       String downloadLocation,
++      List<String> localLibraryLocation,
+       String pipedInstance,
+       ThemeMode themeMode,
+       AudioSource audioSource,
+@@ -126,6 +128,7 @@ class _$UserPreferencesCopyWithImpl<$Res, $Val extends UserPreferences>
+     Object? recommendationMarket = null,
+     Object? searchMode = null,
+     Object? downloadLocation = null,
++    Object? localLibraryLocation = null,
+     Object? pipedInstance = null,
+     Object? themeMode = null,
+     Object? audioSource = null,
+@@ -196,6 +199,10 @@ class _$UserPreferencesCopyWithImpl<$Res, $Val extends UserPreferences>
+           ? _value.downloadLocation
+           : downloadLocation // ignore: cast_nullable_to_non_nullable
+               as String,
++      localLibraryLocation: null == localLibraryLocation
++          ? _value.localLibraryLocation
++          : localLibraryLocation // ignore: cast_nullable_to_non_nullable
++              as List<String>,
+       pipedInstance: null == pipedInstance
+           ? _value.pipedInstance
+           : pipedInstance // ignore: cast_nullable_to_non_nullable
+@@ -264,6 +271,7 @@ abstract class _$$UserPreferencesImplCopyWith<$Res>
+       Market recommendationMarket,
+       SearchMode searchMode,
+       String downloadLocation,
++      List<String> localLibraryLocation,
+       String pipedInstance,
+       ThemeMode themeMode,
+       AudioSource audioSource,
+@@ -300,6 +308,7 @@ class __$$UserPreferencesImplCopyWithImpl<$Res>
+     Object? recommendationMarket = null,
+     Object? searchMode = null,
+     Object? downloadLocation = null,
++    Object? localLibraryLocation = null,
+     Object? pipedInstance = null,
+     Object? themeMode = null,
+     Object? audioSource = null,
+@@ -370,6 +379,10 @@ class __$$UserPreferencesImplCopyWithImpl<$Res>
+           ? _value.downloadLocation
+           : downloadLocation // ignore: cast_nullable_to_non_nullable
+               as String,
++      localLibraryLocation: null == localLibraryLocation
++          ? _value._localLibraryLocation
++          : localLibraryLocation // ignore: cast_nullable_to_non_nullable
++              as List<String>,
+       pipedInstance: null == pipedInstance
+           ? _value.pipedInstance
+           : pipedInstance // ignore: cast_nullable_to_non_nullable
+@@ -433,6 +446,7 @@ class _$UserPreferencesImpl implements _UserPreferences {
+       this.recommendationMarket = Market.US,
+       this.searchMode = SearchMode.youtube,
+       this.downloadLocation = "",
++      final List<String> localLibraryLocation = const [],
+       this.pipedInstance = "https://pipedapi.kavin.rocks",
+       this.themeMode = ThemeMode.system,
+       this.audioSource = AudioSource.youtube,
+@@ -440,7 +454,8 @@ class _$UserPreferencesImpl implements _UserPreferences {
+       this.downloadMusicCodec = SourceCodecs.m4a,
+       this.discordPresence = true,
+       this.endlessPlayback = true,
+-      this.enableConnect = false});
++      this.enableConnect = false})
++      : _localLibraryLocation = localLibraryLocation;
+ 
+   factory _$UserPreferencesImpl.fromJson(Map<String, dynamic> json) =>
+       _$$UserPreferencesImplFromJson(json);
+@@ -496,6 +511,16 @@ class _$UserPreferencesImpl implements _UserPreferences {
+   @override
+   @JsonKey()
+   final String downloadLocation;
++  final List<String> _localLibraryLocation;
++  @override
++  @JsonKey()
++  List<String> get localLibraryLocation {
++    if (_localLibraryLocation is EqualUnmodifiableListView)
++      return _localLibraryLocation;
++    // ignore: implicit_dynamic_type
++    return EqualUnmodifiableListView(_localLibraryLocation);
++  }
++
+   @override
+   @JsonKey()
+   final String pipedInstance;
+@@ -523,7 +548,7 @@ class _$UserPreferencesImpl implements _UserPreferences {
+ 
+   @override
+   String toString() {
+-    return 'UserPreferences(audioQuality: $audioQuality, albumColorSync: $albumColorSync, amoledDarkTheme: $amoledDarkTheme, checkUpdate: $checkUpdate, normalizeAudio: $normalizeAudio, showSystemTrayIcon: $showSystemTrayIcon, skipNonMusic: $skipNonMusic, systemTitleBar: $systemTitleBar, closeBehavior: $closeBehavior, accentColorScheme: $accentColorScheme, layoutMode: $layoutMode, locale: $locale, recommendationMarket: $recommendationMarket, searchMode: $searchMode, downloadLocation: $downloadLocation, pipedInstance: $pipedInstance, themeMode: $themeMode, audioSource: $audioSource, streamMusicCodec: $streamMusicCodec, downloadMusicCodec: $downloadMusicCodec, discordPresence: $discordPresence, endlessPlayback: $endlessPlayback, enableConnect: $enableConnect)';
++    return 'UserPreferences(audioQuality: $audioQuality, albumColorSync: $albumColorSync, amoledDarkTheme: $amoledDarkTheme, checkUpdate: $checkUpdate, normalizeAudio: $normalizeAudio, showSystemTrayIcon: $showSystemTrayIcon, skipNonMusic: $skipNonMusic, systemTitleBar: $systemTitleBar, closeBehavior: $closeBehavior, accentColorScheme: $accentColorScheme, layoutMode: $layoutMode, locale: $locale, recommendationMarket: $recommendationMarket, searchMode: $searchMode, downloadLocation: $downloadLocation, localLibraryLocation: $localLibraryLocation, pipedInstance: $pipedInstance, themeMode: $themeMode, audioSource: $audioSource, streamMusicCodec: $streamMusicCodec, downloadMusicCodec: $downloadMusicCodec, discordPresence: $discordPresence, endlessPlayback: $endlessPlayback, enableConnect: $enableConnect)';
+   }
+ 
+   @override
+@@ -560,6 +585,8 @@ class _$UserPreferencesImpl implements _UserPreferences {
+                 other.searchMode == searchMode) &&
+             (identical(other.downloadLocation, downloadLocation) ||
+                 other.downloadLocation == downloadLocation) &&
++            const DeepCollectionEquality()
++                .equals(other._localLibraryLocation, _localLibraryLocation) &&
+             (identical(other.pipedInstance, pipedInstance) ||
+                 other.pipedInstance == pipedInstance) &&
+             (identical(other.themeMode, themeMode) ||
+@@ -597,6 +624,7 @@ class _$UserPreferencesImpl implements _UserPreferences {
+         recommendationMarket,
+         searchMode,
+         downloadLocation,
++        const DeepCollectionEquality().hash(_localLibraryLocation),
+         pipedInstance,
+         themeMode,
+         audioSource,
+@@ -647,6 +675,7 @@ abstract class _UserPreferences implements UserPreferences {
+       final Market recommendationMarket,
+       final SearchMode searchMode,
+       final String downloadLocation,
++      final List<String> localLibraryLocation,
+       final String pipedInstance,
+       final ThemeMode themeMode,
+       final AudioSource audioSource,
+@@ -698,6 +727,8 @@ abstract class _UserPreferences implements UserPreferences {
+   @override
+   String get downloadLocation;
+   @override
++  List<String> get localLibraryLocation;
++  @override
+   String get pipedInstance;
+   @override
+   ThemeMode get themeMode;
+diff --git a/lib/provider/user_preferences/user_preferences_state.g.dart b/lib/provider/user_preferences/user_preferences_state.g.dart
+index 930b1dd17..95ed4b035 100644
+--- a/lib/provider/user_preferences/user_preferences_state.g.dart
++++ b/lib/provider/user_preferences/user_preferences_state.g.dart
+@@ -44,6 +44,10 @@ _$UserPreferencesImpl _$$UserPreferencesImplFromJson(
+           $enumDecodeNullable(_$SearchModeEnumMap, json['searchMode']) ??
+               SearchMode.youtube,
+       downloadLocation: json['downloadLocation'] as String? ?? "",
++      localLibraryLocation: (json['localLibraryLocation'] as List<dynamic>?)
++              ?.map((e) => e as String)
++              .toList() ??
++          const [],
+       pipedInstance:
+           json['pipedInstance'] as String? ?? "https://pipedapi.kavin.rocks",
+       themeMode: $enumDecodeNullable(_$ThemeModeEnumMap, json['themeMode']) ??
+@@ -81,6 +85,7 @@ Map<String, dynamic> _$$UserPreferencesImplToJson(
+       'recommendationMarket': _$MarketEnumMap[instance.recommendationMarket]!,
+       'searchMode': _$SearchModeEnumMap[instance.searchMode]!,
+       'downloadLocation': instance.downloadLocation,
++      'localLibraryLocation': instance.localLibraryLocation,
+       'pipedInstance': instance.pipedInstance,
+       'themeMode': _$ThemeModeEnumMap[instance.themeMode]!,
+       'audioSource': _$AudioSourceEnumMap[instance.audioSource]!,
+diff --git a/linux/flutter/generated_plugin_registrant.cc b/linux/flutter/generated_plugin_registrant.cc
+index 6dfdd7409..2f61edd64 100644
+--- a/linux/flutter/generated_plugin_registrant.cc
++++ b/linux/flutter/generated_plugin_registrant.cc
+@@ -14,6 +14,7 @@
+ #include <media_kit_libs_linux/media_kit_libs_linux_plugin.h>
+ #include <screen_retriever/screen_retriever_plugin.h>
+ #include <system_theme/system_theme_plugin.h>
++#include <system_tray/system_tray_plugin.h>
+ #include <tray_manager/tray_manager_plugin.h>
+ #include <url_launcher_linux/url_launcher_plugin.h>
+ #include <window_manager/window_manager_plugin.h>
+@@ -44,6 +45,9 @@ void fl_register_plugins(FlPluginRegistry* registry) {
+   g_autoptr(FlPluginRegistrar) system_theme_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "SystemThemePlugin");
+   system_theme_plugin_register_with_registrar(system_theme_registrar);
++  g_autoptr(FlPluginRegistrar) system_tray_registrar =
++      fl_plugin_registry_get_registrar_for_plugin(registry, "SystemTrayPlugin");
++  system_tray_plugin_register_with_registrar(system_tray_registrar);
+   g_autoptr(FlPluginRegistrar) tray_manager_registrar =
+       fl_plugin_registry_get_registrar_for_plugin(registry, "TrayManagerPlugin");
+   tray_manager_plugin_register_with_registrar(tray_manager_registrar);
+diff --git a/linux/flutter/generated_plugins.cmake b/linux/flutter/generated_plugins.cmake
+index 93ffd3e95..48c7e0cad 100644
+--- a/linux/flutter/generated_plugins.cmake
++++ b/linux/flutter/generated_plugins.cmake
+@@ -11,6 +11,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
+   media_kit_libs_linux
+   screen_retriever
+   system_theme
++  system_tray
+   tray_manager
+   url_launcher_linux
+   window_manager
+diff --git a/macos/Flutter/GeneratedPluginRegistrant.swift b/macos/Flutter/GeneratedPluginRegistrant.swift
+index 84f393411..0057db144 100644
+--- a/macos/Flutter/GeneratedPluginRegistrant.swift
++++ b/macos/Flutter/GeneratedPluginRegistrant.swift
+@@ -21,6 +21,7 @@ import screen_retriever
+ import shared_preferences_foundation
+ import sqflite
+ import system_theme
++import system_tray
+ import tray_manager
+ import url_launcher_macos
+ import window_manager
+@@ -43,6 +44,7 @@ func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
+   SharedPreferencesPlugin.register(with: registry.registrar(forPlugin: "SharedPreferencesPlugin"))
+   SqflitePlugin.register(with: registry.registrar(forPlugin: "SqflitePlugin"))
+   SystemThemePlugin.register(with: registry.registrar(forPlugin: "SystemThemePlugin"))
++  SystemTrayPlugin.register(with: registry.registrar(forPlugin: "SystemTrayPlugin"))
+   TrayManagerPlugin.register(with: registry.registrar(forPlugin: "TrayManagerPlugin"))
+   UrlLauncherPlugin.register(with: registry.registrar(forPlugin: "UrlLauncherPlugin"))
+   WindowManagerPlugin.register(with: registry.registrar(forPlugin: "WindowManagerPlugin"))
+diff --git a/pubspec.lock b/pubspec.lock
+index df623b9e1..61de3f25f 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -1455,12 +1455,13 @@ packages:
+     source: hosted
+     version: "1.0.9"
+   media_kit_native_event_loop:
+-    dependency: transitive
++    dependency: "direct overridden"
+     description:
+-      name: media_kit_native_event_loop
+-      sha256: a605cf185499d14d58935b8784955a92a4bf0ff4e19a23de3d17a9106303930e
+-      url: "https://pub.dev"
+-    source: hosted
++      path: media_kit_native_event_loop
++      ref: main
++      resolved-ref: "285f7919bbf4a7d89a62615b14a3766a171ad575"
++      url: "https://github.com/media-kit/media-kit"
++    source: git
+     version: "1.0.8"
+   menu_base:
+     dependency: transitive
+@@ -2156,6 +2157,15 @@ packages:
+       url: "https://pub.dev"
+     source: hosted
+     version: "0.0.2"
++  system_tray:
++    dependency: "direct overridden"
++    description:
++      path: "."
++      ref: dc7ef410d5cfec897edf060c1c4baff69f7c181c
++      resolved-ref: dc7ef410d5cfec897edf060c1c4baff69f7c181c
++      url: "https://github.com/antler119/system_tray"
++    source: git
++    version: "2.0.2"
+   term_glyph:
+     dependency: transitive
+     description:
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 7435e077c..dc60abf62 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -150,6 +150,17 @@ dev_dependencies:
+ 
+ dependency_overrides:
+   uuid: ^4.4.0
++  system_tray:
++    # TODO: remove this when flutter_desktop_tools gets updated
++    # to use [MenuItemBase] instead of [MenuItem]
++    git:
++      url: https://github.com/antler119/system_tray
++      ref: dc7ef410d5cfec897edf060c1c4baff69f7c181c
++  media_kit_native_event_loop: # to fix "macro name must be an identifier"
++    git:
++      url: https://github.com/media-kit/media-kit
++      path: media_kit_native_event_loop
++      ref: main
+ 
+ flutter:
+   generate: true
+diff --git a/untranslated_messages.json b/untranslated_messages.json
+index 9e26dfeeb..91b751eb0 100644
+--- a/untranslated_messages.json
++++ b/untranslated_messages.json
+@@ -1 +1,155 @@
+-{}
+\ No newline at end of file
++{
++  "ar": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "bn": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "ca": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "cs": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "de": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "es": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "fa": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "fr": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "hi": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "it": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "ja": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "ko": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "ne": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "nl": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "pl": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "pt": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "ru": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "th": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "tr": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "uk": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "vi": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ],
++
++  "zh": [
++    "local_library",
++    "add_library_location",
++    "remove_library_location",
++    "local_tab"
++  ]
++}
+diff --git a/windows/flutter/generated_plugin_registrant.cc b/windows/flutter/generated_plugin_registrant.cc
+index 57542decb..f2dd97143 100644
+--- a/windows/flutter/generated_plugin_registrant.cc
++++ b/windows/flutter/generated_plugin_registrant.cc
+@@ -16,6 +16,7 @@
+ #include <permission_handler_windows/permission_handler_windows_plugin.h>
+ #include <screen_retriever/screen_retriever_plugin.h>
+ #include <system_theme/system_theme_plugin.h>
++#include <system_tray/system_tray_plugin.h>
+ #include <tray_manager/tray_manager_plugin.h>
+ #include <url_launcher_windows/url_launcher_windows.h>
+ #include <window_manager/window_manager_plugin.h>
+@@ -42,6 +43,8 @@ void RegisterPlugins(flutter::PluginRegistry* registry) {
+       registry->GetRegistrarForPlugin("ScreenRetrieverPlugin"));
+   SystemThemePluginRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("SystemThemePlugin"));
++  SystemTrayPluginRegisterWithRegistrar(
++      registry->GetRegistrarForPlugin("SystemTrayPlugin"));
+   TrayManagerPluginRegisterWithRegistrar(
+       registry->GetRegistrarForPlugin("TrayManagerPlugin"));
+   UrlLauncherWindowsRegisterWithRegistrar(
+diff --git a/windows/flutter/generated_plugins.cmake b/windows/flutter/generated_plugins.cmake
+index 6a0c77230..f4e142808 100644
+--- a/windows/flutter/generated_plugins.cmake
++++ b/windows/flutter/generated_plugins.cmake
+@@ -13,6 +13,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
+   permission_handler_windows
+   screen_retriever
+   system_theme
++  system_tray
+   tray_manager
+   url_launcher_windows
+   window_manager

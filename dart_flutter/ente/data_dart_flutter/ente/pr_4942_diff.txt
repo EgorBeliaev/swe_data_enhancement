@@ -1,0 +1,68 @@
+diff --git a/mobile/lib/services/filedata/model/file_data.dart b/mobile/lib/services/filedata/model/file_data.dart
+index 4e479bdc7dd..5b92d93225f 100644
+--- a/mobile/lib/services/filedata/model/file_data.dart
++++ b/mobile/lib/services/filedata/model/file_data.dart
+@@ -80,11 +80,16 @@ class FileDataEntity {
+         )
+       : null;
+ 
+-  RemoteClipEmbedding? get clipEmbedding => remoteRawData[_clipKey] != null
+-      ? RemoteClipEmbedding.fromJson(
+-          remoteRawData[_clipKey] as Map<String, dynamic>,
+-        )
+-      : null;
++  RemoteClipEmbedding? getClipEmbeddingIfCompatible(
++    int minClipMlVersion,
++  ) {
++    final clipData = remoteRawData[_clipKey];
++    if (clipData == null) return null;
++
++    final clipEmbedding =
++        RemoteClipEmbedding.fromJson(clipData as Map<String, dynamic>);
++    return clipEmbedding.version >= minClipMlVersion ? clipEmbedding : null;
++  }
+ }
+ 
+ class RemoteFaceEmbedding {
+diff --git a/mobile/lib/utils/ml_util.dart b/mobile/lib/utils/ml_util.dart
+index 06ba53c1d68..d17f2f7ecce 100644
+--- a/mobile/lib/utils/ml_util.dart
++++ b/mobile/lib/utils/ml_util.dart
+@@ -217,13 +217,14 @@ Stream<List<FileMLInstruction>> fetchEmbeddingsAndInstructions(
+         faces.addAll(facesFromRemoteEmbedding);
+         existingInstruction.shouldRunFaces = false;
+       }
+-      if (fileMl.clipEmbedding != null &&
+-          fileMl.clipEmbedding!.version >= clipMlVersion) {
++      final remoteClipEmbedding =
++          fileMl.getClipEmbeddingIfCompatible(clipMlVersion);
++      if (remoteClipEmbedding != null) {
+         clipEmbeddings.add(
+           ClipEmbedding(
+             fileID: fileMl.fileID,
+-            embedding: fileMl.clipEmbedding!.embedding,
+-            version: fileMl.clipEmbedding!.version,
++            embedding: remoteClipEmbedding.embedding,
++            version: remoteClipEmbedding.version,
+           ),
+         );
+         existingInstruction.shouldRunClip = false;
+@@ -235,6 +236,9 @@ Stream<List<FileMLInstruction>> fetchEmbeddingsAndInstructions(
+         pendingIndex[fileMl.fileID] = existingInstruction;
+       }
+     }
++
++    await mlDataDB.bulkInsertFaces(faces);
++    await mlDataDB.putClip(clipEmbeddings);
+     for (final fileID in pendingIndex.keys) {
+       final instruction = pendingIndex[fileID]!;
+       if (instruction.pendingML) {
+@@ -246,8 +250,6 @@ Stream<List<FileMLInstruction>> fetchEmbeddingsAndInstructions(
+         }
+       }
+     }
+-    await mlDataDB.bulkInsertFaces(faces);
+-    await mlDataDB.putClip(clipEmbeddings);
+   }
+   // Yield any remaining instructions
+   if (batchToYield.isNotEmpty) {

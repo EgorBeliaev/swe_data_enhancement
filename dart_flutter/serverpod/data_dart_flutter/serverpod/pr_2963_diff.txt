@@ -1,0 +1,825 @@
+diff --git a/tools/serverpod_cli/lib/src/analyzer/dart/definitions.dart b/tools/serverpod_cli/lib/src/analyzer/dart/definitions.dart
+index 5b6bd77c20..f1fc10b57e 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/dart/definitions.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/dart/definitions.dart
+@@ -20,9 +20,6 @@ class EndpointDefinition {
+   /// The methods this endpoint defines.
+   final List<MethodDefinition> methods;
+ 
+-  /// The subdirectories this endpoints dart file is stored in,
+-  final List<String> subDirParts;
+-
+   /// Create a new [EndpointDefinition].
+   const EndpointDefinition({
+     required this.name,
+@@ -30,7 +27,6 @@ class EndpointDefinition {
+     required this.methods,
+     required this.className,
+     required this.filePath,
+-    required this.subDirParts,
+   });
+ }
+ 
+diff --git a/tools/serverpod_cli/lib/src/analyzer/dart/endpoint_analyzers/endpoint_class_analyzer.dart b/tools/serverpod_cli/lib/src/analyzer/dart/endpoint_analyzers/endpoint_class_analyzer.dart
+index fb2ec5f6d2..477eb9fc65 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/dart/endpoint_analyzers/endpoint_class_analyzer.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/dart/endpoint_analyzers/endpoint_class_analyzer.dart
+@@ -1,5 +1,4 @@
+ import 'package:analyzer/dart/element/element.dart';
+-import 'package:path/path.dart' as path;
+ import 'package:serverpod_cli/src/analyzer/code_analysis_collector.dart';
+ import 'package:serverpod_cli/src/analyzer/dart/definitions.dart';
+ import 'package:serverpod_cli/src/analyzer/dart/element_extensions.dart';
+@@ -11,12 +10,10 @@ abstract class EndpointClassAnalyzer {
+     ClassElement element,
+     List<MethodDefinition> methodDefinitions,
+     String filePath,
+-    String rootPath,
+   ) {
+     var className = element.name;
+     var endpointName = _formatEndpointName(className);
+     var classDocumentationComment = element.documentationComment;
+-    var subDirectoryParts = _getSubdirectoryParts(filePath, rootPath);
+ 
+     return EndpointDefinition(
+       name: endpointName,
+@@ -24,7 +21,6 @@ abstract class EndpointClassAnalyzer {
+       className: className,
+       methods: methodDefinitions,
+       filePath: filePath,
+-      subDirParts: subDirectoryParts,
+     );
+   }
+ 
+@@ -73,21 +69,4 @@ abstract class EndpointClassAnalyzer {
+ 
+     return endpointName;
+   }
+-
+-  static List<String> _getSubdirectoryParts(String filePath, String rootPath) {
+-    // Get the subdirectory of the filePath by removing the first elements
+-    // of the root path and the file path as long as they match.
+-    var rootPathParts = path.split(rootPath);
+-    var fileDirPathParts = path.split(path.dirname(filePath));
+-    while (rootPathParts.isNotEmpty && fileDirPathParts.isNotEmpty) {
+-      if (rootPathParts.first == fileDirPathParts.first) {
+-        rootPathParts.removeAt(0);
+-        fileDirPathParts.removeAt(0);
+-      } else {
+-        break;
+-      }
+-    }
+-
+-    return fileDirPathParts;
+-  }
+ }
+diff --git a/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart b/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
+index 2a11cd90d0..d9b0d92002 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
+@@ -20,10 +20,10 @@ class EndpointsAnalyzer {
+ 
+   /// Create a new [EndpointsAnalyzer], containing a
+   /// [AnalysisContextCollection] that analyzes all dart files in the
+-  /// provided [endpointDirectory].
+-  EndpointsAnalyzer(Directory endpointDirectory)
++  /// provided [directory].
++  EndpointsAnalyzer(Directory directory)
+       : collection = AnalysisContextCollection(
+-          includedPaths: [endpointDirectory.absolute.path],
++          includedPaths: [directory.absolute.path],
+           resourceProvider: PhysicalResourceProvider.INSTANCE,
+         );
+ 
+@@ -37,9 +37,14 @@ class EndpointsAnalyzer {
+ 
+     var endpointDefs = <EndpointDefinition>[];
+ 
+-    List<(ResolvedLibraryResult, String, String)> validLibraries = [];
++    List<(ResolvedLibraryResult, String)> validLibraries = [];
+     Map<String, int> endpointClassMap = {};
+-    await for (var (library, filePath, rootPath) in _libraries) {
++    await for (var (library, filePath) in _libraries) {
++      var endpointClasses = _getEndpointClasses(library);
++      if (endpointClasses.isEmpty) {
++        continue;
++      }
++
+       var maybeDartErrors = await _getErrorsForFile(library.session, filePath);
+       if (maybeDartErrors.isNotEmpty) {
+         collector.addError(
+@@ -55,7 +60,7 @@ class EndpointsAnalyzer {
+         continue;
+       }
+ 
+-      for (var endpointClass in _getEndpointClasses(library)) {
++      for (var endpointClass in endpointClasses) {
+         var className = endpointClass.name;
+         endpointClassMap.update(
+           className,
+@@ -64,7 +69,7 @@ class EndpointsAnalyzer {
+         );
+       }
+ 
+-      validLibraries.add((library, filePath, rootPath));
++      validLibraries.add((library, filePath));
+     }
+ 
+     var duplicateEndpointClasses = endpointClassMap.entries
+@@ -72,7 +77,7 @@ class EndpointsAnalyzer {
+         .map((entry) => entry.key)
+         .toSet();
+ 
+-    for (var (library, filePath, rootPath) in validLibraries) {
++    for (var (library, filePath) in validLibraries) {
+       var severityExceptions = _validateLibrary(
+         library,
+         filePath,
+@@ -86,7 +91,6 @@ class EndpointsAnalyzer {
+         library,
+         collector,
+         filePath,
+-        rootPath,
+         failingExceptions,
+       ));
+     }
+@@ -116,7 +120,6 @@ class EndpointsAnalyzer {
+     ResolvedLibraryResult library,
+     CodeAnalysisCollector collector,
+     String filePath,
+-    String rootPath,
+     Map<String, List<SourceSpanSeverityException>> validationErrors,
+   ) {
+     var topElements = library.element.topLevelElements;
+@@ -150,7 +153,6 @@ class EndpointsAnalyzer {
+         classElement,
+         methodDefs,
+         filePath,
+-        rootPath,
+       );
+ 
+       endpointDefs.add(endpointDefinition);
+@@ -209,7 +211,7 @@ class EndpointsAnalyzer {
+     return validationErrors;
+   }
+ 
+-  Stream<(ResolvedLibraryResult, String, String)> get _libraries async* {
++  Stream<(ResolvedLibraryResult, String)> get _libraries async* {
+     for (var context in collection.contexts) {
+       var analyzedFiles = context.contextRoot.analyzedFiles().toList();
+       analyzedFiles.sort();
+@@ -219,7 +221,7 @@ class EndpointsAnalyzer {
+       for (var filePath in analyzedDartFiles) {
+         var library = await context.currentSession.getResolvedLibrary(filePath);
+         if (library is ResolvedLibraryResult) {
+-          yield (library, filePath, context.contextRoot.root.path);
++          yield (library, filePath);
+         }
+       }
+     }
+diff --git a/tools/serverpod_cli/lib/src/config/config.dart b/tools/serverpod_cli/lib/src/config/config.dart
+index bff8d8bb6d..033992b4c3 100644
+--- a/tools/serverpod_cli/lib/src/config/config.dart
++++ b/tools/serverpod_cli/lib/src/config/config.dart
+@@ -117,6 +117,14 @@ class GeneratorConfig {
+   /// server package.
+   List<String> get generatedServeModelPackagePathParts => ['src', 'generated'];
+ 
++  /// The path parts of the generated endpoint file.
++  List<String> get generatedServerEndpointFilePathParts =>
++      [...generatedServeModelPathParts, 'endpoints.dart'];
++
++  /// The path parts of the generated protocol file.
++  List<String> get generatedServerProtocolFilePathParts =>
++      [...generatedServeModelPathParts, 'protocol.dart'];
++
+   /// The path parts of the directory, where the generated code is stored in the
+   /// server package.
+   List<String> get generatedServeModelPathParts => [
+diff --git a/tools/serverpod_cli/lib/src/generator/dart/library_generators/library_generator.dart b/tools/serverpod_cli/lib/src/generator/dart/library_generators/library_generator.dart
+index 907384ddc6..ead3c0d97a 100644
+--- a/tools/serverpod_cli/lib/src/generator/dart/library_generators/library_generator.dart
++++ b/tools/serverpod_cli/lib/src/generator/dart/library_generators/library_generator.dart
+@@ -757,13 +757,15 @@ class LibraryGenerator {
+     ]).code;
+   }
+ 
++  String? _generatedDirectoryPathCache;
++  String _buildGeneratedDirectoryPath() => _generatedDirectoryPathCache ??=
++      p.joinAll([...config.generatedServeModelPathParts]);
++
+   String _endpointPath(EndpointDefinition endpoint) {
+-    return p.posix.joinAll([
+-      '..',
+-      'endpoints',
+-      ...endpoint.subDirParts,
+-      p.basename(endpoint.filePath),
+-    ]);
++    return p.relative(
++      endpoint.filePath,
++      from: _buildGeneratedDirectoryPath(),
++    );
+   }
+ 
+   Code _buildEndpointLookupMap(List<EndpointDefinition> endpoints) {
+diff --git a/tools/serverpod_cli/lib/src/generator/dart/server_code_generator.dart b/tools/serverpod_cli/lib/src/generator/dart/server_code_generator.dart
+index c66ac943bd..031fdd7ca1 100644
+--- a/tools/serverpod_cli/lib/src/generator/dart/server_code_generator.dart
++++ b/tools/serverpod_cli/lib/src/generator/dart/server_code_generator.dart
+@@ -76,9 +76,9 @@ class DartServerCodeGenerator extends CodeGenerator {
+     );
+ 
+     var codeMap = {
+-      p.joinAll([...config.generatedServeModelPathParts, 'protocol.dart']):
++      p.joinAll([...config.generatedServerProtocolFilePathParts]):
+           serverClassGenerator.generateProtocol().generateCode(),
+-      p.joinAll([...config.generatedServeModelPathParts, 'endpoints.dart']):
++      p.joinAll([...config.generatedServerEndpointFilePathParts]):
+           serverClassGenerator.generateServerEndpointDispatch().generateCode(),
+     };
+ 
+diff --git a/tools/serverpod_cli/lib/src/run/file_watcher.dart b/tools/serverpod_cli/lib/src/run/file_watcher.dart
+deleted file mode 100644
+index 7eac99286a..0000000000
+--- a/tools/serverpod_cli/lib/src/run/file_watcher.dart
++++ /dev/null
+@@ -1,40 +0,0 @@
+-import 'package:watcher/watcher.dart';
+-import 'package:path/path.dart' as p;
+-
+-import '../config/config.dart';
+-
+-class SourceFileWatcher {
+-  final Future<void> Function(String path, bool isProtocol) onChangedSourceFile;
+-  final Future<void> Function(String path) onRemovedProtocolFile;
+-  final GeneratorConfig config;
+-
+-  SourceFileWatcher({
+-    required this.onChangedSourceFile,
+-    required this.onRemovedProtocolFile,
+-    required this.config,
+-  });
+-
+-  Future<void> watch() async {
+-    var watcherClasses = DirectoryWatcher(p.joinAll(config.libSourcePathParts));
+-    await for (WatchEvent event in watcherClasses.events) {
+-      if (event.path
+-          .startsWith(p.joinAll(config.generatedServeModelPathParts))) {
+-        continue;
+-      }
+-      switch (event.type) {
+-        case ChangeType.ADD:
+-        case ChangeType.MODIFY:
+-          await onChangedSourceFile(event.path, _isPathInProtocol(event.path));
+-          break;
+-        case ChangeType.REMOVE:
+-          await onRemovedProtocolFile(event.path);
+-          break;
+-      }
+-    }
+-  }
+-
+-  bool _isPathInProtocol(String path) =>
+-      (path.startsWith('${p.joinAll(config.protocolSourcePathParts)}/') ||
+-          path.startsWith('${p.joinAll(config.endpointsSourcePathParts)}/')) &&
+-      (path.endsWith('.dart') || path.endsWith('.yaml'));
+-}
+diff --git a/tools/serverpod_cli/lib/src/test_util/builders/endpoint_definition_builder.dart b/tools/serverpod_cli/lib/src/test_util/builders/endpoint_definition_builder.dart
+index 84e2497efd..50cf154f00 100644
+--- a/tools/serverpod_cli/lib/src/test_util/builders/endpoint_definition_builder.dart
++++ b/tools/serverpod_cli/lib/src/test_util/builders/endpoint_definition_builder.dart
+@@ -6,7 +6,6 @@ class EndpointDefinitionBuilder {
+   String _className = 'ExampleEndpoint';
+   String _filePath = 'example.dart';
+   List<MethodDefinition> _methods = [];
+-  List<String> _subDirParts = [];
+ 
+   EndpointDefinitionBuilder();
+ 
+@@ -36,11 +35,6 @@ class EndpointDefinitionBuilder {
+     return this;
+   }
+ 
+-  EndpointDefinitionBuilder withSubDirParts(List<String> subDirParts) {
+-    _subDirParts = subDirParts;
+-    return this;
+-  }
+-
+   EndpointDefinition build() {
+     return EndpointDefinition(
+       name: _name,
+@@ -48,7 +42,6 @@ class EndpointDefinitionBuilder {
+       className: _className,
+       filePath: _filePath,
+       methods: _methods,
+-      subDirParts: _subDirParts,
+     );
+   }
+ }
+diff --git a/tools/serverpod_cli/test/generator/dart/server_code_generator/endpoints_test.dart b/tools/serverpod_cli/test/generator/dart/server_code_generator/endpoints_test.dart
+index 63cd3ca8ee..90eae611f4 100644
+--- a/tools/serverpod_cli/test/generator/dart/server_code_generator/endpoints_test.dart
++++ b/tools/serverpod_cli/test/generator/dart/server_code_generator/endpoints_test.dart
+@@ -23,21 +23,25 @@ void main() {
+   group(
+       'Given protocol definition without endpoints when generating endpoints file',
+       () {
+-    var protocolDefinition = const ProtocolDefinition(
+-      endpoints: [],
+-      models: [],
+-    );
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++    setUpAll(() {
++      var protocolDefinition = const ProtocolDefinition(
++        endpoints: [],
++        models: [],
++      );
+ 
+-    var codeMap = generator.generateProtocolCode(
+-      protocolDefinition: protocolDefinition,
+-      config: config,
+-    );
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++      endpointsFile = codeMap[expectedFileName];
++    });
+ 
+     test('then endpoints file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
+ 
+-    var endpointsFile = codeMap[expectedFileName];
+     group(
+       'then endpoints file',
+       () {
+@@ -49,7 +53,6 @@ void main() {
+           expect(endpointsFile, isNot(contains('connectors')));
+         });
+       },
+-      skip: endpointsFile == null,
+     );
+   });
+ 
+@@ -57,26 +60,31 @@ void main() {
+       'Given protocol definition with endpoint when generating endpoints file',
+       () {
+     var endpointName = 'testing';
+-    var protocolDefinition = ProtocolDefinition(
+-      endpoints: [
+-        EndpointDefinitionBuilder()
+-            .withClassName('${endpointName.pascalCase}Endpoint')
+-            .withName(endpointName)
+-            .build(),
+-      ],
+-      models: [],
+-    );
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++    setUpAll(() {
++      var protocolDefinition = ProtocolDefinition(
++        endpoints: [
++          EndpointDefinitionBuilder()
++              .withClassName('${endpointName.pascalCase}Endpoint')
++              .withName(endpointName)
++              .build(),
++        ],
++        models: [],
++      );
+ 
+-    var codeMap = generator.generateProtocolCode(
+-      protocolDefinition: protocolDefinition,
+-      config: config,
+-    );
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++
++      endpointsFile = codeMap[expectedFileName];
++    });
+ 
+     test('then endpoints file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
+ 
+-    var endpointsFile = codeMap[expectedFileName];
+     group(
+       'then endpoints file',
+       () {
+@@ -88,7 +96,6 @@ void main() {
+           expect(endpointsFile, contains('connectors[\'$endpointName\']'));
+         });
+       },
+-      skip: endpointsFile == null,
+     );
+   });
+ 
+@@ -97,29 +104,34 @@ void main() {
+       () {
+     var firstEndpointName = 'testing1';
+     var secondEndpointName = 'testing2';
+-    var protocolDefinition = ProtocolDefinition(
+-      endpoints: [
+-        EndpointDefinitionBuilder()
+-            .withClassName('${firstEndpointName.pascalCase}Endpoint')
+-            .withName(firstEndpointName)
+-            .build(),
+-        EndpointDefinitionBuilder()
+-            .withClassName('${secondEndpointName.pascalCase}Endpoint')
+-            .withName(secondEndpointName)
+-            .build(),
+-      ],
+-      models: [],
+-    );
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++
++    setUpAll(() {
++      var protocolDefinition = ProtocolDefinition(
++        endpoints: [
++          EndpointDefinitionBuilder()
++              .withClassName('${firstEndpointName.pascalCase}Endpoint')
++              .withName(firstEndpointName)
++              .build(),
++          EndpointDefinitionBuilder()
++              .withClassName('${secondEndpointName.pascalCase}Endpoint')
++              .withName(secondEndpointName)
++              .build(),
++        ],
++        models: [],
++      );
+ 
+-    var codeMap = generator.generateProtocolCode(
+-      protocolDefinition: protocolDefinition,
+-      config: config,
+-    );
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++      endpointsFile = codeMap[expectedFileName];
++    });
+ 
+     test('then endpoints file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
+-    var endpointsFile = codeMap[expectedFileName];
+ 
+     group(
+       'then endpoints file',
+@@ -134,7 +146,6 @@ void main() {
+               endpointsFile, contains('connectors[\'$secondEndpointName\']'));
+         });
+       },
+-      skip: endpointsFile == null,
+     );
+   });
+ 
+@@ -143,31 +154,37 @@ void main() {
+       () {
+     var endpointName = 'testing';
+     var methodName = 'streamMethod';
+-    var protocolDefinition = ProtocolDefinition(
+-      endpoints: [
+-        EndpointDefinitionBuilder()
+-            .withClassName('${endpointName.pascalCase}Endpoint')
+-            .withName(endpointName)
+-            .withMethods([
+-          MethodDefinitionBuilder()
+-              .withName(methodName)
+-              .withReturnType(
+-                  TypeDefinitionBuilder().withStreamOf('String').build())
+-              .buildMethodStreamDefinition(),
+-        ]).build(),
+-      ],
+-      models: [],
+-    );
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++
++    setUpAll(() {
++      var protocolDefinition = ProtocolDefinition(
++        endpoints: [
++          EndpointDefinitionBuilder()
++              .withClassName('${endpointName.pascalCase}Endpoint')
++              .withName(endpointName)
++              .withMethods([
++            MethodDefinitionBuilder()
++                .withName(methodName)
++                .withReturnType(
++                    TypeDefinitionBuilder().withStreamOf('String').build())
++                .buildMethodStreamDefinition(),
++          ]).build(),
++        ],
++        models: [],
++      );
+ 
+-    var codeMap = generator.generateProtocolCode(
+-      protocolDefinition: protocolDefinition,
+-      config: config,
+-    );
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++
++      endpointsFile = codeMap[expectedFileName];
++    });
+ 
+     test('then endpoints file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
+-    var endpointsFile = codeMap[expectedFileName];
+ 
+     test('then endpoints file contains MethodStreamConnector for method.', () {
+       expect(
+@@ -188,33 +205,37 @@ void main() {
+       () {
+     var endpointName = 'testing';
+     var methodName = 'streamMethod';
+-    var protocolDefinition = ProtocolDefinition(
+-      endpoints: [
+-        EndpointDefinitionBuilder()
+-            .withClassName('${endpointName.pascalCase}Endpoint')
+-            .withName(endpointName)
+-            .withMethods([
+-          MethodDefinitionBuilder().withName(methodName).withParameters([
+-            ParameterDefinition(
+-              name: 'streamParam',
+-              type: TypeDefinitionBuilder().withStreamOf('String').build(),
+-              required: false,
+-            ),
+-          ]).buildMethodStreamDefinition(),
+-        ]).build(),
+-      ],
+-      models: [],
+-    );
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++    setUpAll(() {
++      var protocolDefinition = ProtocolDefinition(
++        endpoints: [
++          EndpointDefinitionBuilder()
++              .withClassName('${endpointName.pascalCase}Endpoint')
++              .withName(endpointName)
++              .withMethods([
++            MethodDefinitionBuilder().withName(methodName).withParameters([
++              ParameterDefinition(
++                name: 'streamParam',
++                type: TypeDefinitionBuilder().withStreamOf('String').build(),
++                required: false,
++              ),
++            ]).buildMethodStreamDefinition(),
++          ]).build(),
++        ],
++        models: [],
++      );
+ 
+-    var codeMap = generator.generateProtocolCode(
+-      protocolDefinition: protocolDefinition,
+-      config: config,
+-    );
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++      endpointsFile = codeMap[expectedFileName];
++    });
+ 
+     test('then endpoints file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
+-    var endpointsFile = codeMap[expectedFileName];
+ 
+     test('then endpoints file contains MethodStreamConnector for method.', () {
+       expect(
+@@ -246,21 +267,65 @@ void main() {
+       () {
+     var endpointName = 'testing';
+     var methodName = 'deprecatedMethod';
++    late Map<String, String> codeMap;
++    late String? endpointsFile;
++    setUpAll(() {
++      var protocolDefinition = ProtocolDefinition(
++        endpoints: [
++          EndpointDefinitionBuilder()
++              .withClassName('${endpointName.pascalCase}Endpoint')
++              .withName(endpointName)
++              .withMethods([
++            MethodDefinitionBuilder().withName(methodName).withAnnotations([
++              const AnnotationDefinition(
++                name: 'Deprecated',
++                arguments: ["'This method is deprecated.'"],
++                methodCallAnalyzerIgnoreRule:
++                    'deprecated_member_use_from_same_package',
++              )
++            ]).buildMethodCallDefinition(),
++          ]).build(),
++        ],
++        models: [],
++      );
++
++      codeMap = generator.generateProtocolCode(
++        protocolDefinition: protocolDefinition,
++        config: config,
++      );
++      endpointsFile = codeMap[expectedFileName];
++    });
++
++    test('then endpoint file is created.', () {
++      expect(codeMap, contains(expectedFileName));
++    });
++
++    test(
++        'then endpoint file contains "ignore: deprecated_member_use_from_same_package" comment for method.',
++        () {
++      expect(
++        endpointsFile,
++        contains(
++          '\n// ignore: deprecated_member_use_from_same_package\n',
++        ),
++      );
++    });
++  });
++
++  group(
++      'Given a protocol definition with an endpoint defined in the lib folder',
++      () {
+     var protocolDefinition = ProtocolDefinition(
+       endpoints: [
+         EndpointDefinitionBuilder()
+-            .withClassName('${endpointName.pascalCase}Endpoint')
+-            .withName(endpointName)
+-            .withMethods([
+-          MethodDefinitionBuilder().withName(methodName).withAnnotations([
+-            const AnnotationDefinition(
+-              name: 'Deprecated',
+-              arguments: ["'This method is deprecated.'"],
+-              methodCallAnalyzerIgnoreRule:
+-                  'deprecated_member_use_from_same_package',
+-            )
+-          ]).buildMethodCallDefinition(),
+-        ]).build(),
++            .withClassName('MyEndpoint')
++            .withName('myEndpoint')
++            .withFilePath(path.joinAll([
++              ...config.serverPackageDirectoryPathParts,
++              'lib',
++              'my_endpoint.dart'
++            ]))
++            .build(),
+       ],
+       models: [],
+     );
+@@ -270,20 +335,19 @@ void main() {
+       config: config,
+     );
+ 
+-    test('then client file is created.', () {
++    test('then endpoint file is created.', () {
+       expect(codeMap, contains(expectedFileName));
+     });
++
+     var endpointsFile = codeMap[expectedFileName];
+ 
+-    test(
+-        'then client file contains "ignore: deprecated_member_use_from_same_package" comment for method.',
+-        () {
+-      expect(
+-        endpointsFile,
+-        contains(
+-          '\n// ignore: deprecated_member_use_from_same_package\n',
+-        ),
+-      );
++    test('then import path is correct.', () {
++      var importPath = path.joinAll([
++        '..',
++        '..',
++        'my_endpoint.dart',
++      ]);
++      expect(endpointsFile, contains("import '$importPath' as "));
+     });
+   });
+ }
+diff --git a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_class_test.dart b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_class_test.dart
+index eb3afd9c8e..ec6cdf62ea 100644
+--- a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_class_test.dart
++++ b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_class_test.dart
+@@ -90,11 +90,6 @@ class ExampleEndpoint extends Endpoint {
+               'endpoint.dart',
+             ));
+       });
+-
+-      test('has expected subDirParts.', () {
+-        var subDirParts = endpointDefinitions.firstOrNull?.subDirParts;
+-        expect(subDirParts, isEmpty);
+-      });
+     });
+   });
+ 
+diff --git a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_file_test.dart b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_file_test.dart
+index d761a983de..1a86942cef 100644
+--- a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_file_test.dart
++++ b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/endpoint_file_test.dart
+@@ -130,10 +130,16 @@ class ExampleEndpoint extends Endpoint {
+       expect(endpointDefinitions, hasLength(1));
+     });
+ 
+-    test('then endpoint definition has expected subDirParts.', () {
+-      var subDirParts = endpointDefinitions.firstOrNull?.subDirParts;
+-      expect(subDirParts, hasLength(1));
+-      expect(subDirParts?.first, 'subdirectory');
++    test('then endpoint definition has expected file path.', () {
++      var filePath = endpointDefinitions.firstOrNull?.filePath;
++      expect(
++          filePath,
++          path.join(
++            Directory.current.path,
++            testDirectory.path,
++            'subdirectory',
++            'endpoint.dart',
++          ));
+     });
+   });
+ 
+diff --git a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/invalid_dart_endpoints_test.dart b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/invalid_dart_endpoints_test.dart
+index 613a598378..f8639d175d 100644
+--- a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/invalid_dart_endpoints_test.dart
++++ b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/invalid_dart_endpoints_test.dart
+@@ -196,4 +196,73 @@ class ExampleEndpointValid extends Endpoint {
+       expect(endpointDefinitions, hasLength(1));
+     });
+   });
++
++  group('Given an invalid dart file without an endpoint definition', () {
++    var collector = CodeGenerationCollector();
++    var testDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      var invalidDartFile =
++          File(path.join(testDirectory.path, 'my_class.dart'));
++      invalidDartFile.createSync(recursive: true);
++      // Class is missing closing brackets
++      invalidDartFile.writeAsStringSync('''
++class InvalidClass {
++
++
++''');
++      analyzer = EndpointsAnalyzer(testDirectory);
++      await analyzer.analyze(collector: collector);
++    });
++
++    test('then no validation error for invalid Dart syntax is reported.', () {
++      expect(collector.errors, isEmpty);
++    });
++  });
++
++  group(
++      'Given an invalid dart file without an endpoint definition and a valid endpoint definition file',
++      () {
++    var collector = CodeGenerationCollector();
++    var testDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late List<EndpointDefinition> endpointDefinitions;
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      var invalidDartFile =
++          File(path.join(testDirectory.path, 'my_class.dart'));
++      invalidDartFile.createSync(recursive: true);
++      // Class is missing closing brackets
++      invalidDartFile.writeAsStringSync('''
++class InvalidClass {
++
++
++''');
++      var secondEndpointFile =
++          File(path.join(testDirectory.path, 'valid_endpoint.dart'));
++      secondEndpointFile.createSync(recursive: true);
++      secondEndpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpointValid extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++      analyzer = EndpointsAnalyzer(testDirectory);
++      endpointDefinitions = await analyzer.analyze(collector: collector);
++    });
++
++    test('then no validation error for invalid Dart syntax is reported.', () {
++      expect(collector.errors, isEmpty);
++    });
++
++    test('then one endpoint definitions is created.', () {
++      expect(endpointDefinitions, hasLength(1));
++    });
++  });
+ }

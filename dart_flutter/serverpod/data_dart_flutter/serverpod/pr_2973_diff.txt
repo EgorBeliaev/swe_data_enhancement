@@ -1,0 +1,884 @@
+diff --git a/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart b/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
+index 4af3c0c752..19c75df6c5 100644
+--- a/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
++++ b/tests/serverpod_cli_e2e_test/test/generate_watch_test.dart
+@@ -67,14 +67,6 @@ void main() async {
+       createProcess.kill();
+       generateWatch?.kill();
+       generateStreamSearch.cancel();
+-
+-      await Process.run(
+-        'docker',
+-        ['compose', 'down', '-v'],
+-        workingDirectory: commandRoot,
+-      );
+-
+-      while (!await isNetworkPortAvailable(8090)) {}
+     });
+ 
+     test('then the entity files are generated and updated as expected.',
+@@ -242,14 +234,6 @@ fields:
+       createProcess.kill();
+       generateWatch?.kill();
+       generateStreamSearch.cancel();
+-
+-      await Process.run(
+-        'docker',
+-        ['compose', 'down', '-v'],
+-        workingDirectory: commandRoot,
+-      );
+-
+-      while (!await isNetworkPortAvailable(8090)) {}
+     });
+     test('then endpoint dispatcher is generated and updated as expected.',
+         () async {
+@@ -422,14 +406,6 @@ class TestEndpoint extends Endpoint {
+       createProcess.kill();
+       generateWatch?.kill();
+       generateStreamSearch.cancel();
+-
+-      await Process.run(
+-        'docker',
+-        ['compose', 'down', '-v'],
+-        workingDirectory: commandRoot,
+-      );
+-
+-      while (!await isNetworkPortAvailable(8090)) {}
+     });
+     test('then client endpoint dispatcher is updated as expected.', () async {
+       // Add endpoint file
+diff --git a/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart b/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
+index d9b0d92002..e79c542909 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/dart/endpoints_analyzer.dart
+@@ -11,6 +11,7 @@ import 'package:serverpod_cli/src/analyzer/code_analysis_collector.dart';
+ import 'package:serverpod_cli/src/analyzer/dart/endpoint_analyzers/endpoint_class_analyzer.dart';
+ import 'package:serverpod_cli/src/analyzer/dart/endpoint_analyzers/endpoint_method_analyzer.dart';
+ import 'package:serverpod_cli/src/analyzer/dart/endpoint_analyzers/endpoint_parameter_analyzer.dart';
++import 'package:serverpod_cli/src/generator/code_generation_collector.dart';
+ 
+ import 'definitions.dart';
+ 
+@@ -18,6 +19,8 @@ import 'definitions.dart';
+ class EndpointsAnalyzer {
+   final AnalysisContextCollection collection;
+ 
++  final String absoluteIncludedPaths;
++
+   /// Create a new [EndpointsAnalyzer], containing a
+   /// [AnalysisContextCollection] that analyzes all dart files in the
+   /// provided [directory].
+@@ -25,10 +28,33 @@ class EndpointsAnalyzer {
+       : collection = AnalysisContextCollection(
+           includedPaths: [directory.absolute.path],
+           resourceProvider: PhysicalResourceProvider.INSTANCE,
+-        );
++        ),
++        absoluteIncludedPaths = directory.absolute.path;
++
++  Set<EndpointDefinition> _endpointDefinitions = {};
++
++  /// Inform the analyzer that the provided [filePaths] have been updated.
++  ///
++  /// This will trigger a re-analysis of the files and return true if the
++  /// updated files should trigger a code generation.
++  Future<bool> updateFileContexts(Set<String> filePaths) async {
++    await _refreshContextForFiles(filePaths);
++
++    var oldDefinitionsLength = _endpointDefinitions.length;
++    await analyze(collector: CodeGenerationCollector());
++
++    if (_endpointDefinitions.length != oldDefinitionsLength) {
++      return true;
++    }
++
++    return filePaths.any((e) => _isEndpointFile(File(e)));
++  }
+ 
+   /// Analyze all files in the [AnalysisContextCollection].
+-  /// Use [changedFiles] to mark files, that need reloading.
++  ///
++  /// [changedFiles] is an optional list of files that should have their context
++  /// refreshed before analysis. This is useful when only a subset of files have
++  /// changed since [updateFileContexts] was last called.
+   Future<List<EndpointDefinition>> analyze({
+     required CodeAnalysisCollector collector,
+     Set<String>? changedFiles,
+@@ -95,6 +121,7 @@ class EndpointsAnalyzer {
+       ));
+     }
+ 
++    _endpointDefinitions = endpointDefs.toSet();
+     return endpointDefs;
+   }
+ 
+@@ -173,6 +200,17 @@ class EndpointsAnalyzer {
+     }
+   }
+ 
++  bool _isEndpointFile(File file) {
++    if (!file.absolute.path.startsWith(absoluteIncludedPaths)) return false;
++    if (!file.path.endsWith('.dart')) return false;
++    if (!file.existsSync()) return false;
++
++    var contents = file.readAsStringSync();
++    if (!contents.contains('extends Endpoint')) return false;
++
++    return true;
++  }
++
+   Map<String, List<SourceSpanSeverityException>> _validateLibrary(
+     ResolvedLibraryResult library,
+     String filePath,
+diff --git a/tools/serverpod_cli/lib/src/analyzer/models/stateful_analyzer.dart b/tools/serverpod_cli/lib/src/analyzer/models/stateful_analyzer.dart
+index 9acddfeb92..b01886700d 100644
+--- a/tools/serverpod_cli/lib/src/analyzer/models/stateful_analyzer.dart
++++ b/tools/serverpod_cli/lib/src/analyzer/models/stateful_analyzer.dart
+@@ -13,6 +13,11 @@ class StatefulAnalyzer {
+   final Map<String, _ModelState> _modelStates = {};
+   List<SerializableModelDefinition> _models = [];
+ 
++  /// Returns true if any of the models have severe errors.
++  bool get hasSeverErrors => _modelStates.values.any(
++        (state) => CodeAnalysisCollector.containsSeverErrors(state.errors),
++      );
++
+   Function(Uri, CodeGenerationCollector)? _onErrorsChangedNotifier;
+ 
+   StatefulAnalyzer(
+diff --git a/tools/serverpod_cli/lib/src/commands/generate.dart b/tools/serverpod_cli/lib/src/commands/generate.dart
+index 82ba2b8106..94a83c4214 100644
+--- a/tools/serverpod_cli/lib/src/commands/generate.dart
++++ b/tools/serverpod_cli/lib/src/commands/generate.dart
+@@ -5,11 +5,13 @@ import 'package:path/path.dart' as path;
+ import 'package:pub_semver/pub_semver.dart';
+ 
+ import 'package:serverpod_cli/analyzer.dart';
++import 'package:serverpod_cli/src/analyzer/models/stateful_analyzer.dart';
+ import 'package:serverpod_cli/src/generated/version.dart';
+ import 'package:serverpod_cli/src/generator/generator.dart';
+ import 'package:serverpod_cli/src/generator/generator_continuous.dart';
+ import 'package:serverpod_cli/src/runner/serverpod_command.dart';
+ import 'package:serverpod_cli/src/serverpod_packages_version_check/serverpod_packages_version_check.dart';
++import 'package:serverpod_cli/src/util/model_helper.dart';
+ import 'package:serverpod_cli/src/util/serverpod_cli_logger.dart';
+ 
+ class GenerateCommand extends ServerpodCommand {
+@@ -59,11 +61,17 @@ class GenerateCommand extends ServerpodCommand {
+         Directory(path.joinAll(config.endpointsSourcePathParts));
+     var endpointsAnalyzer = EndpointsAnalyzer(endpointDirectory);
+ 
++    var yamlModels = await ModelHelper.loadProjectYamlModelsFromDisk(config);
++    var modelAnalyzer = StatefulAnalyzer(config, yamlModels, (uri, collector) {
++      collector.printErrors();
++    });
++
+     bool success = true;
+     if (watch) {
+       success = await performGenerateContinuously(
+         config: config,
+         endpointsAnalyzer: endpointsAnalyzer,
++        modelAnalyzer: modelAnalyzer,
+       );
+     } else {
+       success = await log.progress(
+@@ -71,6 +79,7 @@ class GenerateCommand extends ServerpodCommand {
+         () => performGenerate(
+           config: config,
+           endpointsAnalyzer: endpointsAnalyzer,
++          modelAnalyzer: modelAnalyzer,
+         ),
+       );
+     }
+diff --git a/tools/serverpod_cli/lib/src/config/config.dart b/tools/serverpod_cli/lib/src/config/config.dart
+index 033992b4c3..46e0cecd88 100644
+--- a/tools/serverpod_cli/lib/src/config/config.dart
++++ b/tools/serverpod_cli/lib/src/config/config.dart
+@@ -101,13 +101,20 @@ class GeneratorConfig {
+   List<String> get libSourcePathParts =>
+       [...serverPackageDirectoryPathParts, 'lib'];
+ 
++  /// Relative path parts to the protocol directory
++  List<String> get relativeProtocolSourcePathParts =>
++      ['lib', 'src', 'protocol'];
++
+   /// Path parts to the protocol directory of the server package.
+   List<String> get protocolSourcePathParts =>
+-      [...serverPackageDirectoryPathParts, 'lib', 'src', 'protocol'];
++      [...serverPackageDirectoryPathParts, ...relativeProtocolSourcePathParts];
++
++  /// Relative path parts to the model directory
++  List<String> get relativeModelSourcePathParts => ['lib', 'src', 'models'];
+ 
+   /// Path parts to the model directory of the server package.
+   List<String> get modelSourcePathParts =>
+-      [...serverPackageDirectoryPathParts, 'lib', 'src', 'models'];
++      [...serverPackageDirectoryPathParts, ...relativeModelSourcePathParts];
+ 
+   /// Path parts to the endpoints directory of the server package.
+   List<String> get endpointsSourcePathParts =>
+diff --git a/tools/serverpod_cli/lib/src/generator/generator.dart b/tools/serverpod_cli/lib/src/generator/generator.dart
+index e9366c4477..15d7834d44 100644
+--- a/tools/serverpod_cli/lib/src/generator/generator.dart
++++ b/tools/serverpod_cli/lib/src/generator/generator.dart
+@@ -2,7 +2,6 @@ import 'package:serverpod_cli/analyzer.dart';
+ import 'package:serverpod_cli/src/analyzer/models/stateful_analyzer.dart';
+ import 'package:serverpod_cli/src/generator/code_generation_collector.dart';
+ import 'package:serverpod_cli/src/generator/serverpod_code_generator.dart';
+-import 'package:serverpod_cli/src/util/model_helper.dart';
+ import 'package:serverpod_cli/src/util/serverpod_cli_logger.dart';
+ 
+ /// Analyze the server package and generate the code.
+@@ -10,22 +9,14 @@ Future<bool> performGenerate({
+   bool dartFormat = true,
+   required GeneratorConfig config,
+   required EndpointsAnalyzer endpointsAnalyzer,
+-  String? changedFilePath,
++  required StatefulAnalyzer modelAnalyzer,
+ }) async {
+   bool success = true;
+ 
+   log.debug('Analyzing serializable models in the protocol directory.');
+-  var protocols = await ModelHelper.loadProjectYamlModelsFromDisk(config);
+ 
+-  var analyzer = StatefulAnalyzer(config, protocols, (uri, collector) {
+-    collector.printErrors();
+-
+-    if (collector.hasSeverErrors) {
+-      success = false;
+-    }
+-  });
+-
+-  var models = analyzer.validateAll();
++  var models = modelAnalyzer.validateAll();
++  success &= !modelAnalyzer.hasSeverErrors;
+ 
+   log.debug('Generating files for serializable models.');
+ 
+@@ -37,20 +28,13 @@ Future<bool> performGenerate({
+ 
+   log.debug('Analyzing the endpoints.');
+ 
+-  var changedFiles = generatedModelFiles.toSet();
+-  if (changedFilePath != null) {
+-    changedFiles.add(changedFilePath);
+-  }
+-
+   var endpointAnalyzerCollector = CodeGenerationCollector();
+   var endpoints = await endpointsAnalyzer.analyze(
+     collector: endpointAnalyzerCollector,
+-    changedFiles: changedFiles,
++    changedFiles: generatedModelFiles.toSet(),
+   );
+ 
+-  if (endpointAnalyzerCollector.hasSeverErrors) {
+-    success = false;
+-  }
++  success &= !endpointAnalyzerCollector.hasSeverErrors;
+   endpointAnalyzerCollector.printErrors();
+ 
+   log.debug('Generating the protocol.');
+diff --git a/tools/serverpod_cli/lib/src/generator/generator_continuous.dart b/tools/serverpod_cli/lib/src/generator/generator_continuous.dart
+index 6e9e2f4207..62adb0008c 100644
+--- a/tools/serverpod_cli/lib/src/generator/generator_continuous.dart
++++ b/tools/serverpod_cli/lib/src/generator/generator_continuous.dart
+@@ -1,8 +1,11 @@
++import 'dart:async';
+ import 'dart:io';
+ 
+ import 'package:async/async.dart';
+ import 'package:intl/intl.dart';
+ import 'package:path/path.dart' as p;
++import 'package:serverpod_cli/src/analyzer/models/stateful_analyzer.dart';
++import 'package:serverpod_cli/src/util/model_helper.dart';
+ import 'package:serverpod_cli/src/util/serverpod_cli_logger.dart';
+ import 'package:watcher/watcher.dart';
+ 
+@@ -14,6 +17,7 @@ import 'generator.dart';
+ Future<bool> performGenerateContinuously({
+   required GeneratorConfig config,
+   required EndpointsAnalyzer endpointsAnalyzer,
++  required StatefulAnalyzer modelAnalyzer,
+ }) async {
+   log.debug('Starting up continuous generator');
+ 
+@@ -22,22 +26,60 @@ Future<bool> performGenerateContinuously({
+   var success = await _performSafeGenerate(
+     config: config,
+     endpointsAnalyzer: endpointsAnalyzer,
++    modelAnalyzer: modelAnalyzer,
+     completionMessage:
+         'Initial code generation complete. Listening for changes.',
+   );
+ 
++  var modelSourcePath = p.joinAll(config.modelSourcePathParts);
++  var protocolSourcePath = p.joinAll(config.protocolSourcePathParts);
++
++  Timer? debouncedGenerate;
+   await for (WatchEvent event in watchers) {
+-    log.info(
+-      DateFormat('MMM dd - HH:mm:ss:SS').format(DateTime.now()),
+-      newParagraph: true,
+-    );
+-    log.info('File changed: $event');
+-    success = await _performSafeGenerate(
+-      config: config,
+-      endpointsAnalyzer: endpointsAnalyzer,
+-      changedFilePath: event.path,
+-      completionMessage: 'Incremental code generation complete.',
+-    );
++    log.debug('File changed: $event');
++
++    var shouldGenerate =
++        await endpointsAnalyzer.updateFileContexts({event.path});
++
++    if (ModelHelper.isModelFile(
++      event.path,
++      modelSourcePath,
++      protocolSourcePath,
++    )) {
++      shouldGenerate = true;
++      var modelUri = Uri.parse(p.absolute(event.path));
++      switch (event.type) {
++        case ChangeType.ADD:
++        case ChangeType.MODIFY:
++          var yaml = File(event.path).readAsStringSync();
++          modelAnalyzer.addYamlModel(ModelSource(
++            defaultModuleAlias,
++            yaml,
++            modelUri,
++            ModelHelper.extractPathFromConfig(config, Uri.parse(event.path)),
++          ));
++        case ChangeType.REMOVE:
++          modelAnalyzer.removeYamlModel(modelUri);
++      }
++    }
++
++    if (!shouldGenerate) continue;
++
++    debouncedGenerate?.cancel();
++    debouncedGenerate = Timer(const Duration(milliseconds: 500), () async {
++      log.info(
++        DateFormat('MMM dd - HH:mm:ss:SS').format(DateTime.now()),
++        newParagraph: true,
++      );
++      log.info('File changed: $event');
++
++      success = await _performSafeGenerate(
++        config: config,
++        endpointsAnalyzer: endpointsAnalyzer,
++        modelAnalyzer: modelAnalyzer,
++        completionMessage: 'Incremental code generation complete.',
++      );
++    });
+   }
+ 
+   return success;
+@@ -73,18 +115,19 @@ bool _directoryPathExists(String path) {
+ Future<bool> _performSafeGenerate({
+   required GeneratorConfig config,
+   required EndpointsAnalyzer endpointsAnalyzer,
+-  String? changedFilePath,
++  required StatefulAnalyzer modelAnalyzer,
+   required String completionMessage,
+ }) async {
+   var success = false;
+   try {
+     success = await log.progress(
+-        'Generating code',
+-        () => performGenerate(
+-              config: config,
+-              endpointsAnalyzer: endpointsAnalyzer,
+-              changedFilePath: changedFilePath,
+-            ));
++      'Generating code',
++      () => performGenerate(
++        config: config,
++        endpointsAnalyzer: endpointsAnalyzer,
++        modelAnalyzer: modelAnalyzer,
++      ),
++    );
+     log.info(completionMessage);
+   } catch (e) {
+     if (e is Error) {
+diff --git a/tools/serverpod_cli/lib/src/util/model_helper.dart b/tools/serverpod_cli/lib/src/util/model_helper.dart
+index 7e8f8902f8..9c17a0a45e 100644
+--- a/tools/serverpod_cli/lib/src/util/model_helper.dart
++++ b/tools/serverpod_cli/lib/src/util/model_helper.dart
+@@ -1,6 +1,7 @@
+ import 'dart:io';
+ import 'package:serverpod_cli/src/config/config.dart';
+ import 'package:path/path.dart';
++import 'package:super_string/super_string.dart';
+ 
+ const String defaultModuleAlias = 'protocol';
+ 
+@@ -32,21 +33,41 @@ class ModelHelper {
+   ) async {
+     var modelSources = <ModelSource>[];
+ 
++    var relativeModelSourcePath = joinAll(config.relativeModelSourcePathParts);
++    var relativeProtocolSourcePath =
++        joinAll(config.relativeProtocolSourcePathParts);
++
+     var modelSource = await _loadYamlModelsFromDisk(
+-        defaultModuleAlias, _absolutePathParts(config.modelSourcePathParts));
++      defaultModuleAlias,
++      _absolutePathParts(config.modelSourcePathParts),
++      relativeModelSourcePath: relativeModelSourcePath,
++      relativeProtocolSourcePath: relativeProtocolSourcePath,
++    );
+     modelSources.addAll(modelSource);
+ 
+     modelSource = await _loadYamlModelsFromDisk(
+-        defaultModuleAlias, _absolutePathParts(config.protocolSourcePathParts));
++      defaultModuleAlias,
++      _absolutePathParts(config.protocolSourcePathParts),
++      relativeModelSourcePath: relativeModelSourcePath,
++      relativeProtocolSourcePath: relativeProtocolSourcePath,
++    );
+     modelSources.addAll(modelSource);
+ 
+     for (var module in config.modulesDependent) {
+       modelSource = await _loadYamlModelsFromDisk(
+-          module.nickname, module.modelSourcePathParts);
++        module.nickname,
++        module.modelSourcePathParts,
++        relativeModelSourcePath: relativeModelSourcePath,
++        relativeProtocolSourcePath: relativeProtocolSourcePath,
++      );
+       modelSources.addAll(modelSource);
+ 
+       modelSource = await _loadYamlModelsFromDisk(
+-          module.nickname, module.protocolSourcePathParts);
++        module.nickname,
++        module.protocolSourcePathParts,
++        relativeModelSourcePath: relativeModelSourcePath,
++        relativeProtocolSourcePath: relativeProtocolSourcePath,
++      );
+       modelSources.addAll(modelSource);
+     }
+ 
+@@ -64,9 +85,15 @@ class ModelHelper {
+ 
+   static Future<List<ModelSource>> _loadYamlModelsFromDisk(
+     String moduleAlias,
+-    List<String> pathParts,
+-  ) async {
+-    var files = await _loadAllModelFiles(pathParts);
++    List<String> pathParts, {
++    required String relativeModelSourcePath,
++    required String relativeProtocolSourcePath,
++  }) async {
++    var files = await _loadAllModelFiles(
++      pathParts,
++      relativeModelSourcePath: relativeModelSourcePath,
++      relativeProtocolSourcePath: relativeProtocolSourcePath,
++    );
+ 
+     List<ModelSource> sources = [];
+     for (var model in files) {
+@@ -83,9 +110,28 @@ class ModelHelper {
+     return sources;
+   }
+ 
++  static bool isModelFile(
++    String path,
++    String modelSourcePath,
++    String protocolSourcePath,
++  ) {
++    var hasValidPath = path.containsAny([
++      modelSourcePath,
++      protocolSourcePath,
++    ]);
++
++    var hasValidExtension = modelFileExtensions.any(
++      (ext) => path.endsWith(ext),
++    );
++
++    return hasValidPath && hasValidExtension;
++  }
++
+   static Future<Iterable<File>> _loadAllModelFiles(
+-    List<String> absolutePathParts,
+-  ) async {
++    List<String> absolutePathParts, {
++    required String relativeModelSourcePath,
++    required String relativeProtocolSourcePath,
++  }) async {
+     List<FileSystemEntity> modelSourceFileList = [];
+ 
+     var path = joinAll(absolutePathParts);
+@@ -103,8 +149,11 @@ class ModelHelper {
+       modelSourceFileList = await modelSourceDir.list(recursive: true).toList();
+     }
+ 
+-    return modelSourceFileList.whereType<File>().where(
+-        (file) => modelFileExtensions.any((ext) => file.path.endsWith(ext)));
++    return modelSourceFileList.whereType<File>().where((file) => isModelFile(
++          file.path,
++          relativeModelSourcePath,
++          relativeProtocolSourcePath,
++        ));
+   }
+ 
+   static List<String> extractPathFromConfig(GeneratorConfig config, Uri uri) {
+diff --git a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/stateful_analyzer_test.dart b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/stateful_analyzer_test.dart
+index 83c34b4f5c..265ef33cad 100644
+--- a/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/stateful_analyzer_test.dart
++++ b/tools/serverpod_cli/test/analyzer/models/stateful_analyzer/stateful_analyzer_test.dart
+@@ -121,6 +121,20 @@ fields:
+     expect(wasCalled, true, reason: 'The error callback was not triggered.');
+   });
+ 
++  test(
++      'Given a model with a severe error (invalid syntax), when validating all, then hasSeverErrors returns true',
++      () {
++    var yamlSource = ModelSourceBuilder().withYaml('''''').build();
++
++    var statefulAnalyzer = StatefulAnalyzer(
++      config,
++      [yamlSource],
++    );
++
++    statefulAnalyzer.validateAll();
++    expect(statefulAnalyzer.hasSeverErrors, true);
++  });
++
+   test(
+       'Given a model with multi line invalid yaml syntax when validating all then error is reported.',
+       () {
+diff --git a/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/update_file_context_test.dart b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/update_file_context_test.dart
+new file mode 100644
+index 0000000000..afb5e6c59b
+--- /dev/null
++++ b/tools/serverpod_cli/test/integration/analyzer/dart/endpoint_validation/update_file_context_test.dart
+@@ -0,0 +1,328 @@
++import 'dart:io';
++
++import 'package:serverpod_cli/src/analyzer/dart/endpoints_analyzer.dart';
++import 'package:serverpod_cli/src/generator/code_generation_collector.dart';
++import 'package:serverpod_cli/src/test_util/endpoint_validation_helpers.dart';
++import 'package:serverpod_serialization/serverpod_serialization.dart';
++import 'package:test/test.dart';
++import 'package:path/path.dart' as path;
++
++const pathToServerpodRoot = '../../../../../../../..';
++var testProjectDirectory = Directory(path.joinAll([
++  'test',
++  'integration',
++  'analyzer',
++  'dart',
++  'endpoint_validation',
++  const Uuid().v4(),
++]));
++
++void main() {
++  setUpAll(() async {
++    await createTestEnvironment(testProjectDirectory, pathToServerpodRoot);
++  });
++
++  tearDownAll(() {
++    testProjectDirectory.deleteSync(recursive: true);
++  });
++
++  group('Given an empty tracked and analyzed directory', () {
++    var trackedDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      analyzer = EndpointsAnalyzer(trackedDirectory);
++      await analyzer.analyze(collector: CodeGenerationCollector());
++    });
++
++    test(
++        'when the file context is updated with a file without an endpoint '
++        'definition in the tracked directory'
++        'then false is returned.', () async {
++      var emptyFile = File(path.join(trackedDirectory.path, 'empty_file.dart'));
++      emptyFile.createSync(recursive: true);
++      emptyFile.writeAsStringSync('');
++
++      await expectLater(
++        analyzer.updateFileContexts({emptyFile.path}),
++        completion(false),
++      );
++    });
++
++    test(
++        'when the file context is updated with an endpoint file outside '
++        'of the tracked directory '
++        'then false is returned.', () async {
++      var endpointFile =
++          File(path.join(testProjectDirectory.path, 'endpoint.dart'));
++      endpointFile.createSync(recursive: true);
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({endpointFile.path}),
++        completion(false),
++      );
++    });
++
++    test(
++        'when the file context is updated with a new endpoint file in the '
++        'tracked directory '
++        'then true is returned.', () async {
++      var endpointFile =
++          File(path.join(trackedDirectory.path, 'endpoint.dart'));
++      endpointFile.createSync(recursive: true);
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({endpointFile.path}),
++        completion(true),
++      );
++    });
++  });
++  group('Given a tracked and analyzed directory with valid endpoint file', () {
++    var trackedDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late File endpointFile;
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      endpointFile = File(path.join(trackedDirectory.path, 'endpoint.dart'));
++      endpointFile.createSync(recursive: true);
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++      analyzer = EndpointsAnalyzer(trackedDirectory);
++      await analyzer.analyze(collector: CodeGenerationCollector());
++    });
++
++    test(
++        'when the file context is updated with the removal of the tracked '
++        'endpoint file '
++        'then true is returned.', () async {
++      endpointFile.deleteSync();
++
++      await expectLater(
++        analyzer.updateFileContexts({endpointFile.path}),
++        completion(true),
++      );
++    });
++
++    test(
++        'when the file context is updated with the update of the endpoint '
++        'file in the tracked folder '
++        'then true is returned.', () async {
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> goodbye(Session session, String name) async {
++    return 'Goodbye \$name';
++  }
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({endpointFile.path}),
++        completion(true),
++      );
++    });
++
++    test(
++        'when the file context is updated with a non endpoint file '
++        'then false is returned.', () async {
++      var nonEndpointFile =
++          File(path.join(trackedDirectory.path, 'non_endpoint.dart'));
++      nonEndpointFile.createSync(recursive: true);
++      nonEndpointFile.writeAsStringSync('''
++class ExampleClass {}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({nonEndpointFile.path}),
++        completion(false),
++      );
++    });
++
++    test(
++        'when the file context is updated with a new endpoint file '
++        'then true is returned.', () async {
++      var newEndpointFile =
++          File(path.join(trackedDirectory.path, 'new_endpoint.dart'));
++      newEndpointFile.createSync(recursive: true);
++      newEndpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class NewEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  });
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({newEndpointFile.path}),
++        completion(true),
++      );
++    });
++  });
++
++  group('Given a tracked and analyzed directory with valid non-endpoint file',
++      () {
++    var trackedDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late File trackedFile;
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      trackedFile = File(path.join(trackedDirectory.path, 'tracked.dart'));
++      trackedFile.createSync(recursive: true);
++      trackedFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleClass {
++  Future<String> hello(String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++      analyzer = EndpointsAnalyzer(trackedDirectory);
++      await analyzer.analyze(collector: CodeGenerationCollector());
++    });
++
++    test(
++        'when the file context is updated with an endpoint definition added '
++        'to the tracked file '
++        'then true is returned.', () async {
++      trackedFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({trackedFile.path}),
++        completion(true),
++      );
++    });
++  });
++
++  group(
++      'Given a tracked and analyzed directory with invalid dart endpoint file',
++      () {
++    var trackedDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late File endpointFile;
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      endpointFile = File(path.join(trackedDirectory.path, 'endpoint.dart'));
++      endpointFile.createSync(recursive: true);
++      // Class is missing closing brackets
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++''');
++      analyzer = EndpointsAnalyzer(trackedDirectory);
++      await analyzer.analyze(collector: CodeGenerationCollector());
++    });
++
++    test(
++        'when the file context is updated with a valid endpoint definition '
++        'added to the tracked file '
++        'then true is returned.', () async {
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++
++class ExampleEndpoint extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    return 'Hello \$name';
++  }
++}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({endpointFile.path}),
++        completion(true),
++      );
++    });
++  });
++
++  group(
++      'Given a tracked and analyzed endpoint file that depends on an invalid dart file',
++      () {
++    var trackedDirectory =
++        Directory(path.join(testProjectDirectory.path, const Uuid().v4()));
++
++    late File invalidDartFile;
++    late EndpointsAnalyzer analyzer;
++    setUpAll(() async {
++      var endpointFile =
++          File(path.join(trackedDirectory.path, 'endpoint.dart'));
++      endpointFile.createSync(recursive: true);
++      endpointFile.writeAsStringSync('''
++import 'package:serverpod/serverpod.dart';
++import 'invalid_dart.dart';
++
++class ExampleClass extends Endpoint {
++  Future<String> hello(Session session, String name) async {
++    InvalidClass example = InvalidClass();
++    return 'Hello \$name';
++  }
++}
++''');
++      invalidDartFile =
++          File(path.join(trackedDirectory.path, 'invalid_dart.dart'));
++      invalidDartFile.createSync(recursive: true);
++      // Class keyword is combined with class name
++      invalidDartFile.writeAsStringSync('''
++classInvalidClass {}
++''');
++      analyzer = EndpointsAnalyzer(trackedDirectory);
++      await analyzer.analyze(collector: CodeGenerationCollector());
++    });
++
++    test(
++        'when the file context is updated with a fix for the invalid dart file '
++        'then true is returned.', () async {
++      invalidDartFile.writeAsStringSync('''
++class InvalidClass {}
++''');
++
++      await expectLater(
++        analyzer.updateFileContexts({invalidDartFile.path}),
++        completion(true),
++      );
++    });
++  });
++}
