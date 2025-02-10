@@ -1,0 +1,388 @@
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index 1766736a9f34..c23aa6027c16 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -1464,6 +1464,87 @@ jobs:
+       # Store test results
+       - store_test_results:
+           path: test-results
++
++  proxy_store_model_in_db_tests:
++    machine:
++      image: ubuntu-2204:2023.10.1
++    resource_class: xlarge
++    working_directory: ~/project
++    steps:
++      - checkout
++      - run:
++          name: Install Docker CLI (In case it's not already installed)
++          command: |
++            sudo apt-get update
++            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
++      - run:
++          name: Install Python 3.9
++          command: |
++            curl https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh --output miniconda.sh
++            bash miniconda.sh -b -p $HOME/miniconda
++            export PATH="$HOME/miniconda/bin:$PATH"
++            conda init bash
++            source ~/.bashrc
++            conda create -n myenv python=3.9 -y
++            conda activate myenv
++            python --version
++      - run:
++          name: Install Dependencies
++          command: |
++            pip install "pytest==7.3.1"
++            pip install "pytest-asyncio==0.21.1"
++            pip install aiohttp
++            python -m pip install --upgrade pip
++            python -m pip install -r requirements.txt
++            pip install "pytest==7.3.1"
++            pip install "pytest-retry==1.6.3"
++            pip install "pytest-mock==3.12.0"
++            pip install "pytest-asyncio==0.21.1"
++      - run:
++          name: Build Docker image
++          command: docker build -t my-app:latest -f ./docker/Dockerfile.database .
++      - run:
++          name: Run Docker container
++          # intentionally give bad redis credentials here
++          # the OTEL test - should get this as a trace
++          command: |
++            docker run -d \
++              -p 4000:4000 \
++              -e DATABASE_URL=$PROXY_DATABASE_URL \
++              -e STORE_MODEL_IN_DB="True" \
++              -e LITELLM_MASTER_KEY="sk-1234" \
++              -e LITELLM_LICENSE=$LITELLM_LICENSE \
++              --name my-app \
++              -v $(pwd)/litellm/proxy/example_config_yaml/store_model_db_config.yaml:/app/config.yaml \
++              my-app:latest \
++              --config /app/config.yaml \
++              --port 4000 \
++              --detailed_debug \
++      - run:
++          name: Install curl and dockerize
++          command: |
++            sudo apt-get update
++            sudo apt-get install -y curl
++            sudo wget https://github.com/jwilder/dockerize/releases/download/v0.6.1/dockerize-linux-amd64-v0.6.1.tar.gz
++            sudo tar -C /usr/local/bin -xzvf dockerize-linux-amd64-v0.6.1.tar.gz
++            sudo rm dockerize-linux-amd64-v0.6.1.tar.gz
++      - run:
++          name: Start outputting logs
++          command: docker logs -f my-app
++          background: true
++      - run:
++          name: Wait for app to be ready
++          command: dockerize -wait http://localhost:4000 -timeout 5m
++      - run:
++          name: Run tests
++          command: |
++            pwd
++            ls
++            python -m pytest -vv tests/store_model_in_db_tests -x --junitxml=test-results/junit.xml --durations=5
++          no_output_timeout:
++            120m
++            # Clean up first container
++      
+   proxy_build_from_pip_tests:
+     # Change from docker to machine executor
+     machine:
+@@ -2012,6 +2093,12 @@ workflows:
+               only:
+                 - main
+                 - /litellm_.*/
++      - proxy_store_model_in_db_tests:
++          filters:
++            branches:
++              only:
++                - main
++                - /litellm_.*/
+       - proxy_build_from_pip_tests:
+           filters:
+             branches:
+@@ -2135,6 +2222,7 @@ workflows:
+             - installing_litellm_on_python
+             - installing_litellm_on_python_3_13
+             - proxy_logging_guardrails_model_info_tests
++            - proxy_store_model_in_db_tests
+             - proxy_build_from_pip_tests
+             - proxy_pass_through_endpoint_tests
+             - check_code_and_doc_quality
+diff --git a/litellm/proxy/example_config_yaml/store_model_db_config.yaml b/litellm/proxy/example_config_yaml/store_model_db_config.yaml
+new file mode 100644
+index 000000000000..b9cd23020461
+--- /dev/null
++++ b/litellm/proxy/example_config_yaml/store_model_db_config.yaml
+@@ -0,0 +1,10 @@
++model_list:
++  - model_name: fake-openai-endpoint
++    litellm_params:
++      model: openai/my-fake-model
++      api_key: my-fake-key
++      api_base: https://exampleopenaiendpoint-production.up.railway.app/
++
++general_settings:
++  store_model_in_db: true
++
+diff --git a/litellm/proxy/proxy_config.yaml b/litellm/proxy/proxy_config.yaml
+index 4b0ca6ba7500..70a926cd035d 100644
+--- a/litellm/proxy/proxy_config.yaml
++++ b/litellm/proxy/proxy_config.yaml
+@@ -1,11 +1,9 @@
+ model_list:
+-  - model_name: bedrock/*
++  - model_name: fake-openai-endpoint
+     litellm_params:
+-      model: bedrock/*
+-
+-litellm_settings:
+-  callbacks: ["datadog"]
+-
++      model: openai/my-fake-model
++      api_key: my-fake-key
++      api_base: https://exampleopenaiendpoint-production.up.railway.app/
+ general_settings:
+-  store_prompts_in_spend_logs: true
++  store_model_in_db: true
+ 
+diff --git a/litellm/proxy/proxy_server.py b/litellm/proxy/proxy_server.py
+index 03592f8e7ec5..2f5866578830 100644
+--- a/litellm/proxy/proxy_server.py
++++ b/litellm/proxy/proxy_server.py
+@@ -1689,7 +1689,7 @@ async def get_config(self, config_file_path: Optional[str] = None) -> dict:
+             # default to file
+             config = await self._get_config_from_file(config_file_path=config_file_path)
+         ## UPDATE CONFIG WITH DB
+-        if prisma_client is not None:
++        if prisma_client is not None and store_model_in_db is True:
+             config = await self._update_config_from_db(
+                 config=config,
+                 prisma_client=prisma_client,
+@@ -2525,6 +2525,16 @@ def _add_environment_variables_from_db_config(self, config_data: dict) -> None:
+         Adds environment variables from DB config to litellm
+         """
+         environment_variables = config_data.get("environment_variables", {})
++        self._decrypt_and_set_db_env_variables(environment_variables)
++
++    def _decrypt_and_set_db_env_variables(self, environment_variables: dict) -> None:
++        """
++        Decrypts a dictionary of environment variables and then sets them in the environment
++
++        Args:
++            environment_variables: dict - dictionary of environment variables to decrypt and set
++            eg. `{"LANGFUSE_PUBLIC_KEY": "kFiKa1VZukMmD8RB6WXB9F......."}`
++        """
+         for k, v in environment_variables.items():
+             try:
+                 decrypted_value = decrypt_value_helper(value=v)
+@@ -2653,19 +2663,43 @@ async def _update_general_settings(self, db_general_settings: Optional[Json]):
+     def _update_config_fields(
+         self,
+         current_config: dict,
+-        param_name: str,
++        param_name: Literal[
++            "general_settings",
++            "router_settings",
++            "litellm_settings",
++            "environment_variables",
++        ],
+         db_param_value: Any,
+     ) -> dict:
++        """
++        Updates the config fields with the new values from the DB
++
++        Args:
++            current_config (dict): Current configuration dictionary to update
++            param_name (Literal): Name of the parameter to update
++            db_param_value (Any): New value from the database
++
++        Returns:
++            dict: Updated configuration dictionary
++        """
++        if param_name == "environment_variables":
++            self._decrypt_and_set_db_env_variables(db_param_value)
++            return current_config
++
++        # If param doesn't exist in config, add it
++        if param_name not in current_config:
++            current_config[param_name] = db_param_value
++            return current_config
++
++        # For dictionary values, update only non-empty values
+         if isinstance(current_config[param_name], dict):
+-            # if dict exists (e.g. litellm_settings),
+-            # go through each key and value,
+-            # and update if new value is not None/empty dict
+-            for key, value in db_param_value.items():
+-                if value:
+-                    current_config[param_name][key] = value
++            # Only keep non None values from db_param_value
++            non_empty_values = {k: v for k, v in db_param_value.items() if v}
++
++            # Update the config with non-empty values
++            current_config[param_name].update(non_empty_values)
+         else:
+             current_config[param_name] = db_param_value
+-
+         return current_config
+ 
+     async def _update_config_from_db(
+@@ -2674,7 +2708,6 @@ async def _update_config_from_db(
+         config: dict,
+         store_model_in_db: Optional[bool],
+     ):
+-
+         if store_model_in_db is not True:
+             verbose_proxy_logger.info(
+                 "'store_model_in_db' is not True, skipping db updates"
+@@ -2696,24 +2729,21 @@ async def _update_config_from_db(
+ 
+         responses = await asyncio.gather(*_tasks)
+         for response in responses:
+-            if response is not None:
+-                param_name = getattr(response, "param_name", None)
+-                if param_name == "litellm_settings":
+-                    verbose_proxy_logger.info(
+-                        f"litellm_settings: {response.param_value}"
+-                    )
+-                param_value = getattr(response, "param_value", None)
+-                if param_name is not None and param_value is not None:
+-                    # check if param_name is already in the config
+-                    if param_name in config:
+-                        config = self._update_config_fields(
+-                            current_config=config,
+-                            param_name=param_name,
+-                            db_param_value=param_value,
+-                        )
+-                    else:
+-                        # if it's not in the config - then add it
+-                        config[param_name] = param_value
++            if response is None:
++                continue
++
++            param_name = getattr(response, "param_name", None)
++            param_value = getattr(response, "param_value", None)
++            verbose_proxy_logger.debug(
++                f"param_name={param_name}, param_value={param_value}"
++            )
++
++            if param_name is not None and param_value is not None:
++                config = self._update_config_fields(
++                    current_config=config,
++                    param_name=param_name,
++                    db_param_value=param_value,
++                )
+ 
+         return config
+ 
+@@ -5786,7 +5816,7 @@ async def token_counter(request: TokenCountRequest):
+         model=model_to_use,
+         text=prompt,
+         messages=messages,
+-        custom_tokenizer=_tokenizer_used,
++        custom_tokenizer=_tokenizer_used,  # type: ignore
+     )
+     return TokenCountResponse(
+         total_tokens=total_tokens,
+diff --git a/tests/store_model_in_db_tests/test_callbacks_in_db.py b/tests/store_model_in_db_tests/test_callbacks_in_db.py
+new file mode 100644
+index 000000000000..4a851251a3ea
+--- /dev/null
++++ b/tests/store_model_in_db_tests/test_callbacks_in_db.py
+@@ -0,0 +1,93 @@
++"""
++PROD TEST - DO NOT Delete this Test
++
++e2e test for langfuse callback in DB 
++- Add langfuse callback to DB - with /config/update
++- wait 20 seconds for the callback to be loaded into the instance 
++- Make a /chat/completions request to the proxy
++- Check if the request is logged in Langfuse
++"""
++
++import pytest
++import asyncio
++import aiohttp
++import os
++import dotenv
++from dotenv import load_dotenv
++import pytest
++from openai import AsyncOpenAI
++from openai.types.chat import ChatCompletion
++
++load_dotenv()
++
++# used for testing
++LANGFUSE_BASE_URL = "https://exampleopenaiendpoint-production-c715.up.railway.app"
++
++
++async def config_update(session, routing_strategy=None):
++    url = "http://0.0.0.0:4000/config/update"
++    headers = {"Authorization": "Bearer sk-1234", "Content-Type": "application/json"}
++    print("routing_strategy: ", routing_strategy)
++    data = {
++        "litellm_settings": {"success_callback": ["langfuse"]},
++        "environment_variables": {
++            "LANGFUSE_PUBLIC_KEY": "any-public-key",
++            "LANGFUSE_SECRET_KEY": "any-secret-key",
++            "LANGFUSE_HOST": LANGFUSE_BASE_URL,
++        },
++    }
++
++    async with session.post(url, headers=headers, json=data) as response:
++        status = response.status
++        response_text = await response.text()
++
++        print(response_text)
++        print("status: ", status)
++
++        if status != 200:
++            raise Exception(f"Request did not return a 200 status code: {status}")
++        return await response.json()
++
++
++async def check_langfuse_request(response_id: str):
++    async with aiohttp.ClientSession() as session:
++        url = f"{LANGFUSE_BASE_URL}/langfuse/trace/{response_id}"
++        async with session.get(url) as response:
++            response_json = await response.json()
++            assert response.status == 200, f"Expected status 200, got {response.status}"
++            assert (
++                response_json["exists"] == True
++            ), f"Request {response_id} not found in Langfuse traces"
++            assert response_json["request_id"] == response_id, f"Request ID mismatch"
++
++
++async def make_chat_completions_request() -> ChatCompletion:
++    client = AsyncOpenAI(api_key="sk-1234", base_url="http://0.0.0.0:4000")
++    response = await client.chat.completions.create(
++        model="fake-openai-endpoint",
++        messages=[{"role": "user", "content": "Hello, world!"}],
++    )
++    print(response)
++    return response
++
++
++@pytest.mark.asyncio
++async def test_e2e_langfuse_callbacks_in_db():
++
++    session = aiohttp.ClientSession()
++
++    # add langfuse callback to DB
++    await config_update(session)
++
++    # wait 20 seconds for the callback to be loaded into the instance
++    await asyncio.sleep(20)
++
++    # make a /chat/completions request to the proxy
++    response = await make_chat_completions_request()
++    print(response)
++    response_id = response.id
++    print("response_id: ", response_id)
++
++    await asyncio.sleep(11)
++    # check if the request is logged in Langfuse
++    await check_langfuse_request(response_id)

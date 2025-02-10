@@ -1,0 +1,165 @@
+diff --git a/backend/server/server.py b/backend/server/server.py
+index fe12dfbaf..da72bcd32 100644
+--- a/backend/server/server.py
++++ b/backend/server/server.py
+@@ -15,25 +15,6 @@
+     execute_multi_agents, handle_websocket_communication
+ )
+ 
+-from gpt_researcher.utils.logging_config import setup_research_logging
+-
+-import logging
+-
+-# Get logger instance
+-logger = logging.getLogger(__name__)
+-
+-# Don't override parent logger settings
+-logger.propagate = True
+-
+-logging.basicConfig(
+-    level=logging.INFO,
+-    format="%(asctime)s - %(levelname)s - %(message)s",
+-    handlers=[
+-        logging.FileHandler("server_log.txt"),  # Log to file
+-        logging.StreamHandler()  # Also print to console
+-    ]
+-)
+-
+ 
+ # Models
+ 
+@@ -94,11 +75,6 @@ def startup_event():
+     app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+     os.makedirs(DOC_PATH, exist_ok=True)
+     
+-    # Setup research logging
+-    log_file, json_file, research_logger, json_handler = setup_research_logging()  # Unpack all 4 values
+-    research_logger.json_handler = json_handler  # Store the JSON handler on the logger
+-    research_logger.info(f"Research log file: {log_file}")
+-    research_logger.info(f"Research JSON file: {json_file}")
+ 
+ # Routes
+ 
+diff --git a/frontend/nextjs/components/ResearchBlocks/AccessReport.tsx b/frontend/nextjs/components/ResearchBlocks/AccessReport.tsx
+index 85248c47b..9140ee092 100644
+--- a/frontend/nextjs/components/ResearchBlocks/AccessReport.tsx
++++ b/frontend/nextjs/components/ResearchBlocks/AccessReport.tsx
+@@ -7,8 +7,9 @@ interface AccessReportProps {
+     docx?: string;
+     json?: string;
+   };
+-  chatBoxSettings: any;
+-  logs?: any[];
++  chatBoxSettings: {
++    report_type?: string;
++  };
+   report: string;
+ }
+ 
+@@ -16,20 +17,28 @@ const AccessReport: React.FC<AccessReportProps> = ({ accessData, chatBoxSettings
+   const host = getHost();
+ 
+   const getReportLink = (dataType: 'pdf' | 'docx' | 'json'): string => {
+-    if (!accessData[dataType]) {
++    // Early return if path is not available
++    if (!accessData?.[dataType]) {
+       console.warn(`No ${dataType} path provided`);
+       return '#';
+     }
+ 
+-    // Ensure path starts with outputs/
+-    let path = accessData[dataType];
+-    if (!path.startsWith('outputs/')) {
+-      path = `outputs/${path}`;
+-    }
++    const path = accessData[dataType] as string;
++    
++    // Clean the path - remove leading/trailing slashes and handle outputs/ prefix
++    const cleanPath = path
++      .trim()
++      .replace(/^\/+|\/+$/g, ''); // Remove leading/trailing slashes
++    
++    // Only prepend outputs/ if it's not already there
++    const finalPath = cleanPath.startsWith('outputs/') 
++      ? cleanPath 
++      : `outputs/${cleanPath}`;
+     
+-    return `${host}/${path}`;
++    return `${host}/${finalPath}`;
+   };
+ 
++  // Safety check for accessData
+   if (!accessData || typeof accessData !== 'object') {
+     return null;
+   }
+@@ -50,13 +59,15 @@ const AccessReport: React.FC<AccessReportProps> = ({ accessData, chatBoxSettings
+         rel="noopener noreferrer">
+         Download DocX
+       </a>
+-      <a
+-        href={getReportLink('json')}
+-        className="bg-purple-500 text-white active:bg-purple-600 font-bold uppercase text-sm px-6 py-3 rounded shadow hover:shadow-lg outline-none focus:outline-none mr-1 mb-1 ease-linear transition-all duration-150"
+-        target="_blank"
+-        rel="noopener noreferrer">
+-        Download Logs
+-      </a>
++      {chatBoxSettings?.report_type === 'research_report' && (
++        <a
++          href={getReportLink('json')}
++          className="bg-purple-500 text-white active:bg-purple-600 font-bold uppercase text-sm px-6 py-3 rounded shadow hover:shadow-lg outline-none focus:outline-none mr-1 mb-1 ease-linear transition-all duration-150"
++          target="_blank"
++          rel="noopener noreferrer">
++          Download Logs
++        </a>
++      )}
+     </div>
+   );
+ };
+diff --git a/frontend/nextjs/components/Settings/ChatBox.tsx b/frontend/nextjs/components/Settings/ChatBox.tsx
+index 4c99578b2..9dff06c43 100644
+--- a/frontend/nextjs/components/Settings/ChatBox.tsx
++++ b/frontend/nextjs/components/Settings/ChatBox.tsx
+@@ -14,6 +14,18 @@ interface ChatBoxProps {
+   chatBoxSettings: ChatBoxSettings;
+   setChatBoxSettings: React.Dispatch<React.SetStateAction<ChatBoxSettings>>;
+ }
++
++interface OutputData {
++  pdf?: string;
++  docx?: string;
++  json?: string;
++}
++
++interface WebSocketMessage {
++  type: 'logs' | 'report' | 'path';
++  output: string | OutputData;
++}
++
+ export default function ChatBox({ chatBoxSettings, setChatBoxSettings }: ChatBoxProps) {
+ 
+   const [agentLogs, setAgentLogs] = useState<any[]>([]);
+@@ -31,17 +43,18 @@ export default function ChatBox({ chatBoxSettings, setChatBoxSettings }: ChatBox
+       setSocket(newSocket);
+ 
+       newSocket.onmessage = (event) => {
+-        const data = JSON.parse(event.data);
++        const data = JSON.parse(event.data) as WebSocketMessage;
+         
+         if (data.type === 'logs') {
+-          setAgentLogs((prevLogs) => [...prevLogs, data]);
++          setAgentLogs((prevLogs: any[]) => [...prevLogs, data]);
+         } else if (data.type === 'report') {
+-          setReport((prevReport) => prevReport + data.output);
++          setReport((prevReport: string) => prevReport + (data.output as string));
+         } else if (data.type === 'path') {
++          const output = data.output as OutputData;
+           setAccessData({
+-            pdf: `outputs/${data.output.pdf}`,
+-            docx: `outputs/${data.output.docx}`,
+-            json: `outputs/${data.output.json}`
++            ...(output.pdf && { pdf: `outputs/${output.pdf}` }),
++            ...(output.docx && { docx: `outputs/${output.docx}` }),
++            ...(output.json && { json: `outputs/${output.json}` })
+           });
+         }
+       };

@@ -1,0 +1,108 @@
+diff --git a/litellm/llms/nvidia_nim/embed.py b/litellm/llms/nvidia_nim/embed.py
+index bf5d4d4ae6b8..1ab608cbdc1b 100644
+--- a/litellm/llms/nvidia_nim/embed.py
++++ b/litellm/llms/nvidia_nim/embed.py
+@@ -58,7 +58,7 @@ def get_config(cls):
+     def get_supported_openai_params(
+         self,
+     ):
+-        return ["encoding_format", "user"]
++        return ["encoding_format", "user", "dimensions"]
+ 
+     def map_openai_params(
+         self,
+@@ -73,6 +73,8 @@ def map_openai_params(
+                 optional_params["extra_body"].update({"input_type": v})
+             elif k == "truncate":
+                 optional_params["extra_body"].update({"truncate": v})
++            else:
++                optional_params[k] = v
+ 
+         if kwargs is not None:
+             # pass kwargs in extra_body
+diff --git a/litellm/proxy/proxy_server.py b/litellm/proxy/proxy_server.py
+index 893f011dd5df..81008fa027f2 100644
+--- a/litellm/proxy/proxy_server.py
++++ b/litellm/proxy/proxy_server.py
+@@ -1631,7 +1631,7 @@ def _init_cache(
+         self,
+         cache_params: dict,
+     ):
+-        global redis_usage_cache
++        global redis_usage_cache, llm_router
+         from litellm import Cache
+ 
+         if "default_in_memory_ttl" in cache_params:
+@@ -1646,6 +1646,10 @@ def _init_cache(
+             ## INIT PROXY REDIS USAGE CLIENT ##
+             redis_usage_cache = litellm.cache.cache
+ 
++            ## INIT ROUTER REDIS CACHE ##
++            if llm_router is not None:
++                llm_router._update_redis_cache(cache=redis_usage_cache)
++
+     async def get_config(self, config_file_path: Optional[str] = None) -> dict:
+         """
+         Load config file
+diff --git a/litellm/router.py b/litellm/router.py
+index faa7cd4a6b8e..920d3f3f6f6d 100644
+--- a/litellm/router.py
++++ b/litellm/router.py
+@@ -573,6 +573,20 @@ def __init__(  # noqa: PLR0915
+             litellm.amoderation, call_type="moderation"
+         )
+ 
++    def _update_redis_cache(self, cache: RedisCache):
++        """
++        Update the redis cache for the router, if none set.
++
++        Allows proxy user to just do
++        ```yaml
++        litellm_settings:
++            cache: true
++        ```
++        and caching to just work.
++        """
++        if self.cache.redis_cache is None:
++            self.cache.redis_cache = cache
++
+     def initialize_assistants_endpoint(self):
+         ## INITIALIZE PASS THROUGH ASSISTANTS ENDPOINT ##
+         self.acreate_assistants = self.factory_function(litellm.acreate_assistants)
+diff --git a/tests/llm_translation/test_nvidia_nim.py b/tests/llm_translation/test_nvidia_nim.py
+index ca0374d45d0b..307f27755d72 100644
+--- a/tests/llm_translation/test_nvidia_nim.py
++++ b/tests/llm_translation/test_nvidia_nim.py
+@@ -77,6 +77,7 @@ def test_embedding_nvidia_nim():
+                 model="nvidia_nim/nvidia/nv-embedqa-e5-v5",
+                 input="What is the meaning of life?",
+                 input_type="passage",
++                dimensions=1024,
+                 client=client,
+             )
+         except Exception as e:
+@@ -87,3 +88,4 @@ def test_embedding_nvidia_nim():
+         assert request_body["input"] == "What is the meaning of life?"
+         assert request_body["model"] == "nvidia/nv-embedqa-e5-v5"
+         assert request_body["extra_body"]["input_type"] == "passage"
++        assert request_body["dimensions"] == 1024
+diff --git a/tests/local_testing/test_router_utils.py b/tests/local_testing/test_router_utils.py
+index fa1c6f5f9e76..7de97075791e 100644
+--- a/tests/local_testing/test_router_utils.py
++++ b/tests/local_testing/test_router_utils.py
+@@ -384,3 +384,15 @@ def test_router_get_model_access_groups(potential_access_group, expected_result)
+         model_access_group=potential_access_group
+     )
+     assert access_groups == expected_result
++
++
++def test_router_redis_cache():
++    router = Router(
++        model_list=[{"model_name": "gemini/*", "litellm_params": {"model": "gemini/*"}}]
++    )
++
++    redis_cache = MagicMock()
++
++    router._update_redis_cache(cache=redis_cache)
++
++    assert router.cache.redis_cache == redis_cache

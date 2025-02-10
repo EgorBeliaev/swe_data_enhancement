@@ -1,0 +1,490 @@
+diff --git a/frontend/app/src/App.tsx b/frontend/app/src/App.tsx
+index 145fb2cdee22..706e30a7765a 100644
+--- a/frontend/app/src/App.tsx
++++ b/frontend/app/src/App.tsx
+@@ -64,7 +64,6 @@ import {
+   measure,
+   notNullOrUndefined,
+   notUndefined,
+-  PerformanceEvents,
+   preserveEmbedQueryParams,
+   PresetThemeName,
+   ScriptRunState,
+@@ -1555,11 +1554,6 @@ export class App extends PureComponent<Props, State> {
+         },
+       })
+     )
+-
+-    PerformanceEvents.record({
+-      name: "RequestedRerun",
+-      scriptRunState: this.state.scriptRunState,
+-    })
+   }
+ 
+   /** Requests that the server stop running the script */
+diff --git a/frontend/app/src/connection/WebsocketConnection.tsx b/frontend/app/src/connection/WebsocketConnection.tsx
+index 1c072261eb0c..f6d5e82bcd57 100644
+--- a/frontend/app/src/connection/WebsocketConnection.tsx
++++ b/frontend/app/src/connection/WebsocketConnection.tsx
+@@ -38,7 +38,6 @@ import {
+   IHostConfigResponse,
+   isNullOrUndefined,
+   notNullOrUndefined,
+-  PerformanceEvents,
+   StreamlitEndpoints,
+ } from "@streamlit/lib"
+ import { BackMsg, ForwardMsg, IBackMsg } from "@streamlit/protobuf"
+@@ -501,25 +500,14 @@ export class WebsocketConnection {
+     const messageIndex = this.nextMessageIndex
+     this.nextMessageIndex += 1
+ 
+-    PerformanceEvents.record({ name: "BeginHandleMessage", messageIndex })
+-
+     const encodedMsg = new Uint8Array(data)
+     const msg = ForwardMsg.decode(encodedMsg)
+ 
+-    PerformanceEvents.record({
+-      name: "DecodedMessage",
+-      messageIndex,
+-      messageType: msg.type,
+-      len: data.byteLength,
+-    })
+-
+     this.messageQueue[messageIndex] = await this.cache.processMessagePayload(
+       msg,
+       encodedMsg
+     )
+ 
+-    PerformanceEvents.record({ name: "GotCachedPayload", messageIndex })
+-
+     // Dispatch any pending messages in the queue. This may *not* result
+     // in our just-decoded message being dispatched: if there are other
+     // messages that were received earlier than this one but are being
+@@ -527,11 +515,7 @@ export class WebsocketConnection {
+     while (this.lastDispatchedMessageIndex + 1 in this.messageQueue) {
+       const dispatchMessageIndex = this.lastDispatchedMessageIndex + 1
+       this.args.onMessage(this.messageQueue[dispatchMessageIndex])
+-      PerformanceEvents.record({
+-        name: "DispatchedMessage",
+-        messageIndex: dispatchMessageIndex,
+-        messageType: this.messageQueue[dispatchMessageIndex].type,
+-      })
++
+       delete this.messageQueue[dispatchMessageIndex]
+       this.lastDispatchedMessageIndex = dispatchMessageIndex
+     }
+diff --git a/frontend/lib/src/index.ts b/frontend/lib/src/index.ts
+index f13f450b851b..fa083b56a7be 100644
+--- a/frontend/lib/src/index.ts
++++ b/frontend/lib/src/index.ts
+@@ -74,8 +74,6 @@ export {
+   mockSessionInfoProps,
+ } from "./mocks/mocks"
+ export { mockTheme } from "./mocks/mockTheme"
+-export { PerformanceEvents } from "./profiler/PerformanceEvents"
+-// export * from "@streamlit/protobuf"
+ export { RootStyleProvider } from "./RootStyleProvider"
+ export { ScriptRunState } from "./ScriptRunState"
+ export { SessionInfo } from "./SessionInfo"
+diff --git a/frontend/lib/src/profiler/PerformanceEvents.ts b/frontend/lib/src/profiler/PerformanceEvents.ts
+deleted file mode 100644
+index 999c37dbd308..000000000000
+--- a/frontend/lib/src/profiler/PerformanceEvents.ts
++++ /dev/null
+@@ -1,87 +0,0 @@
+-/**
+- * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2025)
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import { getLogger } from "loglevel"
+-
+-import { getRerunAnalysis } from "~lib/profiler/RerunAnalyzer"
+-import { ScriptRunState } from "~lib/ScriptRunState"
+-
+-interface PerformanceEventBase {
+-  timestamp?: number
+-}
+-
+-export interface RequestedRerunEvent extends PerformanceEventBase {
+-  name: "RequestedRerun"
+-  scriptRunState: ScriptRunState
+-}
+-
+-export interface BeginHandleMessageEvent extends PerformanceEventBase {
+-  name: "BeginHandleMessage"
+-  messageIndex: number
+-}
+-
+-export interface DecodedMessageEvent extends PerformanceEventBase {
+-  name: "DecodedMessage"
+-  messageIndex: number
+-  messageType?: string
+-  len: number
+-}
+-
+-export interface GotCachedPayloadEvent extends PerformanceEventBase {
+-  name: "GotCachedPayload"
+-  messageIndex: number
+-}
+-
+-export interface DispatchedMessageEvent extends PerformanceEventBase {
+-  name: "DispatchedMessage"
+-  messageIndex: number
+-  messageType?: string
+-}
+-
+-export type HandleMessageEvent =
+-  | BeginHandleMessageEvent
+-  | DecodedMessageEvent
+-  | GotCachedPayloadEvent
+-  | DispatchedMessageEvent
+-
+-export type PerformanceEvent = RequestedRerunEvent | HandleMessageEvent
+-
+-const log = getLogger("PerformanceEvents")
+-
+-/** Simple utility for capturing time samples. */
+-export class PerformanceEvents {
+-  /** Set this to true to capture PerformanceEvents. */
+-  public static enabled = false
+-
+-  private static events: PerformanceEvent[] = []
+-
+-  public static record(event: PerformanceEvent): void {
+-    if (!this.enabled) {
+-      return
+-    }
+-
+-    event.timestamp = performance.now()
+-    this.events.push(event)
+-
+-    if (
+-      event.name === "DispatchedMessage" &&
+-      event.messageType === "scriptFinished"
+-    ) {
+-      log.info("Rerun results", getRerunAnalysis(this.events))
+-      this.events = []
+-    }
+-  }
+-}
+diff --git a/frontend/lib/src/profiler/RerunAnalyzer.ts b/frontend/lib/src/profiler/RerunAnalyzer.ts
+deleted file mode 100644
+index bbf684931155..000000000000
+--- a/frontend/lib/src/profiler/RerunAnalyzer.ts
++++ /dev/null
+@@ -1,208 +0,0 @@
+-/**
+- * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2025)
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import {
+-  DecodedMessageEvent,
+-  HandleMessageEvent,
+-  PerformanceEvent,
+-  RequestedRerunEvent,
+-} from "~lib/profiler/PerformanceEvents"
+-import {
+-  findNextEventIndex,
+-  findPrevEvent,
+-  findPrevEventIndex,
+-  getTimeDelta,
+-  isHandleMessageEvent,
+-} from "~lib/profiler/Utils"
+-
+-type JSON = any
+-
+-class RerunAnalyzer {
+-  /** All the events that occurred in this rerun. */
+-  private readonly rerunEvents: PerformanceEvent[]
+-
+-  /** The rerun request event that immediately preceded the rerun, if any. */
+-  private readonly requestedRerun?: RequestedRerunEvent
+-
+-  public constructor(allEvents: PerformanceEvent[], lastEventIndex: number) {
+-    const firstEventIndex = findRunStartEventIndex(allEvents, lastEventIndex)
+-    if (firstEventIndex === undefined) {
+-      throw new Error("Unable to find run start!")
+-    }
+-
+-    this.rerunEvents = allEvents.slice(firstEventIndex, lastEventIndex + 1)
+-    this.requestedRerun = <RequestedRerunEvent>(
+-      findPrevEvent(
+-        allEvents,
+-        firstEventIndex - 1,
+-        evt => evt.name === "RequestedRerun"
+-      )
+-    )
+-  }
+-
+-  public getResults = (): JSON => {
+-    // Determine which messages were part of the run
+-    const messageIndexes = new Set<number>()
+-    this.rerunEvents.forEach(evt => {
+-      if (isHandleMessageEvent(evt)) {
+-        messageIndexes.add(evt.messageIndex)
+-      }
+-    })
+-
+-    if (messageIndexes.size === 0) {
+-      return "No rerun messages found!"
+-    }
+-
+-    // Analyze each message in the run
+-    const sortedMessageIndexes =
+-      Array.from(messageIndexes).sort(compareNumbers)
+-
+-    // Get the total duration of the run
+-    const lastRerunEvent = this.rerunEvents[this.rerunEvents.length - 1]
+-    const firstRerunEvent = this.rerunEvents[0]
+-
+-    const results: any = {
+-      messages: sortedMessageIndexes.map(this.getMessageAnalysis),
+-      rerunDuration: getTimeDelta(firstRerunEvent, lastRerunEvent),
+-    }
+-
+-    // If we had a rerun request, include some additional stats
+-    if (this.requestedRerun !== undefined) {
+-      results.requestedRerun = true
+-      results.scriptRunStateAtStart = this.requestedRerun.scriptRunState
+-      results.requestToRerunStart = getTimeDelta(
+-        this.requestedRerun,
+-        firstRerunEvent
+-      )
+-    }
+-
+-    return results
+-  }
+-
+-  private getMessageAnalysis = (messageIndex: number): any => {
+-    // Get each event associated with the given message.
+-    const handleMessageEvents: HandleMessageEvent[] = []
+-    let curIndex = 0
+-    while (curIndex < this.rerunEvents.length) {
+-      const nextEventIndex = findNextMessageEvent(
+-        this.rerunEvents,
+-        curIndex,
+-        messageIndex
+-      )
+-
+-      if (nextEventIndex === undefined) {
+-        break
+-      }
+-
+-      handleMessageEvents.push(
+-        <HandleMessageEvent>this.rerunEvents[nextEventIndex]
+-      )
+-      curIndex = nextEventIndex + 1
+-    }
+-
+-    if (handleMessageEvents.length === 0) {
+-      throw new Error(`No messages for the given index: ${messageIndex}`)
+-    }
+-
+-    const first = handleMessageEvents[0]
+-    const last = handleMessageEvents[handleMessageEvents.length - 1]
+-
+-    const messageAnalysis: any = {
+-      messageIndex,
+-      duration: getTimeDelta(first, last),
+-      steps: [],
+-    }
+-
+-    for (let ii = 1; ii < handleMessageEvents.length; ++ii) {
+-      const prevStep = handleMessageEvents[ii - 1]
+-      const thisStep = handleMessageEvents[ii]
+-
+-      if (thisStep.name === "DecodedMessage") {
+-        messageAnalysis.messageType = thisStep.messageType
+-        messageAnalysis.len = thisStep.len
+-      }
+-
+-      messageAnalysis.steps.push({
+-        name: thisStep.name,
+-        duration: getTimeDelta(prevStep, thisStep),
+-      })
+-    }
+-
+-    return messageAnalysis
+-  }
+-}
+-
+-function compareNumbers(a: number, b: number): number {
+-  if (a < b) {
+-    return -1
+-  }
+-  if (a > b) {
+-    return 1
+-  }
+-  return 0
+-}
+-
+-/** Find the index of the first event in the run. */
+-function findRunStartEventIndex(
+-  events: PerformanceEvent[],
+-  lastEventIndex: number
+-): number | undefined {
+-  const newSessionDecodedIndex = findPrevEventIndex(
+-    events,
+-    lastEventIndex - 1,
+-    event =>
+-      event.name === "DecodedMessage" && event.messageType === "newSession"
+-  )
+-
+-  if (newSessionDecodedIndex === undefined) {
+-    return undefined
+-  }
+-
+-  // Find the newSession's "BeginHandleMessage" event
+-  const { messageIndex } = <DecodedMessageEvent>events[newSessionDecodedIndex]
+-
+-  return findPrevEventIndex(
+-    events,
+-    newSessionDecodedIndex,
+-    event =>
+-      event.name === "BeginHandleMessage" &&
+-      event.messageIndex === messageIndex
+-  )
+-}
+-
+-/** Find the next HandleMessageEvent index for the given message. */
+-function findNextMessageEvent(
+-  events: PerformanceEvent[],
+-  startIndex: number,
+-  messageIndex: number
+-): number | undefined {
+-  return findNextEventIndex(
+-    events,
+-    startIndex,
+-    evt => isHandleMessageEvent(evt) && evt.messageIndex === messageIndex
+-  )
+-}
+-
+-/** Return a human-readable performance analysis of a single rerun. */
+-export function getRerunAnalysis(
+-  allEvents: PerformanceEvent[],
+-  lastEventIndex?: number
+-): JSON {
+-  return new RerunAnalyzer(
+-    allEvents,
+-    lastEventIndex ?? allEvents.length - 1
+-  ).getResults()
+-}
+diff --git a/frontend/lib/src/profiler/Utils.ts b/frontend/lib/src/profiler/Utils.ts
+deleted file mode 100644
+index 003317109e1c..000000000000
+--- a/frontend/lib/src/profiler/Utils.ts
++++ /dev/null
+@@ -1,89 +0,0 @@
+-/**
+- * Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022-2025)
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-import {
+-  HandleMessageEvent,
+-  PerformanceEvent,
+-} from "~lib/profiler/PerformanceEvents"
+-
+-export type EventPredicate = (event: PerformanceEvent) => boolean
+-
+-export function findNextEventIndex(
+-  events: PerformanceEvent[],
+-  startEvent: PerformanceEvent | number,
+-  pred: EventPredicate
+-): number | undefined {
+-  const startIndex =
+-    typeof startEvent === "number" ? startEvent : events.indexOf(startEvent)
+-
+-  for (let ii = startIndex; ii < events.length; ++ii) {
+-    if (pred(events[ii])) {
+-      return ii
+-    }
+-  }
+-
+-  return undefined
+-}
+-
+-export function findNextEvent(
+-  events: PerformanceEvent[],
+-  startEvent: PerformanceEvent | number,
+-  pred: EventPredicate
+-): PerformanceEvent | undefined {
+-  const index = findNextEventIndex(events, startEvent, pred)
+-  return index !== undefined ? events[index] : undefined
+-}
+-
+-export function findPrevEventIndex(
+-  events: PerformanceEvent[],
+-  startEvent: PerformanceEvent | number,
+-  pred: EventPredicate
+-): number | undefined {
+-  const startIndex =
+-    typeof startEvent === "number" ? startEvent : events.indexOf(startEvent)
+-
+-  for (let ii = startIndex; ii >= 0; --ii) {
+-    const event = events[ii]
+-    if (pred(event)) {
+-      return ii
+-    }
+-  }
+-
+-  return undefined
+-}
+-
+-export function findPrevEvent(
+-  events: PerformanceEvent[],
+-  startEvent: PerformanceEvent | number,
+-  pred: EventPredicate
+-): PerformanceEvent | undefined {
+-  const index = findPrevEventIndex(events, startEvent, pred)
+-  return index !== undefined ? events[index] : undefined
+-}
+-
+-export function isHandleMessageEvent(
+-  event: PerformanceEvent
+-): event is HandleMessageEvent {
+-  return (event as HandleMessageEvent).messageIndex !== undefined
+-}
+-
+-/** Return the elapsed time between two performance events. */
+-export function getTimeDelta(
+-  a: PerformanceEvent,
+-  b: PerformanceEvent
+-): number {
+-  return Math.abs((b.timestamp as number) - (a.timestamp as number))
+-}

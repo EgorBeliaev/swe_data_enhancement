@@ -1,0 +1,121 @@
+diff --git a/common/linkai_client.py b/common/linkai_client.py
+index fe64247a8..16c7049ab 100644
+--- a/common/linkai_client.py
++++ b/common/linkai_client.py
+@@ -2,7 +2,7 @@
+ from bridge.reply import Reply, ReplyType
+ from common.log import logger
+ from linkai import LinkAIClient, PushMsg
+-from config import conf, pconf, plugin_config, available_setting
++from config import conf, pconf, plugin_config, available_setting, write_plugin_config
+ from plugins import PluginManager
+ import time
+ 
+@@ -51,10 +51,10 @@ def on_config(self, config: dict):
+                 local_config["voice_reply_voice"] = False
+ 
+         if config.get("admin_password"):
+-            if not plugin_config.get("Godcmd"):
+-                plugin_config["Godcmd"] = {"password": config.get("admin_password"), "admin_users": []}
++            if not pconf("Godcmd"):
++                write_plugin_config({"Godcmd": {"password": config.get("admin_password"), "admin_users": []} })
+             else:
+-                plugin_config["Godcmd"]["password"] = config.get("admin_password")
++                pconf("Godcmd")["password"] = config.get("admin_password")
+             PluginManager().instances["GODCMD"].reload()
+ 
+         if config.get("group_app_map") and pconf("linkai"):
+diff --git a/config.py b/config.py
+index a28c5b959..9af6a212a 100644
+--- a/config.py
++++ b/config.py
+@@ -341,6 +341,14 @@ def write_plugin_config(pconf: dict):
+     for k in pconf:
+         plugin_config[k.lower()] = pconf[k]
+ 
++def remove_plugin_config(name: str):
++    """
++    移除待重新加载的插件全局配置
++    :param name: 待重载的插件名
++    """
++    global plugin_config
++    plugin_config.pop(name.lower(), None)
++
+ 
+ def pconf(plugin_name: str) -> dict:
+     """
+diff --git a/plugins/godcmd/godcmd.py b/plugins/godcmd/godcmd.py
+index 3e9d3eabd..f2889b3bf 100644
+--- a/plugins/godcmd/godcmd.py
++++ b/plugins/godcmd/godcmd.py
+@@ -477,7 +477,7 @@ def model_mapping(self, model) -> str:
+         return model
+ 
+     def reload(self):
+-        gconf = plugin_config[self.name]
++        gconf = pconf(self.name)
+         if gconf:
+             if gconf.get("password"):
+                 self.password = gconf["password"]
+diff --git a/plugins/linkai/linkai.py b/plugins/linkai/linkai.py
+index 59eb0dc0a..bf93fa2bc 100644
+--- a/plugins/linkai/linkai.py
++++ b/plugins/linkai/linkai.py
+@@ -289,7 +289,7 @@ def _load_config_template(self):
+                     plugin_conf = json.load(f)
+                     plugin_conf["midjourney"]["enabled"] = False
+                     plugin_conf["summary"]["enabled"] = False
+-                    plugin_config["linkai"] = plugin_conf
++                    write_plugin_config({"linkai": plugin_conf})
+                     return plugin_conf
+         except Exception as e:
+             logger.exception(e)
+diff --git a/plugins/plugin.py b/plugins/plugin.py
+index 028e221db..3847c1182 100644
+--- a/plugins/plugin.py
++++ b/plugins/plugin.py
+@@ -1,6 +1,6 @@
+ import os
+ import json
+-from config import pconf, plugin_config, conf
++from config import pconf, plugin_config, conf, write_plugin_config
+ from common.log import logger
+ 
+ 
+@@ -24,13 +24,13 @@ def load_config(self) -> dict:
+                     plugin_conf = json.load(f)
+ 
+                 # 写入全局配置内存
+-                plugin_config[self.name] = plugin_conf
++                write_plugin_config({self.name: plugin_conf})
+         logger.debug(f"loading plugin config, plugin_name={self.name}, conf={plugin_conf}")
+         return plugin_conf
+ 
+     def save_config(self, config: dict):
+         try:
+-            plugin_config[self.name] = config
++            write_plugin_config({self.name: config})
+             # 写入全局配置
+             global_config_path = "./plugins/config.json"
+             if os.path.exists(global_config_path):
+diff --git a/plugins/plugin_manager.py b/plugins/plugin_manager.py
+index cecf75d65..1945e8366 100644
+--- a/plugins/plugin_manager.py
++++ b/plugins/plugin_manager.py
+@@ -9,7 +9,7 @@
+ from common.log import logger
+ from common.singleton import singleton
+ from common.sorted_dict import SortedDict
+-from config import conf, write_plugin_config
++from config import conf, remove_plugin_config, write_plugin_config
+ 
+ from .event import *
+ 
+@@ -161,6 +161,7 @@ def activate_plugins(self):  # 生成新开启的插件实例
+ 
+     def reload_plugin(self, name: str):
+         name = name.upper()
++        remove_plugin_config(name)
+         if name in self.instances:
+             for event in self.listening_plugins:
+                 if name in self.listening_plugins[event]:

@@ -1,0 +1,97 @@
+diff --git a/modules/scripts_auto_postprocessing.py b/modules/scripts_auto_postprocessing.py
+index d63078de50e..26fd138e736 100644
+--- a/modules/scripts_auto_postprocessing.py
++++ b/modules/scripts_auto_postprocessing.py
+@@ -33,7 +33,7 @@ def create_auto_preprocessing_script_data():
+ 
+     for name in shared.opts.postprocessing_enable_in_main_ui:
+         script = next(iter([x for x in scripts.postprocessing_scripts_data if x.script_class.name == name]), None)
+-        if script is None:
++        if script is None or script.script_class.extra_only:
+             continue
+ 
+         constructor = lambda s=script: ScriptPostprocessingForMainUI(s.script_class())
+diff --git a/modules/scripts_postprocessing.py b/modules/scripts_postprocessing.py
+index 4b3b7afda1c..131ba4b970d 100644
+--- a/modules/scripts_postprocessing.py
++++ b/modules/scripts_postprocessing.py
+@@ -59,6 +59,10 @@ class ScriptPostprocessing:
+     args_from = None
+     args_to = None
+ 
++    # define if the script should be used only in extras or main UI
++    extra_only = None
++    main_ui_only = None
++
+     order = 1000
+     """scripts will be ordred by this value in postprocessing UI"""
+ 
+@@ -119,10 +123,6 @@ def initialize_scripts(self, scripts_data):
+         for script_data in scripts_data:
+             script: ScriptPostprocessing = script_data.script_class()
+             script.filename = script_data.path
+-
+-            if script.name == "Simple Upscale":
+-                continue
+-
+             self.scripts.append(script)
+ 
+     def create_script_ui(self, script, inputs):
+@@ -152,7 +152,7 @@ def script_score(name):
+ 
+             return len(self.scripts)
+ 
+-        filtered_scripts = [script for script in self.scripts if script.name not in scripts_filter_out]
++        filtered_scripts = [script for script in self.scripts if script.name not in scripts_filter_out and not script.main_ui_only]
+         script_scores = {script.name: (script_score(script.name), script.order, script.name, original_index) for original_index, script in enumerate(filtered_scripts)}
+ 
+         return sorted(filtered_scripts, key=lambda x: script_scores[x.name])
+diff --git a/modules/shared_items.py b/modules/shared_items.py
+index 11f10b3f7b1..3aaf0649028 100644
+--- a/modules/shared_items.py
++++ b/modules/shared_items.py
+@@ -16,10 +16,12 @@ def dat_models_names():
+     return [x.name for x in modules.dat_model.get_dat_models(None)]
+ 
+ 
+-def postprocessing_scripts():
++def postprocessing_scripts(filter_out_extra_only=False, filter_out_main_ui_only=False):
+     import modules.scripts
+-
+-    return modules.scripts.scripts_postproc.scripts
++    return list(filter(
++        lambda s: (not filter_out_extra_only or not s.extra_only) and (not filter_out_main_ui_only or not s.main_ui_only),
++        modules.scripts.scripts_postproc.scripts,
++    ))
+ 
+ 
+ def sd_vae_items():
+diff --git a/modules/shared_options.py b/modules/shared_options.py
+index 9f4520274b1..f26cbe332eb 100644
+--- a/modules/shared_options.py
++++ b/modules/shared_options.py
+@@ -410,9 +410,9 @@
+ }))
+ 
+ options_templates.update(options_section(('postprocessing', "Postprocessing", "postprocessing"), {
+-    'postprocessing_enable_in_main_ui': OptionInfo([], "Enable postprocessing operations in txt2img and img2img tabs", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts()]}),
+-    'postprocessing_disable_in_extras': OptionInfo([], "Disable postprocessing operations in extras tab", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts()]}),
+-    'postprocessing_operation_order': OptionInfo([], "Postprocessing operation order", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts()]}),
++    'postprocessing_enable_in_main_ui': OptionInfo([], "Enable postprocessing operations in txt2img and img2img tabs", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts(filter_out_extra_only=True)]}),
++    'postprocessing_disable_in_extras': OptionInfo([], "Disable postprocessing operations in extras tab", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts(filter_out_main_ui_only=True)]}),
++    'postprocessing_operation_order': OptionInfo([], "Postprocessing operation order", ui_components.DropdownMulti, lambda: {"choices": [x.name for x in shared_items.postprocessing_scripts(filter_out_main_ui_only=True)]}),
+     'upscaling_max_images_in_cache': OptionInfo(5, "Maximum number of images in upscaling cache", gr.Slider, {"minimum": 0, "maximum": 10, "step": 1}),
+     'postprocessing_existing_caption_action': OptionInfo("Ignore", "Action for existing captions", gr.Radio, {"choices": ["Ignore", "Keep", "Prepend", "Append"]}).info("when generating captions using postprocessing; Ignore = use generated; Keep = use original; Prepend/Append = combine both"),
+ }))
+diff --git a/scripts/postprocessing_upscale.py b/scripts/postprocessing_upscale.py
+index 2409fd2073e..47a24b1b784 100644
+--- a/scripts/postprocessing_upscale.py
++++ b/scripts/postprocessing_upscale.py
+@@ -169,6 +169,7 @@ def image_changed(self):
+ class ScriptPostprocessingUpscaleSimple(ScriptPostprocessingUpscale):
+     name = "Simple Upscale"
+     order = 900
++    main_ui_only = True
+ 
+     def ui(self):
+         with FormRow():

@@ -1,0 +1,156 @@
+diff --git a/frontend/app/src/App.tsx b/frontend/app/src/App.tsx
+index 23a5eafcf613..145fb2cdee22 100644
+--- a/frontend/app/src/App.tsx
++++ b/frontend/app/src/App.tsx
+@@ -415,7 +415,7 @@ export class App extends PureComponent<Props, State> {
+ 
+   initializeConnectionManager(): void {
+     this.connectionManager = new ConnectionManager({
+-      sessionInfo: this.sessionInfo,
++      getLastSessionId: () => this.sessionInfo.last?.sessionId,
+       endpoints: this.endpoints,
+       onMessage: this.handleMessage,
+       onConnectionError: this.handleConnectionError,
+diff --git a/frontend/app/src/connection/ConnectionManager.ts b/frontend/app/src/connection/ConnectionManager.ts
+index 52ce8c9cb534..1b9d4eca183b 100644
+--- a/frontend/app/src/connection/ConnectionManager.ts
++++ b/frontend/app/src/connection/ConnectionManager.ts
+@@ -19,10 +19,8 @@ import { getLogger } from "loglevel"
+ 
+ import {
+   BaseUriParts,
+-  ensureError,
+   getPossibleBaseUris,
+   IHostConfigResponse,
+-  SessionInfo,
+   StreamlitEndpoints,
+ } from "@streamlit/lib"
+ import { BackMsg, ForwardMsg } from "@streamlit/protobuf"
+@@ -43,7 +41,7 @@ const log = getLogger("ConnectionManager")
+ 
+ interface Props {
+   /** The app's SessionInfo instance */
+-  sessionInfo: SessionInfo
++  getLastSessionId: () => string | undefined
+ 
+   /** The app's StreamlitEndpoints instance */
+   endpoints: StreamlitEndpoints
+@@ -174,7 +172,7 @@ export class ConnectionManager {
+       try {
+         this.websocketConnection = await this.connectToRunningServer()
+       } catch (e) {
+-        const err = ensureError(e)
++        const err = e instanceof Error ? e : new Error(`${e}`)
+         log.error(err.message)
+         this.setConnectionState(
+           ConnectionState.DISCONNECTED_FOREVER,
+@@ -219,7 +217,7 @@ export class ConnectionManager {
+     const baseUriPartsList = getPossibleBaseUris()
+ 
+     return new WebsocketConnection({
+-      sessionInfo: this.props.sessionInfo,
++      getLastSessionId: this.props.getLastSessionId,
+       endpoints: this.props.endpoints,
+       baseUriPartsList,
+       onMessage: this.props.onMessage,
+diff --git a/frontend/app/src/connection/WebsocketConnection.test.tsx b/frontend/app/src/connection/WebsocketConnection.test.tsx
+index 2998f9c52788..f9249a849daf 100644
+--- a/frontend/app/src/connection/WebsocketConnection.test.tsx
++++ b/frontend/app/src/connection/WebsocketConnection.test.tsx
+@@ -20,11 +20,7 @@ import axios from "axios"
+ import { default as WS } from "vitest-websocket-mock"
+ import zip from "lodash/zip"
+ 
+-import {
+-  mockEndpoints,
+-  mockSessionInfoProps,
+-  SessionInfo,
+-} from "@streamlit/lib"
++import { mockEndpoints } from "@streamlit/lib"
+ import { BackMsg } from "@streamlit/protobuf"
+ import { ConnectionState } from "@streamlit/app/src/connection/ConnectionState"
+ import {
+@@ -48,7 +44,7 @@ const MOCK_HEALTH_RESPONSE = { status: "ok" }
+ /** Create mock WebsocketConnection arguments */
+ function createMockArgs(overrides?: Partial<Args>): Args {
+   return {
+-    sessionInfo: new SessionInfo(),
++    getLastSessionId: () => undefined,
+     endpoints: mockEndpoints(),
+     baseUriPartsList: [
+       {
+@@ -717,15 +713,9 @@ describe("WebsocketConnection auth token handling", () => {
+   })
+ 
+   it("sets third Sec-WebSocket-Protocol option to lastSessionId if available", async () => {
+-    // Create a mock SessionInfo with sessionInfo.last.sessionId == "lastSessionId"
+-    const sessionInfo = new SessionInfo()
+-    sessionInfo.setCurrent(
+-      mockSessionInfoProps({ sessionId: "lastSessionId" })
++    const ws = new WebsocketConnection(
++      createMockArgs({ getLastSessionId: () => "lastSessionId" })
+     )
+-    sessionInfo.setCurrent(mockSessionInfoProps())
+-    expect(sessionInfo.last?.sessionId).toBe("lastSessionId")
+-
+-    const ws = new WebsocketConnection(createMockArgs({ sessionInfo }))
+ 
+     // Set correct state for this action
+     // @ts-expect-error
+@@ -741,18 +731,10 @@ describe("WebsocketConnection auth token handling", () => {
+   })
+ 
+   it("sets both host provided auth token and lastSessionId if both set", async () => {
+-    // Create a mock SessionInfo with sessionInfo.last.sessionId == "lastSessionId"
+-    const sessionInfo = new SessionInfo()
+-    sessionInfo.setCurrent(
+-      mockSessionInfoProps({ sessionId: "lastSessionId" })
+-    )
+-    sessionInfo.setCurrent(mockSessionInfoProps())
+-    expect(sessionInfo.last?.sessionId).toBe("lastSessionId")
+-
+     const resetHostAuthToken = vi.fn()
+     const ws = new WebsocketConnection(
+       createMockArgs({
+-        sessionInfo,
++        getLastSessionId: () => "lastSessionId",
+         claimHostAuthToken: () => Promise.resolve("iAmAnAuthToken"),
+         resetHostAuthToken,
+       })
+diff --git a/frontend/app/src/connection/WebsocketConnection.tsx b/frontend/app/src/connection/WebsocketConnection.tsx
+index e7291e614c77..1c072261eb0c 100644
+--- a/frontend/app/src/connection/WebsocketConnection.tsx
++++ b/frontend/app/src/connection/WebsocketConnection.tsx
+@@ -39,7 +39,6 @@ import {
+   isNullOrUndefined,
+   notNullOrUndefined,
+   PerformanceEvents,
+-  SessionInfo,
+   StreamlitEndpoints,
+ } from "@streamlit/lib"
+ import { BackMsg, ForwardMsg, IBackMsg } from "@streamlit/protobuf"
+@@ -48,7 +47,7 @@ import { doInitPings } from "@streamlit/app/src/connection/DoInitPings"
+ 
+ export interface Args {
+   /** The application's SessionInfo instance */
+-  sessionInfo: SessionInfo
++  getLastSessionId: () => string | undefined
+ 
+   endpoints: StreamlitEndpoints
+ 
+@@ -340,13 +339,12 @@ export class WebsocketConnection {
+     const hostAuthToken = await this.args.claimHostAuthToken()
+     const xsrfCookie = getCookie("_streamlit_xsrf")
+     this.args.resetHostAuthToken()
++    const lastSessionId = this.args.getLastSessionId()
+     return [
+       // NOTE: We have to set the auth token to some arbitrary placeholder if
+       // not provided since the empty string is an invalid protocol option.
+       hostAuthToken ?? xsrfCookie ?? "PLACEHOLDER_AUTH_TOKEN",
+-      ...(this.args.sessionInfo.last?.sessionId
+-        ? [this.args.sessionInfo.last?.sessionId]
+-        : []),
++      ...(lastSessionId ? [lastSessionId] : []),
+     ]
+   }
+ 
