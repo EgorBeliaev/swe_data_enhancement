@@ -1,0 +1,213 @@
+diff --git a/cli-commands/vm/list.rb b/cli-commands/vm/list.rb
+index 40ba57a87..f4fab3e69 100644
+--- a/cli-commands/vm/list.rb
++++ b/cli-commands/vm/list.rb
+@@ -1,24 +1,34 @@
+ # frozen_string_literal: true
+ 
+ UbiRodish.on("vm", "list") do
++  fields = %w[location name id ip4 ip6].freeze.each(&:freeze)
++
+   options("ubi vm list [options]", key: :vm_list) do
+-    on("-h", "--headers", "show headers")
+-    on("-i", "--id", "show id")
+-    on("-n", "--name", "show name")
+-    on("-l", "--location", "show location")
+-    on("-4", "--ip4", "show IPv4 address")
+-    on("-6", "--ip6", "show IPv6 address")
++    on("-N", "--no-headers", "do not show headers")
++    on("-f", "--fields=fields", "show specific fields (default: #{fields.join(",")})")
+   end
+ 
+-  fields = %w[location name id ip4 ip6].freeze.each(&:freeze)
+-
+   run do |opts|
+     get(project_path("vm")) do |data|
+       keys = fields
++      headers = true
+       if (opts = opts[:vm_list])
+-        keys = keys.select { opts[_1.to_sym] }
+-        keys = fields if keys.empty?
+-        headers = opts[:headers]
++        if opts[:fields]
++          keys = opts[:fields].split(",")
++          if keys.empty?
++            raise Rodish::CommandFailure, "no fields given in vm list -f option"
++          end
++          unless keys.size == keys.uniq.size
++            raise Rodish::CommandFailure, "duplicate field(s) in vm list -f option"
++          end
++
++          invalid_keys = keys - fields
++          unless invalid_keys.empty?
++            raise Rodish::CommandFailure, "invalid field(s) given vm list -f option: #{invalid_keys.join(",")}"
++          end
++        end
++
++        headers = false if opts[:"no-headers"] == false
+       end
+ 
+       format_rows(keys, data["items"], headers:)
+diff --git a/lib/ubi_cli.rb b/lib/ubi_cli.rb
+index 353e3c3fe..cb7e4b9d7 100644
+--- a/lib/ubi_cli.rb
++++ b/lib/ubi_cli.rb
+@@ -80,31 +80,49 @@ def project_path(rest)
+     "/project/#{project_ubid}/#{rest}"
+   end
+ 
+-  def format_rows(keys, rows, headers: false)
++  def format_rows(keys, rows, headers: false, col_sep: "  ")
+     results = []
+-    tab = false
+ 
+-    if headers
++    sizes = Hash.new(0)
++    string_keys = keys.map(&:to_s)
++    string_keys.each do |key|
++      sizes[key] = key.size
++    end
++    rows = rows.map do |row|
++      row.transform_values(&:to_s)
++    end
++    rows.each do |row|
+       keys.each do |key|
+-        if tab
+-          results << "\t"
++        size = row[key].size
++        sizes[key] = size if size > sizes[key]
++      end
++    end
++    sizes.transform_values! do |size|
++      "%-#{size}s"
++    end
++
++    if headers
++      sep = false
++      string_keys.each do |key|
++        if sep
++          results << col_sep
+         else
+-          tab = true
++          sep = true
+         end
+-        results << key.to_s
++        results << (sizes[key] % key)
+       end
+       results << "\n"
+     end
+ 
+     rows.each do |row|
+-      tab = false
++      sep = false
+       keys.each do |key|
+-        if tab
+-          results << "\t"
++        if sep
++          results << col_sep
+         else
+-          tab = true
++          sep = true
+         end
+-        results << row[key].to_s
++        results << (sizes[key] % row[key])
+       end
+       results << "\n"
+     end
+diff --git a/spec/routes/api/cli/spec_helper.rb b/spec/routes/api/cli/spec_helper.rb
+index 6c069791b..3b852e9ee 100644
+--- a/spec/routes/api/cli/spec_helper.rb
++++ b/spec/routes/api/cli/spec_helper.rb
+@@ -5,7 +5,7 @@
+ RSpec.configure do |config|
+   def cli(argv, status: 200, env: {})
+     post("/cli", {"argv" => argv}.to_json, env)
+-    expect(last_response.status).to eq(status)
++    expect(last_response.status).to eq(status), "status is #{last_response.status} not #{status}, body for failing status: #{last_response.body}"
+     expect(last_response["content-type"]).to eq("text/plain")
+     last_response.body
+   end
+diff --git a/spec/routes/api/cli/vm/list_spec.rb b/spec/routes/api/cli/vm/list_spec.rb
+index 34243e9aa..fbdd94e9f 100644
+--- a/spec/routes/api/cli/vm/list_spec.rb
++++ b/spec/routes/api/cli/vm/list_spec.rb
+@@ -3,41 +3,69 @@
+ require_relative "../spec_helper"
+ 
+ RSpec.describe Clover, "cli vm list" do
++  id_headr = "id" + " " * 24
++
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+   end
+ 
+   it "shows list of vms" do
+-    expect(cli(%w[vm list])).to eq "eu-central-h1\ttest-vm\t#{@vm.ubid}\t128.0.0.1\t128:1234::2\n"
++    expect(cli(%w[vm list -N])).to eq "eu-central-h1  test-vm  #{@vm.ubid}  128.0.0.1  128:1234::2\n"
+   end
+ 
+   it "-i option includes VM ubid" do
+-    expect(cli(%w[vm list -i])).to eq "#{@vm.ubid}\n"
++    expect(cli(%w[vm list -Nfid])).to eq "#{@vm.ubid}\n"
+   end
+ 
+   it "-n option includes VM name" do
+-    expect(cli(%w[vm list -n])).to eq "test-vm\n"
++    expect(cli(%w[vm list -Nfname])).to eq "test-vm\n"
+   end
+ 
+   it "-l option includes VM location" do
+-    expect(cli(%w[vm list -l])).to eq "eu-central-h1\n"
++    expect(cli(%w[vm list -Nflocation])).to eq "eu-central-h1\n"
+   end
+ 
+   it "-4 option includes VM IPv4 address" do
+-    expect(cli(%w[vm list -4])).to eq "128.0.0.1\n"
++    expect(cli(%w[vm list -Nfip4])).to eq "128.0.0.1\n"
+   end
+ 
+   it "-6 option includes VM IPv6 address" do
+-    expect(cli(%w[vm list -6])).to eq "128:1234::2\n"
++    expect(cli(%w[vm list -Nfip6])).to eq "128:1234::2\n"
++  end
++
++  it "headers are shown by default" do
++    expect(cli(%w[vm list])).to eq <<~END
++      location       name     #{id_headr}  ip4        ip6        
++      eu-central-h1  test-vm  #{@vm.ubid}  128.0.0.1  128:1234::2
++    END
+   end
+ 
+-  it "-4 option includes headers" do
+-    expect(cli(%w[vm list -h])).to eq "location\tname\tid\tip4\tip6\neu-central-h1\ttest-vm\t#{@vm.ubid}\t128.0.0.1\t128:1234::2\n"
++  it "handles case where header size is larger than largest column size" do
++    @vm.update(name: "Abc")
++    expect(cli(%w[vm list])).to eq <<~END
++      location       name  #{id_headr}  ip4        ip6        
++      eu-central-h1  Abc   #{@vm.ubid}  128.0.0.1  128:1234::2
++    END
+   end
+ 
+   it "handles multiple options" do
+-    expect(cli(%w[vm list -inl])).to eq "eu-central-h1\ttest-vm\t#{@vm.ubid}\n"
+-    expect(cli(%w[vm list -hinl])).to eq "location\tname\tid\neu-central-h1\ttest-vm\t#{@vm.ubid}\n"
++    expect(cli(%w[vm list -Nflocation,name,id])).to eq "eu-central-h1  test-vm  #{@vm.ubid}\n"
++    expect(cli(%w[vm list -flocation,name,id])).to eq <<~END
++      location       name     #{id_headr}
++      eu-central-h1  test-vm  #{@vm.ubid}
++    END
++  end
++
++  it "shows error for empty fields" do
++    expect(cli(%w[vm list -Nf] + [""], status: 400)).to eq "no fields given in vm list -f option"
++  end
++
++  it "shows error for duplicate fields" do
++    expect(cli(%w[vm list -Nfid,id], status: 400)).to eq "duplicate field(s) in vm list -f option"
++  end
++
++  it "shows error for invalid fields" do
++    expect(cli(%w[vm list -Nffoo], status: 400)).to eq "invalid field(s) given vm list -f option: foo"
+   end
+ end

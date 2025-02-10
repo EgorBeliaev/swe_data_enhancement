@@ -1,0 +1,827 @@
+diff --git a/.circleci/config.yml b/.circleci/config.yml
+index d0055f31..460be1ea 100644
+--- a/.circleci/config.yml
++++ b/.circleci/config.yml
+@@ -10,7 +10,7 @@ jobs:
+       - image: cimg/ruby:3.3.4
+         environment:
+           RAILS_ENV: test
+-      - image: cimg/postgres:13.3
++      - image: cimg/postgres:13.3-postgis
+         environment:
+           POSTGRES_USER: postgres
+           POSTGRES_DB: test_database
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1b70a9eb..1dd4398c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,11 +5,17 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
+-# 0.23.6 - 2025-01-23
++# 0.23.6 - 2025-01-29
+ 
+ ### Added
+ 
+ - Enabled Postgis extension for PostgreSQL.
++- Trips are now store their paths in the database independently of the points.
++- Trips are now being rendered on the map using their precalculated paths instead of list of coordinates.
++
++### Changed
++
++- Requesting photos on the Map page now uses the start and end dates from the URL params. #589
+ 
+ # 0.23.5 - 2025-01-22
+ 
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 00214a48..d1470f1e 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -8,7 +8,7 @@
+ 
+ #### **Did you write a patch that fixes a bug?**
+ 
+-* Open a new GitHub pull request with the patch.
++* Open a new GitHub pull request with the patch against the `dev` branch.
+ 
+ * Ensure the PR description clearly describes the problem and solution. Include the relevant issue number if applicable.
+ 
+diff --git a/Gemfile b/Gemfile
+index 92c6d14f..592c2fd3 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -23,6 +23,7 @@ gem 'activerecord-postgis-adapter', github: 'StoneGod/activerecord-postgis-adapt
+ gem 'puma'
+ gem 'pundit'
+ gem 'rails', '~> 8.0'
++gem 'rgeo'
+ gem 'rswag-api'
+ gem 'rswag-ui'
+ gem 'shrine', '~> 3.6'
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 5460cf07..8407dd3a 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -484,6 +484,7 @@ DEPENDENCIES
+   pundit
+   rails (~> 8.0)
+   redis
++  rgeo
+   rspec-rails
+   rswag-api
+   rswag-specs
+diff --git a/README.md b/README.md
+index a087aab4..0d21ed03 100644
+--- a/README.md
++++ b/README.md
+@@ -28,7 +28,7 @@ Donate using crypto: [0x6bAd13667692632f1bF926cA9B421bEe7EaEB8D4](https://ethers
+ - Explore statistics like the number of countries and cities visited, total distance traveled, and more!
+ 
+ 📄 **Changelog**: Find the latest updates [here](CHANGELOG.md).
+-
++👩‍💻 **Contribute**: See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute to Dawarich.
+ ---
+ 
+ ## ⚠️ Disclaimer
+diff --git a/app/assets/stylesheets/actiontext.css b/app/assets/stylesheets/actiontext.css
+index b849676e..ae5522ab 100644
+--- a/app/assets/stylesheets/actiontext.css
++++ b/app/assets/stylesheets/actiontext.css
+@@ -40,6 +40,7 @@
+   background-color: white !important;
+ }
+ 
+-.trix-content {
++.trix-content-editor {
+   min-height: 10rem;
++  width: 100%;
+ }
+diff --git a/app/controllers/trips_controller.rb b/app/controllers/trips_controller.rb
+index 2a9a26d2..038d4842 100644
+--- a/app/controllers/trips_controller.rb
++++ b/app/controllers/trips_controller.rb
+@@ -10,11 +10,6 @@ def index
+   end
+ 
+   def show
+-    @coordinates = @trip.points.pluck(
+-      :latitude, :longitude, :battery, :altitude, :timestamp, :velocity, :id,
+-      :country
+-    ).map { [_1.to_f, _2.to_f, _3.to_s, _4.to_s, _5.to_s, _6.to_s, _7.to_s, _8.to_s] }
+-
+     @photo_previews = Rails.cache.fetch("trip_photos_#{@trip.id}", expires_in: 1.day) do
+       @trip.photo_previews
+     end
+diff --git a/app/javascript/controllers/datetime_controller.js b/app/javascript/controllers/datetime_controller.js
+index 04c9061b..b56f07e3 100644
+--- a/app/javascript/controllers/datetime_controller.js
++++ b/app/javascript/controllers/datetime_controller.js
+@@ -1,3 +1,7 @@
++// This controller is being used on:
++// - trips/new
++// - trips/edit
++
+ import { Controller } from "@hotwired/stimulus"
+ 
+ export default class extends Controller {
+diff --git a/app/javascript/controllers/maps_controller.js b/app/javascript/controllers/maps_controller.js
+index 313b477d..997821da 100644
+--- a/app/javascript/controllers/maps_controller.js
++++ b/app/javascript/controllers/maps_controller.js
+@@ -218,8 +218,8 @@ export default class extends Controller {
+         }
+ 
+         const urlParams = new URLSearchParams(window.location.search);
+-        const startDate = urlParams.get('start_at')?.split('T')[0] || new Date().toISOString().split('T')[0];
+-        const endDate = urlParams.get('end_at')?.split('T')[0] || new Date().toISOString().split('T')[0];
++        const startDate = urlParams.get('start_at') || new Date().toISOString();
++        const endDate = urlParams.get('end_at')|| new Date().toISOString();
+         await fetchAndDisplayPhotos({
+           map: this.map,
+           photoMarkers: this.photoMarkers,
+diff --git a/app/javascript/controllers/trip_map_controller.js b/app/javascript/controllers/trip_map_controller.js
+index b2a18bfb..1bbdc207 100644
+--- a/app/javascript/controllers/trip_map_controller.js
++++ b/app/javascript/controllers/trip_map_controller.js
+@@ -1,10 +1,13 @@
++// This controller is being used on:
++// - trips/index
++
+ import { Controller } from "@hotwired/stimulus"
+ import L from "leaflet"
+ 
+ export default class extends Controller {
+   static values = {
+     tripId: Number,
+-    coordinates: Array,
++    path: String,
+     apiKey: String,
+     userSettings: Object,
+     timezone: String,
+@@ -12,6 +15,8 @@ export default class extends Controller {
+   }
+ 
+   connect() {
++    console.log("TripMap controller connected")
++
+     setTimeout(() => {
+       this.initializeMap()
+     }, 100)
+@@ -23,7 +28,7 @@ export default class extends Controller {
+       zoomControl: false,
+       dragging: false,
+       scrollWheelZoom: false,
+-      attributionControl: true  // Disable default attribution control
++      attributionControl: true
+     })
+ 
+     // Add the tile layer
+@@ -33,24 +38,69 @@ export default class extends Controller {
+     }).addTo(this.map)
+ 
+     // If we have coordinates, show the route
+-    if (this.hasCoordinatesValue && this.coordinatesValue.length > 0) {
++    if (this.hasPathValue && this.pathValue) {
+       this.showRoute()
++    } else {
++      console.log("No path value available")
+     }
+   }
+ 
+   showRoute() {
+-    const points = this.coordinatesValue.map(coord => [coord[0], coord[1]])
++    const points = this.parseLineString(this.pathValue)
+ 
+-    const polyline = L.polyline(points, {
+-      color: 'blue',
+-      opacity: 0.8,
+-      weight: 3,
+-      zIndexOffset: 400
+-    }).addTo(this.map)
++    // Only create polyline if we have points
++    if (points.length > 0) {
++      const polyline = L.polyline(points, {
++        color: 'blue',
++        opacity: 0.8,
++        weight: 3,
++        zIndexOffset: 400
++      })
+ 
+-    this.map.fitBounds(polyline.getBounds(), {
+-      padding: [20, 20]
+-    })
++      // Add the polyline to the map
++      polyline.addTo(this.map)
++
++      // Fit the map bounds
++      this.map.fitBounds(polyline.getBounds(), {
++        padding: [20, 20]
++      })
++    } else {
++      console.error("No valid points to create polyline")
++    }
++  }
++
++  parseLineString(linestring) {
++    try {
++      // Remove 'LINESTRING (' from start and ')' from end
++      const coordsString = linestring
++        .replace(/LINESTRING\s*\(/, '')  // Remove LINESTRING and opening parenthesis
++        .replace(/\)$/, '')              // Remove closing parenthesis
++        .trim()                          // Remove any leading/trailing whitespace
++
++      // Split into coordinate pairs and parse
++      const points = coordsString.split(',').map(pair => {
++        // Clean up any extra whitespace and remove any special characters
++        const cleanPair = pair.trim().replace(/[()"\s]+/g, ' ')
++        const [lng, lat] = cleanPair.split(' ').filter(Boolean).map(Number)
++
++        // Validate the coordinates
++        if (isNaN(lat) || isNaN(lng) || !lat || !lng) {
++          console.error("Invalid coordinates:", cleanPair)
++          return null
++        }
++
++        return [lat, lng] // Leaflet uses [lat, lng] order
++      }).filter(point => point !== null) // Remove any invalid points
++
++      // Validate we have points before returning
++      if (points.length === 0) {
++        return []
++      }
++
++      return points
++    } catch (error) {
++      return []
++    }
+   }
+ 
+   disconnect() {
+diff --git a/app/javascript/controllers/trips_controller.js b/app/javascript/controllers/trips_controller.js
+index 602c04be..974feb30 100644
+--- a/app/javascript/controllers/trips_controller.js
++++ b/app/javascript/controllers/trips_controller.js
+@@ -1,17 +1,26 @@
++// This controller is being used on:
++// - trips/show
++// - trips/edit
++// - trips/new
++
+ import { Controller } from "@hotwired/stimulus"
+ import L from "leaflet"
+-import { osmMapLayer } from "../maps/layers"
++import {
++  osmMapLayer,
++  osmHotMapLayer,
++  OPNVMapLayer,
++  openTopoMapLayer,
++  cyclOsmMapLayer,
++  esriWorldStreetMapLayer,
++  esriWorldTopoMapLayer,
++  esriWorldImageryMapLayer,
++  esriWorldGrayCanvasMapLayer
++} from "../maps/layers"
+ import { createPopupContent } from "../maps/popups"
+-import { osmHotMapLayer } from "../maps/layers"
+-import { OPNVMapLayer } from "../maps/layers"
+-import { openTopoMapLayer } from "../maps/layers"
+-import { cyclOsmMapLayer } from "../maps/layers"
+-import { esriWorldStreetMapLayer } from "../maps/layers"
+-import { esriWorldTopoMapLayer } from "../maps/layers"
+-import { esriWorldImageryMapLayer } from "../maps/layers"
+-import { esriWorldGrayCanvasMapLayer } from "../maps/layers"
+-import { fetchAndDisplayPhotos } from '../maps/helpers';
+-import { showFlashMessage } from "../maps/helpers";
++import {
++  fetchAndDisplayPhotos,
++  showFlashMessage
++} from '../maps/helpers';
+ 
+ export default class extends Controller {
+   static targets = ["container", "startedAt", "endedAt"]
+@@ -23,9 +32,9 @@ export default class extends Controller {
+     }
+ 
+     console.log("Trips controller connected")
+-    this.coordinates = JSON.parse(this.containerTarget.dataset.coordinates)
++
+     this.apiKey = this.containerTarget.dataset.api_key
+-    this.userSettings = JSON.parse(this.containerTarget.dataset.user_settings)
++    this.userSettings = JSON.parse(this.containerTarget.dataset.user_settings || '{}')
+     this.timezone = this.containerTarget.dataset.timezone
+     this.distanceUnit = this.containerTarget.dataset.distance_unit
+ 
+@@ -34,7 +43,6 @@ export default class extends Controller {
+ 
+     // Add event listener for coordinates updates
+     this.element.addEventListener('coordinates-updated', (event) => {
+-      console.log("Coordinates updated:", event.detail.coordinates)
+       this.updateMapWithCoordinates(event.detail.coordinates)
+     })
+   }
+@@ -42,16 +50,12 @@ export default class extends Controller {
+   // Move map initialization to separate method
+   initializeMap() {
+     // Initialize layer groups
+-    this.markersLayer = L.layerGroup()
+     this.polylinesLayer = L.layerGroup()
+     this.photoMarkers = L.layerGroup()
+ 
+     // Set default center and zoom for world view
+-    const hasValidCoordinates = this.coordinates && Array.isArray(this.coordinates) && this.coordinates.length > 0
+-    const center = hasValidCoordinates
+-      ? [this.coordinates[0][0], this.coordinates[0][1]]
+-      : [20, 0]  // Roughly centers the world map
+-    const zoom = hasValidCoordinates ? 14 : 2
++    const center = [20, 0]  // Roughly centers the world map
++    const zoom = 2
+ 
+     // Initialize map
+     this.map = L.map(this.containerTarget).setView(center, zoom)
+@@ -68,7 +72,6 @@ export default class extends Controller {
+     }).addTo(this.map)
+ 
+     const overlayMaps = {
+-      "Points": this.markersLayer,
+       "Route": this.polylinesLayer,
+       "Photos": this.photoMarkers
+     }
+@@ -80,6 +83,15 @@ export default class extends Controller {
+     this.map.on('overlayadd', (e) => {
+       if (e.name !== 'Photos') return;
+ 
++      const startedAt = this.element.dataset.started_at;
++      const endedAt = this.element.dataset.ended_at;
++
++      console.log('Dataset values:', {
++        startedAt,
++        endedAt,
++        path: this.element.dataset.path
++      });
++
+       if ((!this.userSettings.immich_url || !this.userSettings.immich_api_key) && (!this.userSettings.photoprism_url || !this.userSettings.photoprism_api_key)) {
+         showFlashMessage(
+           'error',
+@@ -88,13 +100,26 @@ export default class extends Controller {
+         return;
+       }
+ 
+-      if (!this.coordinates?.length) return;
+-
+-      const firstCoord = this.coordinates[0];
+-      const lastCoord = this.coordinates[this.coordinates.length - 1];
++      // Try to get dates from coordinates first, then fall back to path data
++      let startDate, endDate;
+ 
+-      const startDate = new Date(firstCoord[4] * 1000).toISOString().split('T')[0];
+-      const endDate = new Date(lastCoord[4] * 1000).toISOString().split('T')[0];
++      if (this.coordinates?.length) {
++        const firstCoord = this.coordinates[0];
++        const lastCoord = this.coordinates[this.coordinates.length - 1];
++        startDate = new Date(firstCoord[4] * 1000).toISOString().split('T')[0];
++        endDate = new Date(lastCoord[4] * 1000).toISOString().split('T')[0];
++      } else if (startedAt && endedAt) {
++        // Parse the dates and format them correctly
++        startDate = new Date(startedAt).toISOString().split('T')[0];
++        endDate = new Date(endedAt).toISOString().split('T')[0];
++      } else {
++        console.log('No date range available for photos');
++        showFlashMessage(
++          'error',
++          'No date range available for photos. Please ensure the trip has start and end dates.'
++        );
++        return;
++      }
+ 
+       fetchAndDisplayPhotos({
+         map: this.map,
+@@ -112,6 +137,27 @@ export default class extends Controller {
+       this.addPolyline()
+       this.fitMapToBounds()
+     }
++
++    // After map initialization, add the path if it exists
++    if (this.containerTarget.dataset.path) {
++      const pathData = this.containerTarget.dataset.path.replace(/^"|"$/g, ''); // Remove surrounding quotes
++      const coordinates = this.parseLineString(pathData);
++
++      const polyline = L.polyline(coordinates, {
++        color: 'blue',
++        opacity: 0.8,
++        weight: 3,
++        zIndexOffset: 400
++      });
++
++      polyline.addTo(this.polylinesLayer);
++      this.polylinesLayer.addTo(this.map);
++
++      // Fit the map to the polyline bounds
++      if (coordinates.length > 0) {
++        this.map.fitBounds(polyline.getBounds(), { padding: [50, 50] });
++      }
++    }
+   }
+ 
+   disconnect() {
+@@ -149,9 +195,7 @@ export default class extends Controller {
+ 
+       const popupContent = createPopupContent(coord, this.timezone, this.distanceUnit)
+       marker.bindPopup(popupContent)
+-
+-      // Add to markers layer instead of directly to map
+-      marker.addTo(this.markersLayer)
++      marker.addTo(this.polylinesLayer)
+     })
+   }
+ 
+@@ -175,7 +219,7 @@ export default class extends Controller {
+     this.map.fitBounds(bounds, { padding: [50, 50] })
+   }
+ 
+-  // Add this new method to update coordinates and refresh the map
++  // Update coordinates and refresh the map
+   updateMapWithCoordinates(newCoordinates) {
+     // Transform the coordinates to match the expected format
+     this.coordinates = newCoordinates.map(point => [
+@@ -187,7 +231,6 @@ export default class extends Controller {
+     ]).sort((a, b) => a[4] - b[4]);
+ 
+     // Clear existing layers
+-    this.markersLayer.clearLayers()
+     this.polylinesLayer.clearLayers()
+     this.photoMarkers.clearLayers()
+ 
+@@ -198,4 +241,17 @@ export default class extends Controller {
+       this.fitMapToBounds()
+     }
+   }
++
++  // Add this method to parse the LineString format
++  parseLineString(lineString) {
++    // Remove LINESTRING and parentheses, then split into coordinate pairs
++    const coordsString = lineString.replace('LINESTRING (', '').replace(')', '');
++    const coords = coordsString.split(', ');
++
++    // Convert each coordinate pair to [lat, lng] format
++    return coords.map(coord => {
++      const [lng, lat] = coord.split(' ').map(Number);
++      return [lat, lng]; // Swap to lat, lng for Leaflet
++    });
++  }
+ }
+diff --git a/app/jobs/trips/create_path_job.rb b/app/jobs/trips/create_path_job.rb
+new file mode 100644
+index 00000000..d64a39ec
+--- /dev/null
++++ b/app/jobs/trips/create_path_job.rb
+@@ -0,0 +1,13 @@
++# frozen_string_literal: true
++
++class Trips::CreatePathJob < ApplicationJob
++  queue_as :default
++
++  def perform(trip_id)
++    trip = Trip.find(trip_id)
++
++    trip.calculate_path_and_distance
++
++    trip.save!
++  end
++end
+diff --git a/app/models/trip.rb b/app/models/trip.rb
+index 4a2b0302..5e094078 100644
+--- a/app/models/trip.rb
++++ b/app/models/trip.rb
+@@ -7,7 +7,13 @@ class Trip < ApplicationRecord
+ 
+   validates :name, :started_at, :ended_at, presence: true
+ 
+-  before_save :calculate_distance
++  before_save :calculate_path_and_distance
++
++  def calculate_path_and_distance
++    calculate_path
++    calculate_distance
++  end
++
+ 
+   def points
+     user.tracked_points.where(timestamp: started_at.to_i..ended_at.to_i).order(:timestamp)
+@@ -40,6 +46,13 @@ def select_dominant_orientation(photos)
+     vertical_photos.count > horizontal_photos.count ? vertical_photos : horizontal_photos
+   end
+ 
++  def calculate_path
++    trip_path = Tracks::BuildPath.new(points.pluck(:latitude, :longitude)).call
++
++    self.path = trip_path
++  end
++
++
+   def calculate_distance
+     distance = 0
+ 
+diff --git a/app/models/user.rb b/app/models/user.rb
+index b3112130..b8d27f17 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -13,7 +13,7 @@ class User < ApplicationRecord
+   has_many :visits,         dependent: :destroy
+   has_many :points, through: :imports
+   has_many :places, through: :visits
+-  has_many :trips, dependent: :destroy
++  has_many :trips,  dependent: :destroy
+ 
+   after_create :create_api_key
+   before_save :strip_trailing_slashes
+diff --git a/app/services/tracks/build_path.rb b/app/services/tracks/build_path.rb
+new file mode 100644
+index 00000000..4feaf49c
+--- /dev/null
++++ b/app/services/tracks/build_path.rb
+@@ -0,0 +1,21 @@
++# frozen_string_literal: true
++
++class Tracks::BuildPath
++  def initialize(coordinates)
++    @coordinates = coordinates
++  end
++
++  def call
++    factory.line_string(
++      coordinates.map { |point| factory.point(point[1].to_f.round(5), point[0].to_f.round(5)) }
++    )
++  end
++
++  private
++
++  attr_reader :coordinates
++
++  def factory
++    @factory ||= RGeo::Geographic.spherical_factory(srid: 3857)
++  end
++end
+diff --git a/app/views/trips/_form.html.erb b/app/views/trips/_form.html.erb
+index cf5518ff..847c2df2 100644
+--- a/app/views/trips/_form.html.erb
++++ b/app/views/trips/_form.html.erb
+@@ -20,7 +20,9 @@
+         data-distance_unit="<%= DISTANCE_UNIT %>"
+         data-api_key="<%= current_user.api_key %>"
+         data-user_settings="<%= current_user.settings.to_json %>"
+-        data-coordinates="<%= @coordinates.to_json %>"
++        data-path="<%= trip.path.to_json %>"
++        data-started_at="<%= trip.started_at %>"
++        data-ended_at="<%= trip.ended_at %>"
+         data-timezone="<%= Rails.configuration.time_zone %>">
+       </div>
+     </div>
+@@ -62,7 +64,7 @@
+ 
+       <div class="form-control">
+         <%= form.label :notes %>
+-        <%= form.rich_text_area :notes %>
++        <%= form.rich_text_area :notes, class: 'trix-content-editor' %>
+       </div>
+ 
+       <div>
+diff --git a/app/views/trips/_trip.html.erb b/app/views/trips/_trip.html.erb
+index e0b14ba8..f7a198b6 100644
+--- a/app/views/trips/_trip.html.erb
++++ b/app/views/trips/_trip.html.erb
+@@ -13,7 +13,7 @@
+             class="rounded-lg z-0"
+             data-controller="trip-map"
+             data-trip-map-trip-id-value="<%= trip.id %>"
+-            data-trip-map-coordinates-value="<%= trip.points.pluck(:latitude, :longitude, :battery, :altitude, :timestamp, :velocity, :id, :country).to_json %>"
++            data-trip-map-path-value="<%= trip.path.to_json %>"
+             data-trip-map-api-key-value="<%= current_user.api_key %>"
+             data-trip-map-user-settings-value="<%= current_user.settings.to_json %>"
+             data-trip-map-timezone-value="<%= Rails.configuration.time_zone %>"
+diff --git a/app/views/trips/show.html.erb b/app/views/trips/show.html.erb
+index f399eb3f..f4709aa5 100644
+--- a/app/views/trips/show.html.erb
++++ b/app/views/trips/show.html.erb
+@@ -24,7 +24,9 @@
+           data-distance_unit="<%= DISTANCE_UNIT %>"
+           data-api_key="<%= current_user.api_key %>"
+           data-user_settings="<%= current_user.settings.to_json %>"
+-          data-coordinates="<%= @coordinates.to_json %>"
++          data-path="<%= @trip.path.to_json %>"
++          data-started_at="<%= @trip.started_at %>"
++          data-ended_at="<%= @trip.ended_at %>"
+           data-timezone="<%= Rails.configuration.time_zone %>">
+           <div data-trips-target="container" class="h-[25rem] w-full min-h-screen">
+           </div>
+diff --git a/config/database.ci.yml b/config/database.ci.yml
+index c5ee5c9d..d5e13575 100644
+--- a/config/database.ci.yml
++++ b/config/database.ci.yml
+@@ -1,8 +1,9 @@
+ # config/database.ci.yml
+ test:
+-  adapter: postgresql
++  adapter: postgis
+   encoding: unicode
+   pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
++  host: localhost
+   database: <%= ENV["POSTGRES_DB"] %>
+   username: <%= ENV['POSTGRES_USER'] %>
+   password: <%= ENV["POSTGRES_PASSWORD"] %>
+diff --git a/config/database.yml b/config/database.yml
+index fca7a51c..79ad2b3b 100644
+--- a/config/database.yml
++++ b/config/database.yml
+@@ -1,5 +1,5 @@
+ default: &default
+-  adapter: postgresql
++  adapter: postgis
+   encoding: unicode
+   database: <%= ENV['DATABASE_NAME'] %>
+   username: <%= ENV['DATABASE_USERNAME'] %>
+diff --git a/config/initializers/03_dawarich_settings.rb b/config/initializers/03_dawarich_settings.rb
+index 87cf4817..451ed716 100644
+--- a/config/initializers/03_dawarich_settings.rb
++++ b/config/initializers/03_dawarich_settings.rb
+@@ -17,5 +17,13 @@ def photon_uses_komoot_io?
+     def geoapify_enabled?
+       @geoapify_enabled ||= GEOAPIFY_API_KEY.present?
+     end
++
++    def meters_between_tracks
++      @meters_between_tracks ||= 300
++    end
++
++    def minutes_between_tracks
++      @minutes_between_tracks ||= 20
++    end
+   end
+ end
+diff --git a/db/data/20250123151849_create_paths_for_trips.rb b/db/data/20250123151849_create_paths_for_trips.rb
+new file mode 100644
+index 00000000..c78cffff
+--- /dev/null
++++ b/db/data/20250123151849_create_paths_for_trips.rb
+@@ -0,0 +1,13 @@
++# frozen_string_literal: true
++
++class CreatePathsForTrips < ActiveRecord::Migration[8.0]
++  def up
++    Trip.find_each do |trip|
++      Trips::CreatePathJob.perform_later(trip.id)
++    end
++  end
++
++  def down
++    raise ActiveRecord::IrreversibleMigration
++  end
++end
+diff --git a/db/migrate/20250123145155_enable_postgis_extension.rb b/db/migrate/20250123145155_enable_postgis_extension.rb
+new file mode 100644
+index 00000000..e9d816dd
+--- /dev/null
++++ b/db/migrate/20250123145155_enable_postgis_extension.rb
+@@ -0,0 +1,7 @@
++# frozen_string_literal: true
++
++class EnablePostgisExtension < ActiveRecord::Migration[8.0]
++  def change
++    enable_extension 'postgis'
++  end
++end
+diff --git a/db/migrate/20250123151657_add_path_to_trips.rb b/db/migrate/20250123151657_add_path_to_trips.rb
+new file mode 100644
+index 00000000..a5f121e7
+--- /dev/null
++++ b/db/migrate/20250123151657_add_path_to_trips.rb
+@@ -0,0 +1,7 @@
++# frozen_string_literal: true
++
++class AddPathToTrips < ActiveRecord::Migration[8.0]
++  def change
++    add_column :trips, :path, :line_string, srid: 3857
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index ebf1007e..b431351f 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,9 +10,10 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2025_01_20_154555) do
++ActiveRecord::Schema[8.0].define(version: 2025_01_23_151657) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pg_catalog.plpgsql"
++  enable_extension "postgis"
+ 
+   create_table "action_text_rich_texts", force: :cascade do |t|
+     t.string "name", null: false
+@@ -200,6 +201,7 @@
+     t.bigint "user_id", null: false
+     t.datetime "created_at", null: false
+     t.datetime "updated_at", null: false
++    t.geometry "path", limit: {:srid=>3857, :type=>"line_string"}
+     t.index ["user_id"], name: "index_trips_on_user_id"
+   end
+ 
+diff --git a/spec/factories/trips.rb b/spec/factories/trips.rb
+index 4ef4041a..5986e882 100644
+--- a/spec/factories/trips.rb
++++ b/spec/factories/trips.rb
+@@ -7,6 +7,8 @@
+     started_at { DateTime.new(2024, 11, 27, 17, 16, 21) }
+     ended_at { DateTime.new(2024, 11, 29, 17, 16, 21) }
+     notes { FFaker::Lorem.sentence }
++    distance { 100 }
++    path { 'LINESTRING(1 1, 2 2, 3 3)' }
+ 
+     trait :with_points do
+       after(:build) do |trip|
+diff --git a/spec/jobs/trips/create_path_job_spec.rb b/spec/jobs/trips/create_path_job_spec.rb
+new file mode 100644
+index 00000000..60d288e3
+--- /dev/null
++++ b/spec/jobs/trips/create_path_job_spec.rb
+@@ -0,0 +1,23 @@
++# frozen_string_literal: true
++
++require 'rails_helper'
++
++RSpec.describe Trips::CreatePathJob, type: :job do
++  let!(:trip) { create(:trip, :with_points) }
++  let(:points) { trip.points }
++  let(:trip_path) do
++    "LINESTRING (#{points.map do |point|
++      "#{point.longitude.to_f.round(5)} #{point.latitude.to_f.round(5)}"
++    end.join(', ')})"
++  end
++
++  before do
++    trip.update(path: nil, distance: nil)
++  end
++
++  it 'creates a path for a trip' do
++    described_class.perform_now(trip.id)
++
++    expect(trip.reload.path.to_s).to eq(trip_path)
++  end
++end
+diff --git a/spec/models/trip_spec.rb b/spec/models/trip_spec.rb
+index 032185bd..f56daf20 100644
+--- a/spec/models/trip_spec.rb
++++ b/spec/models/trip_spec.rb
+@@ -21,6 +21,10 @@
+     it 'sets the distance' do
+       expect(trip.distance).to eq(calculated_distance)
+     end
++
++    it 'sets the path' do
++      expect(trip.path).to be_present
++    end
+   end
+ 
+   describe '#countries' do
+diff --git a/spec/services/tracks/build_path_spec.rb b/spec/services/tracks/build_path_spec.rb
+new file mode 100644
+index 00000000..1d2db10a
+--- /dev/null
++++ b/spec/services/tracks/build_path_spec.rb
+@@ -0,0 +1,35 @@
++# frozen_string_literal: true
++
++require 'rails_helper'
++
++RSpec.describe Tracks::BuildPath do
++  describe '#call' do
++    let(:coordinates) do
++      [
++        [45.123456, -122.654321], # [lat, lng]
++        [45.234567, -122.765432],
++        [45.345678, -122.876543]
++      ]
++    end
++
++    let(:service) { described_class.new(coordinates) }
++    let(:result) { service.call }
++
++    it 'returns an RGeo::Geographic::SphericalLineString' do
++      expect(result).to be_a(RGeo::Geographic::SphericalLineStringImpl)
++    end
++
++    it 'creates a line string with the correct number of points' do
++      expect(result.num_points).to eq(coordinates.length)
++    end
++
++    it 'correctly converts coordinates to points with rounded values' do
++      points = result.points
++
++      coordinates.each_with_index do |(lat, lng), index|
++        expect(points[index].x).to eq(lng.to_f.round(5))
++        expect(points[index].y).to eq(lat.to_f.round(5))
++      end
++    end
++  end
++end

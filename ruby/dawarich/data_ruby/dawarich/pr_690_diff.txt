@@ -1,0 +1,1117 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a34d9ea6..be1d0faa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,13 +5,21 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
+-# 0.22.4 - 2025-01-15
++# 0.22.4 - 2025-01-20
++
++### Added
++
++- You can now drag-n-drop a point on the map to update its position. Enable the "Points" layer on the map to see the points.
+ 
+ ### Changed
+ 
+ - Run seeds even in prod env so Unraid users could have default user.
+ - Precompile assets in production env using dummy secret key base.
+ 
++### Fixed
++
++- Fixed a bug where route wasn't highlighted when it was hovered or clicked.
++
+ # 0.22.3 - 2025-01-14
+ 
+ ### Changed
+diff --git a/app/controllers/api/v1/points_controller.rb b/app/controllers/api/v1/points_controller.rb
+index a70dabdc..7905ca68 100644
+--- a/app/controllers/api/v1/points_controller.rb
++++ b/app/controllers/api/v1/points_controller.rb
+@@ -21,6 +21,14 @@ def index
+     render json: serialized_points
+   end
+ 
++  def update
++    point = current_api_user.tracked_points.find(params[:id])
++
++    point.update(point_params)
++
++    render json: point_serializer.new(point).call
++  end
++
+   def destroy
+     point = current_api_user.tracked_points.find(params[:id])
+     point.destroy
+@@ -30,6 +38,10 @@ def destroy
+ 
+   private
+ 
++  def point_params
++    params.require(:point).permit(:latitude, :longitude)
++  end
++
+   def point_serializer
+     params[:slim] == 'true' ? Api::SlimPointSerializer : Api::PointSerializer
+   end
+diff --git a/app/javascript/controllers/maps_controller.js b/app/javascript/controllers/maps_controller.js
+index 01fa6ad7..313b477d 100644
+--- a/app/javascript/controllers/maps_controller.js
++++ b/app/javascript/controllers/maps_controller.js
+@@ -61,6 +61,35 @@ export default class extends Controller {
+ 
+     this.map = L.map(this.containerTarget).setView([this.center[0], this.center[1]], 14);
+ 
++    // Add scale control
++    L.control.scale({
++      position: 'bottomright',
++      imperial: this.distanceUnit === 'mi',
++      metric: this.distanceUnit === 'km',
++      maxWidth: 120
++    }).addTo(this.map)
++
++    // Add stats control
++    const StatsControl = L.Control.extend({
++      options: {
++        position: 'bottomright'
++      },
++      onAdd: (map) => {
++        const div = L.DomUtil.create('div', 'leaflet-control-stats');
++        const distance = this.element.dataset.distance || '0';
++        const pointsNumber = this.element.dataset.points_number || '0';
++        const unit = this.distanceUnit === 'mi' ? 'mi' : 'km';
++        div.innerHTML = `${distance} ${unit} | ${pointsNumber} points`;
++        div.style.backgroundColor = 'white';
++        div.style.padding = '0 5px';
++        div.style.marginRight = '5px';
++        div.style.display = 'inline-block';
++        return div;
++      }
++    });
++
++    new StatsControl().addTo(this.map);
++
+     // Set the maximum bounds to prevent infinite scroll
+     var southWest = L.latLng(-120, -210);
+     var northEast = L.latLng(120, 210);
+@@ -68,7 +97,7 @@ export default class extends Controller {
+ 
+     this.map.setMaxBounds(bounds);
+ 
+-    this.markersArray = createMarkersArray(this.markers, this.userSettings);
++    this.markersArray = createMarkersArray(this.markers, this.userSettings, this.apiKey);
+     this.markersLayer = L.layerGroup(this.markersArray);
+     this.heatmapMarkers = this.markersArray.map((element) => [element._latlng.lat, element._latlng.lng, 0.2]);
+ 
+@@ -98,35 +127,41 @@ export default class extends Controller {
+       Photos: this.photoMarkers
+     };
+ 
+-    // Add this new custom control BEFORE the scale control
+-    const TestControl = L.Control.extend({
+-      onAdd: (map) => {
+-        const div = L.DomUtil.create('div', 'leaflet-control');
+-        const distance = this.element.dataset.distance || '0';
+-        const pointsNumber = this.element.dataset.points_number || '0';
+-        const unit = this.distanceUnit === 'mi' ? 'mi' : 'km';
+-        div.innerHTML = `${distance} ${unit} | ${pointsNumber} points`;
+-        div.style.backgroundColor = 'white';
+-        div.style.padding = '0 5px';
+-        div.style.marginRight = '5px';
+-        div.style.display = 'inline-block';
+-        return div;
+-      }
+-    });
++    // Initialize layer control first
++    this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
+ 
+-    // Add the test control first
+-    new TestControl({ position: 'bottomright' }).addTo(this.map);
++    // Add the toggle panel button
++    this.addTogglePanelButton();
+ 
+-    // Then add scale control
+-    L.control.scale({
+-      position: 'bottomright',
+-      imperial: this.distanceUnit === 'mi',
+-      metric: this.distanceUnit === 'km',
+-      maxWidth: 120
+-    }).addTo(this.map)
++    // Check if we should open the panel based on localStorage or URL params
++    const urlParams = new URLSearchParams(window.location.search);
++    const isPanelOpen = localStorage.getItem('mapPanelOpen') === 'true';
++    const hasDateParams = urlParams.has('start_at') && urlParams.has('end_at');
+ 
+-    // Initialize layer control
+-    this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
++    // Always create the panel first
++    this.toggleRightPanel();
++
++    // Then hide it if it shouldn't be open
++    if (!isPanelOpen && !hasDateParams) {
++      const panel = document.querySelector('.leaflet-right-panel');
++      if (panel) {
++        panel.style.display = 'none';
++        localStorage.setItem('mapPanelOpen', 'false');
++      }
++    }
++
++    // Update event handlers
++    this.map.on('moveend', () => {
++      if (document.getElementById('fog')) {
++        this.updateFog(this.markers, this.clearFogRadius);
++      }
++    });
++
++    this.map.on('zoomend', () => {
++      if (document.getElementById('fog')) {
++        this.updateFog(this.markers, this.clearFogRadius);
++      }
++    });
+ 
+     // Fetch and draw areas when the map is loaded
+     fetchAndDrawAreas(this.areasLayer, this.apiKey);
+@@ -205,39 +240,6 @@ export default class extends Controller {
+     if (this.liveMapEnabled) {
+       this.setupSubscription();
+     }
+-
+-    // Add the toggle panel button
+-    this.addTogglePanelButton();
+-
+-    // Check if we should open the panel based on localStorage or URL params
+-    const urlParams = new URLSearchParams(window.location.search);
+-    const isPanelOpen = localStorage.getItem('mapPanelOpen') === 'true';
+-    const hasDateParams = urlParams.has('start_at') && urlParams.has('end_at');
+-
+-    // Always create the panel first
+-    this.toggleRightPanel();
+-
+-    // Then hide it if it shouldn't be open
+-    if (!isPanelOpen && !hasDateParams) {
+-      const panel = document.querySelector('.leaflet-right-panel');
+-      if (panel) {
+-        panel.style.display = 'none';
+-        localStorage.setItem('mapPanelOpen', 'false');
+-      }
+-    }
+-
+-    // Update event handlers
+-    this.map.on('moveend', () => {
+-      if (document.getElementById('fog')) {
+-        this.updateFog(this.markers, this.clearFogRadius);
+-      }
+-    });
+-
+-    this.map.on('zoomend', () => {
+-      if (document.getElementById('fog')) {
+-        this.updateFog(this.markers, this.clearFogRadius);
+-      }
+-    });
+   }
+ 
+   disconnect() {
+@@ -786,164 +788,84 @@ export default class extends Controller {
+   }
+ 
+   updateMapWithNewSettings(newSettings) {
+-    console.log('Updating map settings:', {
+-      newSettings,
+-      currentSettings: this.userSettings,
+-      hasPolylines: !!this.polylinesLayer,
+-      isVisible: this.polylinesLayer && this.map.hasLayer(this.polylinesLayer)
+-    });
+-
+     // Show loading indicator
+     const loadingDiv = document.createElement('div');
+     loadingDiv.className = 'map-loading-overlay';
+     loadingDiv.innerHTML = '<div class="loading loading-lg">Updating map...</div>';
+     document.body.appendChild(loadingDiv);
+ 
+-    // Debounce the heavy operations
+-    const updateLayers = debounce(() => {
+-      try {
+-        // Store current layer visibility states
+-        const layerStates = {
+-          Points: this.map.hasLayer(this.markersLayer),
+-          Routes: this.map.hasLayer(this.polylinesLayer),
+-          Heatmap: this.map.hasLayer(this.heatmapLayer),
+-          "Fog of War": this.map.hasLayer(this.fogOverlay),
+-          "Scratch map": this.map.hasLayer(this.scratchLayer),
+-          Areas: this.map.hasLayer(this.areasLayer),
+-          Photos: this.map.hasLayer(this.photoMarkers)
+-        };
+-
+-        // Check if speed_colored_routes setting has changed
+-        if (newSettings.speed_colored_routes !== this.userSettings.speed_colored_routes) {
+-          if (this.polylinesLayer) {
+-            updatePolylinesColors(
+-              this.polylinesLayer,
+-              newSettings.speed_colored_routes
+-            );
+-          }
+-        }
+-
+-        // Update opacity if changed
+-        if (newSettings.route_opacity !== this.userSettings.route_opacity) {
+-          const newOpacity = parseFloat(newSettings.route_opacity) || 0.6;
+-          if (this.polylinesLayer) {
+-            updatePolylinesOpacity(this.polylinesLayer, newOpacity);
+-          }
++    try {
++      // Update settings first
++      if (newSettings.speed_colored_routes !== this.userSettings.speed_colored_routes) {
++        if (this.polylinesLayer) {
++          updatePolylinesColors(
++            this.polylinesLayer,
++            newSettings.speed_colored_routes
++          );
+         }
++      }
+ 
+-        // Update the local settings
+-        this.userSettings = { ...this.userSettings, ...newSettings };
+-        this.routeOpacity = parseFloat(newSettings.route_opacity) || 0.6;
+-        this.clearFogRadius = parseInt(newSettings.fog_of_war_meters) || 50;
+-
+-        // Remove existing layer control
+-        if (this.layerControl) {
+-          this.map.removeControl(this.layerControl);
++      if (newSettings.route_opacity !== this.userSettings.route_opacity) {
++        const newOpacity = parseFloat(newSettings.route_opacity) || 0.6;
++        if (this.polylinesLayer) {
++          updatePolylinesOpacity(this.polylinesLayer, newOpacity);
+         }
+-
+-        // Create new controls layer object with proper initialization
+-        const controlsLayer = {
+-          Points: this.markersLayer || L.layerGroup(),
+-          Routes: this.polylinesLayer || L.layerGroup(),
+-          Heatmap: this.heatmapLayer || L.heatLayer([]),
+-          "Fog of War": new this.fogOverlay(),
+-          "Scratch map": this.scratchLayer || L.layerGroup(),
+-          Areas: this.areasLayer || L.layerGroup(),
+-          Photos: this.photoMarkers || L.layerGroup()
+-        };
+-
+-        // Add new layer control
+-        this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
+-
+-        // Restore layer visibility states
+-        Object.entries(layerStates).forEach(([name, wasVisible]) => {
+-          const layer = controlsLayer[name];
+-          if (wasVisible && layer) {
+-            layer.addTo(this.map);
+-          } else if (layer && this.map.hasLayer(layer)) {
+-            this.map.removeLayer(layer);
+-          }
+-        });
+-
+-      } catch (error) {
+-        console.error('Error updating map settings:', error);
+-        console.error(error.stack);
+-      } finally {
+-        // Remove loading indicator after all updates are complete
+-        setTimeout(() => {
+-          document.body.removeChild(loadingDiv);
+-        }, 500); // Give a small delay to ensure all batches are processed
+       }
+-    }, 250);
+-
+-    updateLayers();
+-  }
+ 
+-  getLayerControlStates() {
+-    const controls = {};
+-
+-    this.map.eachLayer((layer) => {
+-      const layerName = this.getLayerName(layer);
++      // Update the local settings
++      this.userSettings = { ...this.userSettings, ...newSettings };
++      this.routeOpacity = parseFloat(newSettings.route_opacity) || 0.6;
++      this.clearFogRadius = parseInt(newSettings.fog_of_war_meters) || 50;
++
++      // Store current layer states
++      const layerStates = {
++        Points: this.map.hasLayer(this.markersLayer),
++        Routes: this.map.hasLayer(this.polylinesLayer),
++        Heatmap: this.map.hasLayer(this.heatmapLayer),
++        "Fog of War": this.map.hasLayer(this.fogOverlay),
++        "Scratch map": this.map.hasLayer(this.scratchLayer),
++        Areas: this.map.hasLayer(this.areasLayer),
++        Photos: this.map.hasLayer(this.photoMarkers)
++      };
+ 
+-      if (layerName) {
+-        controls[layerName] = this.map.hasLayer(layer);
++      // Remove only the layer control
++      if (this.layerControl) {
++        this.map.removeControl(this.layerControl);
+       }
+-    });
+-
+-    return controls;
+-  }
+-
+-  getLayerName(layer) {
+-    const controlLayers = {
+-      Points: this.markersLayer,
+-      Routes: this.polylinesLayer,
+-      Heatmap: this.heatmapLayer,
+-      "Fog of War": this.fogOverlay,
+-      Areas: this.areasLayer,
+-    };
+-
+-    for (const [name, val] of Object.entries(controlLayers)) {
+-      if (val && val.hasLayer && layer && val.hasLayer(layer)) // Check if the group layer contains the current layer
+-        return name;
+-    }
+-
+-    // Direct instance matching
+-    for (const [name, val] of Object.entries(controlLayers)) {
+-      if (val === layer) return name;
+-    }
+-
+-    return undefined; // Indicate no matching layer name found
+-  }
+ 
+-  applyLayerControlStates(states) {
+-    console.log('Applying layer states:', states);
+-
+-    const layerControl = {
+-      Points: this.markersLayer,
+-      Routes: this.polylinesLayer,
+-      Heatmap: this.heatmapLayer,
+-      "Fog of War": this.fogOverlay,
+-      Areas: this.areasLayer,
+-    };
++      // Create new controls layer object
++      const controlsLayer = {
++        Points: this.markersLayer || L.layerGroup(),
++        Routes: this.polylinesLayer || L.layerGroup(),
++        Heatmap: this.heatmapLayer || L.heatLayer([]),
++        "Fog of War": new this.fogOverlay(),
++        "Scratch map": this.scratchLayer || L.layerGroup(),
++        Areas: this.areasLayer || L.layerGroup(),
++        Photos: this.photoMarkers || L.layerGroup()
++      };
+ 
+-    for (const [name, isVisible] of Object.entries(states)) {
+-      const layer = layerControl[name];
+-      console.log(`Processing layer ${name}:`, { layer, isVisible });
++      // Re-add the layer control in the same position
++      this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
+ 
+-      if (layer) {
+-        if (isVisible && !this.map.hasLayer(layer)) {
+-          console.log(`Adding layer ${name} to map`);
+-          this.map.addLayer(layer);
+-        } else if (!isVisible && this.map.hasLayer(layer)) {
+-          console.log(`Removing layer ${name} from map`);
++      // Restore layer visibility states
++      Object.entries(layerStates).forEach(([name, wasVisible]) => {
++        const layer = controlsLayer[name];
++        if (wasVisible && layer) {
++          layer.addTo(this.map);
++        } else if (layer && this.map.hasLayer(layer)) {
+           this.map.removeLayer(layer);
+         }
+-      }
+-    }
++      });
+ 
+-    // Ensure the layer control reflects the current state
+-    this.map.removeControl(this.layerControl);
+-    this.layerControl = L.control.layers(this.baseMaps(), layerControl).addTo(this.map);
++    } catch (error) {
++      console.error('Error updating map settings:', error);
++      console.error(error.stack);
++    } finally {
++      // Remove loading indicator
++      setTimeout(() => {
++        document.body.removeChild(loadingDiv);
++      }, 500);
++    }
+   }
+ 
+   createPhotoMarker(photo) {
+diff --git a/app/javascript/maps/fog_of_war.js b/app/javascript/maps/fog_of_war.js
+index 482a161e..8e910274 100644
+--- a/app/javascript/maps/fog_of_war.js
++++ b/app/javascript/maps/fog_of_war.js
+@@ -25,7 +25,8 @@ export function initializeFogCanvas(map) {
+ 
+ export function drawFogCanvas(map, markers, clearFogRadius) {
+   const fog = document.getElementById('fog');
+-  if (!fog) return;
++  // Return early if fog element doesn't exist or isn't a canvas
++  if (!fog || !(fog instanceof HTMLCanvasElement)) return;
+ 
+   const ctx = fog.getContext('2d');
+   if (!ctx) return;
+@@ -83,12 +84,25 @@ export function createFogOverlay() {
+   return L.Layer.extend({
+     onAdd: (map) => {
+       initializeFogCanvas(map);
++
++      // Add drag event handlers to update fog during marker movement
++      map.on('drag', () => {
++        const fog = document.getElementById('fog');
++        if (fog) {
++          // Update fog canvas position to match map position
++          const mapPos = map.getContainer().getBoundingClientRect();
++          fog.style.left = `${mapPos.left}px`;
++          fog.style.top = `${mapPos.top}px`;
++        }
++      });
+     },
+     onRemove: (map) => {
+       const fog = document.getElementById('fog');
+       if (fog) {
+         fog.remove();
+       }
++      // Clean up event listener
++      map.off('drag');
+     }
+   });
+ }
+diff --git a/app/javascript/maps/markers.js b/app/javascript/maps/markers.js
+index d55ee7fb..610a81dc 100644
+--- a/app/javascript/maps/markers.js
++++ b/app/javascript/maps/markers.js
+@@ -1,28 +1,163 @@
+ import { createPopupContent } from "./popups";
+ 
+-export function createMarkersArray(markersData, userSettings) {
++export function createMarkersArray(markersData, userSettings, apiKey) {
+   // Create a canvas renderer
+   const renderer = L.canvas({ padding: 0.5 });
+ 
+   if (userSettings.pointsRenderingMode === "simplified") {
+     return createSimplifiedMarkers(markersData, renderer);
+   } else {
+-    return markersData.map((marker) => {
++    return markersData.map((marker, index) => {
+       const [lat, lon] = marker;
+-      const popupContent = createPopupContent(marker, userSettings.timezone, userSettings.distanceUnit);
+-      let markerColor = marker[5] < 0 ? "orange" : "blue";
+-
+-      return L.circleMarker([lat, lon], {
+-        renderer: renderer, // Use canvas renderer
+-        radius: 4,
+-        color: markerColor,
+-        zIndexOffset: 1000,
+-        pane: 'markerPane'
+-      }).bindPopup(popupContent, { autoClose: false });
++      const pointId = marker[6];  // ID is at index 6
++      const markerColor = marker[5] < 0 ? "orange" : "blue";
++
++      return L.marker([lat, lon], {
++        icon: L.divIcon({
++          className: 'custom-div-icon',
++          html: `<div style='background-color: ${markerColor}; width: 8px; height: 8px; border-radius: 50%;'></div>`,
++          iconSize: [8, 8],
++          iconAnchor: [4, 4]
++        }),
++        draggable: true,
++        autoPan: true,
++        pointIndex: index,
++        pointId: pointId,
++        originalLat: lat,
++        originalLng: lon,
++        markerData: marker,  // Store the complete marker data
++        renderer: renderer
++      }).bindPopup(createPopupContent(marker, userSettings.timezone, userSettings.distanceUnit))
++        .on('dragstart', function(e) {
++          this.closePopup();
++        })
++        .on('drag', function(e) {
++          const newLatLng = e.target.getLatLng();
++          const map = e.target._map;
++          const pointIndex = e.target.options.pointIndex;
++          const originalLat = e.target.options.originalLat;
++          const originalLng = e.target.options.originalLng;
++          // Find polylines by iterating through all map layers
++          map.eachLayer((layer) => {
++            // Check if this is a LayerGroup containing polylines
++            if (layer instanceof L.LayerGroup) {
++              layer.eachLayer((featureGroup) => {
++                if (featureGroup instanceof L.FeatureGroup) {
++                  featureGroup.eachLayer((segment) => {
++                    if (segment instanceof L.Polyline) {
++                      const coords = segment.getLatLngs();
++                      const tolerance = 0.0000001;
++                      let updated = false;
++
++                      // Check and update start point
++                      if (Math.abs(coords[0].lat - originalLat) < tolerance &&
++                          Math.abs(coords[0].lng - originalLng) < tolerance) {
++                        coords[0] = newLatLng;
++                        updated = true;
++                      }
++
++                      // Check and update end point
++                      if (Math.abs(coords[1].lat - originalLat) < tolerance &&
++                          Math.abs(coords[1].lng - originalLng) < tolerance) {
++                        coords[1] = newLatLng;
++                        updated = true;
++                      }
++
++                      // Only update if we found a matching endpoint
++                      if (updated) {
++                        segment.setLatLngs(coords);
++                        segment.redraw();
++                      }
++                    }
++                  });
++                }
++              });
++            }
++          });
++
++          // Update the marker's original position for the next drag event
++          e.target.options.originalLat = newLatLng.lat;
++          e.target.options.originalLng = newLatLng.lng;
++        })
++        .on('dragend', function(e) {
++          const newLatLng = e.target.getLatLng();
++          const pointId = e.target.options.pointId;
++          const pointIndex = e.target.options.pointIndex;
++          const originalMarkerData = e.target.options.markerData;
++
++          fetch(`/api/v1/points/${pointId}`, {
++            method: 'PATCH',
++            headers: {
++              'Content-Type': 'application/json',
++              'Accept': 'application/json',
++              'Authorization': `Bearer ${apiKey}`
++            },
++            body: JSON.stringify({
++              point: {
++                latitude: newLatLng.lat.toString(),
++                longitude: newLatLng.lng.toString()
++              }
++            })
++          })
++          .then(response => {
++            if (!response.ok) {
++              throw new Error(`HTTP error! status: ${response.status}`);
++            }
++            return response.json();
++          })
++          .then(data => {
++            const map = e.target._map;
++            if (map && map.mapsController && map.mapsController.markers) {
++              const markers = map.mapsController.markers;
++              if (markers[pointIndex]) {
++                markers[pointIndex][0] = parseFloat(data.latitude);
++                markers[pointIndex][1] = parseFloat(data.longitude);
++              }
++            }
++
++            // Create updated marker data array
++            const updatedMarkerData = [
++              parseFloat(data.latitude),
++              parseFloat(data.longitude),
++              originalMarkerData[2],  // battery
++              originalMarkerData[3],  // altitude
++              originalMarkerData[4],  // timestamp
++              originalMarkerData[5],  // velocity
++              data.id,                // id
++              originalMarkerData[7]   // country
++            ];
++
++            // Update the marker's stored data
++            e.target.options.markerData = updatedMarkerData;
++
++            // Update the popup content
++            if (this._popup) {
++              const updatedPopupContent = createPopupContent(
++                updatedMarkerData,
++                userSettings.timezone,
++                userSettings.distanceUnit
++              );
++              this.setPopupContent(updatedPopupContent);
++            }
++          })
++          .catch(error => {
++            console.error('Error updating point:', error);
++            this.setLatLng([e.target.options.originalLat, e.target.options.originalLng]);
++            alert('Failed to update point position. Please try again.');
++          });
++        });
+     });
+   }
+ }
+ 
++// Helper function to check if a point is connected to a polyline endpoint
++function isConnectedToPoint(latLng, originalPoint, tolerance) {
++  // originalPoint is [lat, lng] array
++  const latMatch = Math.abs(latLng.lat - originalPoint[0]) < tolerance;
++  const lngMatch = Math.abs(latLng.lng - originalPoint[1]) < tolerance;
++  return latMatch && lngMatch;
++}
++
+ export function createSimplifiedMarkers(markersData, renderer) {
+   const distanceThreshold = 50; // meters
+   const timeThreshold = 20000; // milliseconds (3 seconds)
+@@ -35,7 +170,6 @@ export function createSimplifiedMarkers(markersData, renderer) {
+     if (index === 0) return; // Skip the first marker
+ 
+     const [prevLat, prevLon, prevTimestamp] = previousMarker;
+-    const [currLat, currLon, currTimestamp] = currentMarker;
+ 
+     const timeDiff = currTimestamp - prevTimestamp;
+     const distance = haversineDistance(prevLat, prevLon, currLat, currLon, 'km') * 1000; // Convert km to meters
+@@ -53,14 +187,24 @@ export function createSimplifiedMarkers(markersData, renderer) {
+     const popupContent = createPopupContent(marker);
+     let markerColor = marker[5] < 0 ? "orange" : "blue";
+ 
+-    return L.circleMarker(
+-      [lat, lon],
+-      {
+-        renderer: renderer, // Use canvas renderer
+-        radius: 4,
+-        color: markerColor,
+-        zIndexOffset: 1000
+-      }
+-    ).bindPopup(popupContent);
++    // Use L.marker instead of L.circleMarker for better drag support
++    return L.marker([lat, lon], {
++      icon: L.divIcon({
++        className: 'custom-div-icon',
++        html: `<div style='background-color: ${markerColor}; width: 8px; height: 8px; border-radius: 50%;'></div>`,
++        iconSize: [8, 8],
++        iconAnchor: [4, 4]
++      }),
++      draggable: true,
++      autoPan: true
++    }).bindPopup(popupContent)
++      .on('dragstart', function(e) {
++        this.closePopup();
++      })
++      .on('dragend', function(e) {
++        const newLatLng = e.target.getLatLng();
++        this.setLatLng(newLatLng);
++        this.openPopup();
++      });
+   });
+ }
+diff --git a/app/javascript/maps/polylines.js b/app/javascript/maps/polylines.js
+index ba7e15cf..e48479d3 100644
+--- a/app/javascript/maps/polylines.js
++++ b/app/javascript/maps/polylines.js
+@@ -169,54 +169,165 @@ export function addHighlightOnHover(polylineGroup, map, polylineCoordinates, use
+   const endMarker = L.marker([endPoint[0], endPoint[1]], { icon: finishIcon });
+ 
+   let hoverPopup = null;
++  let clickedLayer = null;
+ 
+-  polylineGroup.on("mouseover", function (e) {
+-    let closestSegment = null;
+-    let minDistance = Infinity;
+-    let currentSpeed = 0;
++  // Add events to both group and individual polylines
++  polylineGroup.eachLayer((layer) => {
++    if (layer instanceof L.Polyline) {
++      layer.on("mouseover", function (e) {
++        handleMouseOver(e);
++      });
+ 
+-    polylineGroup.eachLayer((layer) => {
+-      if (layer instanceof L.Polyline) {
+-        const layerLatLngs = layer.getLatLngs();
+-        const distance = pointToLineDistance(e.latlng, layerLatLngs[0], layerLatLngs[1]);
+-
+-        if (distance < minDistance) {
+-          minDistance = distance;
+-          closestSegment = layer;
+-
+-          const startIdx = polylineCoordinates.findIndex(p => {
+-            const latMatch = Math.abs(p[0] - layerLatLngs[0].lat) < 0.0000001;
+-            const lngMatch = Math.abs(p[1] - layerLatLngs[0].lng) < 0.0000001;
+-            return latMatch && lngMatch;
+-          });
++      layer.on("mouseout", function (e) {
++        handleMouseOut(e);
++      });
+ 
+-          if (startIdx !== -1 && startIdx < polylineCoordinates.length - 1) {
+-            currentSpeed = calculateSpeed(
+-              polylineCoordinates[startIdx],
+-              polylineCoordinates[startIdx + 1]
++      layer.on("click", function (e) {
++        handleClick(e);
++      });
++    }
++  });
++
++  function handleMouseOver(e) {
++    // Handle both direct layer events and group propagated events
++    const layer = e.layer || e.target;
++    let speed = 0;
++
++    if (layer instanceof L.Polyline) {
++        // Get the coordinates array from the layer
++        const coords = layer.getLatLngs();
++        if (coords && coords.length >= 2) {
++            const startPoint = coords[0];
++            const endPoint = coords[coords.length - 1];
++
++            // Find the corresponding markers for these coordinates
++            const startMarkerData = polylineCoordinates.find(m =>
++                m[0] === startPoint.lat && m[1] === startPoint.lng
+             );
+-          }
++            const endMarkerData = polylineCoordinates.find(m =>
++                m[0] === endPoint.lat && m[1] === endPoint.lng
++            );
++
++            // Calculate speed if we have both markers
++            if (startMarkerData && endMarkerData) {
++                speed = startMarkerData[5] || endMarkerData[5] || 0;
++            }
+         }
+-      }
+-    });
++    }
+ 
+-    // Apply highlight style to all segments
+-    polylineGroup.eachLayer((layer) => {
+-      if (layer instanceof L.Polyline) {
+-        const highlightStyle = {
+-          weight: 5,
+-          opacity: 1
+-        };
+-
+-        // Only change color to yellow if speed colors are disabled
+-        if (!userSettings.speed_colored_routes) {
+-          highlightStyle.color = '#ffff00';
++    // Don't apply hover styles if this is the clicked layer
++    if (!clickedLayer) {
++        // Apply style to all segments in the group
++        polylineGroup.eachLayer((segment) => {
++            if (segment instanceof L.Polyline) {
++                const newStyle = {
++                    weight: 8,
++                    opacity: 1
++                };
++
++                // Only change color if speed-colored routes are not enabled
++                if (!userSettings.speed_colored_routes) {
++                    newStyle.color = 'yellow';  // Highlight color
++                }
++
++                segment.setStyle(newStyle);
++            }
++        });
++
++        startMarker.addTo(map);
++        endMarker.addTo(map);
++
++        const popupContent = `
++            <strong>Start:</strong> ${firstTimestamp}<br>
++            <strong>End:</strong> ${lastTimestamp}<br>
++            <strong>Duration:</strong> ${timeOnRoute}<br>
++            <strong>Total Distance:</strong> ${formatDistance(totalDistance, distanceUnit)}<br>
++            <strong>Current Speed:</strong> ${Math.round(speed)} km/h
++        `;
++
++        if (hoverPopup) {
++            map.closePopup(hoverPopup);
+         }
+ 
+-        layer.setStyle(highlightStyle);
+-      }
++        hoverPopup = L.popup()
++            .setLatLng(e.latlng)
++            .setContent(popupContent)
++            .openOn(map);
++    }
++  }
++
++  function handleMouseOut(e) {
++    // If there's a clicked state, maintain it
++    if (clickedLayer && polylineGroup.clickedState) {
++        polylineGroup.eachLayer((layer) => {
++            if (layer instanceof L.Polyline) {
++                if (layer === clickedLayer || layer.options.originalPath === clickedLayer.options.originalPath) {
++                    layer.setStyle(polylineGroup.clickedState.style);
++                }
++            }
++        });
++        return;
++    }
++
++    // Apply normal style only if there's no clicked layer
++    polylineGroup.eachLayer((layer) => {
++        if (layer instanceof L.Polyline) {
++            const originalStyle = {
++                weight: 3,
++                opacity: userSettings.route_opacity,
++                color: layer.options.originalColor
++            };
++            layer.setStyle(originalStyle);
++        }
+     });
+ 
++    if (hoverPopup && !clickedLayer) {
++        map.closePopup(hoverPopup);
++        map.removeLayer(startMarker);
++        map.removeLayer(endMarker);
++    }
++  }
++
++  function handleClick(e) {
++    const newClickedLayer = e.target;
++
++    // If clicking the same route that's already clicked, do nothing
++    if (clickedLayer === newClickedLayer) {
++        return;
++    }
++
++    // Store reference to previous clicked layer before updating
++    const previousClickedLayer = clickedLayer;
++
++    // Update clicked layer reference
++    clickedLayer = newClickedLayer;
++
++    // Reset previous clicked layer if it exists
++    if (previousClickedLayer) {
++      previousClickedLayer.setStyle({
++          weight: 3,
++          opacity: userSettings.route_opacity,
++          color: previousClickedLayer.options.originalColor
++      });
++    }
++
++    // Define style for clicked state
++    const clickedStyle = {
++      weight: 8,
++      opacity: 1,
++      color: userSettings.speed_colored_routes ? clickedLayer.options.originalColor : 'yellow'
++    };
++
++    // Apply style to new clicked layer
++    clickedLayer.setStyle(clickedStyle);
++    clickedLayer.bringToFront();
++
++    // Update clicked state
++    polylineGroup.clickedState = {
++      layer: clickedLayer,
++      style: clickedStyle
++    };
++
+     startMarker.addTo(map);
+     endMarker.addTo(map);
+ 
+@@ -225,7 +336,7 @@ export function addHighlightOnHover(polylineGroup, map, polylineCoordinates, use
+       <strong>End:</strong> ${lastTimestamp}<br>
+       <strong>Duration:</strong> ${timeOnRoute}<br>
+       <strong>Total Distance:</strong> ${formatDistance(totalDistance, distanceUnit)}<br>
+-      <strong>Current Speed:</strong> ${Math.round(currentSpeed)} km/h
++      <strong>Current Speed:</strong> ${Math.round(clickedLayer.options.speed || 0)} km/h
+     `;
+ 
+     if (hoverPopup) {
+@@ -233,40 +344,54 @@ export function addHighlightOnHover(polylineGroup, map, polylineCoordinates, use
+     }
+ 
+     hoverPopup = L.popup()
+-      .setLatLng(e.latlng)
+-      .setContent(popupContent)
+-      .openOn(map);
+-  });
+-
+-  polylineGroup.on("mouseout", function () {
+-    // Restore original style
+-    polylineGroup.eachLayer((layer) => {
+-      if (layer instanceof L.Polyline) {
+-        const originalStyle = {
+-          weight: 3,
+-          opacity: userSettings.route_opacity,
+-          color: layer.options.originalColor // Use the stored original color
+-        };
++        .setLatLng(e.latlng)
++        .setContent(popupContent)
++        .openOn(map);
+ 
+-        layer.setStyle(originalStyle);
+-      }
+-    });
++    // Prevent the click event from propagating to the map
++    L.DomEvent.stopPropagation(e);
++  }
+ 
++  // Reset highlight when clicking elsewhere on the map
++  map.on('click', function () {
++    if (clickedLayer) {
++        const clickedGroup = clickedLayer.polylineGroup || polylineGroup;
++        clickedGroup.eachLayer((layer) => {
++            if (layer instanceof L.Polyline) {
++                layer.setStyle({
++                    weight: 3,
++                    opacity: userSettings.route_opacity,
++                    color: layer.options.originalColor
++                });
++            }
++        });
++        clickedLayer = null;
++        clickedGroup.clickedState = null;
++    }
+     if (hoverPopup) {
+-      map.closePopup(hoverPopup);
++        map.closePopup(hoverPopup);
++        map.removeLayer(startMarker);
++        map.removeLayer(endMarker);
+     }
+-    map.removeLayer(startMarker);
+-    map.removeLayer(endMarker);
+   });
+ 
+-  polylineGroup.on("click", function () {
+-    map.fitBounds(polylineGroup.getBounds());
+-  });
++  // Keep the original group events as a fallback
++  polylineGroup.on("mouseover", handleMouseOver);
++  polylineGroup.on("mouseout", handleMouseOut);
++  polylineGroup.on("click", handleClick);
+ }
+ 
+ export function createPolylinesLayer(markers, map, timezone, routeOpacity, userSettings, distanceUnit) {
+-  // Create a canvas renderer
+-  const renderer = L.canvas({ padding: 0.5 });
++  // Create a custom pane for our polylines with higher z-index
++  if (!map.getPane('polylinesPane')) {
++    map.createPane('polylinesPane');
++    map.getPane('polylinesPane').style.zIndex = 450; // Above the default overlay pane (400)
++  }
++
++  const renderer = L.canvas({
++    padding: 0.5,
++    pane: 'polylinesPane'
++  });
+ 
+   const splitPolylines = [];
+   let currentPolyline = [];
+@@ -295,9 +420,11 @@ export function createPolylinesLayer(markers, map, timezone, routeOpacity, userS
+     splitPolylines.push(currentPolyline);
+   }
+ 
+-  return L.layerGroup(
+-    splitPolylines.map((polylineCoordinates) => {
++  // Create the layer group with the polylines
++  const layerGroup = L.layerGroup(
++    splitPolylines.map((polylineCoordinates, groupIndex) => {
+       const segmentGroup = L.featureGroup();
++      const segments = [];
+ 
+       for (let i = 0; i < polylineCoordinates.length - 1; i++) {
+         const speed = calculateSpeed(polylineCoordinates[i], polylineCoordinates[i + 1]);
+@@ -309,25 +436,74 @@ export function createPolylinesLayer(markers, map, timezone, routeOpacity, userS
+             [polylineCoordinates[i + 1][0], polylineCoordinates[i + 1][1]]
+           ],
+           {
+-            renderer: renderer, // Use canvas renderer
++            renderer: renderer,
+             color: color,
+             originalColor: color,
+             opacity: routeOpacity,
+             weight: 3,
+             speed: speed,
+-            startTime: polylineCoordinates[i][4],
+-            endTime: polylineCoordinates[i + 1][4]
++            interactive: true,
++            pane: 'polylinesPane',
++            bubblingMouseEvents: false
+           }
+         );
+ 
++        segments.push(segment);
+         segmentGroup.addLayer(segment);
+       }
+ 
++      // Add mouseover/mouseout to the entire group
++      segmentGroup.on('mouseover', function(e) {
++        L.DomEvent.stopPropagation(e);
++        segments.forEach(segment => {
++          segment.setStyle({
++            weight: 8,
++            opacity: 1
++          });
++          if (map.hasLayer(segment)) {
++            segment.bringToFront();
++          }
++        });
++      });
++
++      segmentGroup.on('mouseout', function(e) {
++        L.DomEvent.stopPropagation(e);
++        segments.forEach(segment => {
++          segment.setStyle({
++            weight: 3,
++            opacity: routeOpacity,
++            color: segment.options.originalColor
++          });
++        });
++      });
++
++      // Make the group interactive
++      segmentGroup.options.interactive = true;
++      segmentGroup.options.bubblingMouseEvents = false;
++
++      // Add the hover functionality to the group
+       addHighlightOnHover(segmentGroup, map, polylineCoordinates, userSettings, distanceUnit);
+ 
+       return segmentGroup;
+     })
+-  ).addTo(map);
++  );
++
++  // Add CSS to ensure our pane receives mouse events
++  const style = document.createElement('style');
++  style.textContent = `
++    .leaflet-polylinesPane-pane {
++      pointer-events: auto !important;
++    }
++    .leaflet-polylinesPane-pane canvas {
++      pointer-events: auto !important;
++    }
++  `;
++  document.head.appendChild(style);
++
++  // Add to map and return
++  layerGroup.addTo(map);
++
++  return layerGroup;
+ }
+ 
+ export function updatePolylinesColors(polylinesLayer, useSpeedColors) {
+diff --git a/app/javascript/maps/popups.js b/app/javascript/maps/popups.js
+index dee74dc5..cba49a22 100644
+--- a/app/javascript/maps/popups.js
++++ b/app/javascript/maps/popups.js
+@@ -8,6 +8,9 @@ export function createPopupContent(marker, timezone, distanceUnit) {
+     marker[3] = marker[3] * 3.28084;
+   }
+ 
++  // convert marker[5] from m/s to km/h and round to nearest integer
++  marker[5] = Math.round(marker[5] * 3.6);
++
+   return `
+     <strong>Timestamp:</strong> ${formatDate(marker[4], timezone)}<br>
+     <strong>Latitude:</strong> ${marker[0]}<br>
+diff --git a/config/routes.rb b/config/routes.rb
+index 8d28efde..0befcca4 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -67,7 +67,7 @@
+       get   'settings', to: 'settings#index'
+ 
+       resources :areas,     only: %i[index create update destroy]
+-      resources :points,    only: %i[index destroy]
++      resources :points,    only: %i[index destroy update]
+       resources :visits,    only: %i[update]
+       resources :stats,     only: :index
+ 

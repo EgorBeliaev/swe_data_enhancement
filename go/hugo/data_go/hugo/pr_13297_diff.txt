@@ -1,0 +1,149 @@
+diff --git a/resources/resource_factories/create/create_integration_test.go b/resources/resource_factories/create/create_integration_test.go
+index 7b9c96e3497..faa2de56549 100644
+--- a/resources/resource_factories/create/create_integration_test.go
++++ b/resources/resource_factories/create/create_integration_test.go
+@@ -56,7 +56,42 @@ func TestGetRemoteHead(t *testing.T) {
+ 
+ 	b.AssertFileContent("public/index.html",
+ 		"Head Content: .",
+-		"Head Data: map[ContentLength:18210 ContentType:image/png Status:200 OK StatusCode:200 TransferEncoding:[]]",
++		"Head Data: map[ContentLength:18210 ContentType:image/png Headers:map[] Status:200 OK StatusCode:200 TransferEncoding:[]]",
++	)
++}
++
++func TestGetRemoteResponseHeaders(t *testing.T) {
++	files := `
++-- config.toml --
++[security]
++  [security.http]
++    methods = ['(?i)GET|POST|HEAD']
++    urls = ['.*gohugo\.io.*']
++-- layouts/index.html --
++{{ $url := "https://gohugo.io/img/hugo.png" }}
++{{ $opts := dict "method" "head" "responseHeaders" (slice "X-Frame-Options" "Server") }}
++{{ with try (resources.GetRemote $url $opts) }}
++  {{ with .Err }}
++    {{ errorf "Unable to get remote resource: %s" . }}
++  {{ else with .Value }}
++    Response Headers: {{ .Data.Headers }}
++  {{ else }}
++  {{ errorf "Unable to get remote resource: %s" $url }}
++  {{ end }}
++{{ end }}
++`
++
++	b := hugolib.NewIntegrationTestBuilder(
++		hugolib.IntegrationTestConfig{
++			T:           t,
++			TxtarString: files,
++		},
++	)
++
++	b.Build()
++
++	b.AssertFileContent("public/index.html",
++		"Response Headers: map[Server:[Netlify] X-Frame-Options:[DENY]]",
+ 	)
+ }
+ 
+diff --git a/resources/resource_factories/create/remote.go b/resources/resource_factories/create/remote.go
+index 3bfb5f3ccd8..e201339b01d 100644
+--- a/resources/resource_factories/create/remote.go
++++ b/resources/resource_factories/create/remote.go
+@@ -30,6 +30,7 @@ import (
+ 
+ 	"github.com/gohugoio/httpcache"
+ 	"github.com/gohugoio/hugo/common/hashing"
++	"github.com/gohugoio/hugo/common/hstrings"
+ 	"github.com/gohugoio/hugo/common/hugio"
+ 	"github.com/gohugoio/hugo/common/loggers"
+ 	"github.com/gohugoio/hugo/common/maps"
+@@ -51,18 +52,28 @@ type HTTPError struct {
+ 	Body       string
+ }
+ 
+-func responseToData(res *http.Response, readBody bool) map[string]any {
++func responseToData(res *http.Response, readBody bool, includeHeaders []string) map[string]any {
+ 	var body []byte
+ 	if readBody {
+ 		body, _ = io.ReadAll(res.Body)
+ 	}
+ 
++	responseHeaders := make(map[string][]string)
++	if true || len(includeHeaders) > 0 {
++		for k, v := range res.Header {
++			if hstrings.InSlicEqualFold(includeHeaders, k) {
++				responseHeaders[k] = v
++			}
++		}
++	}
++
+ 	m := map[string]any{
+ 		"StatusCode":       res.StatusCode,
+ 		"Status":           res.Status,
+ 		"TransferEncoding": res.TransferEncoding,
+ 		"ContentLength":    res.ContentLength,
+ 		"ContentType":      res.Header.Get("Content-Type"),
++		"Headers":          responseHeaders,
+ 	}
+ 
+ 	if readBody {
+@@ -72,7 +83,7 @@ func responseToData(res *http.Response, readBody bool) map[string]any {
+ 	return m
+ }
+ 
+-func toHTTPError(err error, res *http.Response, readBody bool) *HTTPError {
++func toHTTPError(err error, res *http.Response, readBody bool, responseHeaders []string) *HTTPError {
+ 	if err == nil {
+ 		panic("err is nil")
+ 	}
+@@ -85,7 +96,7 @@ func toHTTPError(err error, res *http.Response, readBody bool) *HTTPError {
+ 
+ 	return &HTTPError{
+ 		error: err,
+-		Data:  responseToData(res, readBody),
++		Data:  responseToData(res, readBody, responseHeaders),
+ 	}
+ }
+ 
+@@ -213,7 +224,7 @@ func (c *Client) FromRemote(uri string, optionsm map[string]any) (resource.Resou
+ 		}
+ 
+ 		if res.StatusCode < 200 || res.StatusCode > 299 {
+-			return nil, toHTTPError(fmt.Errorf("failed to fetch remote resource from '%s': %s", uri, http.StatusText(res.StatusCode)), res, !isHeadMethod)
++			return nil, toHTTPError(fmt.Errorf("failed to fetch remote resource from '%s': %s", uri, http.StatusText(res.StatusCode)), res, !isHeadMethod, options.ResponseHeaders)
+ 		}
+ 
+ 		var (
+@@ -280,7 +291,7 @@ func (c *Client) FromRemote(uri string, optionsm map[string]any) (resource.Resou
+ 		}
+ 
+ 		userKey = filename[:len(filename)-len(path.Ext(filename))] + "_" + userKey + mediaType.FirstSuffix.FullSuffix
+-		data := responseToData(res, false)
++		data := responseToData(res, false, options.ResponseHeaders)
+ 
+ 		return c.rs.NewResource(
+ 			resources.ResourceSourceDescriptor{
+@@ -345,9 +356,10 @@ func hasHeaderKey(m http.Header, key string) bool {
+ }
+ 
+ type fromRemoteOptions struct {
+-	Method  string
+-	Headers map[string]any
+-	Body    []byte
++	Method          string
++	Headers         map[string]any
++	Body            []byte
++	ResponseHeaders []string
+ }
+ 
+ func (o fromRemoteOptions) BodyReader() io.Reader {
+@@ -432,7 +444,7 @@ func (t *transport) RoundTrip(req *http.Request) (resp *http.Response, err error
+ 				if resp != nil {
+ 					msg = resp.Status
+ 				}
+-				err := toHTTPError(fmt.Errorf("retry timeout (configured to %s) fetching remote resource: %s", t.Cfg.Timeout(), msg), resp, req.Method != "HEAD")
++				err := toHTTPError(fmt.Errorf("retry timeout (configured to %s) fetching remote resource: %s", t.Cfg.Timeout(), msg), resp, req.Method != "HEAD", nil)
+ 				return resp, err
+ 			}
+ 			time.Sleep(nextSleep)

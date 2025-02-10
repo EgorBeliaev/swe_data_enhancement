@@ -1,0 +1,1047 @@
+diff --git a/lib/option.rb b/lib/option.rb
+index 3c278bae5..e050da487 100644
+--- a/lib/option.rb
++++ b/lib/option.rb
+@@ -55,17 +55,17 @@ def self.kubernetes_locations
+   IoLimits = Struct.new(:max_ios_per_sec, :max_read_mbytes_per_sec, :max_write_mbytes_per_sec)
+   NO_IO_LIMITS = IoLimits.new(nil, nil, nil).freeze
+ 
+-  VmSize = Struct.new(:name, :family, :cores, :vcpus, :cpu_percent_limit, :cpu_burst_percent_limit, :memory_gib, :storage_size_options, :io_limits, :visible, :gpu, :arch) do
++  VmSize = Struct.new(:name, :family, :vcpus, :cpu_percent_limit, :cpu_burst_percent_limit, :memory_gib, :storage_size_options, :io_limits, :visible, :gpu, :arch) do
+     alias_method :display_name, :name
+   end
+   VmSizes = [2, 4, 8, 16, 30, 60].map {
+     storage_size_options = [_1 * 20, _1 * 40]
+-    VmSize.new("standard-#{_1}", "standard", _1 / 2, _1, _1 * 100, 0, _1 * 4, storage_size_options, NO_IO_LIMITS, true, false, "x64")
++    VmSize.new("standard-#{_1}", "standard", _1, _1 * 100, 0, _1 * 4, storage_size_options, NO_IO_LIMITS, true, false, "x64")
+   }.concat([2, 4, 8, 16, 30, 60].map {
+     storage_size_options = [_1 * 20, _1 * 40]
+-    VmSize.new("standard-#{_1}", "standard", _1, _1, _1 * 100, 0, (_1 * 3.2).to_i, storage_size_options, NO_IO_LIMITS, false, false, "arm64")
++    VmSize.new("standard-#{_1}", "standard", _1, _1 * 100, 0, (_1 * 3.2).to_i, storage_size_options, NO_IO_LIMITS, false, false, "arm64")
+   }).concat([6].map {
+-    VmSize.new("standard-gpu-#{_1}", "standard-gpu", _1 / 2, _1, _1 * 100, 0, (_1 * 5.34).to_i, [_1 * 30], NO_IO_LIMITS, false, true, "x64")
++    VmSize.new("standard-gpu-#{_1}", "standard-gpu", _1, _1 * 100, 0, (_1 * 5.34).to_i, [_1 * 30], NO_IO_LIMITS, false, true, "x64")
+   }).freeze
+ 
+   PostgresSize = Struct.new(:location, :name, :vm_size, :family, :vcpu, :memory, :storage_size_options) do
+diff --git a/loader.rb b/loader.rb
+index d72a2918b..f58195b09 100644
+--- a/loader.rb
++++ b/loader.rb
+@@ -216,6 +216,8 @@ def clover_freeze
+     Scheduling::Allocator::StorageAllocation,
+     Scheduling::Allocator::StorageAllocation::StorageDeviceAllocation,
+     Scheduling::Allocator::VmHostAllocation,
++    Scheduling::Allocator::VmHostCpuAllocation,
++    Scheduling::Allocator::VmHostSliceAllocation,
+     SemaphoreMethods,
+     SemaphoreMethods::ClassMethods,
+     Sequel::Database,
+diff --git a/model/vm.rb b/model/vm.rb
+index b6e48d9e7..5e130271b 100644
+--- a/model/vm.rb
++++ b/model/vm.rb
+@@ -104,10 +104,17 @@ def cloud_hypervisor_cpu_topology
+     total_packages = vm_host.total_sockets
+ 
+     # Computed all-system statistics, now scale it down to meet VM needs.
+-    proportion = Rational(cores) / vm_host.total_cores
++    if vcpus == 1 && threads_per_core > 1
++      # special case for single-threaded VMs
++      cores_from_cpus = Rational(vcpus)
++      threads_per_core = 1
++    else
++      cores_from_cpus = Rational(vcpus) / threads_per_core
++    end
++    proportion = cores_from_cpus / vm_host.total_cores
+     packages = (total_packages * proportion).ceil
+     dies_per_package = (total_dies_per_package * proportion).ceil
+-    cores_per_die = Rational(cores) / (packages * dies_per_package)
++    cores_per_die = cores_from_cpus / (packages * dies_per_package)
+     fail "BUG: need uniform number of cores allocated per die" unless cores_per_die.denominator == 1
+ 
+     topo = [threads_per_core, cores_per_die, dies_per_package, packages].map { |num|
+@@ -118,7 +125,7 @@ def cloud_hypervisor_cpu_topology
+     }
+ 
+     # :nocov:
+-    unless topo.reduce(&:*) == threads_per_core * cores
++    unless topo.reduce(&:*) == vcpus
+       fail "BUG: arithmetic does not result in the correct number of vcpus"
+     end
+     # :nocov:
+diff --git a/prog/test/vm_group.rb b/prog/test/vm_group.rb
+index 3116fb6db..9aaa968c6 100644
+--- a/prog/test/vm_group.rb
++++ b/prog/test/vm_group.rb
+@@ -66,10 +66,20 @@ def self.assemble(boot_images:, storage_encrypted: true, test_reboot: true, test
+ 
+   label def wait_verify_vms
+     reap
+-    hop_verify_vm_host_slices if leaf?
++    hop_verify_host_capacity if leaf?
+     donate
+   end
+ 
++  label def verify_host_capacity
++    vm_cores = vm_host.vms.sum(&:cores)
++    slice_cores = vm_host.slices.sum(&:cores)
++    spdk_cores = vm_host.cpus.count { _1.spdk } * vm_host.total_cores / vm_host.total_cpus
++
++    fail_test "Host used cores does not match the allocated VMs cores" if vm_cores + slice_cores + spdk_cores != vm_host.used_cores
++
++    hop_verify_vm_host_slices
++  end
++
+   label def verify_vm_host_slices
+     test_slices = frame.fetch("test_slices")
+ 
+@@ -77,7 +87,7 @@ def self.assemble(boot_images:, storage_encrypted: true, test_reboot: true, test
+       hop_verify_firewall_rules
+     end
+ 
+-    slices = frame["vms"].map { Vm[_1].vm_host_slice.id }
++    slices = frame["vms"].map { Vm[_1].vm_host_slice&.id }.reject(&:nil?)
+     push Prog::Test::VmHostSlices, {"slices" => slices}
+   end
+ 
+diff --git a/prog/vm/nexus.rb b/prog/vm/nexus.rb
+index 507c39e6c..18d4b9141 100644
+--- a/prog/vm/nexus.rb
++++ b/prog/vm/nexus.rb
+@@ -93,7 +93,7 @@ def self.assemble(public_key, project_id, name: nil, size: "standard-2",
+         unix_user: unix_user,
+         name: name,
+         family: vm_size.family,
+-        cores: vm_size.cores,
++        cores: 0, # this will be updated after allocation is complete based on the host's topology
+         vcpus: vm_size.vcpus,
+         cpu_percent_limit: vm_size.cpu_percent_limit,
+         cpu_burst_percent_limit: vm_size.cpu_burst_percent_limit,
+@@ -181,7 +181,7 @@ def before_run
+         if frame["force_host_id"]
+           [[], [], [], [frame["force_host_id"]]]
+         elsif vm.location == "github-runners"
+-          runner_locations = (vm.cores == 30) ? [] : ["github-runners", "hetzner-fsn1", "hetzner-hel1"]
++          runner_locations = (vm.vcpus == 60) ? [] : ["github-runners", "hetzner-fsn1", "hetzner-hel1"]
+           [["accepting"], runner_locations, ["github-runners"], []]
+         else
+           [["accepting"], [vm.location], [], []]
+@@ -465,6 +465,7 @@ def write_params_json
+       end
+ 
+       if vm.vm_host_slice.nil?
++        fail "BUG: Number of cores cannot be zero when VM is runing without a slice" if vm.cores == 0
+         # If there is no slice, we need to update the host utilization directly
+         VmHost.dataset.where(id: vm.vm_host_id).update(
+           used_cores: Sequel[:used_cores] - vm.cores,
+diff --git a/prog/vm/vm_pool.rb b/prog/vm/vm_pool.rb
+index 45854144b..4f6d98731 100644
+--- a/prog/vm/vm_pool.rb
++++ b/prog/vm/vm_pool.rb
+@@ -61,10 +61,10 @@ def before_run
+ 
+   label def wait
+     if vm_pool.size - vm_pool.vms.count > 0
+-      idle_cores = VmHost.where(allocation_state: "accepting", arch: vm_pool.arch, location: ["github-runners", "hetzner-hel1", "hetzner-fsn1"]).select_map { sum(:total_cores) - sum(:used_cores) }.first.to_i
+-      waiting_cores = Vm.where(Sequel.like(:boot_image, "github%")).where(allocated_at: nil, arch: vm_pool.arch).sum(:cores).to_i
+-      pool_vm_core = Validation.validate_vm_size(vm_pool.vm_size, vm_pool.arch).cores
+-      hop_create_new_vm if idle_cores - waiting_cores - pool_vm_core >= 0
++      idle_cpus = VmHost.where(allocation_state: "accepting", arch: vm_pool.arch, location: ["github-runners", "hetzner-hel1", "hetzner-fsn1"]).select_map { sum((total_cores - used_cores) * total_cpus / total_cores) }.first.to_i
++      waiting_cpus = Vm.where(Sequel.like(:boot_image, "github%")).where(allocated_at: nil, arch: vm_pool.arch).sum(:vcpus).to_i
++      pool_vm_cpus = Validation.validate_vm_size(vm_pool.vm_size, vm_pool.arch).vcpus
++      hop_create_new_vm if idle_cpus - waiting_cpus - pool_vm_cpus >= 0
+     end
+     nap 30
+   end
+diff --git a/scheduling/allocator.rb b/scheduling/allocator.rb
+index 7ca36eaca..271809357 100644
+--- a/scheduling/allocator.rb
++++ b/scheduling/allocator.rb
+@@ -15,7 +15,7 @@ def self.target_host_utilization
+   def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [])
+     request = Request.new(
+       vm.id,
+-      vm.cores,
++      vm.vcpus,
+       vm.memory_gib,
+       storage_volumes.map { _1["size_gib"] }.sum,
+       storage_volumes.size.times.zip(storage_volumes).to_h.sort_by { |k, v| v["size_gib"] * -1 },
+@@ -43,7 +43,7 @@ def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_coun
+ 
+   Request = Struct.new(
+     :vm_id,
+-    :cores,
++    :vcpus,
+     :memory_gib,
+     :storage_gib,
+     :storage_volumes,
+@@ -68,7 +68,7 @@ def initialize(*args)
+       self.diagnostics ||= false
+     end
+ 
+-    def memory_gib_for_cores
++    def memory_gib_for_cores(cores)
+       memory_gib_ratio = if arch_filter == "arm64"
+         3.2
+       elsif family == "standard-gpu"
+@@ -79,6 +79,10 @@ def memory_gib_for_cores
+ 
+       (cores * memory_gib_ratio).to_i
+     end
++
++    def cores_for_vcpus(threads_per_core)
++      [1, vcpus / threads_per_core].max
++    end
+   end
+ 
+   class Allocation
+@@ -111,6 +115,7 @@ def self.candidate_hosts(request)
+         .left_join(:vm_provisioning, vm_host_id: Sequel[:vm_host][:id])
+         .select(
+           Sequel[:vm_host][:id].as(:vm_host_id),
++          :total_cpus,
+           :total_cores,
+           :used_cores,
+           :total_hugepages_1g,
+@@ -125,11 +130,12 @@ def self.candidate_hosts(request)
+           Sequel.function(:coalesce, :num_gpus, 0).as(:num_gpus),
+           Sequel.function(:coalesce, :available_gpus, 0).as(:available_gpus),
+           :available_iommu_groups,
+-          Sequel.function(:coalesce, :vm_provisioning_count, 0).as(:vm_provisioning_count)
++          Sequel.function(:coalesce, :vm_provisioning_count, 0).as(:vm_provisioning_count),
++          :accepts_slices
+         )
+         .where(arch: request.arch_filter)
+         .where { (total_hugepages_1g - used_hugepages_1g >= request.memory_gib) }
+-        .where { (total_cores - used_cores >= request.cores) }
++        .where { (total_cores - used_cores >= Sequel.function(:greatest, 1, (request.vcpus * total_cores / total_cpus))) }
+         .with(:total_ipv4, DB[:address]
+           .select_group(:routed_to_host_id)
+           .select_append { round(sum(power(2, 32 - masklen(cidr)))).cast(:integer).as(total_ipv4) }
+@@ -174,8 +180,6 @@ def self.candidate_hosts(request)
+       ds = ds.exclude(Sequel[:vm_host][:id] => request.host_exclusion_filter) unless request.host_exclusion_filter.empty?
+       ds = ds.where(location: request.location_filter) unless request.location_filter.empty?
+       ds = ds.where(allocation_state: request.allocation_state_filter) unless request.allocation_state_filter.empty?
+-      # Match the slice allocation to the hosts that can accept it
+-      ds = ds.where(accepts_slices: request.use_slices)
+ 
+       # Emit the allocation query if the project is flagged for
+       # diagnostics.
+@@ -205,12 +209,15 @@ def self.update_vm(vm_host, vm)
+     def initialize(candidate_host, request)
+       @candidate_host = candidate_host
+       @request = request
+-      @vm_host_allocations = [VmHostAllocation.new(:used_cores, candidate_host[:total_cores], candidate_host[:used_cores], request.cores),
+-        VmHostAllocation.new(:used_hugepages_1g, candidate_host[:total_hugepages_1g], candidate_host[:used_hugepages_1g], request.memory_gib_for_cores)]
++      request_cores = request.cores_for_vcpus(candidate_host[:total_cpus] / candidate_host[:total_cores])
++      request_memory = request.memory_gib_for_cores(request_cores)
++
++      @vm_host_allocations = [VmHostCpuAllocation.new(:used_cores, candidate_host[:total_cores], candidate_host[:used_cores], request_cores),
++        VmHostAllocation.new(:used_hugepages_1g, candidate_host[:total_hugepages_1g], candidate_host[:used_hugepages_1g], request_memory)]
+       @device_allocations = [StorageAllocation.new(candidate_host, request)]
+       @device_allocations << GpuAllocation.new(candidate_host, request) if request.gpu_count > 0
+ 
+-      if request.use_slices
++      if request.use_slices && candidate_host[:accepts_slices]
+         # Wrap around and replace the host allocations. That way we can control that logic from the slice POV
+         @vm_host_allocations = [VmHostSliceAllocation.new(candidate_host, request, @vm_host_allocations)]
+       end
+@@ -233,7 +240,7 @@ def update(vm)
+     end
+ 
+     def to_s
+-      "#{UBID.from_uuidish(@request.vm_id)} (arch=#{@request.arch_filter}, cores=#{@request.cores}, mem=#{@request.memory_gib}, storage=#{@request.storage_gib}) -> #{UBID.from_uuidish(@candidate_host[:vm_host_id])} (cpu=#{@candidate_host[:used_cores]}/#{@candidate_host[:total_cores]}, mem=#{@candidate_host[:used_hugepages_1g]}/#{@candidate_host[:total_hugepages_1g]}, storage=#{@candidate_host[:total_storage_gib] - @candidate_host[:available_storage_gib]}/#{@candidate_host[:total_storage_gib]}), score=#{@score}"
++      "#{UBID.from_uuidish(@request.vm_id)} (arch=#{@request.arch_filter}, vcpus=#{@request.vcpus}, mem=#{@request.memory_gib}, storage=#{@request.storage_gib}) -> #{UBID.from_uuidish(@candidate_host[:vm_host_id])} (cpu=#{@candidate_host[:used_cores]}/#{@candidate_host[:total_cores]}, mem=#{@candidate_host[:used_hugepages_1g]}/#{@candidate_host[:total_hugepages_1g]}, storage=#{@candidate_host[:total_storage_gib] - @candidate_host[:available_storage_gib]}/#{@candidate_host[:total_storage_gib]}), score=#{@score}"
+     end
+ 
+     private
+@@ -291,6 +298,15 @@ def update(vm, vm_host)
+     end
+   end
+ 
++  class VmHostCpuAllocation < VmHostAllocation
++    # in addition to updating the host, also update the number of cores allocated
++    # for the VM. Only do this when we do not host the VM inside a slice.
++    def update(vm, vm_host)
++      super
++      vm.update(cores: requested) unless vm.vm_host_slice_id
++    end
++  end
++
+   # The VmHostSliceAllocation is used when system is configured
+   # to allocate VMs inside VmHostSlice. It wraps around the VmHostAllocation class
+   # used otherwise.
+@@ -315,18 +331,14 @@ def utilization
+ 
+     def update(vm, vm_host)
+       DB.transaction do
+-        # Update the host utilization
+-        VmHost.dataset.where(id: vm_host.id).update(@vm_host_allocations.map(&:get_vm_host_update).reduce(&:merge))
+-
+-        requested_cpus = (vm_host.total_cpus / vm_host.total_cores) * @request.cores
+-        cpus = select_cpuset(vm_host.id, requested_cpus)
++        cpus = select_cpuset(vm_host.id, @request.vcpus)
+ 
+         st = Prog::Vm::VmHostSliceNexus.assemble_with_host(
+           "#{vm.family}_#{vm.inhost_name}",
+           vm_host,
+           family: vm.family,
+           allowed_cpus: cpus,
+-          memory_gib: @request.memory_gib_for_cores,
++          memory_gib: @request.memory_gib_for_cores(@request.cores_for_vcpus(vm_host.total_cpus / vm_host.total_cores)),
+           is_shared: false
+         )
+ 
+@@ -339,6 +351,10 @@ def update(vm, vm_host)
+           used_cpu_percent: Sequel[:used_cpu_percent] + vm.cpu_percent_limit,
+           used_memory_gib: Sequel[:used_memory_gib] + vm.memory_gib
+         )
++
++        # Update the host utilization
++        # This needs to be done after the slice is created and assigned to the VM
++        @vm_host_allocations.each { _1.update(vm, vm_host) }
+       end
+     end
+ 
+diff --git a/spec/model/vm_spec.rb b/spec/model/vm_spec.rb
+index 4ad77f44e..347ac0f07 100644
+--- a/spec/model/vm_spec.rb
++++ b/spec/model/vm_spec.rb
+@@ -40,7 +40,6 @@
+   describe "#cloud_hypervisor_cpu_topology" do
+     it "scales a single-socket hyperthreaded system" do
+       vm.family = "standard"
+-      vm.cores = 2
+       vm.vcpus = 4
+       expect(vm).to receive(:vm_host).and_return(instance_double(
+         VmHost,
+@@ -54,7 +53,6 @@
+ 
+     it "scales a dual-socket hyperthreaded system" do
+       vm.family = "standard"
+-      vm.cores = 2
+       vm.vcpus = 4
+       expect(vm).to receive(:vm_host).and_return(instance_double(
+         VmHost,
+@@ -90,7 +88,6 @@
+ 
+     it "crashes if cores allocated per die is not uniform number" do
+       vm.family = "standard"
+-      vm.cores = 2
+       vm.vcpus = 4
+ 
+       expect(vm).to receive(:vm_host).and_return(instance_double(
+@@ -103,6 +100,59 @@
+ 
+       expect { vm.cloud_hypervisor_cpu_topology }.to raise_error RuntimeError, "BUG: need uniform number of cores allocated per die"
+     end
++
++    it "crashes if the vcpus is an odd number" do
++      vm.family = "burstable"
++      vm.vcpus = 5
++      expect(vm).to receive(:vm_host).and_return(instance_double(
++        VmHost,
++        total_cpus: 12,
++        total_cores: 6,
++        total_dies: 1,
++        total_sockets: 1
++      )).at_least(:once)
++
++      expect { vm.cloud_hypervisor_cpu_topology }.to raise_error RuntimeError, "BUG: need uniform number of cores allocated per die"
++    end
++
++    it "scales a single-socket hyperthreaded system for burstable family for 1 vcpu" do
++      vm.family = "burstable"
++      vm.vcpus = 1
++      expect(vm).to receive(:vm_host).and_return(instance_double(
++        VmHost,
++        total_cpus: 12,
++        total_cores: 6,
++        total_dies: 1,
++        total_sockets: 1
++      )).at_least(:once)
++      expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("1:1:1:1")
++    end
++
++    it "scales a double-socket hyperthreaded system for burstable family for 1 vcpu" do
++      vm.family = "burstable"
++      vm.vcpus = 1
++      expect(vm).to receive(:vm_host).and_return(instance_double(
++        VmHost,
++        total_cpus: 24,
++        total_cores: 12,
++        total_dies: 2,
++        total_sockets: 2
++      )).at_least(:once)
++      expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("1:1:1:1")
++    end
++
++    it "scales a single-socket non-hyperthreaded system for burstable family for 1 vcpu" do
++      vm.family = "burstable"
++      vm.vcpus = 1
++      expect(vm).to receive(:vm_host).and_return(instance_double(
++        VmHost,
++        total_cpus: 12,
++        total_cores: 12,
++        total_dies: 1,
++        total_sockets: 1
++      )).at_least(:once)
++      expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("1:1:1:1")
++    end
+   end
+ 
+   describe "#update_spdk_version" do
+@@ -225,14 +275,8 @@
+       expect(Option::VmSizes.map { _1.name.include?("gpu") == _1.gpu }.all?(true)).to be true
+     end
+ 
+-    it "cpu limit set correctly for each architecture" do
+-      expect(Option::VmSizes.map {
+-        if _1.arch == "x64"
+-          _1.cpu_percent_limit == _1.vcpus * 100 && _1.cores == _1.vcpus / 2
+-        elsif _1.arch == "arm64"
+-          _1.cpu_percent_limit == _1.vcpus * 100 && _1.cores == _1.vcpus
+-        end
+-      }.all?(true)).to be true
++    it "no odd number of vcpus allowed, except for 1" do
++      expect(Option::VmSizes.all? { _1.vcpus == 1 || _1.vcpus.even? }).to be true
+     end
+   end
+ end
+diff --git a/spec/prog/test/vm_group_spec.rb b/spec/prog/test/vm_group_spec.rb
+index 40c913af8..db3610c29 100644
+--- a/spec/prog/test/vm_group_spec.rb
++++ b/spec/prog/test/vm_group_spec.rb
+@@ -70,7 +70,7 @@
+     it "hops to hop_wait_verify_vms" do
+       expect(vg_test).to receive(:reap)
+       expect(vg_test).to receive(:leaf?).and_return(true)
+-      expect { vg_test.wait_verify_vms }.to hop("verify_vm_host_slices")
++      expect { vg_test.wait_verify_vms }.to hop("verify_host_capacity")
+     end
+ 
+     it "stays in wait_verify_vms" do
+@@ -81,6 +81,37 @@
+     end
+   end
+ 
++  describe "#verify_host_capacity" do
++    it "hops to verify_vm_host_slices" do
++      vm_host = instance_double(VmHost,
++        total_cpus: 16,
++        total_cores: 8,
++        used_cores: 3,
++        vms: [instance_double(Vm, cores: 2), instance_double(Vm, cores: 0)],
++        slices: [instance_double(VmHostSlice, cores: 1)],
++        cpus: [])
++      expect(vg_test).to receive_messages(vm_host: vm_host)
++      expect { vg_test.verify_host_capacity }.to hop("verify_vm_host_slices")
++    end
++
++    it "fails if used cores do not match allocated VMs" do
++      vm_host = instance_double(VmHost,
++        total_cpus: 16,
++        total_cores: 8,
++        used_cores: 5,
++        vms: [instance_double(Vm, cores: 2), instance_double(Vm, cores: 0)],
++        slices: [instance_double(VmHostSlice, cores: 1)],
++        cpus: [])
++      expect(vg_test).to receive_messages(vm_host: vm_host)
++
++      strand = instance_double(Strand)
++      allow(vg_test).to receive_messages(strand: strand)
++      expect(strand).to receive(:update).with(exitval: {msg: "Host used cores does not match the allocated VMs cores"})
++
++      expect { vg_test.verify_host_capacity }.to hop("failed")
++    end
++  end
++
+   describe "#verify_vm_host_slices" do
+     it "runs tests on vm host slices" do
+       expect(vg_test).to receive(:frame).and_return({"test_slices" => true, "vms" => ["111", "222", "333"]}).at_least(:once)
+@@ -88,7 +119,7 @@
+       slice2 = instance_double(VmHostSlice, id: "789")
+       expect(Vm).to receive(:[]).with("111").and_return(instance_double(Vm, vm_host_slice: slice1))
+       expect(Vm).to receive(:[]).with("222").and_return(instance_double(Vm, vm_host_slice: slice2))
+-      expect(Vm).to receive(:[]).with("333").and_return(instance_double(Vm, vm_host_slice: slice2))
++      expect(Vm).to receive(:[]).with("333").and_return(instance_double(Vm, vm_host_slice: nil))
+ 
+       expect { vg_test.verify_vm_host_slices }.to hop("start", "Test::VmHostSlices")
+     end
+diff --git a/spec/prog/vm/github_runner_spec.rb b/spec/prog/vm/github_runner_spec.rb
+index 96c240ea3..c2e56383f 100644
+--- a/spec/prog/vm/github_runner_spec.rb
++++ b/spec/prog/vm/github_runner_spec.rb
+@@ -79,7 +79,7 @@
+       expect(vm).not_to be_nil
+       expect(vm.sshable.unix_user).to eq("runneradmin")
+       expect(vm.family).to eq("standard")
+-      expect(vm.cores).to eq(2)
++      expect(vm.vcpus).to eq(4)
+       expect(vm.project_id).to eq(Config.github_runner_service_project_id)
+     end
+ 
+@@ -97,7 +97,7 @@
+       expect(vm).not_to be_nil
+       expect(vm.sshable.unix_user).to eq("runneradmin")
+       expect(vm.family).to eq("standard")
+-      expect(vm.cores).to eq(2)
++      expect(vm.vcpus).to eq(4)
+     end
+ 
+     it "uses the existing vm if pool can pick one" do
+diff --git a/spec/prog/vm/nexus_spec.rb b/spec/prog/vm/nexus_spec.rb
+index 328cb9d0d..ee4faaeee 100644
+--- a/spec/prog/vm/nexus_spec.rb
++++ b/spec/prog/vm/nexus_spec.rb
+@@ -35,8 +35,8 @@
+       boot_image: "ubuntu-jammy",
+       family: "standard",
+       cores: 1,
+-      vcpus: 1,
+-      cpu_percent_limit: 100,
++      vcpus: 2,
++      cpu_percent_limit: 200,
+       cpu_burst_percent_limit: 0,
+       memory_gib: 8,
+       arch: "x64",
+@@ -52,7 +52,7 @@
+         project_id: "50089dcf-b472-8ad2-9ca6-b3e70d12759d",
+         resource_name: _1.name,
+         billing_rate_id: BillingRate.from_resource_properties("VmVCpu", _1.family, _1.location)["id"],
+-        amount: _1.cores
++        amount: _1.vcpus
+       )])
+     }
+     vm
+@@ -180,7 +180,7 @@ def requested_disk_size(st)
+ 
+     it "creates arm64 vm with double core count and 3.2GB memory per core" do
+       st = described_class.assemble("some_ssh_key", prj.id, size: "standard-4", arch: "arm64")
+-      expect(st.subject.cores).to eq(4)
++      expect(st.subject.vcpus).to eq(4)
+       expect(st.subject.memory_gib).to eq(12)
+     end
+ 
+@@ -280,7 +280,7 @@ def requested_disk_size(st)
+       expect(nic).to receive(:ubid_to_tap_name).and_return("tap4ncdd56m")
+       expect(vm).to receive(:nics).and_return([nic]).at_least(:once)
+       expect(nic).to receive(:private_subnet).and_return(ps).at_least(:once)
+-      expect(vm).to receive(:cloud_hypervisor_cpu_topology).and_return(Vm::CloudHypervisorCpuTopo.new(1, 1, 1, 1))
++      expect(vm).to receive(:cloud_hypervisor_cpu_topology).and_return(Vm::CloudHypervisorCpuTopo.new(2, 1, 1, 1))
+       expect(vm).to receive(:pci_devices).and_return([pci]).at_least(:once)
+       prj.set_ff_vm_public_ssh_keys(["operator_ssh_key"])
+       expect(vm).to receive(:project).and_return(prj).at_least(:once)
+@@ -288,7 +288,7 @@ def requested_disk_size(st)
+       sshable = instance_spy(Sshable)
+       expect(sshable).to receive(:cmd).with("common/bin/daemonizer --check prep_#{nx.vm_name}").and_return("NotStarted")
+       vmh = instance_double(VmHost, sshable: sshable,
+-        total_cpus: 80, total_cores: 40, total_sockets: 10, ndp_needed: false, arch: "arm64")
++        total_cpus: 80, total_cores: 80, total_sockets: 10, ndp_needed: false, arch: "arm64")
+       expect(vm).to receive(:vm_host).and_return(vmh).at_least(:once)
+ 
+       expect(sshable).to receive(:cmd).with(/sudo -u vm[0-9a-z]+ tee/, stdin: String) do |**kwargs|
+@@ -298,15 +298,15 @@ def requested_disk_size(st)
+           "public_ipv6" => "fe80::/64",
+           "unix_user" => "test_user",
+           "ssh_public_keys" => ["test_ssh_key", "operator_ssh_key"],
+-          "max_vcpus" => 1,
+-          "cpu_topology" => "1:1:1:1",
++          "max_vcpus" => 2,
++          "cpu_topology" => "2:1:1:1",
+           "mem_gib" => 8,
+           "local_ipv4" => "169.254.0.0",
+           "nics" => [["fd10:9b0b:6b4b:8fbb::/64", "10.0.0.3/32", "tap4ncdd56m", "5a:0f:75:80:c3:64", "10.0.0.1/26"]],
+           "swap_size_bytes" => nil,
+           "pci_devices" => [["01:00.0", 23]],
+           "slice_name" => "system.slice",
+-          "cpu_percent_limit" => 100,
++          "cpu_percent_limit" => 200,
+           "cpu_burst_percent_limit" => 0
+         })
+       end
+@@ -425,7 +425,7 @@ def requested_disk_size(st)
+ 
+     it "considers all locations for standard-60 runners" do
+       vm.location = "github-runners"
+-      vm.cores = 30
++      vm.vcpus = 60
+       expect(Scheduling::Allocator).to receive(:allocate).with(
+         vm, :storage_volumes,
+         allocation_state_filter: ["accepting"],
+@@ -889,6 +889,14 @@ def requested_disk_size(st)
+       expect { nx.destroy }.to hop("destroy_slice")
+     end
+ 
++    it "fails if VM cores is 0" do
++      expect(vm).to receive(:update).with(display_state: "deleting")
++      allow(vm).to receive(:vm_storage_volumes).and_return([])
++      expect(vm).to receive(:vm_host_slice).and_return(nil)
++      expect(vm).to receive(:cores).and_return(0)
++      expect { nx.destroy }.to raise_error(RuntimeError, "BUG: Number of cores cannot be zero when VM is runing without a slice")
++    end
++
+     it "#destroy_slice when no slice" do
+       expect(vm).to receive(:destroy).and_return(true)
+       expect { nx.destroy_slice }.to exit({"msg" => "vm deleted"})
+diff --git a/spec/prog/vm/vm_pool_spec.rb b/spec/prog/vm/vm_pool_spec.rb
+index adb369f62..4655c4d0a 100644
+--- a/spec/prog/vm/vm_pool_spec.rb
++++ b/spec/prog/vm/vm_pool_spec.rb
+@@ -53,7 +53,7 @@
+ 
+   describe "#wait" do
+     before do
+-      create_vm_host(location: "github-runners", total_cores: 2, used_cores: 0)
++      create_vm_host(location: "github-runners", total_cores: 2, total_cpus: 4, used_cores: 0)
+     end
+ 
+     let(:pool) {
+@@ -80,7 +80,7 @@
+       pool.update(size: 1)
+ 
+       expect(nx).to receive(:vm_pool).and_return(pool).at_least(:once)
+-      Vm.create(vm_host: VmHost.first, unix_user: "ubi", public_key: "key", name: "vm1", location: "github-runners", boot_image: "github-ubuntu-2204", family: "standard", arch: "arm64", cores: 4, vcpus: 2, memory_gib: 8, project_id:) { _1.id = Sshable.create_with_id.id }
++      Vm.create(vm_host: VmHost.first, unix_user: "ubi", public_key: "key", name: "vm1", location: "github-runners", boot_image: "github-ubuntu-2204", family: "standard", arch: "arm64", cores: 2, vcpus: 2, memory_gib: 8, project_id:) { _1.id = Sshable.create_with_id.id }
+ 
+       expect { nx.wait }.to hop("create_new_vm")
+     end
+@@ -89,7 +89,7 @@
+       pool.update(size: 1)
+ 
+       expect(nx).to receive(:vm_pool).and_return(pool).at_least(:once)
+-      Vm.create(vm_host: VmHost.first, unix_user: "ubi", public_key: "key", name: "vm1", location: "github-runners", boot_image: "github-ubuntu-2204", family: "standard", arch: "x64", cores: 2, vcpus: 2, memory_gib: 8, project_id:) { _1.id = Sshable.create_with_id.id }
++      Vm.create(vm_host: VmHost.first, unix_user: "ubi", public_key: "key", name: "vm1", location: "github-runners", boot_image: "github-ubuntu-2204", family: "standard", arch: "x64", cores: 2, vcpus: 4, memory_gib: 8, project_id:) { _1.id = Sshable.create_with_id.id }
+ 
+       expect { nx.wait }.to nap(30)
+     end
+diff --git a/spec/routes/web/project/billing_spec.rb b/spec/routes/web/project/billing_spec.rb
+index 8d0ade224..fde3148d4 100644
+--- a/spec/routes/web/project/billing_spec.rb
++++ b/spec/routes/web/project/billing_spec.rb
+@@ -255,7 +255,7 @@ def billing_record(begin_time, end_time)
+           resource_name: vm.name,
+           span: Sequel::Postgres::PGRange.new(begin_time, end_time),
+           billing_rate_id: BillingRate.from_resource_properties("VmVCpu", vm.family, vm.location)["id"],
+-          amount: vm.cores
++          amount: vm.vcpus
+         )
+       end
+ 
+diff --git a/spec/scheduling/allocator_spec.rb b/spec/scheduling/allocator_spec.rb
+index 845b4f7fb..9ad7be70d 100644
+--- a/spec/scheduling/allocator_spec.rb
++++ b/spec/scheduling/allocator_spec.rb
+@@ -8,7 +8,7 @@
+ TestResourceAllocation = Struct.new(:utilization, :is_valid)
+ RSpec.describe Al do
+   let(:vm) {
+-    Vm.new(family: "standard", cores: 1, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, name: "dummy-vm", arch: "x64", location: "loc1", ip4_enabled: "true", created_at: Time.now, unix_user: "", public_key: "", boot_image: "ubuntu-jammy").tap {
++    Vm.new(family: "standard", vcpus: 2, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, name: "dummy-vm", arch: "x64", location: "loc1", ip4_enabled: "true", created_at: Time.now, unix_user: "", public_key: "", boot_image: "ubuntu-jammy").tap {
+       _1.id = "2464de61-7501-8374-9ab0-416caebe31da"
+     }
+   }
+@@ -18,7 +18,7 @@
+   def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_storage_devices: false, gpu_count: 0, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], use_slices: false, diagnostics: false)
+     Al::Request.new(
+       vm.id,
+-      vm.cores,
++      vm.vcpus,
+       vm.memory_gib,
+       storage_volumes.map { _1["size_gib"] }.sum,
+       storage_volumes.size.times.zip(storage_volumes).to_h.sort_by { |k, v| v["size_gib"] * -1 },
+@@ -75,7 +75,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+       al = instance_double(Al::Allocation)
+       expect(Al::Allocation).to receive(:best_allocation)
+         .with(Al::Request.new(
+-          "2464de61-7501-8374-9ab0-416caebe31da", 1, 8, 33,
++          "2464de61-7501-8374-9ab0-416caebe31da", 2, 8, 33,
+           [[1, {"use_bdev_ubi" => true, "skip_sync" => false, "size_gib" => 22, "boot" => false}],
+             [0, {"use_bdev_ubi" => false, "skip_sync" => true, "size_gib" => 11, "boot" => true}]],
+           "ubuntu-jammy", false, 0, true, Config.allocator_target_host_utilization, "x64", ["accepting"], [], [], [], [],
+@@ -90,7 +90,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+   describe "candidate_selection" do
+     let(:req) {
+       Al::Request.new(
+-        "2464de61-7501-8374-9ab0-416caebe31da", 2, 8, 33,
++        "2464de61-7501-8374-9ab0-416caebe31da", 4, 8, 33,
+         [[1, {"use_bdev_ubi" => true, "skip_sync" => false, "size_gib" => 22, "boot" => false}],
+           [0, {"use_bdev_ubi" => false, "skip_sync" => true, "size_gib" => 11, "boot" => true}]],
+         "ubuntu-jammy", false, 0, true, 0.65, "x64", ["accepting"], [], [], [], [],
+@@ -139,7 +139,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "retrieves correct values" do
+-      vmh = create_vm_host(total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+       sd1 = StorageDevice.create_with_id(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 123, total_storage_gib: 345)
+       sd2 = StorageDevice.create_with_id(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 12, total_storage_gib: 99)
+@@ -150,6 +150,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+                  num_storage_devices: 2,
+                  storage_devices: [{"available_storage_gib" => sd2.available_storage_gib, "id" => sd2.id, "total_storage_gib" => sd2.total_storage_gib},
+                    {"available_storage_gib" => sd1.available_storage_gib, "id" => sd1.id, "total_storage_gib" => sd1.total_storage_gib}],
++                 total_cpus: vmh.total_cpus,
+                  total_cores: vmh.total_cores,
+                  total_hugepages_1g: vmh.total_hugepages_1g,
+                  total_storage_gib: sd1.total_storage_gib + sd2.total_storage_gib,
+@@ -162,11 +163,12 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+                  available_gpus: 0,
+                  available_iommu_groups: nil,
+                  used_ipv4: 1,
+-                 vm_provisioning_count: 0}])
++                 vm_provisioning_count: 0,
++                 accepts_slices: false}])
+     end
+ 
+     it "retrieves provisioning count" do
+-      vmh = create_vm_host(total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+       sd1 = StorageDevice.create_with_id(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 123, total_storage_gib: 345)
+       create_vm(vm_host_id: vmh.id, location: vmh.location, boot_image: "", display_state: "creating")
+@@ -177,6 +179,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+         .to eq([{location: vmh.location,
+                  num_storage_devices: 1,
+                  storage_devices: [{"available_storage_gib" => sd1.available_storage_gib, "id" => sd1.id, "total_storage_gib" => sd1.total_storage_gib}],
++                 total_cpus: vmh.total_cpus,
+                  total_cores: vmh.total_cores,
+                  total_hugepages_1g: vmh.total_hugepages_1g,
+                  total_storage_gib: sd1.total_storage_gib,
+@@ -189,12 +192,13 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+                  available_gpus: 0,
+                  available_iommu_groups: nil,
+                  used_ipv4: 1,
+-                 vm_provisioning_count: 2}])
++                 vm_provisioning_count: 2,
++                 accepts_slices: false}])
+     end
+ 
+     it "applies host filter" do
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -210,8 +214,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "applies host exclusion filter" do
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -227,8 +231,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "applies location filter" do
+-      vmh1 = create_vm_host(location: "loc1", total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(location: "loc2", total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(location: "loc1", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(location: "loc2", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -244,8 +248,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "retrieves candidates with enough storage devices" do
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor2", available_storage_gib: 100, total_storage_gib: 100)
+@@ -261,8 +265,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "retrieves candidates with available ipv4 addresses if ip4_enabled" do
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -277,8 +281,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+ 
+     it "retrieves candidates without available ipv4 addresses if not ip4_enabled" do
+       req.ip4_enabled = false
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -291,8 +295,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "retrieves candidates with gpu if gpu_count > 0" do
+-      vmh1 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+-      vmh2 = create_vm_host(total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
++      vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+       StorageDevice.create_with_id(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+       Address.create_with_id(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+@@ -314,7 +318,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+   describe "Allocation" do
+     let(:req) {
+       Al::Request.new(
+-        "2464de61-7501-8374-9ab0-416caebe31da", 2, 16, 33,
++        "2464de61-7501-8374-9ab0-416caebe31da", 4, 16, 33,
+         [[1, {"use_bdev_ubi" => true, "skip_sync" => false, "size_gib" => 22, "boot" => false}],
+           [0, {"use_bdev_ubi" => false, "skip_sync" => true, "size_gib" => 11, "boot" => true}]],
+         "ubuntu-jammy", false, 0, true, 0.65, "x64", ["accepting"], [], [], [], [],
+@@ -328,6 +332,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+          {"available_storage_gib" => 101, "id" => "sd2id", "total_storage_gib" => 91}],
+        total_storage_gib: 111,
+        available_storage_gib: 101,
++       total_cpus: 16,
+        total_cores: 8,
+        used_cores: 3,
+        total_hugepages_1g: 22,
+@@ -339,7 +344,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     }
+ 
+     it "initializes individual resource allocations" do
+-      expect(Al::VmHostAllocation).to receive(:new).with(:used_cores, vmhds[:total_cores], vmhds[:used_cores], req.cores).and_return(instance_double(Al::VmHostAllocation, utilization: req.target_host_utilization, is_valid: true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).with(:used_cores, vmhds[:total_cores], vmhds[:used_cores], req.cores_for_vcpus(vmhds[:total_cpus] / vmhds[:total_cores])).and_return(instance_double(Al::VmHostCpuAllocation, utilization: req.target_host_utilization, is_valid: true))
+       expect(Al::VmHostAllocation).to receive(:new).with(:used_hugepages_1g, vmhds[:total_hugepages_1g], vmhds[:used_hugepages_1g], req.memory_gib).and_return(instance_double(Al::VmHostAllocation, utilization: req.target_host_utilization, is_valid: true))
+       expect(Al::StorageAllocation).to receive(:new).with(vmhds, req).and_return(instance_double(Al::StorageAllocation, utilization: req.target_host_utilization, is_valid: true))
+ 
+@@ -349,7 +354,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "is valid only if all resource allocations are valid" do
+-      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, false))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+ 
+@@ -359,24 +364,28 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "has score of 0 if all resources are at target utilization" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+ 
+       expect(Al::Allocation.new(vmhds, req).score).to eq 0
+     end
+ 
+     it "is penalized if utilization is below target" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization * 0.9, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 0.9, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 0.9, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 0.9, true))
+       expect(Al::Allocation.new(vmhds, req).score).to be > 0
+     end
+ 
+     it "penalizes over-utilization more than under-utilization" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       score_low_utilization = Al::Allocation.new(vmhds, req).score
+ 
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization * 1.01, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 1.01, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 1.01, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization * 1.01, true))
+       score_over_target = Al::Allocation.new(vmhds, req).score
+ 
+@@ -384,12 +393,12 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "penalizes imbalance" do
+-      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.5, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.5, true))
+       expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.5, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.5, true))
+       score_balance = Al::Allocation.new(vmhds, req).score
+ 
+-      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.4, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.4, true))
+       expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.5, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(0.6, true))
+       score_imbalance = Al::Allocation.new(vmhds, req).score
+@@ -398,7 +407,8 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "penalizes concurrent provisioning for github runners" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       vmhds[:location] = "github-runners"
+       vmhds[:vm_provisioning_count] = 1
+@@ -406,25 +416,30 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+     end
+ 
+     it "penalizes AX161 github runners" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       vmhds[:location] = "github-runners"
+       vmhds[:total_cores] = 32
++      vmhds[:total_cpus] = 64
+       expect(Al::Allocation.new(vmhds, req).score).to eq(0.5)
+     end
+ 
+     it "respects location preferences" do
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       score_no_preference = Al::Allocation.new(vmhds, req).score
+ 
+       req.location_preference = ["loc1"]
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(0, true))
+       score_preference_met = Al::Allocation.new(vmhds, req).score
+ 
+       req.location_preference = ["loc2"]
+-      expect(Al::VmHostAllocation).to receive(:new).twice.and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
++      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+       score_preference_not_met = Al::Allocation.new(vmhds, req).score
+ 
+@@ -455,7 +470,7 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+   describe "StorageAllocation" do
+     let(:req) {
+       Al::Request.new(
+-        "2464de61-7501-8374-9ab0-416caebe31da", 2, 8, 33,
++        "2464de61-7501-8374-9ab0-416caebe31da", 4, 8, 33,
+         [[1, {"use_bdev_ubi" => true, "skip_sync" => false, "size_gib" => 22, "boot" => false}],
+           [0, {"use_bdev_ubi" => false, "skip_sync" => true, "size_gib" => 11, "boot" => true}]],
+         "ubuntu-jammy", false, 0.65, "x64", ["accepting"], [], [], [], [],
+@@ -735,6 +750,24 @@ def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_stor
+       expect(vm).to receive(:ip4_enabled).and_return(true).at_least(:once)
+       expect { Al::Allocation.update_vm(vmh, vm) }.to raise_error(RuntimeError, /no ip4 addresses left/)
+     end
++
++    it "allocates correctly on GEX44 host" do
++      vmh = VmHost.first
++      # Set the host to match GEX44 specs - it is an x64 host, but with one thread per core
++      vmh.update(arch: "x64", total_dies: 1, total_sockets: 1, total_cpus: 14, total_cores: 14, used_cores: 2)
++
++      vm = create_vm
++      used_cores = vmh.used_cores
++      described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "skip_sync" => false, "encrypted" => true, "boot" => false},
++        {"size_gib" => 95, "use_bdev_ubi" => false, "skip_sync" => false, "encrypted" => true, "boot" => false}])
++      vmh.reload
++      vm.reload
++
++      # Expect the number of vcpus to match the number of cores
++      expect(vm.vcpus).to eq(2)
++      expect(vm.cores).to eq(2)
++      expect(used_cores + vm.cores).to eq(vmh.used_cores)
++    end
+   end
+ 
+   describe "slice selection" do
+@@ -834,7 +867,7 @@ def create_vm_with_use_slice_enabled(**args)
+       Prog::Vm::VmHostSliceNexus.assemble_with_host("sl1", vh, family: "standard", allowed_cpus: (2..5), memory_gib: 16)
+       Prog::Vm::VmHostSliceNexus.assemble_with_host("sl2", vh, family: "standard", allowed_cpus: (8..11), memory_gib: 16)
+ 
+-      vm = create_vm_with_use_slice_enabled(cores: 2, memory_gib: 16, cpu_percent_limit: 400)
++      vm = create_vm_with_use_slice_enabled(vcpus: 4, memory_gib: 16, cpu_percent_limit: 400)
+       al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+       al.update(vm)
+       vh.reload
+@@ -844,25 +877,53 @@ def create_vm_with_use_slice_enabled(**args)
+       expect(slice.allowed_cpus_cgroup).to eq("6-7,12-13")
+     end
+ 
++    it "allocates with no slice if no host available" do
++      # mark the first host as full
++      vmh1 = VmHost.first
++      vmh1.update(used_cores: vmh1.total_cores, used_hugepages_1g: vmh1.total_hugepages_1g)
++
++      # create a second host
++      vmh2 = create_vm_host(accepts_slices: false, net6: "2001:db8::/64", total_cpus: 16, total_cores: 8, used_cores: 1, total_hugepages_1g: 54, used_hugepages_1g: 2)
++      BootImage.create_with_id(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
++      StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
++      StorageDevice.create_with_id(vm_host_id: vmh2.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
++      SpdkInstallation.create(vm_host_id: vmh2.id, version: "v1", allocation_weight: 100) { _1.id = vmh2.id }
++      Address.create_with_id(cidr: "1.2.1.0/30", routed_to_host_id: vmh2.id)
++      PciDevice.create_with_id(vm_host_id: vmh2.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
++      PciDevice.create_with_id(vm_host_id: vmh2.id, slot: "01:00.1", device_class: "0420", vendor: "vd", device: "dv2", numa_node: 0, iommu_group: 3)
++      (0..16).each do |i|
++        VmHostCpu.create(vm_host_id: vmh2.id, cpu_number: i, spdk: i < 2)
++      end
++
++      vm = create_vm_with_use_slice_enabled
++      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
++      expect(al).not_to be_nil
++      al.update(vm)
++
++      expect(vm.vm_host.id).to eq(vmh2.id)
++      expect(vm.vm_host_slice).to be_nil
++      expect(vm.cores).to eq(1)
++    end
++
+     it "memory_gib_for_cores handles standard family" do
+       vm = create_vm
+       req = create_req(vm, vol)
+ 
+-      expect(req.memory_gib_for_cores).to eq 8
++      expect(req.memory_gib_for_cores(req.cores_for_vcpus(2))).to eq 8
+     end
+ 
+     it "memory_gib_for_cores returns correct ratio for standard-gpu" do
+       vm = create_vm(family: "standard-gpu")
+       req = create_req(vm, vol)
+ 
+-      expect(req.memory_gib_for_cores).to eq 10
++      expect(req.memory_gib_for_cores(req.cores_for_vcpus(2))).to eq 10
+     end
+ 
+     it "memory_gib_for_cores handles arm64" do
+       vm = create_vm(arch: "arm64")
+       req = create_req(vm, vol)
+ 
+-      expect(req.memory_gib_for_cores).to eq 3
++      expect(req.memory_gib_for_cores(req.cores_for_vcpus(1))).to eq 6
+     end
+ 
+     it "select_cpuset fails if not enough cpus" do
+diff --git a/spec/spec_helper.rb b/spec/spec_helper.rb
+index cd794a3fa..bd08e1eb6 100644
+--- a/spec/spec_helper.rb
++++ b/spec/spec_helper.rb
+@@ -243,7 +243,7 @@ def create_vm_host(**args)
+   end
+ 
+   def create_vm(**args)
+-    defaults = {unix_user: "ubi", public_key: "ssh-ed25519 key", name: "test-vm", family: "standard", cores: 1, vcpus: 2, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, arch: "x64", location: "hetzner-fsn1", boot_image: "ubuntu-jammy", display_state: "running", ip4_enabled: false, created_at: Time.now}
++    defaults = {unix_user: "ubi", public_key: "ssh-ed25519 key", name: "test-vm", family: "standard", cores: 0, vcpus: 2, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, arch: "x64", location: "hetzner-fsn1", boot_image: "ubuntu-jammy", display_state: "running", ip4_enabled: false, created_at: Time.now}
+     args = defaults.merge(args)
+     args[:project_id] ||= Project.create(name: "create-vm-project").id
+     Vm.create(**args)
+diff --git a/spec/thawed_mock.rb b/spec/thawed_mock.rb
+index 649712c50..c4435386c 100644
+--- a/spec/thawed_mock.rb
++++ b/spec/thawed_mock.rb
+@@ -109,6 +109,7 @@ module ExpectOverride
+   allow_mocking(Scheduling::Allocator, :allocate)
+   allow_mocking(Scheduling::Allocator::Allocation, :best_allocation, :candidate_hosts, :new, :random_score, :update_vm)
+   allow_mocking(Scheduling::Allocator::StorageAllocation, :new)
++  allow_mocking(Scheduling::Allocator::VmHostCpuAllocation, :new)
+   allow_mocking(Scheduling::Allocator::VmHostAllocation, :new)
+   allow_mocking(Serializers::Vm, :serialize_internal)
+   allow_mocking(SshKey, :generate)

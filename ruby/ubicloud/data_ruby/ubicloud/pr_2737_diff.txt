@@ -1,0 +1,156 @@
+diff --git a/model/load_balancers_vms.rb b/model/load_balancers_vms.rb
+index 9cfb770b7..240d3c8c1 100644
+--- a/model/load_balancers_vms.rb
++++ b/model/load_balancers_vms.rb
+@@ -38,7 +38,7 @@ def check_probe(session, type)
+   end
+ 
+   def health_check_cmd(type)
+-    address = (type == :ipv4) ? vm.nics.first.private_ipv4.network : vm.ephemeral_net6.nth(2)
++    address = (type == :ipv4) ? vm.private_ipv4 : vm.ephemeral_net6.nth(2)
+     if load_balancer.health_check_protocol == "tcp"
+       "sudo ip netns exec #{vm.inhost_name} nc -z -w #{load_balancer.health_check_timeout} #{address} #{load_balancer.dst_port} && echo 200 || echo 400"
+     else
+diff --git a/model/vm.rb b/model/vm.rb
+index 9753b5168..b6e48d9e7 100644
+--- a/model/vm.rb
++++ b/model/vm.rb
+@@ -51,7 +51,7 @@ def ip4
+   end
+ 
+   def private_ipv4
+-    (nics.first.private_ipv4.netmask.to_s == "/32") ? nics.first.private_ipv4.network : nics.first.private_ipv4.nth(1)
++    (nics.first.private_ipv4.netmask.prefix_len == 32) ? nics.first.private_ipv4.network : nics.first.private_ipv4.nth(1)
+   end
+ 
+   def private_ipv6
+diff --git a/rhizome/host/lib/vm_setup.rb b/rhizome/host/lib/vm_setup.rb
+index a31598269..27a3bfedc 100644
+--- a/rhizome/host/lib/vm_setup.rb
++++ b/rhizome/host/lib/vm_setup.rb
+@@ -340,6 +340,8 @@ def routes4(ip4, ip4_local, nics)
+   end
+ 
+   def update_via_routes(nics)
++    return if NetAddr::IPv4Net.parse(nics.first.net4).netmask.prefix_len == 32
++
+     # we create tap devices in "interfaces" function in this file. but
+     # code execution happens faster than linux taking care of the device creation.
+     # that's why by the time we reach this function, we need to check whether the
+@@ -358,7 +360,7 @@ def update_via_routes(nics)
+ 
+     nics.each do |nic|
+       local_ip4 = NetAddr::IPv4Net.parse(nic.net4)
+-      r "ip -n #{q_vm} route replace #{local_ip4.to_s.shellescape} via #{local_ip4.nth(1).to_s.shellescape} dev #{nic.tap}" unless local_ip4.netmask.to_s == "/32"
++      r "ip -n #{q_vm} route replace #{local_ip4.to_s.shellescape} via #{local_ip4.nth(1).to_s.shellescape} dev #{nic.tap}" unless local_ip4.netmask.prefix_len == 32
+     end
+   end
+ 
+@@ -373,7 +375,7 @@ def generate_nat4_rules(ip4, private_ip)
+ 
+     public_ipv4 = NetAddr::IPv4Net.parse(ip4).network.to_s
+     private_ipv4_addr = NetAddr::IPv4Net.parse(private_ip)
+-    private_ipv4 = (private_ipv4_addr.netmask.to_s == "/32") ? private_ipv4_addr.network.to_s : private_ipv4_addr.nth(1).to_s
++    private_ipv4 = (private_ipv4_addr.netmask.prefix_len == 32) ? private_ipv4_addr.network.to_s : private_ipv4_addr.nth(1).to_s
+     <<~NAT4_RULES
+     table ip nat {
+       chain prerouting {
+@@ -470,7 +472,7 @@ def cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dn
+     private_ip_dhcp = nics.map do |nic|
+       vm_sub_6 = NetAddr::IPv6Net.parse(nic.net6)
+       vm_net4 = NetAddr::IPv4Net.parse(nic.net4)
+-      vm_sub_4 = (vm_net4.netmask.to_s == "/32") ? vm_net4.nth(0) : vm_net4.nth(1)
++      vm_sub_4 = (vm_net4.netmask.prefix_len == 32) ? vm_net4.nth(0) : vm_net4.nth(1)
+       <<DHCP
+ dhcp-range=#{nic.tap},#{vm_sub_4},#{vm_sub_4},6h
+ dhcp-range=#{nic.tap},#{vm_sub_6.nth(2)},#{vm_sub_6.nth(2)},#{vm_sub_6.netmask.prefix_len}
+diff --git a/serializers/nic.rb b/serializers/nic.rb
+index c56471816..d6078c14a 100644
+--- a/serializers/nic.rb
++++ b/serializers/nic.rb
+@@ -5,7 +5,7 @@ def self.serialize_internal(nic, options = {})
+     {
+       id: nic.ubid,
+       name: nic.name,
+-      private_ipv4: nic.private_ipv4.network.to_s,
++      private_ipv4: (nic.private_ipv4.netmask.prefix_len == 32) ? nic.private_ipv4.network.to_s : nic.private_ipv4.nth(1).to_s,
+       private_ipv6: nic.private_ipv6.nth(2).to_s,
+       vm_name: nic.vm&.name
+     }
+diff --git a/spec/model/minio/minio_server_spec.rb b/spec/model/minio/minio_server_spec.rb
+index 2908c9c21..48c22cd2d 100644
+--- a/spec/model/minio/minio_server_spec.rb
++++ b/spec/model/minio/minio_server_spec.rb
+@@ -35,7 +35,7 @@
+   end
+ 
+   it "returns private ipv4 address properly" do
+-    nic = instance_double(Nic, private_ipv4: instance_double(NetAddr::IPv4Net, network: "192.168.0.0", netmask: "/32"))
++    nic = instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("192.168.0.0/32"))
+     expect(ms.vm).to receive(:nics).and_return([nic]).at_least(:once)
+     expect(ms.private_ipv4_address).to eq("192.168.0.0")
+   end
+diff --git a/spec/model/vm_spec.rb b/spec/model/vm_spec.rb
+index 1c2d16509..4ad77f44e 100644
+--- a/spec/model/vm_spec.rb
++++ b/spec/model/vm_spec.rb
+@@ -140,7 +140,7 @@
+     end
+ 
+     it "returns the right private_ipv4 based on the netmask" do
+-      nic = instance_double(Nic, private_ipv4: instance_double(NetAddr::IPv4Net, network: "192.168.12.13", netmask: "/32"))
++      nic = instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("192.168.12.13/32"))
+       expect(vm).to receive(:nics).and_return([nic]).twice
+       expect(vm.private_ipv4.to_s).to eq("192.168.12.13")
+ 
+diff --git a/spec/serializers/nic_spec.rb b/spec/serializers/nic_spec.rb
+new file mode 100644
+index 000000000..c66f016fe
+--- /dev/null
++++ b/spec/serializers/nic_spec.rb
+@@ -0,0 +1,45 @@
++# frozen_string_literal: true
++
++require_relative "../spec_helper"
++
++RSpec.describe Serializers::Nic do
++  describe ".serialize_internal" do
++    it "serializes a NIC with a non-/32 IPv4 subnet correctly" do
++      vm = instance_double(Vm, name: "test-vm")
++
++      private_ipv4 = NetAddr::IPv4Net.parse("192.168.1.0/24")
++      private_ipv6 = NetAddr::IPv6Net.parse("fd91:4ef3:a586:943d:c2ae::/79")
++
++      nic = instance_double(Nic, ubid: "abc123", name: "nic-name", private_ipv4: private_ipv4, private_ipv6: private_ipv6, vm: vm)
++
++      expected_result = {
++        id: "abc123",
++        name: "nic-name",
++        private_ipv4: "192.168.1.1",
++        private_ipv6: "fd91:4ef3:a586:943d:c2ae::2",
++        vm_name: "test-vm"
++      }
++
++      expect(described_class.serialize_internal(nic)).to eq(expected_result)
++    end
++
++    it "serializes a NIC object correctly" do
++      vm = instance_double(Vm, name: "test-vm")
++
++      private_ipv4 = NetAddr::IPv4Net.parse("10.23.34.53/32")
++      private_ipv6 = NetAddr::IPv6Net.parse("fd91:4ef3:a586:943d:c2ae::/79")
++
++      nic = instance_double(Nic, ubid: "69c0f4cd-99c1-4e1w-acfe-7b013ce2fa0b", name: "nic-name", private_ipv4: private_ipv4, private_ipv6: private_ipv6, vm: vm)
++
++      expected_result = {
++        id: "69c0f4cd-99c1-4e1w-acfe-7b013ce2fa0b",
++        name: "nic-name",
++        private_ipv4: "10.23.34.53",
++        private_ipv6: "fd91:4ef3:a586:943d:c2ae::2",
++        vm_name: "test-vm"
++      }
++
++      expect(described_class.serialize_internal(nic)).to eq(expected_result)
++    end
++  end
++end

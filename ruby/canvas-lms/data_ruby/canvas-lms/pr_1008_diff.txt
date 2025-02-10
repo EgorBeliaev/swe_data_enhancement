@@ -1,0 +1,264 @@
+diff --git a/app/controllers/developer_keys_controller.rb b/app/controllers/developer_keys_controller.rb
+index c5d03c9b5868e..08709f347113e 100644
+--- a/app/controllers/developer_keys_controller.rb
++++ b/app/controllers/developer_keys_controller.rb
+@@ -88,6 +88,6 @@ def require_manage_developer_keys
+   end
+ 
+   def developer_key_params
+-    params.require(:developer_key).permit(:api_key, :name, :icon_url, :redirect_uri, :redirect_uris, :email, :auto_expire_tokens)
++    params.require(:developer_key).permit(:api_key, :name, :icon_url, :redirect_uri, :redirect_uris, :email, :auto_expire_tokens, :notes, :access_token_count)
+   end
+ end
+diff --git a/app/models/access_token.rb b/app/models/access_token.rb
+index d8d089a0b0e1b..c56039bb0b1fd 100644
+--- a/app/models/access_token.rb
++++ b/app/models/access_token.rb
+@@ -1,7 +1,7 @@
+ class AccessToken < ActiveRecord::Base
+   attr_reader :full_token
+   attr_reader :plaintext_refresh_token
+-  belongs_to :developer_key
++  belongs_to :developer_key, counter_cache: :access_token_count
+   belongs_to :user
+   has_one :account, through: :developer_key
+ 
+diff --git a/app/models/developer_key.rb b/app/models/developer_key.rb
+index ae4597acb50d0..a5ae6e1c83776 100644
+--- a/app/models/developer_key.rb
++++ b/app/models/developer_key.rb
+@@ -106,6 +106,10 @@ def account_name
+     account.try(:name)
+   end
+ 
++  def last_used_at
++    self.access_tokens.maximum(:last_used_at)
++  end
++
+   class << self
+     def find_cached(id)
+       global_id = Shard.global_id_for(id)
+diff --git a/app/stylesheets/bundles/developer_keys.scss b/app/stylesheets/bundles/developer_keys.scss
+index f1d3e95d6b782..cf835c0456eea 100644
+--- a/app/stylesheets/bundles/developer_keys.scss
++++ b/app/stylesheets/bundles/developer_keys.scss
+@@ -38,6 +38,13 @@
+       font-weight: bold;
+       @include fontSize(14px);
+     }
++    &.notes {
++      width: 15%;
++      > div {
++        max-height: 100px;
++        overflow-x: auto
++      }
++    }
+     &.links i {
+       opacity: 0.4;
+     }
+diff --git a/app/views/developer_keys/index.html.erb b/app/views/developer_keys/index.html.erb
+index 07d85f8e99fa8..fbe3a71f7cd73 100644
+--- a/app/views/developer_keys/index.html.erb
++++ b/app/views/developer_keys/index.html.erb
+@@ -13,6 +13,7 @@
+       <th><%= t :user, "User" %></th>
+       <th><%= t :details, "Details" %></th>
+       <th><%= t :stats, "Stats" %></th>
++      <th><%= t :notes, "Notes" %></th>
+       <th>&nbsp;</th>
+     </tr>
+   </thead>
+diff --git a/app/views/jst/developer_key.handlebars b/app/views/jst/developer_key.handlebars
+index 8af0866d023b4..37bbbb2bf9da0 100644
+--- a/app/views/jst/developer_key.handlebars
++++ b/app/views/jst/developer_key.handlebars
+@@ -28,23 +28,33 @@
+     <td>
+         <div class="details">
+             <div>
+-               {{#t "identifier"}}ID: {{id}}{{/t}}
++               {{#t}}ID: {{id}}{{/t}}
+             </div>
+             <div>
+-               {{#t "api_key"}}Key: <span class='api_key'>{{api_key}}</span>{{/t}}
++               {{#t}}Key: <span class='api_key'>{{api_key}}</span>{{/t}}
+             </div>
+             <div>
+                 {{#if redirect_uri}}
+-                    {{#t "redirect_uri"}}URI: {{redirect_uri}}{{/t}}
++                    {{#t}}URI: {{redirect_uri}}{{/t}}
+                 {{/if}}
+             </div>
+         </div>
+     </td>
+     <td>
+         <div>
+-            {{#t "created"}}Created:{{/t}} {{datetimeFormatted created_at}}
++          {{#t}}Access Token Count: {{access_token_count}}{{/t}}
+         </div>
+-        <!-- TODO: Add some better stats here, like token count, last usage, etc. -->
++        <div>
++            {{#t}}Created:{{/t}} {{datetimeFormatted created_at}}
++        </div>
++        <div>
++            {{#t}}Last Used:{{/t}} {{#ifExists last_used_at}}{{last_used_at}}{{else}}Never{{/ifExists}}
++        </div>
++    </td>
++    <td class='notes'>
++      <div>
++        {{#t}}{{notes}}{{/t}}
++      </div>
+     </td>
+     <td class='links'>
+         <a href="#" class="edit_link" aria-label="{{#t}}Edit key {{name}}{{/t}}" title="{{#t "edit_key"}}Edit this key{{/t}}"><i class="icon-edit standalone-icon"></i></a>
+@@ -53,6 +63,6 @@
+         {{else}}
+           <a href="#" role="checkbox" aria-checked="true" aria-label="{{#t}}Activate key {{name}}{{/t}}" class="deactivate_link" title="{{#t}}Deactivate this key{{/t}}"><i class="icon-lock standalone-icon"></i></a>
+         {{/if}}
+-        <a href="#" class="delete_link" aria-label="{{#t}}Delete key {{name}}{{/t}}" title="{{#t "delete_key"}}Delete this key{{/t}}"><i class="icon-trash standalone-icon"></i></a>
++        <a href="#" class="delete_link" title="{{#t}}Delete this key{{/t}}"><i class="icon-trash standalone-icon"></i></a>
+     </td>
+ </tr>
+diff --git a/app/views/jst/developer_key_form.handlebars b/app/views/jst/developer_key_form.handlebars
+index cc24ba3884ba8..57b92c4da2a45 100644
+--- a/app/views/jst/developer_key_form.handlebars
++++ b/app/views/jst/developer_key_form.handlebars
+@@ -20,6 +20,10 @@
+         <td><label for='icon_url'>{{#t "icon_url"}}Icon URL:{{/t}}</label></td>
+         <td><input type='text' id='icon_url' name='developer_key[icon_url]' value='{{ icon_url }}'/>
+     </tr>
++    <tr>
++        <td><label for='notes'>{{#t "notes"}}Notes:{{/t}}</label></td>
++        <td><textarea id='notes' name='developer_key[notes]' class="input-block-level">{{ notes }}</textarea>
++    </tr>
+     <tr>
+         <td colspan='2'>
+             <div class='button-container'>
+diff --git a/db/migrate/20170320212242_add_notes_to_developer_keys.rb b/db/migrate/20170320212242_add_notes_to_developer_keys.rb
+new file mode 100644
+index 0000000000000..19a5b5f39aae9
+--- /dev/null
++++ b/db/migrate/20170320212242_add_notes_to_developer_keys.rb
+@@ -0,0 +1,7 @@
++class AddNotesToDeveloperKeys < ActiveRecord::Migration[4.2]
++  tag :predeploy
++
++  def change
++    add_column :developer_keys, :notes, :text
++  end
++end
+diff --git a/db/migrate/20170323205406_add_access_token_count_to_developer_keys.rb b/db/migrate/20170323205406_add_access_token_count_to_developer_keys.rb
+new file mode 100644
+index 0000000000000..1b118b7e78856
+--- /dev/null
++++ b/db/migrate/20170323205406_add_access_token_count_to_developer_keys.rb
+@@ -0,0 +1,6 @@
++class AddAccessTokenCountToDeveloperKeys < ActiveRecord::Migration[4.2]
++  tag :predeploy
++  def change
++    add_column :developer_keys, :access_token_count, :integer, :default => 0, :null => false
++  end
++end
+diff --git a/db/migrate/20170323212756_update_developer_key_access_token_counts.rb b/db/migrate/20170323212756_update_developer_key_access_token_counts.rb
+new file mode 100644
+index 0000000000000..fa792807bb10f
+--- /dev/null
++++ b/db/migrate/20170323212756_update_developer_key_access_token_counts.rb
+@@ -0,0 +1,8 @@
++class UpdateDeveloperKeyAccessTokenCounts < ActiveRecord::Migration[4.2]
++  tag :postdeploy
++
++  def up
++    DataFixup::UpdateDeveloperKeyAccessTokenCounts.send_later_if_production_enqueue_args(:run,
++      :priority => Delayed::LOW_PRIORITY)
++  end
++end
+diff --git a/db/migrate/20170324212128_add_last_used_at_index_to_developer_keys.rb b/db/migrate/20170324212128_add_last_used_at_index_to_developer_keys.rb
+new file mode 100644
+index 0000000000000..46ffed4e1f26f
+--- /dev/null
++++ b/db/migrate/20170324212128_add_last_used_at_index_to_developer_keys.rb
+@@ -0,0 +1,8 @@
++class AddLastUsedAtIndexToDeveloperKeys < ActiveRecord::Migration[4.2]
++  tag :predeploy
++  disable_ddl_transaction!
++
++  def change
++    add_index :access_tokens, [:developer_key_id, :last_used_at], algorithm: :concurrently
++  end
++end
+diff --git a/lib/api/v1/developer_key.rb b/lib/api/v1/developer_key.rb
+index c6fd7510234a6..be84bfeb62a14 100644
+--- a/lib/api/v1/developer_key.rb
++++ b/lib/api/v1/developer_key.rb
+@@ -20,7 +20,7 @@ module Api::V1::DeveloperKey
+   include Api::V1::Json
+ 
+   DEVELOPER_KEY_JSON_ATTRS = %w(
+-    name created_at email user_id user_name icon_url workflow_state
++    name created_at email user_id user_name icon_url notes workflow_state
+   ).freeze
+ 
+   def developer_keys_json(keys, user, session, context=nil)
+@@ -34,6 +34,9 @@ def developer_key_json(key, user, session, context=nil)
+         hash['api_key'] = key.api_key
+         hash['redirect_uri'] = key.redirect_uri
+         hash['redirect_uris'] = key.redirect_uris.join("\n")
++        hash['notes'] = key.notes
++        hash['access_token_count'] = key.access_token_count
++        hash['last_used_at'] = key.last_used_at
+       end
+       hash['account_name'] = key.account_name
+       hash['id'] = key.global_id
+diff --git a/lib/data_fixup/update_developer_key_access_token_counts.rb b/lib/data_fixup/update_developer_key_access_token_counts.rb
+new file mode 100644
+index 0000000000000..94df5bc4ea8da
+--- /dev/null
++++ b/lib/data_fixup/update_developer_key_access_token_counts.rb
+@@ -0,0 +1,5 @@
++module DataFixup::UpdateDeveloperKeyAccessTokenCounts
++  def self.run
++    DeveloperKey.find_each { |key| DeveloperKey.reset_counters(key.id, :access_tokens) }
++  end
++end
+diff --git a/spec/models/developer_key_spec.rb b/spec/models/developer_key_spec.rb
+index b6458b598ac67..ba390a2780d72 100644
+--- a/spec/models/developer_key_spec.rb
++++ b/spec/models/developer_key_spec.rb
+@@ -55,6 +55,36 @@
+     expect(key).to be_valid
+   end
+ 
++  it "returns the correct count of access_tokens" do
++    key = DeveloperKey.create!(
++      :name => 'test',
++      :email => 'test@test.com',
++      :redirect_uri => 'http://test.com'
++    )
++
++    expect(key.access_token_count).to eq 0
++
++    AccessToken.create!(:user => user_model, :developer_key => key)
++    AccessToken.create!(:user => user_model, :developer_key => key)
++    AccessToken.create!(:user => user_model, :developer_key => key)
++
++    expect(key.access_token_count).to eq 3
++  end
++
++  it "returns the last_used_at value for a key" do
++    key = DeveloperKey.create!(
++      :name => 'test',
++      :email => 'test@test.com',
++      :redirect_uri => 'http://test.com'
++    )
++
++    expect(key.last_used_at).to be_nil
++    at = AccessToken.create!(:user => user_model, :developer_key => key)
++    at.used!
++    expect(key.last_used_at).not_to be_nil
++  end
++
++
+   describe "#redirect_domain_matches?" do
+     it "should match domains exactly, and sub-domains" do
+       key = DeveloperKey.create!(:redirect_uri => "http://example.com/a/b")

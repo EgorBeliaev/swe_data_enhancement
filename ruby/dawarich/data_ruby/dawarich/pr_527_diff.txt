@@ -1,0 +1,588 @@
+diff --git a/.app_version b/.app_version
+index 16235ea2..68d0e0ab 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.19.5
++0.19.6
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 31d488f3..621769eb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.19.6 - 2024-12-11
++
++⚠️ This release introduces a breaking change. ⚠️
++
++The `dawarich_shared` volume now being mounted to `/data` instead of `/var/shared` within the container. It fixes Redis data being lost on container restart.
++
++To change this, you need to update the `docker-compose.yml` file:
++
++```diff
++  dawarich_redis:
++    image: redis:7.0-alpine
++    container_name: dawarich_redis
++    command: redis-server
++    volumes:
+++     - dawarich_shared:/data
++    restart: always
++    healthcheck:
++```
++
++Telemetry is now disabled by default. To enable it, you need to set `ENABLE_TELEMETRY` env var to `true`. For those who have telemetry enabled using `DISABLE_TELEMETRY` env var set to `false`, telemetry is now disabled by default.
++
++### Fixed
++
++- Flash messages are now being removed after 5 seconds.
++- Fixed broken migration that was preventing the app from starting.
++- Visits page is now loading a lot faster than before.
++- Redis data should now be preserved on container restart.
++- Fixed a bug where export files could have double extension, e.g. `file.gpx.gpx`.
++
++### Changed
++
++- Places page is now accessible from the Visits & Places tab on the navbar.
++- Exporting process is now being logged.
++- `ENABLE_TELEMETRY` env var is now used instead of `DISABLE_TELEMETRY` to enable/disable telemetry.
++
+ # 0.19.5 - 2024-12-10
+ 
+ ### Fixed
+diff --git a/app/assets/stylesheets/application.tailwind.css b/app/assets/stylesheets/application.tailwind.css
+index 3bff5194..48e213d2 100644
+--- a/app/assets/stylesheets/application.tailwind.css
++++ b/app/assets/stylesheets/application.tailwind.css
+@@ -12,4 +12,11 @@
+ }
+ 
+ */
+-@import 'actiontext.css';
+\ No newline at end of file
++@import 'actiontext.css';
++
++@layer components {
++  .fade-out {
++    opacity: 0;
++    transition: opacity 150ms ease-in-out;
++  }
++}
+diff --git a/app/controllers/exports_controller.rb b/app/controllers/exports_controller.rb
+index cfa0d506..6f9b4c65 100644
+--- a/app/controllers/exports_controller.rb
++++ b/app/controllers/exports_controller.rb
+@@ -9,7 +9,8 @@ def index
+   end
+ 
+   def create
+-    export_name = "export_from_#{params[:start_at].to_date}_to_#{params[:end_at].to_date}.#{params[:file_format]}"
++    export_name =
++      "export_from_#{params[:start_at].to_date}_to_#{params[:end_at].to_date}.#{params[:file_format]}"
+     export = current_user.exports.create(name: export_name, status: :created)
+ 
+     ExportJob.perform_later(export.id, params[:start_at], params[:end_at], file_format: params[:file_format])
+diff --git a/app/controllers/visits_controller.rb b/app/controllers/visits_controller.rb
+index cde2c8fd..a8469831 100644
+--- a/app/controllers/visits_controller.rb
++++ b/app/controllers/visits_controller.rb
+@@ -13,12 +13,10 @@ def index
+              .where(status:)
+              .includes(%i[suggested_places area])
+              .order(started_at: order_by)
+-             .group_by { |visit| visit.started_at.to_date }
+-             .map { |k, v| { date: k, visits: v } }
+ 
+     @suggested_visits_count = current_user.visits.suggested.count
+ 
+-    @visits = Kaminari.paginate_array(visits).page(params[:page]).per(10)
++    @visits = visits.page(params[:page]).per(10)
+   end
+ 
+   def update
+diff --git a/app/helpers/application_helper.rb b/app/helpers/application_helper.rb
+index 3fe89204..08b341ef 100644
+--- a/app/helpers/application_helper.rb
++++ b/app/helpers/application_helper.rb
+@@ -101,6 +101,10 @@ def active_tab?(link_path)
+     'tab-active' if current_page?(link_path)
+   end
+ 
++  def active_visit_places_tab?(controller_name)
++    'tab-active' if current_page?(controller: controller_name)
++  end
++
+   def notification_link_color(notification)
+     return 'text-gray-600' if notification.read?
+ 
+diff --git a/app/javascript/controllers/removals_controller.js b/app/javascript/controllers/removals_controller.js
+index 9d4172df..cf487d07 100644
+--- a/app/javascript/controllers/removals_controller.js
++++ b/app/javascript/controllers/removals_controller.js
+@@ -1,7 +1,28 @@
+ import { Controller } from "@hotwired/stimulus"
+ 
+ export default class extends Controller {
++  static values = {
++    timeout: Number
++  }
++
++  connect() {
++    if (this.timeoutValue) {
++      setTimeout(() => {
++        this.remove()
++      }, this.timeoutValue)
++    }
++  }
++
+   remove() {
+-    this.element.remove()
++    this.element.classList.add('fade-out')
++    setTimeout(() => {
++      this.element.remove()
++
++      // Remove the container if it's empty
++      const container = document.getElementById('flash-messages')
++      if (container && !container.hasChildNodes()) {
++        container.remove()
++      }
++    }, 150)
+   }
+ }
+diff --git a/app/jobs/telemetry_sending_job.rb b/app/jobs/telemetry_sending_job.rb
+index 5b84f11a..7bec3b00 100644
+--- a/app/jobs/telemetry_sending_job.rb
++++ b/app/jobs/telemetry_sending_job.rb
+@@ -4,7 +4,7 @@ class TelemetrySendingJob < ApplicationJob
+   queue_as :default
+ 
+   def perform
+-    return if ENV['DISABLE_TELEMETRY'] == 'true'
++    return unless ENV['ENABLE_TELEMETRY'] == 'true'
+ 
+     data = Telemetry::Gather.new.call
+     Rails.logger.info("Telemetry data: #{data}")
+diff --git a/app/services/exports/create.rb b/app/services/exports/create.rb
+index 2d31a9c0..08181b4d 100644
+--- a/app/services/exports/create.rb
++++ b/app/services/exports/create.rb
+@@ -18,7 +18,7 @@ def call
+ 
+     create_export_file(data)
+ 
+-    export.update!(status: :completed, url: "exports/#{export.name}.#{file_format}")
++    export.update!(status: :completed, url: "exports/#{export.name}")
+ 
+     create_export_finished_notification
+   rescue StandardError => e
+@@ -74,10 +74,16 @@ def process_gpx_export(points)
+ 
+   def create_export_file(data)
+     dir_path = Rails.root.join('public/exports')
+-    Dir.mkdir(dir_path) unless Dir.exist?(dir_path)
+ 
+-    file_path = dir_path.join("#{export.name}.#{file_format}")
++    FileUtils.mkdir_p(dir_path) unless Dir.exist?(dir_path)
++
++    file_path = dir_path.join(export.name)
++
++    Rails.logger.info("Creating export file at: #{file_path}")
+ 
+     File.open(file_path, 'w') { |file| file.write(data) }
++  rescue StandardError => e
++    Rails.logger.error("Failed to create export file: #{e.message}")
++    raise
+   end
+ end
+diff --git a/app/services/telemetry/send.rb b/app/services/telemetry/send.rb
+index 46401294..96f222af 100644
+--- a/app/services/telemetry/send.rb
++++ b/app/services/telemetry/send.rb
+@@ -9,7 +9,7 @@ def initialize(payload)
+   end
+ 
+   def call
+-    return if ENV['DISABLE_TELEMETRY'] == 'true'
++    return unless ENV['ENABLE_TELEMETRY'] == 'true'
+ 
+     line_protocol = build_line_protocol
+     response = send_request(line_protocol)
+diff --git a/app/views/places/index.html.erb b/app/views/places/index.html.erb
+index 4d93a744..939cca3b 100644
+--- a/app/views/places/index.html.erb
++++ b/app/views/places/index.html.erb
+@@ -1,8 +1,9 @@
+ <% content_for :title, "Places" %>
+ 
+ <div class="w-full my-5">
+-  <div class="flex justify-center">
+-    <h1 class="font-bold text-4xl">Places</h1>
++  <div role="tablist" class="tabs tabs-lifted tabs-lg">
++    <%= link_to 'Visits', visits_path(status: :confirmed), role: 'tab', class: "tab font-bold text-xl #{active_visit_places_tab?('visits')}" %>
++    <%= link_to 'Places', places_path, role: 'tab', class: "tab font-bold text-xl #{active_visit_places_tab?('places')}" %>
+   </div>
+ 
+   <div id="places" class="min-w-full">
+diff --git a/app/views/shared/_flash.html.erb b/app/views/shared/_flash.html.erb
+index 5b01dbdd..54895274 100644
+--- a/app/views/shared/_flash.html.erb
++++ b/app/views/shared/_flash.html.erb
+@@ -1,11 +1,15 @@
+-<% flash.each do |key, value| %>
+-  <div data-controller="removals" class="flex items-center fixed top-5 right-5 <%= classes_for_flash(key) %> py-3 px-5 rounded-lg">
+-    <div class="mr-4"><%= value %></div>
++<div class="fixed top-5 right-5 flex flex-col gap-2" id="flash-messages">
++  <% flash.each do |key, value| %>
++    <div data-controller="removals"
++         data-removals-timeout-value="5000"
++         class="flex items-center <%= classes_for_flash(key) %> py-3 px-5 rounded-lg z-[6000]">
++      <div class="mr-4"><%= value %></div>
+ 
+-    <button type="button" data-action="click->removals#remove">
+-      <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+-      </svg>
+-    </button>
+-  </div>
+-<% end %>
++      <button type="button" data-action="click->removals#remove">
++        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++        </svg>
++      </button>
++    </div>
++  <% end %>
++</div>
+diff --git a/app/views/shared/_navbar.html.erb b/app/views/shared/_navbar.html.erb
+index 89e9dc44..96ec7428 100644
+--- a/app/views/shared/_navbar.html.erb
++++ b/app/views/shared/_navbar.html.erb
+@@ -8,8 +8,7 @@
+         <li><%= link_to 'Map', map_url, class: "#{active_class?(map_url)}" %></li>
+         <li><%= link_to 'Points', points_url, class: "#{active_class?(points_url)}" %></li>
+         <li><%= link_to 'Stats', stats_url, class: "#{active_class?(stats_url)}" %></li>
+-        <li><%= link_to 'Visits<sup>α</sup>'.html_safe, visits_url(status: :confirmed), class: "#{active_class?(visits_url)}" %></li>
+-        <li><%= link_to 'Places<sup>α</sup>'.html_safe, places_url, class: "#{active_class?(places_url)}" %></li>
++        <li><%= link_to 'Visits & Places<sup>α</sup>'.html_safe, visits_url(status: :confirmed), class: "#{active_class?(visits_url)}" %></li>
+         <li><%= link_to 'Trips<sup>α</sup>'.html_safe, trips_url, class: "#{active_class?(trips_url)}" %></li>
+         <li><%= link_to 'Imports', imports_url, class: "#{active_class?(imports_url)}" %></li>
+         <li><%= link_to 'Exports', exports_url, class: "#{active_class?(exports_url)}" %></li>
+@@ -45,8 +44,7 @@
+       <li><%= link_to 'Map', map_url, class: "mx-1 #{active_class?(map_url)}" %></li>
+       <li><%= link_to 'Points', points_url, class: "mx-1 #{active_class?(points_url)}" %></li>
+       <li><%= link_to 'Stats', stats_url, class: "mx-1 #{active_class?(stats_url)}" %></li>
+-      <li><%= link_to 'Visits<sup>α</sup>'.html_safe, visits_url(status: :confirmed), class: "mx-1 #{active_class?(visits_url)}" %></li>
+-      <li><%= link_to 'Places<sup>α</sup>'.html_safe, places_url, class: "mx-1 #{active_class?(places_url)}" %></li>
++      <li><%= link_to 'Visits & Places<sup>α</sup>'.html_safe, visits_url(status: :confirmed), class: "mx-1 #{active_class?(visits_url)}" %></li>
+       <li><%= link_to 'Trips<sup>α</sup>'.html_safe, trips_url, class: "mx-1 #{active_class?(trips_url)}" %></li>
+       <li><%= link_to 'Imports', imports_url, class: "mx-1 #{active_class?(imports_url)}" %></li>
+       <li><%= link_to 'Exports', exports_url, class: "mx-1 #{active_class?(exports_url)}" %></li>
+@@ -55,7 +53,7 @@
+   <div class="navbar-end">
+     <ul class="menu menu-horizontal bg-base-100 rounded-box px-1">
+       <% if user_signed_in? %>
+-        <div class="dropdown dropdown-end dropdown-bottom dropdown-hover z-[5000]"
++        <div class="dropdown dropdown-end dropdown-bottom dropdown-hover"
+           data-controller="notifications"
+           data-notifications-user-id-value="<%= current_user.id %>">
+           <div tabindex="0" role="button" class='btn btn-sm btn-ghost hover:btn-ghost'>
+@@ -77,7 +75,7 @@
+               </span>
+             <% end %>
+           </div>
+-          <ul tabindex="0" class="dropdown-content z-10 menu p-2 shadow-lg bg-base-100 rounded-box min-w-52" data-notifications-target="list">
++          <ul tabindex="0" class="dropdown-content z-[5000] menu p-2 shadow-lg bg-base-100 rounded-box min-w-52" data-notifications-target="list">
+             <li><%= link_to 'See all', notifications_path %></li>
+             <div class="divider p-0 m-0"></div>
+             <% @unread_notifications.first(10).each do |notification| %>
+diff --git a/app/views/visits/_visit.html.erb b/app/views/visits/_visit.html.erb
+index 0c62f68d..c5de1ce7 100644
+--- a/app/views/visits/_visit.html.erb
++++ b/app/views/visits/_visit.html.erb
+@@ -1,4 +1,4 @@
+-<div class="group relative">
++<div class="group relative timeline-box">
+   <div class="flex items-center justify-between">
+     <div>
+       <%= render 'visits/name', visit: visit %>
+diff --git a/app/views/visits/index.html.erb b/app/views/visits/index.html.erb
+index cec01276..3fd03b64 100644
+--- a/app/views/visits/index.html.erb
++++ b/app/views/visits/index.html.erb
+@@ -1,9 +1,12 @@
+ <% content_for :title, "Visits" %>
+ 
+ <div class="w-full my-5">
++  <div role="tablist" class="tabs tabs-lifted tabs-lg">
++    <%= link_to 'Visits', visits_path(status: :confirmed), role: 'tab', class: "tab font-bold text-xl #{active_visit_places_tab?('visits')}" %>
++    <%= link_to 'Places', places_path, role: 'tab', class: "tab font-bold text-xl #{active_visit_places_tab?('places')}" %>
++  </div>
+ 
+   <div class="flex justify-between">
+-    <h1 class="font-bold text-4xl">Visits</h1>
+     <div role="tablist" class="tabs tabs-boxed">
+       <%= link_to 'Confirmed', visits_path(status: :confirmed), role: 'tab',
+           class: "tab #{active_tab?(visits_path(status: :confirmed))}" %>
+@@ -24,7 +27,7 @@
+     </div>
+   </div>
+ 
+-  <div role="alert" class="alert">
++  <div role="alert" class="alert mt-5">
+     <svg
+       xmlns="http://www.w3.org/2000/svg"
+       fill="none"
+@@ -58,13 +61,13 @@
+     </div>
+ 
+     <ul class="timeline timeline-snap-icon max-md:timeline-compact timeline-vertical">
+-      <% @visits.each.with_index do |date, index| %>
++      <% @visits.each do |visit| %>
+         <li>
+           <div class="timeline-middle">
+             <svg
+               xmlns="http://www.w3.org/2000/svg"
+               viewBox="0 0 20 20"
+-              fill="<%= date[:visits].all?(&:confirmed?) ? 'green' : 'currentColor' %>"
++              fill="<%= visit.confirmed? ? 'green' : 'currentColor' %>"
+               class="h-5 w-5">
+               <path
+                 fill-rule="evenodd"
+@@ -72,11 +75,11 @@
+                 clip-rule="evenodd" />
+             </svg>
+           </div>
+-          <div class="<%= index.odd? ? 'timeline-start' : 'timeline-end' %> mb-10 md:text-end">
+-            <time class="font-mono italic"><%= date[:date].strftime('%A, %d %B %Y') %></time>
+-            <% date[:visits].each do |visit| %>
+-              <%= render partial: 'visit', locals: { visit: visit } %>
+-            <% end %>
++          <div class="timeline-start md:text-end">
++            <time class="font-mono italic"><%= visit.started_at.strftime('%A, %d %B %Y') %></time>
++          </div>
++          <div class="timeline-end md:text-end">
++            <%= render partial: 'visit', locals: { visit: visit } %>
+           </div>
+           <hr />
+         </li>
+diff --git a/db/migrate/20241202114820_add_reverse_geocoded_at_to_points.rb b/db/migrate/20241202114820_add_reverse_geocoded_at_to_points.rb
+index 357849b5..5f52b1da 100644
+--- a/db/migrate/20241202114820_add_reverse_geocoded_at_to_points.rb
++++ b/db/migrate/20241202114820_add_reverse_geocoded_at_to_points.rb
+@@ -4,8 +4,9 @@ class AddReverseGeocodedAtToPoints < ActiveRecord::Migration[7.2]
+   disable_ddl_transaction!
+ 
+   def change
+-    add_column :points, :reverse_geocoded_at, :datetime
++    return if column_exists?(:points, :reverse_geocoded_at)
+ 
++    add_column :points, :reverse_geocoded_at, :datetime
+     add_index :points, :reverse_geocoded_at, algorithm: :concurrently
+   end
+ end
+diff --git a/db/migrate/20241211113119_add_started_at_index_to_visits.rb b/db/migrate/20241211113119_add_started_at_index_to_visits.rb
+new file mode 100644
+index 00000000..9e91d9a4
+--- /dev/null
++++ b/db/migrate/20241211113119_add_started_at_index_to_visits.rb
+@@ -0,0 +1,9 @@
++# frozen_string_literal: true
++
++class AddStartedAtIndexToVisits < ActiveRecord::Migration[7.2]
++  disable_ddl_transaction!
++
++  def change
++    add_index :visits, :started_at, algorithm: :concurrently
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 2927e2d5..a79c53a9 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.2].define(version: 2024_12_05_160055) do
++ActiveRecord::Schema[7.2].define(version: 2024_12_11_113119) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "plpgsql"
+ 
+@@ -232,6 +232,7 @@
+     t.bigint "place_id"
+     t.index ["area_id"], name: "index_visits_on_area_id"
+     t.index ["place_id"], name: "index_visits_on_place_id"
++    t.index ["started_at"], name: "index_visits_on_started_at"
+     t.index ["user_id"], name: "index_visits_on_user_id"
+   end
+ 
+diff --git a/docker-compose.yml b/docker-compose.yml
+index c04194f0..b3dc7f96 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -8,7 +8,7 @@ services:
+     networks:
+       - dawarich
+     volumes:
+-      - dawarich_shared:/var/shared/redis
++      - dawarich_shared:/data
+     restart: always
+     healthcheck:
+       test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+@@ -69,7 +69,7 @@ services:
+       PROMETHEUS_EXPORTER_ENABLED: false
+       PROMETHEUS_EXPORTER_HOST: 0.0.0.0
+       PROMETHEUS_EXPORTER_PORT: 9394
+-      DISABLE_TELEMETRY: false # More on telemetry: https://dawarich.app/docs/tutorials/telemetry
++      ENABLE_TELEMETRY: false # More on telemetry: https://dawarich.app/docs/tutorials/telemetry
+     logging:
+       driver: "json-file"
+       options:
+@@ -124,7 +124,7 @@ services:
+       PROMETHEUS_EXPORTER_ENABLED: false
+       PROMETHEUS_EXPORTER_HOST: dawarich_app
+       PROMETHEUS_EXPORTER_PORT: 9394
+-      DISABLE_TELEMETRY: false # More on telemetry: https://dawarich.app/docs/tutorials/telemetry
++      ENABLE_TELEMETRY: false # More on telemetry: https://dawarich.app/docs/tutorials/telemetry
+     logging:
+       driver: "json-file"
+       options:
+diff --git a/spec/jobs/telemetry_sending_job_spec.rb b/spec/jobs/telemetry_sending_job_spec.rb
+index 0acef0ee..54c63d7c 100644
+--- a/spec/jobs/telemetry_sending_job_spec.rb
++++ b/spec/jobs/telemetry_sending_job_spec.rb
+@@ -15,22 +15,24 @@
+       allow(send_service).to receive(:call)
+     end
+ 
+-    it 'gathers telemetry data and sends it' do
+-      described_class.perform_now
++    context 'with default env' do
++      it 'does not send telemetry data' do
++        described_class.perform_now
+ 
+-      expect(gather_service).to have_received(:call)
+-      expect(send_service).to have_received(:call)
++        expect(send_service).not_to have_received(:call)
++      end
+     end
+ 
+-    context 'when DISABLE_TELEMETRY is set to true' do
++    context 'when ENABLE_TELEMETRY is set to true' do
+       before do
+-        stub_const('ENV', ENV.to_h.merge('DISABLE_TELEMETRY' => 'true'))
++        stub_const('ENV', ENV.to_h.merge('ENABLE_TELEMETRY' => 'true'))
+       end
+ 
+-      it 'does not send telemetry data' do
++        it 'gathers telemetry data and sends it' do
+         described_class.perform_now
+ 
+-        expect(send_service).not_to have_received(:call)
++        expect(gather_service).to have_received(:call)
++        expect(send_service).to have_received(:call)
+       end
+     end
+   end
+diff --git a/spec/requests/visits_spec.rb b/spec/requests/visits_spec.rb
+index 4e3b3dc2..2e463bf5 100644
+--- a/spec/requests/visits_spec.rb
++++ b/spec/requests/visits_spec.rb
+@@ -24,9 +24,7 @@
+       it 'returns confirmed visits' do
+         get visits_url
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).to match_array(confirmed_visits)
++        expect(@controller.instance_variable_get(:@visits)).to match_array(confirmed_visits)
+       end
+     end
+ 
+@@ -36,17 +34,13 @@
+       it 'does not return suggested visits' do
+         get visits_url
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).not_to include(suggested_visits)
++        expect(@controller.instance_variable_get(:@visits)).not_to include(suggested_visits)
+       end
+ 
+       it 'returns suggested visits' do
+         get visits_url, params: { status: 'suggested' }
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).to match_array(suggested_visits)
++        expect(@controller.instance_variable_get(:@visits)).to match_array(suggested_visits)
+       end
+     end
+ 
+@@ -56,17 +50,13 @@
+       it 'does not return declined visits' do
+         get visits_url
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).not_to include(declined_visits)
++        expect(@controller.instance_variable_get(:@visits)).not_to include(declined_visits)
+       end
+ 
+       it 'returns declined visits' do
+         get visits_url, params: { status: 'declined' }
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).to match_array(declined_visits)
++        expect(@controller.instance_variable_get(:@visits)).to match_array(declined_visits)
+       end
+     end
+ 
+@@ -76,17 +66,13 @@
+       it 'does not return suggested visits' do
+         get visits_url
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).not_to include(suggested_visits)
++        expect(@controller.instance_variable_get(:@visits)).not_to include(suggested_visits)
+       end
+ 
+       it 'returns suggested visits' do
+         get visits_url, params: { status: 'suggested' }
+ 
+-        expect(@controller.instance_variable_get(:@visits).map do |v|
+-                 v[:visits]
+-               end.flatten).to match_array(suggested_visits)
++        expect(@controller.instance_variable_get(:@visits)).to match_array(suggested_visits)
+       end
+     end
+   end
+diff --git a/spec/services/exports/create_spec.rb b/spec/services/exports/create_spec.rb
+index e20e2d41..2110b6b0 100644
+--- a/spec/services/exports/create_spec.rb
++++ b/spec/services/exports/create_spec.rb
+@@ -10,7 +10,7 @@
+     let(:user)            { create(:user) }
+     let(:start_at)        { DateTime.new(2021, 1, 1).to_s }
+     let(:end_at)          { DateTime.new(2021, 1, 2).to_s }
+-    let(:export_name)     { "#{start_at.to_date}_#{end_at.to_date}" }
++    let(:export_name)     { "#{start_at.to_date}_#{end_at.to_date}.#{file_format}" }
+     let(:export)          { create(:export, user:, name: export_name, status: :created) }
+     let(:export_content)  { Points::GeojsonSerializer.new(points).call }
+     let(:reverse_geocoded_at) { Time.zone.local(2021, 1, 1) }
+@@ -30,10 +30,10 @@
+       expect(File.read(file_path).strip).to eq(export_content)
+     end
+ 
+-    it 'updates the export url' do
++    it 'sets the export url' do
+       create_export
+ 
+-      expect(export.reload.url).to eq("exports/#{export.name}.json")
++      expect(export.reload.url).to eq("exports/#{export.name}")
+     end
+ 
+     it 'updates the export status to completed' do

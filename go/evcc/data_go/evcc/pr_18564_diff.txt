@@ -1,0 +1,226 @@
+diff --git a/cmd/token.go b/cmd/token.go
+index 9dd1ec3cf5..3d8f419828 100644
+--- a/cmd/token.go
++++ b/cmd/token.go
+@@ -65,8 +65,6 @@ func runToken(cmd *cobra.Command, args []string) {
+ 	typ := strings.ToLower(vehicleConf.Type)
+ 
+ 	switch typ {
+-	case "mercedes":
+-		token, err = mercedesToken()
+ 	case "ford", "ford-connect":
+ 		token, err = fordConnectToken(vehicleConf)
+ 	case "tronity":
+diff --git a/cmd/token_mercedes.go b/cmd/token_mercedes.go
+deleted file mode 100644
+index 9bc0b83579..0000000000
+--- a/cmd/token_mercedes.go
++++ /dev/null
+@@ -1,68 +0,0 @@
+-package cmd
+-
+-import (
+-	"errors"
+-	"strings"
+-
+-	"github.com/AlecAivazis/survey/v2"
+-	"github.com/evcc-io/evcc/vehicle/mercedes"
+-	"golang.org/x/oauth2"
+-)
+-
+-func mercedesUsernameAndRegionPrompt() (string, string, error) {
+-	prompt_user := &survey.Input{
+-		Message: "Please enter your Mercedes ME user-account (e-mail or mobile)",
+-	}
+-	var user string
+-	if err := survey.AskOne(prompt_user, &user, survey.WithValidator(survey.Required)); err != nil {
+-		return "", "", err
+-	}
+-
+-	prompt_region := &survey.Select{
+-		Message: "Choose your MB region:",
+-		Options: []string{"APAC", "EMEA", "NORAM"},
+-	}
+-	var region string
+-	if err := survey.AskOne(prompt_region, &region, survey.WithValidator(survey.Required)); err != nil {
+-		return "", "", err
+-	}
+-
+-	return user, region, nil
+-}
+-
+-func mercedesPinPrompt() (string, error) {
+-	var code string
+-	prompt_pin := &survey.Input{
+-		Message: "Please enter the Pin that you received via email/sms",
+-	}
+-	if err := survey.AskOne(prompt_pin, &code, survey.WithValidator(survey.Required)); err != nil {
+-		return "", err
+-	}
+-
+-	return strings.TrimSpace(code), nil
+-}
+-
+-func mercedesToken() (*oauth2.Token, error) {
+-	// Get username and region from user to initiate the email process
+-	username, region, err := mercedesUsernameAndRegionPrompt()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	api := mercedes.NewSetupAPI(log, username, region)
+-	result, nonce, err := api.RequestPin()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if !result {
+-		return nil, errors.New("unknown PinResponse - 200, result empty")
+-	}
+-
+-	pin, err := mercedesPinPrompt()
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return api.RequestAccessToken(*nonce, pin)
+-}
+diff --git a/templates/definition/vehicle/mercedes.yaml b/templates/definition/vehicle/mercedes.yaml
+index 9e3f07f8b0..06348aaf59 100644
+--- a/templates/definition/vehicle/mercedes.yaml
++++ b/templates/definition/vehicle/mercedes.yaml
+@@ -4,9 +4,9 @@ products:
+ requirements:
+   description:
+     de: |
+-      Benötigt `access` und `refresh` Tokens. Diese können über den Befehl `evcc token [name]` generiert werden.
++      Benötigt `access` und `refresh` Tokens. Anleitung zur Generierung hier: https://tinyurl.com/mbapi2020helptoken.
+     en: |
+-      Requires `access` and `refresh` tokens. These can be generated with command `evcc token [name]`.
++      Requires `access` and `refresh` tokens. Documentation here: https://tinyurl.com/mbapi2020helptoken.
+ params:
+   - preset: vehicle-common
+   - name: user
+diff --git a/vehicle/mercedes/helper.go b/vehicle/mercedes/helper.go
+index e5836f9676..cfdc231a24 100644
+--- a/vehicle/mercedes/helper.go
++++ b/vehicle/mercedes/helper.go
+@@ -35,13 +35,12 @@ const (
+ 	BffUriNORAM                = "https://bff.amap-prod.mobilesdk.mercedes-benz.com"
+ 	WidgetUriNORAM             = "https://widget.amap-prod.mobilesdk.mercedes-benz.com"
+ 	IdUri                      = "https://id.mercedes-benz.com"
+-	ClientId                   = "01398c1c-dc45-4b42-882b-9f5ba9f175f1"
+-	RisApplicationVersionEMEA  = "1.44.0"
+-	RisSdkVersionEMEA          = "2.150.1"
+-	RisApplicationVersionAPAC  = "1.44.0"
+-	RisSdkVersionAPAC          = "2.150.1"
+-	RisApplicationVersionNORAM = "3.42.0"
+-	RisSdkVersionNORAM         = "2.150.1"
++	RisApplicationVersionEMEA  = "1.52.0"
++	RisSdkVersionEMEA          = "2.160.1"
++	RisApplicationVersionAPAC  = "1.52.0"
++	RisSdkVersionAPAC          = "2.160.1"
++	RisApplicationVersionNORAM = "3.52.0"
++	RisSdkVersionNORAM         = "2.160.1"
+ 	RisOsVersion               = "17.3"
+ 	RisOsName                  = "ios"
+ 	XApplicationNameEMEA       = "mycar-store-ece"
+diff --git a/vehicle/mercedes/setupapi.go b/vehicle/mercedes/setupapi.go
+deleted file mode 100644
+index 2de3907370..0000000000
+--- a/vehicle/mercedes/setupapi.go
++++ /dev/null
+@@ -1,93 +0,0 @@
+-package mercedes
+-
+-import (
+-	"fmt"
+-	"net/http"
+-	"net/url"
+-	"strings"
+-
+-	"github.com/evcc-io/evcc/util"
+-	"github.com/evcc-io/evcc/util/request"
+-	"github.com/evcc-io/evcc/util/transport"
+-	"github.com/google/uuid"
+-	"golang.org/x/oauth2"
+-)
+-
+-type SetupAPI struct {
+-	log     *util.Logger
+-	account string
+-	region  string
+-	*request.Helper
+-}
+-
+-func NewSetupAPI(log *util.Logger, account string, region string) *SetupAPI {
+-	client := request.NewHelper(log)
+-
+-	client.Transport = &transport.Decorator{
+-		Base:      client.Transport,
+-		Decorator: transport.DecorateHeaders(mbheaders(true, region)),
+-	}
+-
+-	return &SetupAPI{
+-		Helper:  client,
+-		log:     log,
+-		region:  region,
+-		account: account,
+-	}
+-}
+-
+-func (vs *SetupAPI) RequestPin() (bool, *string, error) {
+-	client := request.NewHelper(vs.log)
+-
+-	client.Transport = &transport.Decorator{
+-		Base:      client.Transport,
+-		Decorator: transport.DecorateHeaders(mbheaders(false, vs.region)),
+-	}
+-
+-	// Preflight request required to get a pin
+-	uri := fmt.Sprintf("%s/v1/config", getBffUri(vs.region))
+-	if _, err := client.GetBody(uri); err != nil {
+-		return false, nil, err
+-	}
+-
+-	nonce := uuid.New().String()
+-	data := PinRequest{
+-		EmailOrPhoneNumber: vs.account,
+-		CountryCode:        "EN",
+-		Nonce:              nonce,
+-	}
+-
+-	uri = fmt.Sprintf("%s/v1/login", getBffUri(vs.region))
+-	req, err := request.New(http.MethodPost, uri, request.MarshalJSON(data))
+-	if err != nil {
+-		return false, nil, err
+-	}
+-
+-	var res PinResponse
+-	if err := client.DoJSON(req, &res); err != nil {
+-		return false, nil, err
+-	}
+-
+-	// Only if the response field email is the same like the account an email is send by the servers.
+-	return res.UserName == vs.account, &nonce, nil
+-}
+-
+-func (vs *SetupAPI) RequestAccessToken(nonce string, pin string) (*oauth2.Token, error) {
+-	data := url.Values{
+-		"client_id":  {ClientId},
+-		"grant_type": {"password"},
+-		"password":   {fmt.Sprintf("%s:%s", nonce, pin)},
+-		"scope":      {"openid email phone profile offline_access ciam-uid"},
+-		"username":   {vs.account},
+-	}
+-
+-	uri := fmt.Sprintf("%s/as/token.oauth2", IdUri)
+-	req, _ := request.New(http.MethodPost, uri, strings.NewReader(data.Encode()), mbheaders(true, vs.region))
+-
+-	var res oauth2.Token
+-	if err := vs.DoJSON(req, &res); err != nil {
+-		return nil, err
+-	}
+-
+-	return util.TokenWithExpiry(&res), nil
+-}

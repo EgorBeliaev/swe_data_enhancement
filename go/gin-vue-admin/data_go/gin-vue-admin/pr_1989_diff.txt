@@ -1,0 +1,723 @@
+diff --git a/web/src/components/commandMenu/index.vue b/web/src/components/commandMenu/index.vue
+index eb403d4a1e..27ef93fc48 100644
+--- a/web/src/components/commandMenu/index.vue
++++ b/web/src/components/commandMenu/index.vue
+@@ -54,7 +54,8 @@
+   const options = reactive([])
+   const deepMenus = (menus) => {
+     const arr = []
+-    menus.forEach((menu) => {
++    menus?.forEach((menu) => {
++      if (!menu?.children) return
+       if (menu.children && menu.children.length > 0) {
+         arr.push(...deepMenus(menu.children))
+       } else {
+@@ -77,7 +78,7 @@
+       label: '跳转',
+       children: []
+     }
+-    const menus = deepMenus(routerStore.asyncRouters[0].children)
++    const menus = deepMenus(routerStore.asyncRouters[0]?.children || [])
+     option.children.push(...menus)
+     options.push(option)
+   }
+diff --git a/web/src/pathInfo.json b/web/src/pathInfo.json
+index e08798c046..bf0f039458 100644
+--- a/web/src/pathInfo.json
++++ b/web/src/pathInfo.json
+@@ -27,6 +27,7 @@
+   "/src/view/layout/aside/normalMode.vue": "GvaAside",
+   "/src/view/layout/header/index.vue": "Index",
+   "/src/view/layout/header/tools.vue": "Tools",
++  "/src/view/layout/iframe.vue": "GvaLayoutIframe",
+   "/src/view/layout/index.vue": "GvaLayout",
+   "/src/view/layout/screenfull/index.vue": "Screenfull",
+   "/src/view/layout/search/search.vue": "BtnBox",
+diff --git a/web/src/permission.js b/web/src/permission.js
+index 70c21bee89..b3efa313a0 100644
+--- a/web/src/permission.js
++++ b/web/src/permission.js
+@@ -4,134 +4,143 @@ import getPageTitle from '@/utils/page'
+ import router from '@/router'
+ import Nprogress from 'nprogress'
+ import 'nprogress/nprogress.css'
+-Nprogress.configure({ showSpinner: false, ease: 'ease', speed: 500 })
+ 
+-const whiteList = ['Login', 'Init']
++// 配置 NProgress
++Nprogress.configure({
++  showSpinner: false,
++  ease: 'ease',
++  speed: 500
++})
+ 
+-const getRouter = async (userStore) => {
+-  const routerStore = useRouterStore()
+-  await routerStore.SetAsyncRouter()
+-  await userStore.GetUserInfo()
+-  const asyncRouters = routerStore.asyncRouters
+-  asyncRouters.forEach((asyncRouter) => {
+-    router.addRoute(asyncRouter)
+-  })
++// 白名单路由
++const WHITE_LIST = ['Login', 'Init', 'Iframe']
++
++// 处理路由加载
++const setupRouter = async (userStore) => {
++  try {
++    const routerStore = useRouterStore()
++    await Promise.all([routerStore.SetAsyncRouter(), userStore.GetUserInfo()])
++
++    routerStore.asyncRouters.forEach((route) => router.addRoute(route))
++    return true
++  } catch (error) {
++    console.error('Setup router failed:', error)
++    return false
++  }
+ }
+ 
++// 移除加载动画
+ const removeLoading = () => {
+   const element = document.getElementById('gva-loading-box')
+-  if (element) {
+-    element.remove()
+-  }
++  element?.remove()
+ }
+ 
+-async function handleKeepAlive(to) {
+-  if (to.matched.some((item) => item.meta.keepAlive)) {
+-    if (to.matched && to.matched.length > 2) {
+-      for (let i = 1; i < to.matched.length; i++) {
+-        const element = to.matched[i - 1]
+-        if (element.name === 'layout') {
+-          to.matched.splice(i, 1)
+-          await handleKeepAlive(to)
+-        }
+-        // 如果没有按需加载完成则等待加载
+-        if (typeof element.components.default === 'function') {
+-          await element.components.default()
+-          await handleKeepAlive(to)
+-        }
++// 处理组件缓存
++const handleKeepAlive = async (to) => {
++  if (!to.matched.some((item) => item.meta.keepAlive)) return
++
++  if (to.matched?.length > 2) {
++    for (let i = 1; i < to.matched.length; i++) {
++      const element = to.matched[i - 1]
++
++      if (element.name === 'layout') {
++        to.matched.splice(i, 1)
++        await handleKeepAlive(to)
++        continue
++      }
++
++      if (typeof element.components.default === 'function') {
++        await element.components.default()
++        await handleKeepAlive(to)
+       }
+     }
+   }
+ }
+ 
++// 处理路由重定向
++const handleRedirect = (to, userStore) => {
++  if (router.hasRoute(userStore.userInfo.authority.defaultRouter)) {
++    return { ...to, replace: true }
++  }
++  return { path: '/layout/404' }
++}
++
++// 路由守卫
+ router.beforeEach(async (to, from) => {
++  const userStore = useUserStore()
+   const routerStore = useRouterStore()
++  const token = userStore.token
++
+   Nprogress.start()
+-  const userStore = useUserStore()
++
++  // 处理元数据和缓存
+   to.meta.matched = [...to.matched]
+-  handleKeepAlive(to)
+-  const token = userStore.token
+-  // 在白名单中的判断情况
++  await handleKeepAlive(to)
++
++  // 设置页面标题
+   document.title = getPageTitle(to.meta.title, to)
++
+   if (to.meta.client) {
+     return true
+   }
+-  if (whiteList.indexOf(to.name) > -1) {
+-    if (token) {
+-      if (!routerStore.asyncRouterFlag && whiteList.indexOf(from.name) < 0) {
+-        await getRouter(userStore)
+-      }
+-      // token 可以解析但是却是不存在的用户 id 或角色 id 会导致无限调用
+-      if (userStore.userInfo?.authority?.defaultRouter != null) {
+-        if (router.hasRoute(userStore.userInfo.authority.defaultRouter)) {
+-          return { name: userStore.userInfo.authority.defaultRouter }
+-        } else {
+-          return { path: '/layout/404' }
+-        }
+-      } else {
+-        // 强制退出账号
+-        userStore.ClearStorage()
+-        return {
+-          name: 'Login',
+-          query: {
+-            redirect: document.location.hash
+-          }
+-        }
+-      }
+-    } else {
+-      return true
++
++  // 白名单路由处理
++  if (WHITE_LIST.includes(to.name)) {
++    if (
++      token &&
++      !routerStore.asyncRouterFlag &&
++      !WHITE_LIST.includes(from.name)
++    ) {
++      await setupRouter(userStore)
+     }
+-  } else {
+-    // 不在白名单中并且已经登录的时候
+-    if (token) {
+-      if (sessionStorage.getItem('needToHome') === 'true') {
+-        sessionStorage.removeItem('needToHome')
+-        return { path: '/' }
+-      }
+-      // 添加flag防止多次获取动态路由和栈溢出
+-      if (!routerStore.asyncRouterFlag && whiteList.indexOf(from.name) < 0) {
+-        await getRouter(userStore)
+-        if (userStore.token) {
+-          if (router.hasRoute(userStore.userInfo.authority.defaultRouter)) {
+-            return { ...to, replace: true }
+-          } else {
+-            return { path: '/layout/404' }
+-          }
+-        } else {
+-          return {
+-            name: 'Login',
+-            query: { redirect: to.href }
+-          }
+-        }
+-      } else {
+-        if (to.matched.length) {
+-          return true
+-        } else {
+-          return { path: '/layout/404' }
+-        }
+-      }
++    return true
++  }
++
++  // 需要登录的路由处理
++  if (token) {
++    // 处理需要跳转到首页的情况
++    if (sessionStorage.getItem('needToHome') === 'true') {
++      sessionStorage.removeItem('needToHome')
++      return { path: '/' }
+     }
+-    // 不在白名单中并且未登录的时候
+-    if (!token) {
++
++    // 处理异步路由
++    if (!routerStore.asyncRouterFlag && !WHITE_LIST.includes(from.name)) {
++      const setupSuccess = await setupRouter(userStore)
++
++      if (setupSuccess && userStore.token) {
++        return handleRedirect(to, userStore)
++      }
++
+       return {
+         name: 'Login',
+-        query: {
+-          redirect: document.location.hash
+-        }
++        query: { redirect: to.href }
+       }
+     }
++
++    return to.matched.length ? true : { path: '/layout/404' }
++  }
++
++  // 未登录跳转登录页
++  return {
++    name: 'Login',
++    query: {
++      redirect: document.location.hash
++    }
+   }
+ })
+ 
++// 路由加载完成
+ router.afterEach(() => {
+-  // 路由加载完成后关闭进度条
+-  document.getElementsByClassName('main-cont main-right')[0]?.scrollTo(0, 0)
++  document.querySelector('.main-cont.main-right')?.scrollTo(0, 0)
+   Nprogress.done()
+ })
+ 
+-router.onError(() => {
+-  // 路由发生错误后销毁进度条
++// 路由错误处理
++router.onError((error) => {
++  console.error('Router error:', error)
+   Nprogress.remove()
+ })
+ 
++// 移除初始加载动画
+ removeLoading()
+diff --git a/web/src/router/index.js b/web/src/router/index.js
+index d5203b2f87..6928e0845e 100644
+--- a/web/src/router/index.js
++++ b/web/src/router/index.js
+@@ -21,6 +21,11 @@ const routes = [
+       closeTab: true
+     },
+     component: () => import('@/view/error/index.vue')
++  },
++  {
++    path: '/iframe',
++    name: 'Iframe',
++    component: () => import('@/view/layout/iframe.vue')
+   }
+ ]
+ 
+diff --git a/web/src/view/dashboard/index.vue b/web/src/view/dashboard/index.vue
+index ac58ee523d..353bca608e 100644
+--- a/web/src/view/dashboard/index.vue
++++ b/web/src/view/dashboard/index.vue
+@@ -2,19 +2,19 @@
+   <div
+     class="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-7 py-2 gap-4 md:gap-2 gva-container2"
+   >
+-    <gva-card custom-class="col-span-1 lg:col-span-2 h-32">
++    <gva-card custom-class="col-span-1 lg:col-span-2 ">
+       <gva-chart :type="1" title="访问人数" />
+     </gva-card>
+-    <gva-card custom-class="col-span-1 lg:col-span-2 h-32 ">
++    <gva-card custom-class="col-span-1 lg:col-span-2  ">
+       <gva-chart :type="2" title="新增客户" />
+     </gva-card>
+-    <gva-card custom-class="col-span-1 lg:col-span-2 h-32">
++    <gva-card custom-class="col-span-1 lg:col-span-2 ">
+       <gva-chart :type="3" title="解决数量" />
+     </gva-card>
+     <gva-card
+       title="快捷功能"
+       show-action
+-      custom-class="col-start-1 md:col-start-3 lg:col-start-7 row-span-2 h-38"
++      custom-class="col-start-1 md:col-start-3 lg:col-start-7 row-span-2 "
+     >
+       <gva-quick-link />
+     </gva-card>
+diff --git a/web/src/view/layout/aside/combinationMode.vue b/web/src/view/layout/aside/combinationMode.vue
+index 22c6c38df6..e344943c87 100644
+--- a/web/src/view/layout/aside/combinationMode.vue
++++ b/web/src/view/layout/aside/combinationMode.vue
+@@ -97,6 +97,10 @@
+   })
+ 
+   watchEffect(() => {
++    if (route.name === 'Iframe') {
++      active.value = decodeURIComponent(route.query.url)
++      return
++    }
+     active.value = route.meta.activeName || route.name
+   })
+ 
+@@ -123,7 +127,18 @@
+       })
+     if (index === route.name) return
+     if (index.indexOf('http://') > -1 || index.indexOf('https://') > -1) {
+-      window.open(index)
++      if (index === 'Iframe') {
++        query.url = decodeURIComponent(index)
++        router.push({
++          name: 'Iframe',
++          query,
++          params
++        })
++        return
++      } else {
++        window.open(index, '_blank')
++        return
++      }
+     } else {
+       if (!top) {
+         router.push({ name: index, query, params })
+diff --git a/web/src/view/layout/aside/headMode.vue b/web/src/view/layout/aside/headMode.vue
+index 9157c59261..dd8295f754 100644
+--- a/web/src/view/layout/aside/headMode.vue
++++ b/web/src/view/layout/aside/headMode.vue
+@@ -40,6 +40,10 @@
+   const isCollapse = ref(false)
+   const active = ref('')
+   watchEffect(() => {
++    if (route.name === 'Iframe') {
++      active.value = decodeURIComponent(route.query.url)
++      return
++    }
+     active.value = route.meta.activeName || route.name
+   })
+ 
+@@ -66,7 +70,18 @@
+       })
+     if (index === route.name) return
+     if (index.indexOf('http://') > -1 || index.indexOf('https://') > -1) {
+-      window.open(index)
++      if (index === 'Iframe') {
++        query.url = decodeURIComponent(index)
++        router.push({
++          name: 'Iframe',
++          query,
++          params
++        })
++        return
++      } else {
++        window.open(index, '_blank')
++        return
++      }
+     } else {
+       router.push({ name: index, query, params })
+     }
+diff --git a/web/src/view/layout/aside/normalMode.vue b/web/src/view/layout/aside/normalMode.vue
+index a3bc7f4241..8c0fae1081 100644
+--- a/web/src/view/layout/aside/normalMode.vue
++++ b/web/src/view/layout/aside/normalMode.vue
+@@ -15,7 +15,7 @@
+         unique-opened
+         @select="selectMenuItem"
+       >
+-        <template v-for="item in routerStore.asyncRouters[0].children">
++        <template v-for="item in routerStore.asyncRouters[0]?.children || []">
+           <aside-component
+             v-if="!item.hidden"
+             :key="item.name"
+@@ -65,6 +65,10 @@
+     }
+   })
+   watchEffect(() => {
++    if (route.name === 'Iframe') {
++      active.value = decodeURIComponent(route.query.url)
++      return
++    }
+     active.value = route.meta.activeName || route.name
+   })
+ 
+@@ -91,7 +95,18 @@
+       })
+     if (index === route.name) return
+     if (index.indexOf('http://') > -1 || index.indexOf('https://') > -1) {
+-      window.open(index)
++      if (index === 'Iframe') {
++        query.url = decodeURIComponent(index)
++        router.push({
++          name: 'Iframe',
++          query,
++          params
++        })
++        return
++      } else {
++        window.open(index, '_blank')
++        return
++      }
+     } else {
+       router.push({ name: index, query, params })
+     }
+diff --git a/web/src/view/layout/iframe.vue b/web/src/view/layout/iframe.vue
+new file mode 100644
+index 0000000000..773cb49947
+--- /dev/null
++++ b/web/src/view/layout/iframe.vue
+@@ -0,0 +1,107 @@
++<template>
++  <div
++    class="bg-gray-50 text-slate-700 dark:text-slate-500 dark:bg-slate-800 w-screen h-screen"
++  >
++    <el-watermark
++      v-if="config.show_watermark"
++      :font="font"
++      :z-index="9999"
++      :gap="[180, 150]"
++      class="absolute inset-0 pointer-events-none"
++      :content="userStore.userInfo.nickName"
++    />
++    <gva-header />
++    <div class="flex flex-row w-full gva-container pt-16 box-border h-full">
++      <gva-aside
++        v-if="
++          config.side_mode === 'normal' ||
++          (device === 'mobile' && config.side_mode == 'head') ||
++          (device === 'mobile' && config.side_mode == 'combination')
++        "
++      />
++      <gva-aside
++        v-if="config.side_mode === 'combination' && device !== 'mobile'"
++        mode="normal"
++      />
++      <div class="flex-1 p-2 w-0 h-full">
++        <gva-tabs v-if="config.showTabs" />
++        <div
++          class="overflow-auto"
++          :class="config.showTabs ? 'gva-container2' : 'gva-container pt-1'"
++        >
++          <iframe
++            v-if="reloadFlag"
++            id="gva-base-load-dom"
++            class="gva-body-h bg-gray-50 dark:bg-slate-800 w-full border-t border-gray-200 dark:border-slate-700"
++            src="https://www.gin-vue-admin.com"
++          ></iframe>
++          <BottomInfo />
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
++
++<script setup>
++  import GvaAside from '@/view/layout/aside/index.vue'
++  import GvaHeader from '@/view/layout/header/index.vue'
++  import useResponsive from '@/hooks/responsive'
++  import GvaTabs from './tabs/index.vue'
++  import BottomInfo from '@/components/bottomInfo/bottomInfo.vue'
++  import { emitter } from '@/utils/bus.js'
++  import { ref, onMounted, nextTick, reactive, watchEffect } from 'vue'
++  import { useRouter, useRoute } from 'vue-router'
++  import { useRouterStore } from '@/pinia/modules/router'
++  import { useUserStore } from '@/pinia/modules/user'
++  import { useAppStore } from '@/pinia'
++  import { storeToRefs } from 'pinia'
++  const appStore = useAppStore()
++  const { config, isDark, device } = storeToRefs(appStore)
++
++  defineOptions({
++    name: 'GvaLayoutIframe'
++  })
++
++  useResponsive(true)
++  const font = reactive({
++    color: 'rgba(0, 0, 0, .15)'
++  })
++
++  watchEffect(() => {
++    font.color = isDark.value ? 'rgba(255,255,255, .15)' : 'rgba(0, 0, 0, .15)'
++  })
++
++  const router = useRouter()
++  const route = useRoute()
++  const routerStore = useRouterStore()
++
++  onMounted(() => {
++    // 挂载一些通用的事件
++    emitter.on('reload', reload)
++    if (userStore.loadingInstance) {
++      userStore.loadingInstance.close()
++    }
++  })
++
++  const userStore = useUserStore()
++
++  const reloadFlag = ref(true)
++  let reloadTimer = null
++  const reload = async () => {
++    if (reloadTimer) {
++      window.clearTimeout(reloadTimer)
++    }
++    reloadTimer = window.setTimeout(async () => {
++      if (route.meta.keepAlive) {
++        reloadFlag.value = false
++        await nextTick()
++        reloadFlag.value = true
++      } else {
++        const title = route.meta.title
++        router.push({ name: 'Reload', params: { title } })
++      }
++    }, 400)
++  }
++</script>
++
++<style lang="scss"></style>
+diff --git a/web/src/view/layout/index.vue b/web/src/view/layout/index.vue
+index c5d26fc8f2..da2009a1a6 100644
+--- a/web/src/view/layout/index.vue
++++ b/web/src/view/layout/index.vue
+@@ -74,8 +74,7 @@
+   })
+ 
+   watchEffect(() => {
+-    font.color =
+-      isDark.value ? 'rgba(255,255,255, .15)' : 'rgba(0, 0, 0, .15)'
++    font.color = isDark.value ? 'rgba(255,255,255, .15)' : 'rgba(0, 0, 0, .15)'
+   })
+ 
+   const router = useRouter()
+diff --git a/web/src/view/person/person.vue b/web/src/view/person/person.vue
+index f146483905..9915e52aaa 100644
+--- a/web/src/view/person/person.vue
++++ b/web/src/view/person/person.vue
+@@ -19,11 +19,16 @@
+           </div>
+ 
+           <!-- 右侧信息 -->
+-          <div class="flex-1 pt-20 w-full">
+-            <div class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
+-              <div>
++          <div class="flex-1 pt-12 lg:pt-20 w-full">
++            <div
++              class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4"
++            >
++              <div class="lg:mt-4">
+                 <div class="flex items-center gap-4 mb-4">
+-                  <div v-if="!editFlag" class="text-2xl font-bold flex items-center gap-3 text-gray-800 dark:text-gray-100">
++                  <div
++                    v-if="!editFlag"
++                    class="text-2xl font-bold flex items-center gap-3 text-gray-800 dark:text-gray-100"
++                  >
+                     {{ userStore.userInfo.nickName }}
+                     <el-icon
+                       class="cursor-pointer text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors duration-200"
+@@ -33,11 +38,7 @@
+                     </el-icon>
+                   </div>
+                   <div v-else class="flex items-center gap-3">
+-                    <el-input
+-                      v-model="nickName"
+-                      class="w-48"
+-                      size="large"
+-                    />
++                    <el-input v-model="nickName" class="w-48" size="large" />
+                     <el-button type="success" circle @click="enterEdit">
+                       <el-icon><check /></el-icon>
+                     </el-button>
+@@ -47,7 +48,9 @@
+                   </div>
+                 </div>
+ 
+-                <div class="flex flex-col lg:flex-row items-start lg:items-center gap-4 lg:gap-8 text-gray-500 dark:text-gray-400">
++                <div
++                  class="flex flex-col lg:flex-row items-start lg:items-center gap-4 lg:gap-8 text-gray-500 dark:text-gray-400"
++                >
+                   <div class="flex items-center gap-2">
+                     <el-icon><location /></el-icon>
+                     <span>中国·北京市·朝阳区</span>
+@@ -64,14 +67,10 @@
+               </div>
+ 
+               <div class="flex gap-4 mt-4 lg:mt-0">
+-                <el-button type="primary" plain>
+-                  <el-icon><message /></el-icon>
++                <el-button type="primary" plain icon="message">
+                   发送消息
+                 </el-button>
+-                <el-button>
+-                  <el-icon><share /></el-icon>
+-                  分享主页
+-                </el-button>
++                <el-button icon="share"> 分享主页 </el-button>
+               </div>
+             </div>
+           </div>
+@@ -83,13 +82,17 @@
+     <div class="grid lg:grid-cols-12 md:grid-cols-1 gap-8">
+       <!-- 左侧信息栏 -->
+       <div class="lg:col-span-4">
+-        <div class="bg-white dark:bg-slate-800 rounded-xl p-6 mb-6 profile-card">
++        <div
++          class="bg-white dark:bg-slate-800 rounded-xl p-6 mb-6 profile-card"
++        >
+           <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
+             <el-icon class="text-blue-500"><info-filled /></el-icon>
+             基本信息
+           </h2>
+           <div class="space-y-4">
+-            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++            <div
++              class="flex items-center gap-1 lg:gap-3 text-gray-600 dark:text-gray-300"
++            >
+               <el-icon class="text-blue-500"><phone /></el-icon>
+               <span class="font-medium">手机号码：</span>
+               <span>{{ userStore.userInfo.phone || '未设置' }}</span>
+@@ -102,9 +105,11 @@
+                 修改
+               </el-button>
+             </div>
+-            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++            <div
++              class="flex items-center gap-1 lg:gap-3 text-gray-600 dark:text-gray-300"
++            >
+               <el-icon class="text-green-500"><message /></el-icon>
+-              <span class="font-medium">邮箱地址：</span>
++              <span class="font-medium flex-shrink-0">邮箱地址：</span>
+               <span>{{ userStore.userInfo.email || '未设置' }}</span>
+               <el-button
+                 link
+@@ -115,7 +120,9 @@
+                 修改
+               </el-button>
+             </div>
+-            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++            <div
++              class="flex items-center gap-1 lg:gap-3 text-gray-600 dark:text-gray-300"
++            >
+               <el-icon class="text-purple-500"><lock /></el-icon>
+               <span class="font-medium">账号密码：</span>
+               <span>已设置</span>
+@@ -162,19 +169,35 @@
+               </template>
+               <div class="grid grid-cols-2 md:grid-cols-4 gap-4 lg:gap-6 py-6">
+                 <div class="stat-card">
+-                  <div class="text-2xl lg:text-4xl font-bold text-blue-500 mb-2">138</div>
++                  <div
++                    class="text-2xl lg:text-4xl font-bold text-blue-500 mb-2"
++                  >
++                    138
++                  </div>
+                   <div class="text-gray-500 text-sm">项目参与</div>
+                 </div>
+                 <div class="stat-card">
+-                  <div class="text-2xl lg:text-4xl font-bold text-green-500 mb-2">2.3k</div>
++                  <div
++                    class="text-2xl lg:text-4xl font-bold text-green-500 mb-2"
++                  >
++                    2.3k
++                  </div>
+                   <div class="text-gray-500 text-sm">代码提交</div>
+                 </div>
+                 <div class="stat-card">
+-                  <div class="text-2xl lg:text-4xl font-bold text-purple-500 mb-2">95%</div>
++                  <div
++                    class="text-2xl lg:text-4xl font-bold text-purple-500 mb-2"
++                  >
++                    95%
++                  </div>
+                   <div class="text-gray-500 text-sm">任务完成</div>
+                 </div>
+                 <div class="stat-card">
+-                  <div class="text-2xl lg:text-4xl font-bold text-yellow-500 mb-2">12</div>
++                  <div
++                    class="text-2xl lg:text-4xl font-bold text-yellow-500 mb-2"
++                  >
++                    12
++                  </div>
+                   <div class="text-gray-500 text-sm">获得勋章</div>
+                 </div>
+               </div>
+@@ -196,7 +219,9 @@
+                     :hollow="true"
+                     class="pb-6"
+                   >
+-                    <h3 class="text-base font-medium mb-1">{{ activity.title }}</h3>
++                    <h3 class="text-base font-medium mb-1">
++                      {{ activity.title }}
++                    </h3>
+                     <p class="text-gray-500 text-sm">{{ activity.content }}</p>
+                   </el-timeline-item>
+                 </el-timeline>

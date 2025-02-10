@@ -1,0 +1,143 @@
+diff --git a/app/models/submission.rb b/app/models/submission.rb
+index 7dc8d7678c1ca..0be476b1c7377 100644
+--- a/app/models/submission.rb
++++ b/app/models/submission.rb
+@@ -326,13 +326,15 @@ def can_view_plagiarism_report(type, user, session)
+       plagData = self.vericite_data_hash
+       @submit_to_vericite = false
+       settings = assignment.vericite_settings
++      type_can_peer_review = true
+     else
+       plagData = self.turnitin_data
+       @submit_to_turnitin = false
+       settings = assignment.turnitin_settings
++      type_can_peer_review = false
+     end
+     return plagData &&
+-    user_can_read_grade?(user, session) &&
++    (user_can_read_grade?(user, session) || (type_can_peer_review && user_can_peer_review_plagiarism?(user))) &&
+     (assignment.context.grants_right?(user, session, :manage_grades) ||
+       case settings[:originality_report_visibility]
+        when 'immediate' then true
+@@ -344,6 +346,18 @@ def can_view_plagiarism_report(type, user, session)
+     )
+   end
+ 
++  def user_can_peer_review_plagiarism?(user)
++    assignment.peer_reviews &&
++    assignment.current_submissions_and_assessors[:submissions].select{ |submission|
++      # first filter by submissions for the requested reviewer
++      user.id == submission.user_id &&
++      submission.assigned_assessments
++    }.any? {|submission|
++      # next filter the assigned assessments by the submission user_id being reviewed
++      submission.assigned_assessments.any? {|review| user_id == review.user_id}
++    }
++  end
++
+   def user_can_read_grade?(user, session=nil)
+     # improves performance by checking permissions on the assignment before the submission
+     self.assignment.user_can_read_grades?(user, session) || self.grants_right?(user, session, :read_grade)
+diff --git a/app/views/submissions/show.html.erb b/app/views/submissions/show.html.erb
+index 1b175f80b7009..2b5ea5afb916d 100644
+--- a/app/views/submissions/show.html.erb
++++ b/app/views/submissions/show.html.erb
+@@ -72,18 +72,18 @@
+             </span>
+           <% end %>
+         <% end %>
+-        <% if @submission.can_view_plagiarism_report('vericite', @current_user, session) %>
+-          <% if (vericite_score = @submission.vericite_data(true)[@submission.asset_string]) && @submission.turnitin_data[:provider] == :vericite && vericite_score[:similarity_score] %>
+-            <span class="turnitin_score_container">
+-              <span class="vericite_score_container_caret <%= vericite_score[:state] %>_score"></span>
+-              <a href="<%= context_url(@context, :context_assignment_submission_vericite_report_url, @submission.assignment_id, @submission.user_id, @submission.asset_string) %>" target="_blank" title="VeriCite similarity score -- more information" class="tooltip not_external turnitin_similarity_score <%= vericite_score[:state] %>_score">
+-                <%= vericite_score[:similarity_score] %>%
+-                <span class="tooltip_wrap right">
+-                  <span class="tooltip_text"><%= t(:see_vericite_results, "See VeriCite results") %></span>
+-                </span>
+-              </a>
+-            </span>
+-          <% end %>
++      <% end %>
++      <% if @submission.can_view_plagiarism_report('vericite', @current_user, session) && !@assignment.muted? %>
++        <% if (vericite_score = @submission.vericite_data(true)[@submission.asset_string]) && @submission.turnitin_data[:provider] == :vericite && vericite_score[:similarity_score] %>
++          <span class="turnitin_score_container">
++            <span class="vericite_score_container_caret <%= vericite_score[:state] %>_score"></span>
++            <a href="<%= context_url(@context, :context_assignment_submission_vericite_report_url, @submission.assignment_id, @submission.user_id, @submission.asset_string) %>" target="_blank" title="VeriCite similarity score -- more information" class="tooltip not_external turnitin_similarity_score <%= vericite_score[:state] %>_score">
++              <%= vericite_score[:similarity_score] %>%
++              <span class="tooltip_wrap right">
++                <span class="tooltip_text"><%= t(:see_vericite_results, "See VeriCite results") %></span>
++              </span>
++            </a>
++          </span>
+         <% end %>
+       <% end %>
+       <% if @rubric_association && (
+diff --git a/spec/selenium/assignments/assignments_peer_reviews_spec.rb b/spec/selenium/assignments/assignments_peer_reviews_spec.rb
+index c094d7ebfc530..5fdb95e65f393 100644
+--- a/spec/selenium/assignments/assignments_peer_reviews_spec.rb
++++ b/spec/selenium/assignments/assignments_peer_reviews_spec.rb
+@@ -103,6 +103,17 @@
+         user: reviewed
+       })
+     }
++    let!(:submissionReviewer) {
++      submission_model({
++        assignment: assignment,
++        body: 'submission body reviewer',
++        course: review_course,
++        grade: "5",
++        score: "5",
++        submission_type: 'online_text_entry',
++        user: reviewer
++      })
++    }
+     let!(:comment) {
+       submission_comment_model({
+         author: reviewer,
+@@ -183,5 +194,45 @@
+         expect(f("#rubric_assessment_option_#{assessment.id}")).to include_text(assessment.assessor_name)
+       end
+     end
++
++    context 'when peer review and plagiarism are enabled' do
++      before(:each) {
++        user_logged_in(user: reviewer)
++        # assignment settings
++        assignment.vericite_enabled = true
++        turnitin_settings = {}
++        turnitin_settings[:originality_report_visibility] = "immediate"
++        turnitin_settings[:exclude_quoted] = '1'
++        turnitin_settings[:created] = true
++        turnitin_settings[:s_view_report] = '1'
++        turnitin_settings[:s_paper_check] = '1'
++        turnitin_settings[:internet_check] = '1'
++        turnitin_settings[:current] = true
++        turnitin_settings[:vericite] = true
++        assignment.turnitin_settings = turnitin_settings
++        # submission settings
++        turnitin_data = {}
++        turnitin_data[:provider] = :vericite
++        turnitin_data[:last_processed_attempt] = 1
++        submission_data = {}
++        submission_data[:status] = "scored"
++        submission_data[:object_id] = "canvas/1/25/5/ee0486b43afa304201c1d8dd44ec2da3d76dd86c"
++        submission_data[:submit_time] = Time.now.to_i
++        submission_data[:similarity_score_check_time] = 1481569668
++        submission_data[:similarity_score_time] = Time.now.to_i
++        submission_data[:similarity_score] = Time.now.to_i
++        submission_data[:similarity_score] = 100
++        submission_data[:state] = "none"
++        turnitin_data["submission_" + submission.id.to_s] = submission_data
++        submission.turnitin_data = turnitin_data
++        submission.turnitin_data_changed!
++        submission.save!
++      }
++      it 'should show the plagiarism report link for reviewer', priority: "1", test_id: 216392 do
++        get "/courses/#{review_course.id}/assignments/#{assignment.id}/submissions/#{reviewed.id}"
++        expect(f(".turnitin_similarity_score")).to be_displayed
++      end
++    end
++
+   end
+ end

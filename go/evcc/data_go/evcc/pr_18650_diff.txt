@@ -1,0 +1,295 @@
+diff --git a/core/loadpoint.go b/core/loadpoint.go
+index 9a2fd9ade4..b808279bd9 100644
+--- a/core/loadpoint.go
++++ b/core/loadpoint.go
+@@ -500,7 +500,7 @@ func (lp *Loadpoint) evVehicleConnectHandler() {
+ 	// energy
+ 	lp.energyMetrics.Reset()
+ 	lp.energyMetrics.Publish("session", lp)
+-	lp.publish(keys.ChargedEnergy, lp.getChargedEnergy())
++	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
+ 
+ 	// duration
+ 	lp.connectedTime = lp.clock.Now()
+@@ -538,7 +538,7 @@ func (lp *Loadpoint) evVehicleDisconnectHandler() {
+ 
+ 	// energy and duration
+ 	lp.energyMetrics.Publish("session", lp)
+-	lp.publish(keys.ChargedEnergy, lp.getChargedEnergy())
++	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
+ 	lp.publish(keys.ConnectedDuration, lp.clock.Since(lp.connectedTime).Round(time.Second))
+ 
+ 	// charge status
+@@ -993,19 +993,23 @@ func (lp *Loadpoint) vehicleHasSoc() bool {
+ 
+ // remainingLimitEnergy returns missing energy amount in kWh if vehicle has a valid energy target
+ func (lp *Loadpoint) remainingLimitEnergy() (float64, bool) {
+-	limit := lp.GetLimitEnergy()
++	limit := lp.getLimitEnergy()
+ 	return max(0, limit-lp.getChargedEnergy()/1e3),
+ 		limit > 0 && !lp.socBasedPlanning()
+ }
+ 
+-// limitEnergyReached checks if target is configured and reached
+-func (lp *Loadpoint) limitEnergyReached() bool {
++// LimitEnergyReached checks if target is configured and reached
++func (lp *Loadpoint) LimitEnergyReached() bool {
++	lp.RLock()
++	defer lp.RUnlock()
+ 	f, ok := lp.remainingLimitEnergy()
+ 	return ok && f <= 0
+ }
+ 
+-// limitSocReached returns true if the effective limit has been reached
+-func (lp *Loadpoint) limitSocReached() bool {
++// LimitSocReached returns true if the effective limit has been reached
++func (lp *Loadpoint) LimitSocReached() bool {
++	lp.RLock()
++	defer lp.RUnlock()
+ 	limit := lp.effectiveLimitSoc()
+ 	return limit > 0 && limit < 100 && lp.vehicleSoc >= float64(limit)
+ }
+@@ -1032,7 +1036,7 @@ func (lp *Loadpoint) minSocNotReached() bool {
+ 	}
+ 
+ 	minEnergy := v.Capacity() * float64(minSoc) / 100 / soc.ChargeEfficiency
+-	return minEnergy > 0 && lp.getChargedEnergy() < minEnergy
++	return minEnergy > 0 && lp.GetChargedEnergy() < minEnergy
+ }
+ 
+ // disableUnlessClimater disables the charger unless climate is active
+@@ -1629,7 +1633,7 @@ func (lp *Loadpoint) publishChargeProgress() {
+ 	lp.energyMetrics.Publish("session", lp)
+ 
+ 	// TODO deprecated: use sessionEnergy instead
+-	lp.publish(keys.ChargedEnergy, lp.getChargedEnergy())
++	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
+ 	lp.publish(keys.ChargeDuration, lp.chargeDuration)
+ 	if _, ok := lp.chargeMeter.(api.MeterEnergy); ok {
+ 		lp.publish(keys.ChargeTotalImport, lp.chargeMeterTotal())
+@@ -1658,7 +1662,7 @@ func (lp *Loadpoint) publishSocAndRange() {
+ 	if err == nil || lp.chargerHasFeature(api.IntegratedDevice) || lp.vehicleSocPollAllowed() {
+ 		lp.socUpdated = lp.clock.Now()
+ 
+-		f, err := socEstimator.Soc(lp.getChargedEnergy())
++		f, err := socEstimator.Soc(lp.GetChargedEnergy())
+ 		if err != nil {
+ 			if loadpoint.AcceptableError(err) {
+ 				lp.socUpdated = time.Time{}
+@@ -1688,7 +1692,7 @@ func (lp *Loadpoint) publishSocAndRange() {
+ 		}
+ 
+ 		// use minimum of vehicle and loadpoint
+-		limitSoc := min(apiLimitSoc, lp.effectiveLimitSoc())
++		limitSoc := min(apiLimitSoc, lp.EffectiveLimitSoc())
+ 
+ 		var d time.Duration
+ 		if lp.charging() {
+@@ -1867,12 +1871,12 @@ func (lp *Loadpoint) Update(sitePower, batteryBoostPower float64, rates api.Rate
+ 		lp.resetPhaseTimer()
+ 		lp.elapsePVTimer() // let PV mode disable immediately afterwards
+ 
+-	case lp.limitEnergyReached():
+-		lp.log.DEBUG.Printf("limitEnergy reached: %.0fkWh > %0.1fkWh", lp.getChargedEnergy()/1e3, lp.limitEnergy)
++	case lp.LimitEnergyReached():
++		lp.log.DEBUG.Printf("limitEnergy reached: %.0fkWh > %0.1fkWh", lp.GetChargedEnergy()/1e3, lp.limitEnergy)
+ 		err = lp.disableUnlessClimater()
+ 
+-	case lp.limitSocReached():
+-		lp.log.DEBUG.Printf("limitSoc reached: %.1f%% > %d%%", lp.vehicleSoc, lp.effectiveLimitSoc())
++	case lp.LimitSocReached():
++		lp.log.DEBUG.Printf("limitSoc reached: %.1f%% > %d%%", lp.vehicleSoc, lp.EffectiveLimitSoc())
+ 		err = lp.disableUnlessClimater()
+ 
+ 	// immediate charging- must be placed after limits are evaluated
+@@ -1913,7 +1917,7 @@ func (lp *Loadpoint) Update(sitePower, batteryBoostPower float64, rates api.Rate
+ 	// Wake-up checks
+ 	if lp.enabled && lp.status == api.StatusB &&
+ 		// TODO take vehicle api limits into account
+-		int(lp.vehicleSoc) < lp.effectiveLimitSoc() && lp.wakeUpTimer.Expired() {
++		int(lp.vehicleSoc) < lp.EffectiveLimitSoc() && lp.wakeUpTimer.Expired() {
+ 		lp.wakeUpVehicle()
+ 	}
+ 
+diff --git a/core/loadpoint_api.go b/core/loadpoint_api.go
+index f9158bbbf9..52c0c6aea1 100644
+--- a/core/loadpoint_api.go
++++ b/core/loadpoint_api.go
+@@ -133,10 +133,15 @@ func (lp *Loadpoint) SetDefaultMode(mode api.ChargeMode) {
+ 	}
+ }
+ 
+-// getChargedEnergy returns session charge energy in Wh
+-func (lp *Loadpoint) getChargedEnergy() float64 {
++// GetChargedEnergy returns session charge energy in Wh
++func (lp *Loadpoint) GetChargedEnergy() float64 {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.getChargedEnergy()
++}
++
++// getChargedEnergy returns session charge energy in Wh
++func (lp *Loadpoint) getChargedEnergy() float64 {
+ 	return lp.energyMetrics.TotalWh()
+ }
+ 
+@@ -170,6 +175,11 @@ func (lp *Loadpoint) SetPriority(prio int) {
+ func (lp *Loadpoint) GetPhases() int {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.getPhases()
++}
++
++// getPhases returns loadpoint enabled phases
++func (lp *Loadpoint) getPhases() int {
+ 	return lp.phases
+ }
+ 
+@@ -233,6 +243,11 @@ func (lp *Loadpoint) SetLimitSoc(soc int) {
+ func (lp *Loadpoint) GetLimitEnergy() float64 {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.getLimitEnergy()
++}
++
++// getLimitEnergy returns the session limit energy
++func (lp *Loadpoint) getLimitEnergy() float64 {
+ 	return lp.limitEnergy
+ }
+ 
+@@ -261,6 +276,11 @@ func (lp *Loadpoint) SetLimitEnergy(energy float64) {
+ func (lp *Loadpoint) GetPlanEnergy() (time.Time, float64) {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.getPlanEnergy()
++}
++
++// getPlanEnergy returns plan target energy
++func (lp *Loadpoint) getPlanEnergy() (time.Time, float64) {
+ 	return lp.planTime, lp.planEnergy
+ }
+ 
+@@ -581,6 +601,11 @@ func (lp *Loadpoint) SetMinCurrent(current float64) error {
+ func (lp *Loadpoint) GetMaxCurrent() float64 {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.getMaxCurrent()
++}
++
++// getMaxCurrent returns the max loadpoint current
++func (lp *Loadpoint) getMaxCurrent() float64 {
+ 	return lp.maxCurrent
+ }
+ 
+diff --git a/core/loadpoint_effective.go b/core/loadpoint_effective.go
+index 716f7f4e85..d810b02fea 100644
+--- a/core/loadpoint_effective.go
++++ b/core/loadpoint_effective.go
+@@ -18,7 +18,7 @@ func (lp *Loadpoint) PublishEffectiveValues() {
+ 	lp.publish(keys.EffectivePlanSoc, lp.EffectivePlanSoc())
+ 	lp.publish(keys.EffectiveMinCurrent, lp.effectiveMinCurrent())
+ 	lp.publish(keys.EffectiveMaxCurrent, lp.effectiveMaxCurrent())
+-	lp.publish(keys.EffectiveLimitSoc, lp.effectiveLimitSoc())
++	lp.publish(keys.EffectiveLimitSoc, lp.EffectiveLimitSoc())
+ }
+ 
+ // EffectivePriority returns the effective priority
+@@ -82,7 +82,7 @@ func (lp *Loadpoint) nextVehiclePlan() (time.Time, int, int) {
+ 		}
+ 
+ 		// calculate earliest required plan start
+-		if plan := lp.nextActivePlan(lp.EffectiveMaxPower(), plans); plan != nil {
++		if plan := lp.nextActivePlan(lp.effectiveMaxPower(), plans); plan != nil {
+ 			return plan.End, plan.Soc, plan.Id
+ 		}
+ 	}
+@@ -153,7 +153,7 @@ func (lp *Loadpoint) effectiveMinCurrent() float64 {
+ 
+ // effectiveMaxCurrent returns the effective max current
+ func (lp *Loadpoint) effectiveMaxCurrent() float64 {
+-	maxCurrent := lp.GetMaxCurrent()
++	maxCurrent := lp.getMaxCurrent()
+ 
+ 	if v := lp.GetVehicle(); v != nil {
+ 		if res, ok := v.OnIdentified().GetMaxCurrent(); ok && res > 0 {
+@@ -170,12 +170,16 @@ func (lp *Loadpoint) effectiveMaxCurrent() float64 {
+ 	return maxCurrent
+ }
+ 
+-// effectiveLimitSoc returns the effective session limit soc
+-// TODO take vehicle api limits into account
+-func (lp *Loadpoint) effectiveLimitSoc() int {
++// EffectiveLimitSoc returns the effective session limit soc
++func (lp *Loadpoint) EffectiveLimitSoc() int {
+ 	lp.RLock()
+ 	defer lp.RUnlock()
++	return lp.effectiveLimitSoc()
++}
+ 
++// effectiveLimitSoc returns the effective session limit soc
++// TODO take vehicle api limits into account
++func (lp *Loadpoint) effectiveLimitSoc() int {
+ 	if lp.limitSoc > 0 {
+ 		return lp.limitSoc
+ 	}
+@@ -202,5 +206,12 @@ func (lp *Loadpoint) EffectiveMinPower() float64 {
+ 
+ // EffectiveMaxPower returns the effective max power taking vehicle capabilities and phase scaling into account
+ func (lp *Loadpoint) EffectiveMaxPower() float64 {
++	lp.RLock()
++	defer lp.RUnlock()
++	return lp.effectiveMaxPower()
++}
++
++// effectiveMaxPower returns the effective max power taking vehicle capabilities and phase scaling into account
++func (lp *Loadpoint) effectiveMaxPower() float64 {
+ 	return Voltage * lp.effectiveMaxCurrent() * float64(lp.maxActivePhases())
+ }
+diff --git a/core/loadpoint_phases.go b/core/loadpoint_phases.go
+index ead7958122..ad81983dcf 100644
+--- a/core/loadpoint_phases.go
++++ b/core/loadpoint_phases.go
+@@ -60,7 +60,7 @@ func expect(phases int) int {
+ // ActivePhases returns the number of expectedly active phases for the meter.
+ // If unknown for 1p3p chargers during startup it will assume 3p.
+ func (lp *Loadpoint) ActivePhases() int {
+-	physical := lp.GetPhases()
++	physical := lp.getPhases()
+ 	vehicle := lp.getVehiclePhases()
+ 	measured := lp.getMeasuredPhases()
+ 	charger := lp.getChargerPhysicalPhases()
+@@ -91,7 +91,7 @@ func (lp *Loadpoint) minActivePhases() int {
+ 
+ // maxActivePhases returns the maximum number of active phases for the loadpoint.
+ func (lp *Loadpoint) maxActivePhases() int {
+-	physical := lp.GetPhases()
++	physical := lp.getPhases()
+ 	measured := lp.getMeasuredPhases()
+ 	vehicle := lp.getVehiclePhases()
+ 	charger := lp.getChargerPhysicalPhases()
+diff --git a/core/loadpoint_plan.go b/core/loadpoint_plan.go
+index d8875313ad..2ff3005880 100644
+--- a/core/loadpoint_plan.go
++++ b/core/loadpoint_plan.go
+@@ -70,7 +70,7 @@ func (lp *Loadpoint) GetPlanGoal() (float64, bool) {
+ 		return float64(soc), true
+ 	}
+ 
+-	_, limit := lp.GetPlanEnergy()
++	_, limit := lp.getPlanEnergy()
+ 	return limit, false
+ }
+ 
+diff --git a/core/loadpoint_session.go b/core/loadpoint_session.go
+index 1c11b38500..5d7493b604 100644
+--- a/core/loadpoint_session.go
++++ b/core/loadpoint_session.go
+@@ -63,7 +63,7 @@ func (lp *Loadpoint) stopSession() {
+ 		s.MeterStop = &meterStop
+ 	}
+ 
+-	if chargedEnergy := lp.getChargedEnergy() / 1e3; chargedEnergy > s.ChargedEnergy {
++	if chargedEnergy := lp.GetChargedEnergy() / 1e3; chargedEnergy > s.ChargedEnergy {
+ 		lp.energyMetrics.Update(chargedEnergy)
+ 	}
+ 

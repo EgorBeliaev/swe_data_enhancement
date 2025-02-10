@@ -1,0 +1,174 @@
+diff --git a/composer/lib/dependabot/composer/update_checker/version_resolver.rb b/composer/lib/dependabot/composer/update_checker/version_resolver.rb
+index 9c17ed68cbf..34fa10e9d13 100644
+--- a/composer/lib/dependabot/composer/update_checker/version_resolver.rb
++++ b/composer/lib/dependabot/composer/update_checker/version_resolver.rb
+@@ -48,6 +48,7 @@ def initialize(credentials:, dependency:, dependency_files:,
+           @requirements_to_unlock       = requirements_to_unlock
+           @latest_allowable_version     = latest_allowable_version
+           @composer_platform_extensions = initial_platform
++          @error_handler                = ComposerErrorHandler.new
+         end
+ 
+         def latest_resolvable_version
+@@ -62,6 +63,7 @@ def latest_resolvable_version
+         attr_reader :requirements_to_unlock
+         attr_reader :latest_allowable_version
+         attr_reader :composer_platform_extensions
++        attr_reader :error_handler
+ 
+         def fetch_latest_resolvable_version
+           version = fetch_latest_resolvable_version_string
+@@ -344,6 +346,8 @@ def handle_composer_errors(error)
+                   "See https://getcomposer.org/doc/04-schema.md for details on the schema."
+             raise Dependabot::DependencyFileNotParseable, msg
+           else
++            error_handler.handle_composer_error(error)
++
+             raise error
+           end
+         end
+@@ -524,5 +528,52 @@ def registry_credentials
+         end
+       end
+     end
++
++    class ComposerErrorHandler
++      extend T::Sig
++
++      # Private source errors
++      CURL_ERROR = /curl error 52 while downloading (?<url>.*): Empty reply from server/
++
++      PRIVATE_SOURCE_AUTH_FAIL = [
++        /Could not authenticate against (?<url>.*)/,
++        /The '(?<url>.*)' URL could not be accessed \(HTTP 403\)/,
++        /The "(?<url>.*)" file could not be downloaded/
++      ].freeze
++
++      REQUIREMENT_ERROR = /^(?<req>.*) is invalid, it should not contain uppercase characters/
++
++      NO_URL = "No URL specified"
++
++      def sanitize_uri(url)
++        url = "http://#{url}" unless url.start_with?("http")
++        uri = URI.parse(url)
++        host = T.must(uri.host).downcase
++        host.start_with?("www.") ? host[4..-1] : host
++      end
++
++      # Handles errors with specific to composer error codes
++      sig { params(error: SharedHelpers::HelperSubprocessFailed).void }
++      def handle_composer_error(error)
++        # private source auth errors
++        PRIVATE_SOURCE_AUTH_FAIL.each do |regex|
++          next unless error.message.match?(regex)
++
++          url = T.must(error.message.match(regex)).named_captures["url"]
++          raise Dependabot::PrivateSourceAuthenticationFailure, sanitize_uri(url).empty? ? NO_URL : sanitize_uri(url)
++        end
++
++        # invalid requirement mentioned in manifest file
++        if error.message.match?(REQUIREMENT_ERROR)
++          raise DependencyFileNotResolvable,
++                "Invalid requirement: #{T.must(error.message.match(REQUIREMENT_ERROR)).named_captures['req']}"
++        end
++
++        return unless error.message.match?(CURL_ERROR)
++
++        url = T.must(error.message.match(CURL_ERROR)).named_captures["url"]
++        raise PrivateSourceBadResponse, url
++      end
++    end
+   end
+ end
+diff --git a/composer/spec/dependabot/composer/composer_error_handler_spec.rb b/composer/spec/dependabot/composer/composer_error_handler_spec.rb
+new file mode 100644
+index 00000000000..61f40f8df65
+--- /dev/null
++++ b/composer/spec/dependabot/composer/composer_error_handler_spec.rb
+@@ -0,0 +1,86 @@
++# typed: false
++# frozen_string_literal: true
++
++require "spec_helper"
++require "dependabot/dependency"
++require "dependabot/dependency_file"
++require "dependabot/composer/update_checker/version_resolver"
++
++RSpec.describe Dependabot::Composer::ComposerErrorHandler do
++  subject(:error_handler) { described_class.new }
++
++  let(:error) { instance_double(Dependabot::SharedHelpers::HelperSubprocessFailed, message: error_message) }
++
++  context "when the error message returns an empty response from server" do
++    let(:error_message) do
++      "curl error 52 while downloading https://rep.com: Empty reply from server"
++    end
++
++    it "raises a PrivateSourceBadResponse error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::PrivateSourceBadResponse)
++    end
++  end
++
++  context "when the error message returns an private source auth error" do
++    let(:error_message) do
++      "Could not authenticate against composer.registry.com"
++    end
++
++    it "raises a PrivateSourceAuthenticationFailure error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
++    end
++  end
++
++  context "when the error message returns an private source HTTP 403 error" do
++    let(:error_message) do
++      "The 'https://el.typo.com/packages.json' URL could not be accessed (HTTP 403): HTTP/1.1 403"
++    end
++
++    it "raises a PrivateSourceAuthenticationFailure error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
++    end
++  end
++
++  context "when the error message returns an private source bad response" do
++    let(:error_message) do
++      "The \"https://repo.magento.com/p/magento/module.json\" file could not be downloaded"
++    end
++
++    it "raises a PrivateSourceAuthenticationFailure error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
++    end
++  end
++
++  context "when the error message returns an private source bad response" do
++    let(:error_message) do
++      "The \"?pagelen=100&fields=values.name%2C\" file could not be downloaded"
++    end
++
++    it "raises a PrivateSourceAuthenticationFailure error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::PrivateSourceAuthenticationFailure)
++    end
++  end
++
++  context "when the error message returns invalid requirement error" do
++    let(:error_message) do
++      "require.PHPOffice/PHPExcel is invalid, it should not contain uppercase characters." \
++        " Please use phpoffice/phpexcel instead."
++    end
++
++    it "raises a DependencyFileNotResolvable error with the correct message" do
++      expect do
++        error_handler.handle_composer_error(error)
++      end.to raise_error(Dependabot::DependencyFileNotResolvable)
++    end
++  end
++end

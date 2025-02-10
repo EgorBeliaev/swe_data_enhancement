@@ -1,0 +1,318 @@
+diff --git a/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater.rb b/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater.rb
+index 9ba92f24ec..47a38004be 100644
+--- a/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater.rb
++++ b/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater.rb
+@@ -56,10 +56,11 @@ def updated_dependency_files
+         updated_files = T.let([], T::Array[DependencyFile])
+ 
+         updated_files += updated_manifest_files
+-        if Dependabot::Experiments.enabled?(:enable_pnpm_workspace_catalog)
+-          updated_files += updated_pnpm_workspace_files
+-        end
+-        updated_files += updated_lockfiles
++        updated_files += if should_update_pnpm_workspace?
++                           update_pnpm_workspace_and_locks
++                         else
++                           updated_lockfiles
++                         end
+ 
+         if updated_files.none?
+ 
+@@ -98,6 +99,33 @@ def updated_dependency_files
+ 
+       private
+ 
++      sig { returns(T::Boolean) }
++      def should_update_pnpm_workspace?
++        Dependabot::Experiments.enabled?(:enable_pnpm_workspace_catalog) && pnpm_workspace.any?
++      end
++
++      sig { returns(T::Array[Dependabot::DependencyFile]) }
++      def update_pnpm_workspace_and_locks
++        workspace_updates = updated_pnpm_workspace_files
++        lock_updates = update_pnpm_locks(is_catalog: true)
++
++        workspace_updates + lock_updates
++      end
++
++      sig { params(is_catalog: T::Boolean).returns(T::Array[Dependabot::DependencyFile]) }
++      def update_pnpm_locks(is_catalog: false)
++        updated_files = []
++        pnpm_locks.each do |pnpm_lock|
++          next unless pnpm_lock_changed?(pnpm_lock)
++
++          updated_files << updated_file(
++            file: pnpm_lock,
++            content: updated_pnpm_lock_content(pnpm_lock, is_catalog: is_catalog)
++          )
++        end
++        updated_files
++      end
++
+       sig { params(updated_files: T::Array[Dependabot::DependencyFile]).returns(T::Array[Dependabot::DependencyFile]) }
+       def vendor_updated_files(updated_files)
+         base_dir = T.must(updated_files.first).directory
+@@ -294,8 +322,6 @@ def updated_pnpm_workspace_files
+         end
+       end
+ 
+-      # rubocop:disable Metrics/MethodLength
+-      # rubocop:disable Metrics/PerceivedComplexity
+       sig { returns(T::Array[Dependabot::DependencyFile]) }
+       def updated_lockfiles
+         updated_files = []
+@@ -309,14 +335,7 @@ def updated_lockfiles
+           )
+         end
+ 
+-        pnpm_locks.each do |pnpm_lock|
+-          next unless pnpm_lock_changed?(pnpm_lock)
+-
+-          updated_files << updated_file(
+-            file: pnpm_lock,
+-            content: updated_pnpm_lock_content(pnpm_lock)
+-          )
+-        end
++        updated_files.concat(update_pnpm_locks)
+ 
+         bun_locks.each do |bun_lock|
+           next unless bun_lock_changed?(bun_lock)
+@@ -347,9 +366,6 @@ def updated_lockfiles
+ 
+         updated_files
+       end
+-      # rubocop:enable Metrics/MethodLength
+-      # rubocop:enable Metrics/PerceivedComplexity
+-
+       sig { params(yarn_lock: Dependabot::DependencyFile).returns(String) }
+       def updated_yarn_lock_content(yarn_lock)
+         @updated_yarn_lock_content ||= T.let({}, T.nilable(T::Hash[String, T.nilable(String)]))
+@@ -357,11 +373,16 @@ def updated_yarn_lock_content(yarn_lock)
+           yarn_lockfile_updater.updated_yarn_lock_content(yarn_lock)
+       end
+ 
+-      sig { params(pnpm_lock: Dependabot::DependencyFile).returns(String) }
+-      def updated_pnpm_lock_content(pnpm_lock)
++      sig do
++        params(
++          pnpm_lock: Dependabot::DependencyFile,
++          is_catalog: T::Boolean
++        ).returns(String)
++      end
++      def updated_pnpm_lock_content(pnpm_lock, is_catalog: false)
+         @updated_pnpm_lock_content ||= T.let({}, T.nilable(T::Hash[String, T.nilable(String)]))
+         @updated_pnpm_lock_content[pnpm_lock.name] ||=
+-          pnpm_lockfile_updater.updated_pnpm_lock_content(pnpm_lock)
++          pnpm_lockfile_updater.updated_pnpm_lock_content(pnpm_lock, is_catalog)
+       end
+ 
+       sig { params(bun_lock: Dependabot::DependencyFile).returns(String) }
+diff --git a/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater.rb b/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater.rb
+index 3926c4461e..c22ff09910 100644
+--- a/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater.rb
++++ b/npm_and_yarn/lib/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater.rb
+@@ -24,11 +24,11 @@ def initialize(dependencies:, dependency_files:, repo_contents_path:, credential
+           )
+         end
+ 
+-        def updated_pnpm_lock_content(pnpm_lock)
++        def updated_pnpm_lock_content(pnpm_lock, is_catalog)
+           @updated_pnpm_lock_content ||= {}
+           return @updated_pnpm_lock_content[pnpm_lock.name] if @updated_pnpm_lock_content[pnpm_lock.name]
+ 
+-          new_content = run_pnpm_update(pnpm_lock: pnpm_lock)
++          new_content = run_pnpm_update(pnpm_lock: pnpm_lock, is_catalog: is_catalog)
+           @updated_pnpm_lock_content[pnpm_lock.name] = new_content
+         rescue SharedHelpers::HelperSubprocessFailed => e
+           handle_pnpm_lock_updater_error(e, pnpm_lock)
+@@ -100,14 +100,15 @@ def updated_pnpm_lock_content(pnpm_lock)
+         # Peer dependencies configuration error
+         ERR_PNPM_PEER_DEP_ISSUES = /ERR_PNPM_PEER_DEP_ISSUES/
+ 
+-        def run_pnpm_update(pnpm_lock:)
++        def run_pnpm_update(pnpm_lock:, is_catalog:)
+           SharedHelpers.in_a_temporary_repo_directory(base_dir, repo_contents_path) do
+             File.write(".npmrc", npmrc_content(pnpm_lock))
+ 
+             SharedHelpers.with_git_configured(credentials: credentials) do
+-              run_pnpm_update_packages
+-
+-              write_final_package_json_files
++              unless is_catalog
++                run_pnpm_update_packages
++                write_final_package_json_files
++              end
+ 
+               run_pnpm_install
+ 
+diff --git a/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater_spec.rb b/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater_spec.rb
+index 79e47977af..7f0172fdc0 100644
+--- a/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater_spec.rb
++++ b/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater_spec.rb
+@@ -5,8 +5,9 @@
+ require "dependabot/npm_and_yarn/file_updater/pnpm_lockfile_updater"
+ 
+ RSpec.describe Dependabot::NpmAndYarn::FileUpdater::PnpmLockfileUpdater do
+-  subject(:updated_pnpm_lock_content) { updater.updated_pnpm_lock_content(pnpm_lock) }
++  subject(:updated_pnpm_lock_content) { updater.updated_pnpm_lock_content(pnpm_lock, is_catalog) }
+ 
++  let(:is_catalog) { false }
+   let(:updater) do
+     described_class.new(
+       dependency_files: files,
+@@ -16,7 +17,6 @@
+     )
+   end
+   let(:dependencies) { [dependency] }
+-
+   let(:credentials) do
+     [Dependabot::Credential.new({
+       "type" => "git_source",
+@@ -72,6 +72,8 @@
+       .with(:enable_corepack_for_npm_and_yarn).and_return(enable_corepack_for_npm_and_yarn)
+     allow(Dependabot::Experiments).to receive(:enabled?)
+       .with(:enable_shared_helpers_command_timeout).and_return(true)
++    allow(Dependabot::Experiments).to receive(:enabled?)
++      .with(:enable_pnpm_workspace_catalog).and_return(true)
+   end
+ 
+   after do
+@@ -688,4 +690,65 @@
+       end
+     end
+   end
++
++  describe "lockfile updates" do
++    before do
++      allow(Dependabot::Experiments).to receive(:enabled?)
++        .with(:enable_fix_for_pnpm_no_change_error).and_return(true)
++    end
++
++    context "when updating a regular package dependency" do
++      let(:project_name) { "pnpm/catalog_prettier" }
++      let(:dependencies) do
++        [
++          create_dependency(
++            name: "prettier",
++            required_version: "3.3.3",
++            previous_required_version: "3.3.0",
++            version: "3.3.3",
++            file: "pnpm-workspace.yaml"
++          )
++        ]
++      end
++
++      let(:pnpm_lock) do
++        files.find { |f| f.name == "pnpm-workspace.yaml" }
++      end
++
++      context "when pnpm updates followed by install for non catalog dependencies" do
++        let(:is_catalog) { true }
++
++        it "uses pnpm update followed by install" do
++          expect(Dependabot::NpmAndYarn::Helpers).not_to receive(:run_pnpm_command)
++            .with(
++              "update prettier@3.3.3  --lockfile-only --no-save -r",
++              { fingerprint: "update <dependency_updates>  --lockfile-only --no-save -r" }
++            )
++          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
++            .with("install --lockfile-only")
++            .ordered
++
++          updated_pnpm_lock_content
++        end
++      end
++
++      context "when updating a regular package dependency" do
++        let(:is_catalog) { false }
++
++        it "uses pnpm update followed by install" do
++          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
++            .with(
++              "update prettier@3.3.3  --lockfile-only --no-save -r",
++              { fingerprint: "update <dependency_updates>  --lockfile-only --no-save -r" }
++            )
++            .ordered
++          expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
++            .with("install --lockfile-only")
++            .ordered
++
++          updated_pnpm_lock_content
++        end
++      end
++    end
++  end
+ end
+diff --git a/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater_spec.rb b/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater_spec.rb
+index 693ec3ee03..bdb09ec648 100644
+--- a/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater_spec.rb
++++ b/npm_and_yarn/spec/dependabot/npm_and_yarn/file_updater_spec.rb
+@@ -4142,7 +4142,7 @@
+         end
+       end
+ 
+-      context "with pnpm catalog protocol" do
++      describe "pnpm catalog protocol" do
+         context "when individual dependency needs updating" do
+           let(:project_name) { "pnpm/catalog_prettier" }
+           let(:dependency_name) { "prettier" }
+@@ -4159,7 +4159,7 @@
+           end
+ 
+           it "updates the workspace" do
+-            expect(updated_files.map(&:name)).to eq(%w(pnpm-workspace.yaml))
++            expect(updated_files.map(&:name)).to eq(%w(pnpm-workspace.yaml pnpm-lock.yaml))
+             expect(updated_pnpm_workspace.content).to include("prettier: 3.3.3")
+           end
+         end
+@@ -4266,6 +4266,32 @@
+             expect(updated_pnpm_workspace.content).to include("react: \"^18.2.3\"")
+             expect(updated_pnpm_workspace.content).to include("react-dom: '^18.2.3'")
+           end
++
++          context "when updating workspace catalog entries" do
++            let(:project_name) { "pnpm/catalog_prettier" }
++
++            let(:dependencies) do
++              [
++                create_dependency(
++                  file: "pnpm-workspace.yaml",
++                  name: "prettier",
++                  version: "3.3.0",
++                  required_version: "3.3.3",
++                  previous_required_version: "3.3.0"
++                )
++              ]
++            end
++
++            it "uses pnpm install for catalog updates" do
++              expect(Dependabot::NpmAndYarn::Helpers).not_to receive(:run_pnpm_command)
++                .with(/update.*--lockfile-only/)
++
++              expect(Dependabot::NpmAndYarn::Helpers).to receive(:run_pnpm_command)
++                .with("install --lockfile-only")
++
++              updated_files
++            end
++          end
+         end
+       end
+     end
+diff --git a/npm_and_yarn/spec/fixtures/projects/pnpm/catalog_prettier/pnpm-lock.yaml b/npm_and_yarn/spec/fixtures/projects/pnpm/catalog_prettier/pnpm-lock.yaml
+new file mode 100644
+index 0000000000..3def24a04d
+--- /dev/null
++++ b/npm_and_yarn/spec/fixtures/projects/pnpm/catalog_prettier/pnpm-lock.yaml
+@@ -0,0 +1,12 @@
++lockfileVersion: '9.0'
++
++settings:
++  autoInstallPeers: true
++  excludeLinksFromLockfile: false
++
++catalog:
++  prettier: 3.3.0
++
++importers:
++
++  .: {}

@@ -1,0 +1,249 @@
+diff --git a/cache/dynacache/dynacache.go b/cache/dynacache/dynacache.go
+index a906a0dd315..25d0f9b29eb 100644
+--- a/cache/dynacache/dynacache.go
++++ b/cache/dynacache/dynacache.go
+@@ -176,11 +176,12 @@ func (c *Cache) ClearMatching(predicatePartition func(k string, p PartitionManag
+ }
+ 
+ // ClearOnRebuild prepares the cache for a new rebuild taking the given changeset into account.
+-func (c *Cache) ClearOnRebuild(changeset ...identity.Identity) {
++// predicate is optional and will clear any entry for which it returns true.
++func (c *Cache) ClearOnRebuild(predicate func(k, v any) bool, changeset ...identity.Identity) {
+ 	g := rungroup.Run[PartitionManager](context.Background(), rungroup.Config[PartitionManager]{
+ 		NumWorkers: len(c.partitions),
+ 		Handle: func(ctx context.Context, partition PartitionManager) error {
+-			partition.clearOnRebuild(changeset...)
++			partition.clearOnRebuild(predicate, changeset...)
+ 			return nil
+ 		},
+ 	})
+@@ -479,7 +480,12 @@ func (p *Partition[K, V]) clearMatching(predicate func(k, v any) bool) {
+ 	})
+ }
+ 
+-func (p *Partition[K, V]) clearOnRebuild(changeset ...identity.Identity) {
++func (p *Partition[K, V]) clearOnRebuild(predicate func(k, v any) bool, changeset ...identity.Identity) {
++	if predicate == nil {
++		predicate = func(k, v any) bool {
++			return false
++		}
++	}
+ 	opts := p.getOptions()
+ 	if opts.ClearWhen == ClearNever {
+ 		return
+@@ -525,7 +531,7 @@ func (p *Partition[K, V]) clearOnRebuild(changeset ...identity.Identity) {
+ 	// Second pass needs to be done in a separate loop to catch any
+ 	// elements marked as stale in the other partitions.
+ 	p.c.DeleteFunc(func(key K, v V) bool {
+-		if shouldDelete(key, v) {
++		if predicate(key, v) || shouldDelete(key, v) {
+ 			p.trace.Log(
+ 				logg.StringFunc(
+ 					func() string {
+@@ -601,7 +607,7 @@ type PartitionManager interface {
+ 	adjustMaxSize(addend int) int
+ 	getMaxSize() int
+ 	getOptions() OptionsPartition
+-	clearOnRebuild(changeset ...identity.Identity)
++	clearOnRebuild(predicate func(k, v any) bool, changeset ...identity.Identity)
+ 	clearMatching(predicate func(k, v any) bool)
+ 	clearStale()
+ }
+diff --git a/cache/dynacache/dynacache_test.go b/cache/dynacache/dynacache_test.go
+index 87239479b86..14abf240da2 100644
+--- a/cache/dynacache/dynacache_test.go
++++ b/cache/dynacache/dynacache_test.go
+@@ -147,13 +147,13 @@ func TestClear(t *testing.T) {
+ 
+ 	c.Assert(cache.Keys(predicateAll), qt.HasLen, 4)
+ 
+-	cache.ClearOnRebuild()
++	cache.ClearOnRebuild(nil)
+ 
+ 	// Stale items are always cleared.
+ 	c.Assert(cache.Keys(predicateAll), qt.HasLen, 2)
+ 
+ 	cache = newTestCache(t)
+-	cache.ClearOnRebuild(identity.StringIdentity("changed"))
++	cache.ClearOnRebuild(nil, identity.StringIdentity("changed"))
+ 
+ 	c.Assert(cache.Keys(nil), qt.HasLen, 1)
+ 
+diff --git a/hugolib/content_map_page.go b/hugolib/content_map_page.go
+index b930845e58b..9485f2e138d 100644
+--- a/hugolib/content_map_page.go
++++ b/hugolib/content_map_page.go
+@@ -1123,6 +1123,9 @@ func (h *HugoSites) resolveAndClearStateForIdentities(
+ 	l logg.LevelLogger,
+ 	cachebuster func(s string) bool, changes []identity.Identity,
+ ) error {
++	// Drain the cache eviction stack to start fresh.
++	h.Deps.MemCache.DrainEvictedIdentities()
++
+ 	h.Log.Debug().Log(logg.StringFunc(
+ 		func() string {
+ 			var sb strings.Builder
+@@ -1163,17 +1166,32 @@ func (h *HugoSites) resolveAndClearStateForIdentities(
+ 	}
+ 
+ 	// The order matters here:
+-	// 1. Handle the cache busters first, as those may produce identities for the page reset step.
++	// 1. Then GC the cache, which may produce changes.
+ 	// 2. Then reset the page outputs, which may mark some resources as stale.
+-	// 3. Then GC the cache.
+-	if cachebuster != nil {
+-		if err := loggers.TimeTrackfn(func() (logg.LevelLogger, error) {
+-			ll := l.WithField("substep", "gc dynacache cachebuster")
+-			h.dynacacheGCCacheBuster(cachebuster)
+-			return ll, nil
+-		}); err != nil {
+-			return err
++	if err := loggers.TimeTrackfn(func() (logg.LevelLogger, error) {
++		ll := l.WithField("substep", "gc dynacache")
++
++		predicate := func(k any, v any) bool {
++			if cachebuster != nil {
++				if s, ok := k.(string); ok {
++					return cachebuster(s)
++				}
++			}
++			return false
+ 		}
++
++		h.MemCache.ClearOnRebuild(predicate, changes...)
++		h.Log.Trace(logg.StringFunc(func() string {
++			var sb strings.Builder
++			sb.WriteString("dynacache keys:\n")
++			for _, key := range h.MemCache.Keys(nil) {
++				sb.WriteString(fmt.Sprintf("   %s\n", key))
++			}
++			return sb.String()
++		}))
++		return ll, nil
++	}); err != nil {
++		return err
+ 	}
+ 
+ 	// Drain the cache eviction stack.
+@@ -1238,23 +1256,6 @@ func (h *HugoSites) resolveAndClearStateForIdentities(
+ 		return err
+ 	}
+ 
+-	if err := loggers.TimeTrackfn(func() (logg.LevelLogger, error) {
+-		ll := l.WithField("substep", "gc dynacache")
+-
+-		h.MemCache.ClearOnRebuild(changes...)
+-		h.Log.Trace(logg.StringFunc(func() string {
+-			var sb strings.Builder
+-			sb.WriteString("dynacache keys:\n")
+-			for _, key := range h.MemCache.Keys(nil) {
+-				sb.WriteString(fmt.Sprintf("   %s\n", key))
+-			}
+-			return sb.String()
+-		}))
+-		return ll, nil
+-	}); err != nil {
+-		return err
+-	}
+-
+ 	return nil
+ }
+ 
+diff --git a/hugolib/hugo_sites_build.go b/hugolib/hugo_sites_build.go
+index d862747914a..e066aa1009a 100644
+--- a/hugolib/hugo_sites_build.go
++++ b/hugolib/hugo_sites_build.go
+@@ -27,7 +27,6 @@ import (
+ 
+ 	"github.com/bep/logg"
+ 	"github.com/gohugoio/hugo/bufferpool"
+-	"github.com/gohugoio/hugo/cache/dynacache"
+ 	"github.com/gohugoio/hugo/deps"
+ 	"github.com/gohugoio/hugo/hugofs"
+ 	"github.com/gohugoio/hugo/hugofs/files"
+@@ -828,6 +827,11 @@ func (h *HugoSites) processPartialFileEvents(ctx context.Context, l logg.LevelLo
+ 		addedContentPaths []*paths.Path
+ 	)
+ 
++	var (
++		addedOrChangedContent []pathChange
++		changes               []identity.Identity
++	)
++
+ 	for _, ev := range eventInfos {
+ 		cpss := h.BaseFs.ResolvePaths(ev.Name)
+ 		pss := make([]*paths.Path, len(cpss))
+@@ -854,6 +858,13 @@ func (h *HugoSites) processPartialFileEvents(ctx context.Context, l logg.LevelLo
+ 			if err == nil && g != nil {
+ 				cacheBusters = append(cacheBusters, g)
+ 			}
++
++			if ev.added {
++				changes = append(changes, identity.StructuralChangeAdd)
++			}
++			if ev.removed {
++				changes = append(changes, identity.StructuralChangeRemove)
++			}
+ 		}
+ 
+ 		if ev.removed {
+@@ -865,11 +876,6 @@ func (h *HugoSites) processPartialFileEvents(ctx context.Context, l logg.LevelLo
+ 		}
+ 	}
+ 
+-	var (
+-		addedOrChangedContent []pathChange
+-		changes               []identity.Identity
+-	)
+-
+ 	// Find the most specific identity possible.
+ 	handleChange := func(pathInfo *paths.Path, delete, isDir bool) {
+ 		switch pathInfo.Component() {
+@@ -1063,18 +1069,6 @@ func (h *HugoSites) processPartialFileEvents(ctx context.Context, l logg.LevelLo
+ 
+ 	resourceFiles := h.fileEventsContentPaths(addedOrChangedContent)
+ 
+-	defer func() {
+-		// See issue 13316.
+-		h.MemCache.DrainEvictedIdentitiesMatching(func(ki dynacache.KeyIdentity) bool {
+-			for _, c := range changes {
+-				if c.IdentifierBase() == ki.Identity.IdentifierBase() {
+-					return true
+-				}
+-			}
+-			return false
+-		})
+-	}()
+-
+ 	changed := &WhatChanged{
+ 		needsPagesAssembly: needsPagesAssemble,
+ 		identitySet:        make(identity.Identities),
+diff --git a/identity/identity.go b/identity/identity.go
+index e38a8f0f24d..53169dfe1bd 100644
+--- a/identity/identity.go
++++ b/identity/identity.go
+@@ -33,6 +33,9 @@ const (
+ 
+ 	// GenghisKhan is an Identity everyone relates to.
+ 	GenghisKhan = StringIdentity("__genghiskhan")
++
++	StructuralChangeAdd    = StringIdentity("__structural_change_add")
++	StructuralChangeRemove = StringIdentity("__structural_change_remove")
+ )
+ 
+ var NopManager = new(nopManager)
+diff --git a/resources/resource_factories/bundler/bundler.go b/resources/resource_factories/bundler/bundler.go
+index dd0f1a4e1b9..8b268ebbe1b 100644
+--- a/resources/resource_factories/bundler/bundler.go
++++ b/resources/resource_factories/bundler/bundler.go
+@@ -95,6 +95,10 @@ func (c *Client) Concat(targetPath string, r resource.Resources) (resource.Resou
+ 		}
+ 
+ 		idm := c.rs.Cfg.NewIdentityManager("concat")
++
++		// Re-create on structural changes.
++		idm.AddIdentity(identity.StructuralChangeAdd, identity.StructuralChangeRemove)
++
+ 		// Add the concatenated resources as dependencies to the composite resource
+ 		// so that we can track changes to the individual resources.
+ 		idm.AddIdentityForEach(identity.ForEeachIdentityProviderFunc(

@@ -1,0 +1,665 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 51cb51d75..f1e4647d6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,7 +4,7 @@
+ - [BREAKING]: A breaking change. After an upgrade, your app may need modifications to keep working correctly.
+ - [FEATURE]: A non-breaking improvement to the app. Either introduces new functionality, or improves on an existing feature.
+ - [BUGFIX]: Fixes a bug with a non-breaking change.
+-- [COMPAT]: Compatibility improvements - changes to make Administrate more compatible with different dependency versions.
++- [COMPAT]: Compatibility improvements - changes to make Langchain.rb more compatible with different dependency versions.
+ - [OPTIM]: Optimization or performance increase.
+ - [DOCS]: Documentation changes. No changes to the library's behavior.
+ - [SECURITY]: A change which fixes a security vulnerability.
+@@ -12,6 +12,8 @@
+ ## [Unreleased]
+ - [FEATURE] [https://github.com/patterns-ai-core/langchainrb/pull/858] Assistant, when using Anthropic, now also accepts image_url in the message.
+ - [FEATURE] [https://github.com/patterns-ai-core/langchainrb/pull/861] Clean up passing `max_tokens` to Anthropic constructor and chat method
++- [FEATURE] [https://github.com/patterns-ai-core/langchainrb/pull/849] Langchain::Assistant now works with AWS Bedrock-hosted Anthropic models
++- [OPTIM] [https://github.com/patterns-ai-core/langchainrb/pull/849] Simplify Langchain::LLM::AwsBedrock class
+ 
+ ## [0.19.0] - 2024-10-23
+ - [BREAKING] [https://github.com/patterns-ai-core/langchainrb/pull/840] Rename `chat_completion_model_name` parameter to `chat_model` in Langchain::LLM parameters.
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 74b760fbf..6bc305da6 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -48,16 +48,16 @@ GEM
+       faraday-multipart (>= 1)
+     ast (2.4.2)
+     aws-eventstream (1.3.0)
+-    aws-partitions (1.937.0)
+-    aws-sdk-bedrockruntime (1.9.0)
+-      aws-sdk-core (~> 3, >= 3.193.0)
+-      aws-sigv4 (~> 1.1)
+-    aws-sdk-core (3.196.1)
++    aws-partitions (1.992.0)
++    aws-sdk-bedrockruntime (1.27.0)
++      aws-sdk-core (~> 3, >= 3.210.0)
++      aws-sigv4 (~> 1.5)
++    aws-sdk-core (3.210.0)
+       aws-eventstream (~> 1, >= 1.3.0)
+-      aws-partitions (~> 1, >= 1.651.0)
+-      aws-sigv4 (~> 1.8)
++      aws-partitions (~> 1, >= 1.992.0)
++      aws-sigv4 (~> 1.9)
+       jmespath (~> 1, >= 1.6.1)
+-    aws-sigv4 (1.8.0)
++    aws-sigv4 (1.10.0)
+       aws-eventstream (~> 1, >= 1.0.2)
+     baran (0.1.12)
+     base64 (0.2.0)
+diff --git a/lib/langchain/assistant/llm/adapter.rb b/lib/langchain/assistant/llm/adapter.rb
+index 24c78f8e5..6a2e969f9 100644
+--- a/lib/langchain/assistant/llm/adapter.rb
++++ b/lib/langchain/assistant/llm/adapter.rb
+@@ -6,16 +6,17 @@ module LLM
+       # TODO: Fix the message truncation when context window is exceeded
+       class Adapter
+         def self.build(llm)
+-          case llm
+-          when Langchain::LLM::Anthropic
++          if llm.is_a?(Langchain::LLM::Anthropic)
+             LLM::Adapters::Anthropic.new
+-          when Langchain::LLM::GoogleGemini, Langchain::LLM::GoogleVertexAI
++          elsif llm.is_a?(Langchain::LLM::AwsBedrock) && llm.defaults[:chat_model].include?("anthropic")
++            LLM::Adapters::AwsBedrockAnthropic.new
++          elsif llm.is_a?(Langchain::LLM::GoogleGemini) || llm.is_a?(Langchain::LLM::GoogleVertexAI)
+             LLM::Adapters::GoogleGemini.new
+-          when Langchain::LLM::MistralAI
++          elsif llm.is_a?(Langchain::LLM::MistralAI)
+             LLM::Adapters::MistralAI.new
+-          when Langchain::LLM::Ollama
++          elsif llm.is_a?(Langchain::LLM::Ollama)
+             LLM::Adapters::Ollama.new
+-          when Langchain::LLM::OpenAI
++          elsif llm.is_a?(Langchain::LLM::OpenAI)
+             LLM::Adapters::OpenAI.new
+           else
+             raise ArgumentError, "Unsupported LLM type: #{llm.class}"
+diff --git a/lib/langchain/assistant/llm/adapters/aws_bedrock_anthropic.rb b/lib/langchain/assistant/llm/adapters/aws_bedrock_anthropic.rb
+new file mode 100644
+index 000000000..88b233c33
+--- /dev/null
++++ b/lib/langchain/assistant/llm/adapters/aws_bedrock_anthropic.rb
+@@ -0,0 +1,35 @@
++# frozen_string_literal: true
++
++module Langchain
++  class Assistant
++    module LLM
++      module Adapters
++        class AwsBedrockAnthropic < Anthropic
++          private
++
++          # @param [String] choice
++          # @param [Boolean] _parallel_tool_calls
++          # @return [Hash]
++          def build_tool_choice(choice, _parallel_tool_calls)
++            # Aws Bedrock hosted Anthropic does not support parallel tool calls
++            Langchain.logger.warn "WARNING: parallel_tool_calls is not supported by AWS Bedrock Anthropic currently"
++
++            tool_choice_object = {}
++
++            case choice
++            when "auto"
++              tool_choice_object[:type] = "auto"
++            when "any"
++              tool_choice_object[:type] = "any"
++            else
++              tool_choice_object[:type] = "tool"
++              tool_choice_object[:name] = choice
++            end
++
++            tool_choice_object
++          end
++        end
++      end
++    end
++  end
++end
+diff --git a/lib/langchain/llm/aws_bedrock.rb b/lib/langchain/llm/aws_bedrock.rb
+index 9f4dfd97e..39f487aca 100644
+--- a/lib/langchain/llm/aws_bedrock.rb
++++ b/lib/langchain/llm/aws_bedrock.rb
+@@ -7,51 +7,40 @@ module Langchain::LLM
+   #    gem 'aws-sdk-bedrockruntime', '~> 1.1'
+   #
+   # Usage:
+-  #    llm = Langchain::LLM::AwsBedrock.new(llm_options: {})
++  #    llm = Langchain::LLM::AwsBedrock.new(default_options: {})
+   #
+   class AwsBedrock < Base
+     DEFAULTS = {
+-      chat_model: "anthropic.claude-v2",
+-      completion_model: "anthropic.claude-v2",
++      chat_model: "anthropic.claude-3-5-sonnet-20240620-v1:0",
++      completion_model: "anthropic.claude-v2:1",
+       embedding_model: "amazon.titan-embed-text-v1",
+       max_tokens_to_sample: 300,
+       temperature: 1,
+       top_k: 250,
+       top_p: 0.999,
+       stop_sequences: ["\n\nHuman:"],
+-      anthropic_version: "bedrock-2023-05-31",
+-      return_likelihoods: "NONE",
+-      count_penalty: {
+-        scale: 0,
+-        apply_to_whitespaces: false,
+-        apply_to_punctuations: false,
+-        apply_to_numbers: false,
+-        apply_to_stopwords: false,
+-        apply_to_emojis: false
+-      },
+-      presence_penalty: {
+-        scale: 0,
+-        apply_to_whitespaces: false,
+-        apply_to_punctuations: false,
+-        apply_to_numbers: false,
+-        apply_to_stopwords: false,
+-        apply_to_emojis: false
+-      },
+-      frequency_penalty: {
+-        scale: 0,
+-        apply_to_whitespaces: false,
+-        apply_to_punctuations: false,
+-        apply_to_numbers: false,
+-        apply_to_stopwords: false,
+-        apply_to_emojis: false
+-      }
++      return_likelihoods: "NONE"
+     }.freeze
+ 
+     attr_reader :client, :defaults
+ 
+-    SUPPORTED_COMPLETION_PROVIDERS = %i[anthropic ai21 cohere meta].freeze
+-    SUPPORTED_CHAT_COMPLETION_PROVIDERS = %i[anthropic].freeze
+-    SUPPORTED_EMBEDDING_PROVIDERS = %i[amazon cohere].freeze
++    SUPPORTED_COMPLETION_PROVIDERS = %i[
++      anthropic
++      ai21
++      cohere
++      meta
++    ].freeze
++
++    SUPPORTED_CHAT_COMPLETION_PROVIDERS = %i[
++      anthropic
++      ai21
++      mistral
++    ].freeze
++
++    SUPPORTED_EMBEDDING_PROVIDERS = %i[
++      amazon
++      cohere
++    ].freeze
+ 
+     def initialize(aws_client_options: {}, default_options: {})
+       depends_on "aws-sdk-bedrockruntime", req: "aws-sdk-bedrockruntime"
+@@ -64,8 +53,7 @@ def initialize(aws_client_options: {}, default_options: {})
+         temperature: {},
+         max_tokens: {default: @defaults[:max_tokens_to_sample]},
+         metadata: {},
+-        system: {},
+-        anthropic_version: {default: "bedrock-2023-05-31"}
++        system: {}
+       )
+       chat_parameters.ignore(:n, :user)
+       chat_parameters.remap(stop: :stop_sequences)
+@@ -100,23 +88,25 @@ def embed(text:, **params)
+     # @param params  extra parameters passed to Aws::BedrockRuntime::Client#invoke_model
+     # @return [Langchain::LLM::AnthropicResponse], [Langchain::LLM::CohereResponse] or [Langchain::LLM::AI21Response] Response object
+     #
+-    def complete(prompt:, **params)
+-      raise "Completion provider #{completion_provider} is not supported." unless SUPPORTED_COMPLETION_PROVIDERS.include?(completion_provider)
++    def complete(
++      prompt:,
++      model: @defaults[:completion_model],
++      **params
++    )
++      raise "Completion provider #{model} is not supported." unless SUPPORTED_COMPLETION_PROVIDERS.include?(provider_name(model))
+ 
+-      raise "Model #{@defaults[:completion_model]} only supports #chat." if @defaults[:completion_model].include?("claude-3")
+-
+-      parameters = compose_parameters params
++      parameters = compose_parameters(params, model)
+ 
+       parameters[:prompt] = wrap_prompt prompt
+ 
+       response = client.invoke_model({
+-        model_id: @defaults[:completion_model],
++        model_id: model,
+         body: parameters.to_json,
+         content_type: "application/json",
+         accept: "application/json"
+       })
+ 
+-      parse_response response
++      parse_response(response, model)
+     end
+ 
+     # Generate a chat completion for a given prompt
+@@ -137,10 +127,11 @@ def complete(prompt:, **params)
+     # @return [Langchain::LLM::AnthropicResponse] Response object
+     def chat(params = {}, &block)
+       parameters = chat_parameters.to_params(params)
++      parameters = compose_parameters(parameters, parameters[:model])
+ 
+-      raise ArgumentError.new("messages argument is required") if Array(parameters[:messages]).empty?
+-
+-      raise "Model #{parameters[:model]} does not support chat completions." unless Langchain::LLM::AwsBedrock::SUPPORTED_CHAT_COMPLETION_PROVIDERS.include?(completion_provider)
++      unless SUPPORTED_CHAT_COMPLETION_PROVIDERS.include?(provider_name(parameters[:model]))
++        raise "Chat provider #{parameters[:model]} is not supported."
++      end
+ 
+       if block
+         response_chunks = []
+@@ -168,12 +159,26 @@ def chat(params = {}, &block)
+           accept: "application/json"
+         })
+ 
+-        parse_response response
++        parse_response(response, parameters[:model])
+       end
+     end
+ 
+     private
+ 
++    def parse_model_id(model_id)
++      model_id
++        .gsub("us.", "") # Meta append "us." to their model ids
++        .split(".")
++    end
++
++    def provider_name(model_id)
++      parse_model_id(model_id).first.to_sym
++    end
++
++    def model_name(model_id)
++      parse_model_id(model_id).last
++    end
++
+     def completion_provider
+       @defaults[:completion_model].split(".").first.to_sym
+     end
+@@ -200,15 +205,17 @@ def max_tokens_key
+       end
+     end
+ 
+-    def compose_parameters(params)
+-      if completion_provider == :anthropic
+-        compose_parameters_anthropic params
+-      elsif completion_provider == :cohere
+-        compose_parameters_cohere params
+-      elsif completion_provider == :ai21
+-        compose_parameters_ai21 params
+-      elsif completion_provider == :meta
+-        compose_parameters_meta params
++    def compose_parameters(params, model_id)
++      if provider_name(model_id) == :anthropic
++        compose_parameters_anthropic(params)
++      elsif provider_name(model_id) == :cohere
++        compose_parameters_cohere(params)
++      elsif provider_name(model_id) == :ai21
++        params
++      elsif provider_name(model_id) == :meta
++        params
++      elsif provider_name(model_id) == :mistral
++        params
+       end
+     end
+ 
+@@ -220,15 +227,17 @@ def compose_embedding_parameters(params)
+       end
+     end
+ 
+-    def parse_response(response)
+-      if completion_provider == :anthropic
++    def parse_response(response, model_id)
++      if provider_name(model_id) == :anthropic
+         Langchain::LLM::AnthropicResponse.new(JSON.parse(response.body.string))
+-      elsif completion_provider == :cohere
++      elsif provider_name(model_id) == :cohere
+         Langchain::LLM::CohereResponse.new(JSON.parse(response.body.string))
+-      elsif completion_provider == :ai21
++      elsif provider_name(model_id) == :ai21
+         Langchain::LLM::AI21Response.new(JSON.parse(response.body.string, symbolize_names: true))
+-      elsif completion_provider == :meta
++      elsif provider_name(model_id) == :meta
+         Langchain::LLM::AwsBedrockMetaResponse.new(JSON.parse(response.body.string))
++      elsif provider_name(model_id) == :mistral
++        Langchain::LLM::MistralAIResponse.new(JSON.parse(response.body.string))
+       end
+     end
+ 
+@@ -276,61 +285,7 @@ def compose_parameters_cohere(params)
+     end
+ 
+     def compose_parameters_anthropic(params)
+-      default_params = @defaults.merge(params)
+-
+-      {
+-        max_tokens_to_sample: default_params[:max_tokens_to_sample],
+-        temperature: default_params[:temperature],
+-        top_k: default_params[:top_k],
+-        top_p: default_params[:top_p],
+-        stop_sequences: default_params[:stop_sequences],
+-        anthropic_version: default_params[:anthropic_version]
+-      }
+-    end
+-
+-    def compose_parameters_ai21(params)
+-      default_params = @defaults.merge(params)
+-
+-      {
+-        maxTokens: default_params[:max_tokens_to_sample],
+-        temperature: default_params[:temperature],
+-        topP: default_params[:top_p],
+-        stopSequences: default_params[:stop_sequences],
+-        countPenalty: {
+-          scale: default_params[:count_penalty][:scale],
+-          applyToWhitespaces: default_params[:count_penalty][:apply_to_whitespaces],
+-          applyToPunctuations: default_params[:count_penalty][:apply_to_punctuations],
+-          applyToNumbers: default_params[:count_penalty][:apply_to_numbers],
+-          applyToStopwords: default_params[:count_penalty][:apply_to_stopwords],
+-          applyToEmojis: default_params[:count_penalty][:apply_to_emojis]
+-        },
+-        presencePenalty: {
+-          scale: default_params[:presence_penalty][:scale],
+-          applyToWhitespaces: default_params[:presence_penalty][:apply_to_whitespaces],
+-          applyToPunctuations: default_params[:presence_penalty][:apply_to_punctuations],
+-          applyToNumbers: default_params[:presence_penalty][:apply_to_numbers],
+-          applyToStopwords: default_params[:presence_penalty][:apply_to_stopwords],
+-          applyToEmojis: default_params[:presence_penalty][:apply_to_emojis]
+-        },
+-        frequencyPenalty: {
+-          scale: default_params[:frequency_penalty][:scale],
+-          applyToWhitespaces: default_params[:frequency_penalty][:apply_to_whitespaces],
+-          applyToPunctuations: default_params[:frequency_penalty][:apply_to_punctuations],
+-          applyToNumbers: default_params[:frequency_penalty][:apply_to_numbers],
+-          applyToStopwords: default_params[:frequency_penalty][:apply_to_stopwords],
+-          applyToEmojis: default_params[:frequency_penalty][:apply_to_emojis]
+-        }
+-      }
+-    end
+-
+-    def compose_parameters_meta(params)
+-      default_params = @defaults.merge(params)
+-
+-      {
+-        temperature: default_params[:temperature],
+-        top_p: default_params[:top_p],
+-        max_gen_len: default_params[:max_tokens_to_sample]
+-      }
++      params.merge(anthropic_version: "bedrock-2023-05-31")
+     end
+ 
+     def response_from_chunks(chunks)
+diff --git a/lib/langchain/llm/response/ai21_response.rb b/lib/langchain/llm/response/ai21_response.rb
+index 1de801c78..bd76ef82b 100644
+--- a/lib/langchain/llm/response/ai21_response.rb
++++ b/lib/langchain/llm/response/ai21_response.rb
+@@ -9,5 +9,25 @@ def completions
+     def completion
+       completions.dig(0, :data, :text)
+     end
++
++    def chat_completion
++      raw_response.dig(:choices, 0, :message, :content)
++    end
++
++    def prompt_tokens
++      raw_response.dig(:usage, :prompt_tokens).to_i
++    end
++
++    def completion_tokens
++      raw_response.dig(:usage, :completion_tokens).to_i
++    end
++
++    def total_tokens
++      raw_response.dig(:usage, :total_tokens).to_i
++    end
++
++    def role
++      raw_response.dig(:choices, 0, :message, :role)
++    end
+   end
+ end
+diff --git a/spec/langchain/assistant/llm/adapters/anthropic_spec.rb b/spec/langchain/assistant/llm/adapters/anthropic_spec.rb
+index e52121abe..bcb7b603e 100644
+--- a/spec/langchain/assistant/llm/adapters/anthropic_spec.rb
++++ b/spec/langchain/assistant/llm/adapters/anthropic_spec.rb
+@@ -1,8 +1,6 @@
+ # frozen_string_literal: true
+ 
+ RSpec.describe Langchain::Assistant::LLM::Adapters::Anthropic do
+-  subject { described_class.new }
+-
+   describe "#build_chat_params" do
+     it "returns the chat parameters" do
+       expect(
+diff --git a/spec/langchain/assistant/llm/adapters/aws_bedrock_anthropic_spec.rb b/spec/langchain/assistant/llm/adapters/aws_bedrock_anthropic_spec.rb
+new file mode 100644
+index 000000000..f3e30715e
+--- /dev/null
++++ b/spec/langchain/assistant/llm/adapters/aws_bedrock_anthropic_spec.rb
+@@ -0,0 +1,13 @@
++# frozen_string_literal: true
++
++RSpec.describe Langchain::Assistant::LLM::Adapters::AwsBedrockAnthropic do
++  describe "#build_tool_choice" do
++    it "returns the tool choice object with 'auto'" do
++      expect(subject.send(:build_tool_choice, "auto", true)).to eq({type: "auto"})
++    end
++
++    it "returns the tool choice object with selected tool function" do
++      expect(subject.send(:build_tool_choice, "langchain_tool_calculator__execute", false)).to eq({type: "tool", name: "langchain_tool_calculator__execute"})
++    end
++  end
++end
+diff --git a/spec/langchain/llm/aws_bedrock_spec.rb b/spec/langchain/llm/aws_bedrock_spec.rb
+index cf6c8dea0..5e20789c2 100644
+--- a/spec/langchain/llm/aws_bedrock_spec.rb
++++ b/spec/langchain/llm/aws_bedrock_spec.rb
+@@ -55,7 +55,7 @@
+       end
+ 
+       context "without default model" do
+-        let(:model_id) { "anthropic.claude-v2" }
++        let(:model_id) { "anthropic.claude-3-5-sonnet-20240620-v1:0" }
+ 
+         it "returns a completion" do
+           expect(
+@@ -129,11 +129,6 @@
+ 
+       let(:expected_body) do
+         {
+-          max_tokens_to_sample: 300,
+-          temperature: 1,
+-          top_k: 250,
+-          top_p: 0.999,
+-          stop_sequences: ["\n\nHuman:"],
+           anthropic_version: "bedrock-2023-05-31",
+           prompt: "\n\nHuman: Hello World\n\nAssistant:"
+         }
+@@ -144,7 +139,7 @@
+           response_object = double("response_object")
+           allow(response_object).to receive(:body).and_return(response)
+           allow(subject.client).to receive(:invoke_model)
+-            .with({model_id: "anthropic.claude-v2", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
++            .with({model_id: "anthropic.claude-v2:1", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
+             .and_return(response_object)
+         end
+ 
+@@ -156,11 +151,8 @@
+       context "with additional parameters" do
+         let(:expected_body) do
+           {
+-            max_tokens_to_sample: 100,
+             temperature: 0.7,
+-            top_k: 250,
+-            top_p: 0.999,
+-            stop_sequences: ["\n\nHuman:"],
++            max_tokens_to_sample: 100,
+             anthropic_version: "bedrock-2023-05-31",
+             prompt: "\n\nHuman: Hello World\n\nAssistant:"
+           }
+@@ -170,7 +162,7 @@
+           response_object = double("response_object")
+           allow(response_object).to receive(:body).and_return(response)
+           allow(subject.client).to receive(:invoke_model)
+-            .with({model_id: "anthropic.claude-v2", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
++            .with({model_id: "anthropic.claude-v2:1", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
+             .and_return(response_object)
+         end
+ 
+@@ -190,11 +182,6 @@
+         let(:response_object) { double("response_object") }
+         let(:expected_body) do
+           {
+-            max_tokens_to_sample: 100,
+-            temperature: 0.7,
+-            top_k: 250,
+-            top_p: 0.999,
+-            stop_sequences: ["\n\nHuman:"],
+             anthropic_version: "bedrock-2023-05-31",
+             prompt: "\n\nHuman: Hello World\n\nAssistant:"
+           }
+@@ -203,12 +190,12 @@
+         before do
+           allow(response_object).to receive(:body).and_return(response)
+           allow(subject.client).to receive(:invoke_model)
+-            .with({model_id: "anthropic.claude-v2", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
++            .with({model_id: "anthropic.claude-v2:1", body: expected_body.to_json, content_type: "application/json", accept: "application/json"})
+             .and_return(response_object)
+         end
+ 
+         it "passes correct options to the client's complete method" do
+-          expect(subject.client).to receive(:invoke_model).with({model_id: "anthropic.claude-v2", body: expected_body.to_json, content_type: "application/json", accept: "application/json"}).and_return(response_object)
++          expect(subject.client).to receive(:invoke_model).with({model_id: "anthropic.claude-v2:1", body: expected_body.to_json, content_type: "application/json", accept: "application/json"}).and_return(response_object)
+ 
+           expect(subject.complete(prompt: "Hello World").completion).to eq("\nWhat is the meaning of life? What is the meaning of life?\nWhat is the meaning")
+         end
+@@ -224,34 +211,6 @@
+ 
+       let(:expected_body) do
+         {
+-          maxTokens: 300,
+-          temperature: 1,
+-          topP: 0.999,
+-          stopSequences: ["\n\nHuman:"],
+-          countPenalty: {
+-            scale: 0,
+-            applyToWhitespaces: false,
+-            applyToPunctuations: false,
+-            applyToNumbers: false,
+-            applyToStopwords: false,
+-            applyToEmojis: false
+-          },
+-          presencePenalty: {
+-            scale: 0,
+-            applyToWhitespaces: false,
+-            applyToPunctuations: false,
+-            applyToNumbers: false,
+-            applyToStopwords: false,
+-            applyToEmojis: false
+-          },
+-          frequencyPenalty: {
+-            scale: 0,
+-            applyToWhitespaces: false,
+-            applyToPunctuations: false,
+-            applyToNumbers: false,
+-            applyToStopwords: false,
+-            applyToEmojis: false
+-          },
+           prompt: "Hello World"
+         }
+       end
+@@ -273,34 +232,8 @@
+       context "with additional parameters" do
+         let(:expected_body) do
+           {
+-            maxTokens: 100,
+             temperature: 0.7,
+-            topP: 0.999,
+-            stopSequences: ["\n\nHuman:"],
+-            countPenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
+-            presencePenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
+-            frequencyPenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
++            max_tokens: 100,
+             prompt: "Hello World"
+           }
+         end
+@@ -314,7 +247,7 @@
+         end
+ 
+         it "returns a completion" do
+-          expect(subject.complete(prompt: "Hello World", temperature: 0.7, max_tokens_to_sample: 100).completion).to eq(
++          expect(subject.complete(prompt: "Hello World", temperature: 0.7, max_tokens: 100).completion).to eq(
+             "\nWhat is the meaning of life? What is the meaning of life?\nWhat is the meaning"
+           )
+         end
+@@ -333,34 +266,6 @@
+         let(:response_object) { double("response_object") }
+         let(:expected_body) do
+           {
+-            maxTokens: 100,
+-            temperature: 0.7,
+-            topP: 0.999,
+-            stopSequences: ["\n\nHuman:"],
+-            countPenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
+-            presencePenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
+-            frequencyPenalty: {
+-              scale: 0,
+-              applyToWhitespaces: false,
+-              applyToPunctuations: false,
+-              applyToNumbers: false,
+-              applyToStopwords: false,
+-              applyToEmojis: false
+-            },
+             prompt: "Hello World"
+           }
+         end
+@@ -480,7 +385,7 @@
+       let(:subject) { described_class.new(default_options: {completion_model: "unsupported.provider"}) }
+ 
+       it "raises an exception" do
+-        expect { subject.complete(prompt: "Hello World") }.to raise_error("Completion provider unsupported is not supported.")
++        expect { subject.complete(prompt: "Hello World") }.to raise_error("Completion provider unsupported.provider is not supported.")
+       end
+     end
+   end

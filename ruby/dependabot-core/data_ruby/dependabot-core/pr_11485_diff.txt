@@ -1,0 +1,247 @@
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core.Test/Analyze/VersionFinderTests.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core.Test/Analyze/VersionFinderTests.cs
+index a1617961929..32c1ca10bbb 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core.Test/Analyze/VersionFinderTests.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core.Test/Analyze/VersionFinderTests.cs
+@@ -1,6 +1,11 @@
++using System.Collections.Immutable;
++
++using NuGet.Frameworks;
+ using NuGet.Versioning;
+ 
+ using NuGetUpdater.Core.Analyze;
++using NuGetUpdater.Core.Test.Update;
++using NuGetUpdater.Core.Test.Utilities;
+ 
+ using Xunit;
+ 
+@@ -190,4 +195,32 @@ public void VersionFilter_WildcardPreviewVersion_ReturnsTrue()
+ 
+         Assert.True(result);
+     }
++
++    [Fact]
++    public async Task TargetFrameworkIsConsideredForUpdatedVersions()
++    {
++        // arrange
++        using var tempDir = new TemporaryDirectory();
++        await UpdateWorkerTestBase.MockNuGetPackagesInDirectory(
++            [
++                MockNuGetPackage.CreateSimplePackage("Some.Package", "1.0.0", "net8.0"),
++                MockNuGetPackage.CreateSimplePackage("Some.Package", "2.0.0", "net8.0"), // can only update to this version because of the tfm
++                MockNuGetPackage.CreateSimplePackage("Some.Package", "3.0.0", "net9.0"),
++            ],
++            tempDir.DirectoryPath);
++
++        // act
++        var projectTfms = new[] { "net8.0" }.Select(NuGetFramework.Parse).ToImmutableArray();
++        var packageId = "Some.Package";
++        var currentVersion = NuGetVersion.Parse("1.0.0");
++        var logger = new TestLogger();
++        var nugetContext = new NuGetContext(tempDir.DirectoryPath);
++        var versionResult = await VersionFinder.GetVersionsAsync(projectTfms, packageId, currentVersion, nugetContext, logger, CancellationToken.None);
++        var versions = versionResult.GetVersions();
++
++        // assert
++        var actual = versions.Select(v => v.ToString()).ToArray();
++        var expected = new[] { "2.0.0" };
++        AssertEx.Equal(expected, actual);
++    }
+ }
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/AnalyzeWorker.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/AnalyzeWorker.cs
+index c4c9163dd88..20dd19eb96b 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/AnalyzeWorker.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/AnalyzeWorker.cs
+@@ -236,6 +236,7 @@ private static async Task<T> DeserializeJsonFileAsync<T>(string filePath, string
+         CancellationToken cancellationToken)
+     {
+         var versionResult = await VersionFinder.GetVersionsAsync(
++            projectFrameworks,
+             dependencyInfo,
+             nugetContext,
+             logger,
+@@ -262,6 +263,7 @@ private static async Task<T> DeserializeJsonFileAsync<T>(string filePath, string
+         CancellationToken cancellationToken)
+     {
+         var versionResult = await VersionFinder.GetVersionsAsync(
++            projectFrameworks,
+             packageIds.First(),
+             version,
+             nugetContext,
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/CompatabilityChecker.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/CompatabilityChecker.cs
+index b6ebaf894f9..151fa9225c9 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/CompatabilityChecker.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/CompatabilityChecker.cs
+@@ -108,19 +108,18 @@ internal static bool PerformCheck(
+ 
+         foreach (var d in dependencyGroups)
+         {
+-            var libItems = (await readers.ContentReader.GetLibItemsAsync(cancellationToken)).ToList();
+-
+-            foreach (var item in libItems)
+-            {
+-                tfms.Add(item.TargetFramework);
+-            }
+-
+             if (!d.TargetFramework.IsAny)
+             {
+                 tfms.Add(d.TargetFramework);
+             }
+         }
+ 
++        var refItems = await readers.ContentReader.GetReferenceItemsAsync(cancellationToken);
++        foreach (var refItem in refItems)
++        {
++            tfms.Add(refItem.TargetFramework);
++        }
++
+         if (!tfms.Any())
+         {
+             tfms.Add(NuGetFramework.AnyFramework);
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionFinder.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionFinder.cs
+index 7a8f7160e48..834b74e8122 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionFinder.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionFinder.cs
+@@ -2,6 +2,7 @@
+ 
+ using NuGet.Common;
+ using NuGet.Configuration;
++using NuGet.Frameworks;
+ using NuGet.Packaging.Core;
+ using NuGet.Protocol;
+ using NuGet.Protocol.Core.Types;
+@@ -12,6 +13,7 @@ namespace NuGetUpdater.Core.Analyze;
+ internal static class VersionFinder
+ {
+     public static Task<VersionResult> GetVersionsAsync(
++        ImmutableArray<NuGetFramework> projectTfms,
+         string packageId,
+         NuGetVersion currentVersion,
+         NuGetContext nugetContext,
+@@ -20,10 +22,11 @@ public static Task<VersionResult> GetVersionsAsync(
+     {
+         var versionFilter = CreateVersionFilter(currentVersion);
+ 
+-        return GetVersionsAsync(packageId, currentVersion, versionFilter, nugetContext, logger, cancellationToken);
++        return GetVersionsAsync(projectTfms, packageId, currentVersion, versionFilter, nugetContext, logger, cancellationToken);
+     }
+ 
+     public static Task<VersionResult> GetVersionsAsync(
++        ImmutableArray<NuGetFramework> projectTfms,
+         DependencyInfo dependencyInfo,
+         NuGetContext nugetContext,
+         ILogger logger,
+@@ -34,10 +37,11 @@ public static Task<VersionResult> GetVersionsAsync(
+         var currentVersion = versionRange.MinVersion!;
+         var versionFilter = CreateVersionFilter(dependencyInfo, versionRange);
+ 
+-        return GetVersionsAsync(packageId, currentVersion, versionFilter, nugetContext, logger, cancellationToken);
++        return GetVersionsAsync(projectTfms, packageId, currentVersion, versionFilter, nugetContext, logger, cancellationToken);
+     }
+ 
+     public static async Task<VersionResult> GetVersionsAsync(
++        ImmutableArray<NuGetFramework> projectTfms,
+         string packageId,
+         NuGetVersion currentVersion,
+         Func<NuGetVersion, bool> versionFilter,
+@@ -62,7 +66,14 @@ public static async Task<VersionResult> GetVersionsAsync(
+             var feed = await sourceRepository.GetResourceAsync<MetadataResource>();
+             if (feed is null)
+             {
+-                logger.Warn($"Failed to get MetadataResource for [{source.Source}]");
++                logger.Warn($"Failed to get {nameof(MetadataResource)} for [{source.Source}]");
++                continue;
++            }
++
++            var packageFinder = await sourceRepository.GetResourceAsync<FindPackageByIdResource>();
++            if (packageFinder is null)
++            {
++                logger.Warn($"Failed to get {nameof(FindPackageByIdResource)} for [{source.Source}]");
+                 continue;
+             }
+ 
+@@ -100,7 +111,21 @@ public static async Task<VersionResult> GetVersionsAsync(
+                 result.AddCurrentVersionSource(source);
+             }
+ 
+-            result.AddRange(source, feedVersions.Where(versionFilter));
++            var versions = feedVersions.Where(versionFilter).ToArray();
++            foreach (var version in versions)
++            {
++                var isTfmCompatible = await CompatibilityChecker.CheckAsync(
++                    new PackageIdentity(packageId, version),
++                    projectTfms,
++                    nugetContext,
++                    logger,
++                    CancellationToken.None);
++                if (isTfmCompatible || projectTfms.IsEmpty)
++                {
++                    // dotnet-tools.json and global.json packages won't specify a TFM, so they're always compatible
++                    result.Add(source, version);
++                }
++            }
+         }
+ 
+         return result;
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionResult.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionResult.cs
+index 2c7d304ec28..337b6f345a6 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionResult.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Analyze/VersionResult.cs
+@@ -22,18 +22,15 @@ public void AddCurrentVersionSource(PackageSource source)
+         _currentVersionSources.Add(source);
+     }
+ 
+-    public void AddRange(PackageSource source, IEnumerable<NuGetVersion> versions)
++    public void Add(PackageSource source, NuGetVersion version)
+     {
+-        foreach (var version in versions)
++        if (_versions.ContainsKey(version))
+         {
+-            if (_versions.ContainsKey(version))
+-            {
+-                _versions[version].Add(source);
+-            }
+-            else
+-            {
+-                _versions.Add(version, [source]);
+-            }
++            _versions[version].Add(source);
++        }
++        else
++        {
++            _versions.Add(version, [source]);
+         }
+     }
+ 
+diff --git a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Utilities/DependencyConflictResolver.cs b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Utilities/DependencyConflictResolver.cs
+index 34fe141ff3f..fe2dd26653c 100644
+--- a/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Utilities/DependencyConflictResolver.cs
++++ b/nuget/helpers/lib/NuGetUpdater/NuGetUpdater.Core/Utilities/DependencyConflictResolver.cs
+@@ -420,6 +420,8 @@ public async Task<string> UpdateVersion(List<PackageToUpdate> existingPackages,
+                     }
+                 }
+ 
++                var projectFramework = NuGetFramework.Parse(targetFramework);
++
+                 // Get the parent packages of the package and check the compatibility between its family
+                 HashSet<PackageToUpdate> parentPackages = GetParentPackages(package);
+ 
+@@ -458,7 +460,7 @@ public async Task<string> UpdateVersion(List<PackageToUpdate> existingPackages,
+                             string currentVersionString = parent.CurrentVersion;
+                             NuGetVersion currentVersionParent = NuGetVersion.Parse(currentVersionString);
+ 
+-                            var result = await VersionFinder.GetVersionsAsync(parent.PackageName, currentVersionParent, nugetContext, logger, CancellationToken.None);
++                            var result = await VersionFinder.GetVersionsAsync([projectFramework], parent.PackageName, currentVersionParent, nugetContext, logger, CancellationToken.None);
+                             var versions = result.GetVersions();
+                             NuGetVersion latestVersion = versions.Where(v => !v.IsPrerelease).Max();
+ 
+@@ -565,8 +567,9 @@ public async Task<NuGetVersion> FindCompatibleVersionAsync(List<PackageToUpdate>
+ 
+         // Create a NugetContext instance to get the latest versions of the parent
+         NuGetContext nugetContext = new NuGetContext(Path.GetDirectoryName(projectPath));
++        var projectFramework = NuGetFramework.Parse(targetFramework);
+ 
+-        var result = await VersionFinder.GetVersionsAsync(possibleParent.PackageName, CurrentVersion, nugetContext, logger, CancellationToken.None);
++        var result = await VersionFinder.GetVersionsAsync([projectFramework], possibleParent.PackageName, CurrentVersion, nugetContext, logger, CancellationToken.None);
+         var versions = result.GetVersions();
+ 
+         // If there are no versions

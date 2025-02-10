@@ -1,0 +1,150 @@
+diff --git a/tpl/collections/merge.go b/tpl/collections/merge.go
+index 8c019e412a1..b9696b5026c 100644
+--- a/tpl/collections/merge.go
++++ b/tpl/collections/merge.go
+@@ -75,9 +75,13 @@ func caseInsensitiveLookup(m, k reflect.Value) (reflect.Value, bool) {
+ 		return v, hreflect.IsTruthfulValue(v)
+ 	}
+ 
+-	for _, key := range m.MapKeys() {
+-		if strings.EqualFold(k.String(), key.String()) {
+-			return m.MapIndex(key), true
++	k2 := reflect.New(m.Type().Key()).Elem()
++
++	iter := m.MapRange()
++	for iter.Next() {
++		k2.SetIterKey(iter)
++		if strings.EqualFold(k.String(), k2.String()) {
++			return iter.Value(), true
+ 		}
+ 	}
+ 
+@@ -90,17 +94,28 @@ func mergeMap(dst, src reflect.Value) reflect.Value {
+ 	// If the destination is Params, we must lower case all keys.
+ 	_, lowerCase := dst.Interface().(maps.Params)
+ 
++	k := reflect.New(dst.Type().Key()).Elem()
++	v := reflect.New(dst.Type().Elem()).Elem()
++
+ 	// Copy the destination map.
+-	for _, key := range dst.MapKeys() {
+-		v := dst.MapIndex(key)
+-		out.SetMapIndex(key, v)
++	iter := dst.MapRange()
++	for iter.Next() {
++		k.SetIterKey(iter)
++		v.SetIterValue(iter)
++		out.SetMapIndex(k, v)
+ 	}
+ 
+ 	// Add all keys in src not already in destination.
+ 	// Maps of the same type will be merged.
+-	for _, key := range src.MapKeys() {
+-		sv := src.MapIndex(key)
+-		dv, found := caseInsensitiveLookup(dst, key)
++	k = reflect.New(src.Type().Key()).Elem()
++	sv := reflect.New(src.Type().Elem()).Elem()
++
++	iter = src.MapRange()
++	for iter.Next() {
++		sv.SetIterValue(iter)
++		k.SetIterKey(iter)
++
++		dv, found := caseInsensitiveLookup(dst, k)
+ 
+ 		if found {
+ 			// If both are the same map key type, merge.
+@@ -112,14 +127,15 @@ func mergeMap(dst, src reflect.Value) reflect.Value {
+ 				}
+ 
+ 				if dve.Type().Key() == sve.Type().Key() {
+-					out.SetMapIndex(key, mergeMap(dve, sve))
++					out.SetMapIndex(k, mergeMap(dve, sve))
+ 				}
+ 			}
+ 		} else {
+-			if lowerCase && key.Kind() == reflect.String {
+-				key = reflect.ValueOf(strings.ToLower(key.String()))
++			kk := k
++			if lowerCase && k.Kind() == reflect.String {
++				kk = reflect.ValueOf(strings.ToLower(k.String()))
+ 			}
+-			out.SetMapIndex(key, sv)
++			out.SetMapIndex(kk, sv)
+ 		}
+ 	}
+ 
+diff --git a/tpl/collections/sort.go b/tpl/collections/sort.go
+index 2040f8490c5..20862a45145 100644
+--- a/tpl/collections/sort.go
++++ b/tpl/collections/sort.go
+@@ -99,18 +99,21 @@ func (ns *Namespace) Sort(ctx context.Context, l any, args ...any) (any, error)
+ 		}
+ 
+ 	case reflect.Map:
+-		keys := seqv.MapKeys()
+-		for i := 0; i < seqv.Len(); i++ {
+-			p.Pairs[i].Value = seqv.MapIndex(keys[i])
+ 
++		iter := seqv.MapRange()
++		i := 0
++		for iter.Next() {
++			key := iter.Key()
++			value := iter.Value()
++			p.Pairs[i].Value = value
+ 			if sortByField == "" {
+-				p.Pairs[i].Key = keys[i]
++				p.Pairs[i].Key = key
+ 			} else if sortByField == "value" {
+ 				p.Pairs[i].Key = p.Pairs[i].Value
+ 			} else {
+ 				v := p.Pairs[i].Value
+ 				var err error
+-				for i, elemName := range path {
++				for j, elemName := range path {
+ 					v, err = evaluateSubElem(ctxv, v, elemName)
+ 					if err != nil {
+ 						return nil, err
+@@ -120,12 +123,13 @@ func (ns *Namespace) Sort(ctx context.Context, l any, args ...any) (any, error)
+ 					}
+ 					// Special handling of lower cased maps.
+ 					if params, ok := v.Interface().(maps.Params); ok {
+-						v = reflect.ValueOf(params.GetNested(path[i+1:]...))
++						v = reflect.ValueOf(params.GetNested(path[j+1:]...))
+ 						break
+ 					}
+ 				}
+ 				p.Pairs[i].Key = v
+ 			}
++			i++
+ 		}
+ 	}
+ 
+diff --git a/tpl/collections/where.go b/tpl/collections/where.go
+index bf3f750447a..a14a4863d37 100644
+--- a/tpl/collections/where.go
++++ b/tpl/collections/where.go
+@@ -409,7 +409,6 @@ func (ns *Namespace) checkWhereArray(ctxv, seqv, kv, mv reflect.Value, path []st
+ 				for i, elemName := range path {
+ 					var err error
+ 					vvv, err = evaluateSubElem(ctxv, vvv, elemName)
+-
+ 					if err != nil {
+ 						continue
+ 					}
+@@ -442,9 +441,12 @@ func (ns *Namespace) checkWhereArray(ctxv, seqv, kv, mv reflect.Value, path []st
+ // checkWhereMap handles the where-matching logic when the seqv value is a Map.
+ func (ns *Namespace) checkWhereMap(ctxv, seqv, kv, mv reflect.Value, path []string, op string) (any, error) {
+ 	rv := reflect.MakeMap(seqv.Type())
+-	keys := seqv.MapKeys()
+-	for _, k := range keys {
+-		elemv := seqv.MapIndex(k)
++	k := reflect.New(seqv.Type().Key()).Elem()
++	elemv := reflect.New(seqv.Type().Elem()).Elem()
++	iter := seqv.MapRange()
++	for iter.Next() {
++		k.SetIterKey(iter)
++		elemv.SetIterValue(iter)
+ 		switch elemv.Kind() {
+ 		case reflect.Array, reflect.Slice:
+ 			r, err := ns.checkWhereArray(ctxv, elemv, kv, mv, path, op)

@@ -1,0 +1,245 @@
+diff --git a/.app_version b/.app_version
+index 727d97b9..144996ed 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.20.2
++0.20.3
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 99c1a9d8..bdd8fea7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.20.3 - 2024-12-20
++
++### Added
++
++- A button on a year stats card to update stats for the whole year.
++- A button on a month stats card to update stats for a specific month.
++- A confirmation alert on the Notifications page before deleting all notifications.
++
+ # 0.20.2 - 2024-12-17
+ 
+ ### Added
+diff --git a/app/controllers/stats_controller.rb b/app/controllers/stats_controller.rb
+index 2305a44e..b7e68f41 100644
+--- a/app/controllers/stats_controller.rb
++++ b/app/controllers/stats_controller.rb
+@@ -16,6 +16,22 @@ def show
+   end
+ 
+   def update
++    if params[:month] == 'all'
++      (1..12).each do |month|
++        Stats::CalculatingJob.perform_later(current_user.id, params[:year], month)
++      end
++
++      target = "the whole #{params[:year]}"
++    else
++      Stats::CalculatingJob.perform_later(current_user.id, params[:year], params[:month])
++
++      target = "#{Date::MONTHNAMES[params[:month].to_i]} of #{params[:year]}"
++    end
++
++    redirect_to stats_path, notice: "Stats for #{target} are being updated", status: :see_other
++  end
++
++  def update_all
+     current_user.years_tracked.each do |year|
+       year[:months].each do |month|
+         Stats::CalculatingJob.perform_later(
+diff --git a/app/jobs/stats/calculating_job.rb b/app/jobs/stats/calculating_job.rb
+index 02da4d5e..ac28ccf6 100644
+--- a/app/jobs/stats/calculating_job.rb
++++ b/app/jobs/stats/calculating_job.rb
+@@ -19,8 +19,8 @@ def create_stats_updated_notification(user_id, year, month)
+     Notifications::Create.new(
+       user:,
+       kind: :info,
+-      title: "Stats updated: #{year}-#{month}",
+-      content: "Stats updated for #{year}-#{month}"
++      title: "Stats updated for #{Date::MONTHNAMES[month.to_i]} of #{year}",
++      content: "Stats updated for #{Date::MONTHNAMES[month.to_i]} of #{year}"
+     ).call
+   end
+ 
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 796cf738..64e45425 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -1,8 +1,6 @@
+ # frozen_string_literal: true
+ 
+ class User < ApplicationRecord
+-  # Include default devise modules. Others available are:
+-  # :confirmable, :lockable, :timeoutable, and :omniauthable
+   devise :database_authenticatable, :registerable,
+          :recoverable, :rememberable, :validatable, :trackable
+ 
+diff --git a/app/services/stats/calculate_month.rb b/app/services/stats/calculate_month.rb
+index b99b2603..324cc3a7 100644
+--- a/app/services/stats/calculate_month.rb
++++ b/app/services/stats/calculate_month.rb
+@@ -3,8 +3,8 @@
+ class Stats::CalculateMonth
+   def initialize(user_id, year, month)
+     @user = User.find(user_id)
+-    @year = year
+-    @month = month
++    @year = year.to_i
++    @month = month.to_i
+   end
+ 
+   def call
+diff --git a/app/views/notifications/index.html.erb b/app/views/notifications/index.html.erb
+index 09e760fb..43b2ff51 100644
+--- a/app/views/notifications/index.html.erb
++++ b/app/views/notifications/index.html.erb
+@@ -7,7 +7,7 @@
+         <%= link_to "Mark all as read", mark_notifications_as_read_path, method: :post, data: { turbo_method: :post }, class: "btn btn-sm btn-primary" %>&nbsp;
+       <% end %>
+       <% if @notifications.any? %>
+-        <%= link_to "Delete all", delete_all_notifications_path, method: :post, data: { turbo_method: :post }, class: "btn btn-sm btn-warning" %>
++        <%= link_to "Delete all", delete_all_notifications_path, method: :post, data: { turbo_method: :post, turbo_confirm: 'Are you sure you want to delete all notifications?' }, class: "btn btn-sm btn-warning" %>
+       <% end %>
+     </div>
+     <div class="mb-4">
+diff --git a/app/views/stats/_stat.html.erb b/app/views/stats/_stat.html.erb
+index 4309c3b0..f8e59e04 100644
+--- a/app/views/stats/_stat.html.erb
++++ b/app/views/stats/_stat.html.erb
+@@ -1,10 +1,16 @@
+ <div id="<%= dom_id stat %>" class="card w-full bg-base-200 shadow-xl">
+   <div class="card-body">
+-    <h2 class="card-title">
+-      <%= link_to map_url(timespan(stat.month, stat.year)), class: "underline hover:no-underline text-#{header_colors.sample}" do %>
+-        <%= "#{Date::MONTHNAMES[stat.month]} of #{stat.year}" %>
+-      <% end %>
+-    </h2>
++    <div class="flex justify-between items-center">
++      <h2 class="card-title">
++        <%= link_to map_url(timespan(stat.month, stat.year)), class: "underline hover:no-underline text-#{header_colors.sample}" do %>
++          <%= Date::MONTHNAMES[stat.month] %>
++        <% end %>
++      </h2>
++
++      <div class="flex items-center gap-2">
++        <%= link_to '[Update]', update_year_month_stats_path(stat.year, stat.month), data: { turbo_method: :put }, class: 'text-sm text-gray-500 hover:underline' %>
++      </div>
++    </div>
+     <p><%= stat.distance %><%= DISTANCE_UNIT %></p>
+     <% if REVERSE_GEOCODING_ENABLED %>
+       <div class="card-actions justify-end">
+diff --git a/app/views/stats/index.html.erb b/app/views/stats/index.html.erb
+index ee3b33cd..d67037de 100644
+--- a/app/views/stats/index.html.erb
++++ b/app/views/stats/index.html.erb
+@@ -21,15 +21,18 @@
+     <% end %>
+   </div>
+ 
+-  <%= link_to 'Update stats', stats_path, data: { 'turbo-method' => :post }, class: 'btn btn-primary mt-5' %>
++  <%= link_to 'Update stats', update_all_stats_path, data: { turbo_method: :put }, class: 'btn btn-primary mt-5' %>
+ 
+-  <div class="mt-5 grid grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-6 p-4">
++  <div class="mt-6 grid grid-cols-1 sm:grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-6">
+     <% @stats.each do |year, stats| %>
+       <div class="card w-full bg-base-200 shadow-xl">
+         <div class="card-body">
+-          <h2 class="card-title text-<%= header_colors.sample %>">
+-            <%= link_to year, "/stats/#{year}", class: 'underline hover:no-underline' %>
+-            <%= link_to '[Map]', map_url(year_timespan(year)), class: 'underline hover:no-underline' %>
++          <h2 class="card-title justify-between text-<%= header_colors.sample %>">
++            <div>
++              <%= link_to year, "/stats/#{year}", class: 'underline hover:no-underline' %>
++              <%= link_to '[Map]', map_url(year_timespan(year)), class: 'underline hover:no-underline' %>
++            </div>
++            <%= link_to '[Update]', update_year_month_stats_path(year, :all), data: { turbo_method: :put }, class: 'text-sm text-gray-500 hover:underline' %>
+           </h2>
+           <p>
+             <% cache [current_user, 'year_distance_stat', year], skip_digest: true do %>
+diff --git a/config/routes.rb b/config/routes.rb
+index 4478d7db..8d28efde 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -41,10 +41,14 @@
+   post 'notifications/destroy_all', to: 'notifications#destroy_all', as: :delete_all_notifications
+   resources :stats, only: :index do
+     collection do
+-      post :update
++      put :update_all
+     end
+   end
+   get 'stats/:year', to: 'stats#show', constraints: { year: /\d{4}/ }
++  put 'stats/:year/:month/update',
++      to: 'stats#update',
++      as: :update_year_month_stats,
++      constraints: { year: /\d{4}/, month: /\d{1,2}|all/ }
+ 
+   root to: 'home#index'
+   devise_for :users, skip: [:registrations]
+@@ -53,8 +57,6 @@
+     put 'users' => 'devise/registrations#update', :as => 'user_registration'
+   end
+ 
+-  # And then modify the app/views/devise/shared/_links.erb
+-
+   get 'map', to: 'map#index'
+ 
+   namespace :api do
+diff --git a/spec/requests/stats_spec.rb b/spec/requests/stats_spec.rb
+index 224cb3b5..c7473bed 100644
+--- a/spec/requests/stats_spec.rb
++++ b/spec/requests/stats_spec.rb
+@@ -27,12 +27,10 @@
+   end
+ 
+   context 'when user is signed in' do
+-    before do
+-      sign_in user
+-    end
+-
+     let(:user) { create(:user) }
+ 
++    before { sign_in user }
++
+     describe 'GET /index' do
+       it 'renders a successful response' do
+         get stats_url
+@@ -54,10 +52,32 @@
+     describe 'POST /update' do
+       let(:stat) { create(:stat, user:, year: 2024) }
+ 
++      context 'when updating a specific month' do
++        it 'enqueues Stats::CalculatingJob for the given year and month' do
++          put update_year_month_stats_url(year: '2024', month: '1')
++
++          expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, '2024', '1')
++        end
++      end
++
++      context 'when updating the whole year' do
++        it 'enqueues Stats::CalculatingJob for each month of the year' do
++          put update_year_month_stats_url(year: '2024', month: 'all')
++
++          (1..12).each do |month|
++            expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, '2024', month)
++          end
++        end
++      end
++    end
++
++    describe 'PUT /update_all' do
++      let(:stat) { create(:stat, user:, year: 2024) }
++
+       it 'enqueues Stats::CalculatingJob for each tracked year and month' do
+         allow(user).to receive(:years_tracked).and_return([{ year: 2024, months: %w[Jan Feb] }])
+ 
+-        post stats_url
++        put update_all_stats_url
+ 
+         expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 1)
+         expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 2)

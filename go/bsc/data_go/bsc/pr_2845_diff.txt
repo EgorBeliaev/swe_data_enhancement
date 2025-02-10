@@ -1,0 +1,189 @@
+diff --git a/consensus/consensus.go b/consensus/consensus.go
+index 54aef4e82b..9128aa6da2 100644
+--- a/consensus/consensus.go
++++ b/consensus/consensus.go
+@@ -161,4 +161,6 @@ type PoSA interface {
+ 	GetFinalizedHeader(chain ChainHeaderReader, header *types.Header) *types.Header
+ 	VerifyVote(chain ChainHeaderReader, vote *types.VoteEnvelope) error
+ 	IsActiveValidatorAt(chain ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool
++	BlockInterval() uint64
++	NextProposalBlock(chain ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error)
+ }
+diff --git a/consensus/parlia/parlia.go b/consensus/parlia/parlia.go
+index bce6757b63..9b7d255d61 100644
+--- a/consensus/parlia/parlia.go
++++ b/consensus/parlia/parlia.go
+@@ -2123,6 +2123,19 @@ func (p *Parlia) backOffTime(snap *Snapshot, header *types.Header, val common.Ad
+ 	}
+ }
+ 
++func (p *Parlia) BlockInterval() uint64 {
++	return p.config.Period
++}
++
++func (p *Parlia) NextProposalBlock(chain consensus.ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error) {
++	snap, err := p.snapshot(chain, header.Number.Uint64(), header.Hash(), nil)
++	if err != nil {
++		return 0, 0, err
++	}
++
++	return snap.nextProposalBlock(proposer)
++}
++
+ // chain context
+ type chainContext struct {
+ 	Chain  consensus.ChainHeaderReader
+diff --git a/consensus/parlia/snapshot.go b/consensus/parlia/snapshot.go
+index 339736771d..d474c06041 100644
+--- a/consensus/parlia/snapshot.go
++++ b/consensus/parlia/snapshot.go
+@@ -411,6 +411,37 @@ func (s *Snapshot) inturnValidator() common.Address {
+ 	return validators[offset]
+ }
+ 
++func (s *Snapshot) nexValidatorsChangeBlock() uint64 {
++	currentEpoch := s.Number - s.Number%s.config.Epoch
++	checkLen := s.minerHistoryCheckLen()
++	if s.Number%s.config.Epoch < checkLen {
++		return currentEpoch + checkLen
++	}
++	return currentEpoch + s.config.Epoch + checkLen
++}
++
++// nextProposalBlock returns the validator next proposal block.
++func (s *Snapshot) nextProposalBlock(proposer common.Address) (uint64, uint64, error) {
++	validators := s.validators()
++	currentIndex := int(s.Number / uint64(s.TurnLength) % uint64(len(validators)))
++	expectIndex := s.indexOfVal(proposer)
++	if expectIndex < 0 {
++		return 0, 0, errors.New("proposer not in validator set")
++	}
++	startBlock := s.Number + uint64(((expectIndex+len(validators)-currentIndex)%len(validators))*int(s.TurnLength))
++	startBlock = startBlock - startBlock%uint64(s.TurnLength)
++	endBlock := startBlock + uint64(s.TurnLength) - 1
++
++	changeValidatorsBlock := s.nexValidatorsChangeBlock()
++	if startBlock >= changeValidatorsBlock {
++		return 0, 0, errors.New("next proposal block is out of current epoch")
++	}
++	if endBlock >= changeValidatorsBlock {
++		endBlock = changeValidatorsBlock
++	}
++	return startBlock, endBlock, nil
++}
++
+ func (s *Snapshot) enoughDistance(validator common.Address, header *types.Header) bool {
+ 	idx := s.indexOfVal(validator)
+ 	if idx < 0 {
+diff --git a/eth/backend.go b/eth/backend.go
+index fad49c3a49..b8f565d460 100644
+--- a/eth/backend.go
++++ b/eth/backend.go
+@@ -637,6 +637,9 @@ func (s *Ethereum) setupDiscovery() error {
+ // Stop implements node.Lifecycle, terminating all internal goroutines used by the
+ // Ethereum protocol.
+ func (s *Ethereum) Stop() error {
++	if s.miner.Mining() {
++		s.miner.TryWaitProposalDoneWhenStopping()
++	}
+ 	// Stop all the peer-related stuff first.
+ 	s.discmix.Close()
+ 	s.handler.Stop()
+diff --git a/miner/miner.go b/miner/miner.go
+index c54235f5ff..c43fbf024e 100644
+--- a/miner/miner.go
++++ b/miner/miner.go
+@@ -174,6 +174,10 @@ func (miner *Miner) InTurn() bool {
+ 	return miner.worker.inTurn()
+ }
+ 
++func (miner *Miner) TryWaitProposalDoneWhenStopping() {
++	miner.worker.tryWaitProposalDoneWhenStopping()
++}
++
+ // Pending returns the currently pending block and associated receipts, logs
+ // and statedb. The returned values can be nil in case the pending block is
+ // not initialized.
+diff --git a/miner/minerconfig/config.go b/miner/minerconfig/config.go
+index 35b0aa97e8..36e43e0b66 100644
+--- a/miner/minerconfig/config.go
++++ b/miner/minerconfig/config.go
+@@ -28,14 +28,15 @@ import (
+ 
+ // Config is the configuration parameters of mining.
+ type Config struct {
+-	Etherbase     common.Address `toml:",omitempty"` // Public address for block mining rewards
+-	ExtraData     hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+-	DelayLeftOver time.Duration  // Time reserved to finalize a block(calculate root, distribute income...)
+-	GasFloor      uint64         // Target gas floor for mined blocks.
+-	GasCeil       uint64         // Target gas ceiling for mined blocks.
+-	GasPrice      *big.Int       // Minimum gas price for mining a transaction
+-	Recommit      time.Duration  // The time interval for miner to re-create mining work.
+-	VoteEnable    bool           // Whether to vote when mining
++	Etherbase             common.Address `toml:",omitempty"` // Public address for block mining rewards
++	ExtraData             hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
++	DelayLeftOver         time.Duration  // Time reserved to finalize a block(calculate root, distribute income...)
++	GasFloor              uint64         // Target gas floor for mined blocks.
++	GasCeil               uint64         // Target gas ceiling for mined blocks.
++	GasPrice              *big.Int       // Minimum gas price for mining a transaction
++	Recommit              time.Duration  // The time interval for miner to re-create mining work.
++	VoteEnable            bool           // Whether to vote when mining
++	MaxWaitProposalInSecs uint64         // The maximum time to wait for the proposal to be done, it's aimed to prevent validator being slashed when restarting
+ 
+ 	DisableVoteAttestation bool // Whether to skip assembling vote attestation
+ 
+@@ -54,6 +55,10 @@ var DefaultConfig = Config{
+ 	Recommit:      3 * time.Second,
+ 	DelayLeftOver: 50 * time.Millisecond,
+ 
++	// The default value is set to 30 seconds.
++	// Because the avg restart time in mainnet is around 30s, so the node try to wait for the next multi-proposals to be done.
++	MaxWaitProposalInSecs: 30,
++
+ 	Mev: DefaultMevConfig,
+ }
+ 
+diff --git a/miner/worker.go b/miner/worker.go
+index e600e17546..1418eb7340 100644
+--- a/miner/worker.go
++++ b/miner/worker.go
+@@ -1508,6 +1508,39 @@ func (w *worker) getSealingBlock(params *generateParams) *newPayloadResult {
+ 	}
+ }
+ 
++func (w *worker) tryWaitProposalDoneWhenStopping() {
++	posa, ok := w.engine.(consensus.PoSA)
++	// if the consensus is not PoSA, just skip waiting
++	if !ok {
++		return
++	}
++
++	currentHeader := w.chain.CurrentBlock()
++	currentBlock := currentHeader.Number.Uint64()
++	startBlock, endBlock, err := posa.NextProposalBlock(w.chain, currentHeader, w.coinbase)
++	if err != nil {
++		log.Warn("Failed to get next proposal block, skip waiting", "err", err)
++		return
++	}
++
++	log.Info("Checking miner's next proposal block", "current", currentBlock,
++		"proposalStart", startBlock, "proposalEnd", endBlock, "maxWait", w.config.MaxWaitProposalInSecs)
++	if endBlock <= currentBlock {
++		log.Warn("next proposal end block has passed, ignore")
++		return
++	}
++	if startBlock > currentBlock && (startBlock-currentBlock)*posa.BlockInterval() > w.config.MaxWaitProposalInSecs {
++		log.Warn("the next proposal start block is too far, just skip waiting")
++		return
++	}
++
++	// wait one more block for safety
++	waitSecs := (endBlock - currentBlock + 1) * posa.BlockInterval()
++	log.Info("The miner will propose in later, waiting for the proposal to be done",
++		"currentBlock", currentBlock, "nextProposalStart", startBlock, "nextProposalEnd", endBlock, "waitTime", waitSecs)
++	time.Sleep(time.Duration(waitSecs) * time.Second)
++}
++
+ // copyReceipts makes a deep copy of the given receipts.
+ func copyReceipts(receipts []*types.Receipt) []*types.Receipt {
+ 	result := make([]*types.Receipt, len(receipts))

@@ -1,0 +1,2219 @@
+diff --git a/.gitignore b/.gitignore
+index 5f7b8d3809..a25df7bb36 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,3 @@
+-.idea/
+ /web/node_modules
+ /web/dist
+ 
+@@ -33,3 +32,11 @@ server/uploads/
+ *.iml
+ web/.pnpm-debug.log
+ web/pnpm-lock.yaml
++
++# binary files
++*.exe
++
++# SQLite database files
++*.db
++*.sqlite
++*.sqlite3
+diff --git a/Makefile b/Makefile
+index 4b193fc6d6..9135c9ad9c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -13,16 +13,9 @@ CONFIG_FILE         = config.yaml
+ IMAGE_NAME          = gva
+ #镜像地址
+ REPOSITORY          = registry.cn-hangzhou.aliyuncs.com/${IMAGE_NAME}
+-
+-ifeq ($(TAGS_OPT),)
+-TAGS_OPT            = latest
+-else
+-endif
+-
+-ifeq ($(PLUGIN),)
+-PLUGIN            = email
+-else
+-endif
++#镜像版本
++TAGS_OPT           ?= latest
++PLUGIN             ?= email
+ 
+ #容器环境前后端共同打包
+ build: build-web build-server
+@@ -48,7 +41,7 @@ build-image-server:
+ build-local:
+ 	if [ -d "build" ];then rm -rf build; else echo "OK!"; fi \
+ 	&& if [ -f "/.dockerenv" ];then echo "OK!"; else  make build-web-local && make build-server-local; fi \
+-	&& mkdir build && cp -r web/dist build/ && cp server/server build/ && cp -r server/resource build/resource 
++	&& mkdir build && cp -r web/dist build/ && cp server/server build/ && cp -r server/resource build/resource
+ 
+ #本地环境打包前端
+ build-web-local:
+@@ -63,13 +56,17 @@ build-server-local:
+ 	&& go build -ldflags "-B 0x$(shell head -c20 /dev/urandom|od -An -tx1|tr -d ' \n') -X main.Version=${TAGS_OPT}" -v
+ 
+ #打包前后端二合一镜像
+-image: build 
++image: build
+ 	docker build -t ${REPOSITORY}/gin-vue-admin:${TAGS_OPT} -f deploy/docker/Dockerfile .
+ 
+ #尝鲜版
+ images: build build-image-web build-image-server
+ 	docker build -t ${REPOSITORY}/all:${TAGS_OPT} -f deploy/docker/Dockerfile .
+-	
++
++#swagger 文档生成
++doc:
++	@cd server && swag init
++
+ #插件快捷打包： make plugin PLUGIN="这里是插件文件夹名称,默认为email"
+ plugin:
+ 	if [ -d ".plugin" ];then rm -rf .plugin ; else echo "OK!"; fi && mkdir -p .plugin/${PLUGIN}/{server/plugin,web/plugin} \
+diff --git a/server/api/v1/system/sys_export_template.go b/server/api/v1/system/sys_export_template.go
+index 38b22965be..9b83a17c43 100644
+--- a/server/api/v1/system/sys_export_template.go
++++ b/server/api/v1/system/sys_export_template.go
+@@ -213,7 +213,7 @@ func (sysExportTemplateApi *SysExportTemplateApi) ExportExcel(c *gin.Context) {
+ // @Security ApiKeyAuth
+ // @accept application/json
+ // @Produce application/json
+-// @Router /sysExportTemplate/exportExcel [get]
++// @Router /sysExportTemplate/ExportTemplate [get]
+ func (sysExportTemplateApi *SysExportTemplateApi) ExportTemplate(c *gin.Context) {
+ 	templateID := c.Query("templateID")
+ 	if templateID == "" {
+diff --git a/server/core/server.go b/server/core/server.go
+index 796deb7a17..3cbe33dc43 100644
+--- a/server/core/server.go
++++ b/server/core/server.go
+@@ -39,8 +39,8 @@ func RunWindowsServer() {
+ 
+ 	fmt.Printf(`
+ 	欢迎使用 gin-vue-admin
+-	当前版本:v2.7.8-beta1
+-    加群方式:微信号：shouzi_1994 QQ群：470239250
++	当前版本:v2.7.8
++	加群方式:微信号：shouzi_1994 QQ群：470239250
+ 	项目地址：https://github.com/flipped-aurora/gin-vue-admin
+ 	插件市场:https://plugin.gin-vue-admin.com
+ 	GVA讨论社区:https://support.qq.com/products/371961
+diff --git a/server/docs/docs.go b/server/docs/docs.go
+index 4ae77cef93..2826291942 100644
+--- a/server/docs/docs.go
++++ b/server/docs/docs.go
+@@ -9080,7 +9080,7 @@ const docTemplate = `{
+ 
+ // SwaggerInfo holds exported Swagger Info so clients can modify it
+ var SwaggerInfo = &swag.Spec{
+-	Version:          "v2.7.8-beta1",
++	Version:          "v2.7.8",
+ 	Host:             "",
+ 	BasePath:         "",
+ 	Schemes:          []string{},
+diff --git a/server/initialize/internal/gorm.go b/server/initialize/internal/gorm.go
+index dcf388bea2..ebf5526c3c 100644
+--- a/server/initialize/internal/gorm.go
++++ b/server/initialize/internal/gorm.go
+@@ -6,8 +6,6 @@ import (
+ 	"gorm.io/gorm"
+ 	"gorm.io/gorm/logger"
+ 	"gorm.io/gorm/schema"
+-	"log"
+-	"os"
+ 	"time"
+ )
+ 
+@@ -34,7 +32,7 @@ func (g *_gorm) Config(prefix string, singular bool) *gorm.Config {
+ 		general = global.GVA_CONFIG.Mysql.GeneralDB
+ 	}
+ 	return &gorm.Config{
+-		Logger: logger.New(NewWriter(general, log.New(os.Stdout, "\r\n", log.LstdFlags)), logger.Config{
++		Logger: logger.New(NewWriter(general), logger.Config{
+ 			SlowThreshold: 200 * time.Millisecond,
+ 			LogLevel:      general.LogLevel(),
+ 			Colorful:      true,
+diff --git a/server/initialize/internal/gorm_logger_writer.go b/server/initialize/internal/gorm_logger_writer.go
+index 955503d873..9774c96350 100644
+--- a/server/initialize/internal/gorm_logger_writer.go
++++ b/server/initialize/internal/gorm_logger_writer.go
+@@ -3,7 +3,7 @@ package internal
+ import (
+ 	"fmt"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/config"
+-	"go.uber.org/zap"
++	"github.com/flipped-aurora/gin-vue-admin/server/global"
+ 	"gorm.io/gorm/logger"
+ )
+ 
+@@ -12,26 +12,30 @@ type Writer struct {
+ 	writer logger.Writer
+ }
+ 
+-func NewWriter(config config.GeneralDB, writer logger.Writer) *Writer {
+-	return &Writer{config: config, writer: writer}
++func NewWriter(config config.GeneralDB) *Writer {
++	return &Writer{config: config}
+ }
+ 
+ // Printf 格式化打印日志
+ func (c *Writer) Printf(message string, data ...any) {
++
++	// 当有日志时候均需要输出到控制台
++	fmt.Printf(message, data...)
++
++	// 当开启了zap的情况，会打印到日志记录
+ 	if c.config.LogZap {
+ 		switch c.config.LogLevel() {
+ 		case logger.Silent:
+-			zap.L().Debug(fmt.Sprintf(message, data...))
++			global.GVA_LOG.Debug(fmt.Sprintf(message, data...))
+ 		case logger.Error:
+-			zap.L().Error(fmt.Sprintf(message, data...))
++			global.GVA_LOG.Error(fmt.Sprintf(message, data...))
+ 		case logger.Warn:
+-			zap.L().Warn(fmt.Sprintf(message, data...))
++			global.GVA_LOG.Warn(fmt.Sprintf(message, data...))
+ 		case logger.Info:
+-			zap.L().Info(fmt.Sprintf(message, data...))
++			global.GVA_LOG.Info(fmt.Sprintf(message, data...))
+ 		default:
+-			zap.L().Info(fmt.Sprintf(message, data...))
++			global.GVA_LOG.Info(fmt.Sprintf(message, data...))
+ 		}
+ 		return
+ 	}
+-	c.writer.Printf(message, data...)
+ }
+diff --git a/server/main.go b/server/main.go
+index a01b4159d9..226565f902 100644
+--- a/server/main.go
++++ b/server/main.go
+@@ -13,8 +13,15 @@ import (
+ //go:generate go mod tidy
+ //go:generate go mod download
+ 
++// 这部分 @Tag 设置用于排序, 需要排序的接口请按照下面的格式添加
++// swag init 对 @Tag 只会从入口文件解析, 默认 main.go
++// 也可通过 --generalInfo flag 指定其他文件
++// @Tag.Name        Base
++// @Tag.Name        SysUser
++// @Tag.Description 用户
++
+ // @title                       Gin-Vue-Admin Swagger API接口文档
+-// @version                     v2.7.8-beta1
++// @version                     v2.7.8
+ // @description                 使用gin+vue进行极速开发的全栈开发基础平台
+ // @securityDefinitions.apikey  ApiKeyAuth
+ // @in                          header
+diff --git a/server/middleware/limit_ip.go b/server/middleware/limit_ip.go
+index 315010b223..acc6e98b62 100644
+--- a/server/middleware/limit_ip.go
++++ b/server/middleware/limit_ip.go
+@@ -27,7 +27,7 @@ type LimitConfig struct {
+ func (l LimitConfig) LimitWithTime() gin.HandlerFunc {
+ 	return func(c *gin.Context) {
+ 		if err := l.CheckOrMark(l.GenerationKey(c), l.Expire, l.Limit); err != nil {
+-			c.JSON(http.StatusOK, gin.H{"code": response.ERROR, "msg": err})
++			c.JSON(http.StatusOK, gin.H{"code": response.ERROR, "msg": err.Error()})
+ 			c.Abort()
+ 			return
+ 		} else {
+diff --git a/server/plugin/announcement/model/info.go b/server/plugin/announcement/model/info.go
+index fcaa11f59d..42d62fe0aa 100644
+--- a/server/plugin/announcement/model/info.go
++++ b/server/plugin/announcement/model/info.go
+@@ -8,10 +8,10 @@ import (
+ // Info 公告 结构体
+ type Info struct {
+ 	global.GVA_MODEL
+-	Title       string         `json:"title" form:"title" gorm:"column:title;comment:公告标题;"`                                             //标题
+-	Content     string         `json:"content" form:"content" gorm:"column:content;comment:公告内容;type:text;"`                             //内容
+-	UserID      *int           `json:"userID" form:"userID" gorm:"column:user_id;comment:发布者;"`                                          //作者
+-	Attachments datatypes.JSON `json:"attachments" form:"attachments" gorm:"column:attachments;comment:相关附件;"swaggertype:"array,object"` //附件
++	Title       string         `json:"title" form:"title" gorm:"column:title;comment:公告标题;"`                                              //标题
++	Content     string         `json:"content" form:"content" gorm:"column:content;comment:公告内容;type:text;"`                              //内容
++	UserID      *int           `json:"userID" form:"userID" gorm:"column:user_id;comment:发布者;"`                                           //作者
++	Attachments datatypes.JSON `json:"attachments" form:"attachments" gorm:"column:attachments;comment:相关附件;" swaggertype:"array,object"` //附件
+ }
+ 
+ // TableName 公告 Info自定义表名 gva_announcements_info
+diff --git a/server/resource/function/api.go.tpl b/server/resource/function/api.go.tpl
+index 1d276cff63..4b5bd666ae 100644
+--- a/server/resource/function/api.go.tpl
++++ b/server/resource/function/api.go.tpl
+@@ -2,7 +2,7 @@
+ // {{.FuncName}} {{.FuncDesc}}
+ // @Tags {{.StructName}}
+ // @Summary {{.FuncDesc}}
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/{{.Router}} [{{.Method}}]
+@@ -22,7 +22,7 @@ func (a *{{.Abbreviation}}) {{.FuncName}}(c *gin.Context) {
+ // {{.FuncName}} {{.FuncDesc}}
+ // @Tags {{.StructName}}
+ // @Summary {{.FuncDesc}}
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query {{.Package}}Req.{{.StructName}}Search true "成功"
+ // @Success 200 {object} response.Response{data=object,msg=string} "成功"
+@@ -37,4 +37,4 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api){{.FuncName}}(c *gin.Context) {
+    	}
+    	response.OkWithData("返回数据",c)
+ }
+-{{end}}
+\ No newline at end of file
++{{end}}
+diff --git a/server/resource/function/api.js.tpl b/server/resource/function/api.js.tpl
+index 5cc491fe32..a07b102307 100644
+--- a/server/resource/function/api.js.tpl
++++ b/server/resource/function/api.js.tpl
+@@ -2,7 +2,7 @@
+ // {{.FuncName}} {{.FuncDesc}}
+ // @Tags {{.StructName}}
+ // @Summary {{.FuncDesc}}
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/{{.Router}} [{{.Method}}]
+@@ -18,7 +18,7 @@ export const {{.Router}} = () => {
+ // {{.FuncName}} {{.FuncDesc}}
+ // @Tags {{.StructName}}
+ // @Summary {{.FuncDesc}}
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "成功"
+ // @Router /{{.Abbreviation}}/{{.Router}} [{{.Method}}]
+@@ -29,4 +29,4 @@ export const {{.Router}} = () => {
+   })
+ }
+ 
+-{{- end -}}
+\ No newline at end of file
++{{- end -}}
+diff --git a/server/resource/package/server/api/api.go.tpl b/server/resource/package/server/api/api.go.tpl
+index 5aae0995ff..9495e88e92 100644
+--- a/server/resource/package/server/api/api.go.tpl
++++ b/server/resource/package/server/api/api.go.tpl
+@@ -27,7 +27,7 @@ type {{.StructName}}Api struct {}
+ // @Tags {{.StructName}}
+ // @Summary 创建{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body {{.Package}}.{{.StructName}} true "创建{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "创建成功"
+@@ -55,7 +55,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Create{{.StructName}}(c *gin.Con
+ // @Tags {{.StructName}}
+ // @Summary 删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body {{.Package}}.{{.StructName}} true "删除{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "删除成功"
+@@ -78,7 +78,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Delete{{.StructName}}(c *gin.Con
+ // @Tags {{.StructName}}
+ // @Summary 批量删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{msg=string} "批量删除成功"
+ // @Router /{{.Abbreviation}}/delete{{.StructName}}ByIds [delete]
+@@ -100,7 +100,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Delete{{.StructName}}ByIds(c *gi
+ // @Tags {{.StructName}}
+ // @Summary 更新{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body {{.Package}}.{{.StructName}} true "更新{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "更新成功"
+@@ -128,9 +128,9 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Update{{.StructName}}(c *gin.Con
+ // @Tags {{.StructName}}
+ // @Summary 用id查询{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+-// @Param data query {{.Package}}.{{.StructName}} true "用id查询{{.Description}}"
++// @Param {{.PrimaryField.FieldJson}} query {{.PrimaryField.FieldType}} true "用id查询{{.Description}}"
+ // @Success 200 {object} response.Response{data={{.Package}}.{{.StructName}},msg=string} "查询成功"
+ // @Router /{{.Abbreviation}}/find{{.StructName}} [get]
+ func ({{.Abbreviation}}Api *{{.StructName}}Api) Find{{.StructName}}(c *gin.Context) {
+@@ -149,7 +149,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Find{{.StructName}}(c *gin.Conte
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=response.PageResult,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}List [get]
+@@ -167,7 +167,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Get{{.StructName}}List(c *gin.Co
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query {{.Package}}Req.{{.StructName}}Search true "分页获取{{.Description}}列表"
+ // @Success 200 {object} response.Response{data=response.PageResult,msg=string} "获取成功"
+@@ -198,7 +198,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Get{{.StructName}}List(c *gin.Co
+ // Get{{.StructName}}DataSource 获取{{.StructName}}的数据源
+ // @Tags {{.StructName}}
+ // @Summary 获取{{.StructName}}的数据源
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "查询成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}DataSource [get]
+@@ -219,7 +219,7 @@ func ({{.Abbreviation}}Api *{{.StructName}}Api) Get{{.StructName}}DataSource(c *
+ // Get{{.StructName}}Public 不需要鉴权的{{.Description}}接口
+ // @Tags {{.StructName}}
+ // @Summary 不需要鉴权的{{.Description}}接口
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}Public [get]
+diff --git a/server/resource/package/server/model/model.go.tpl b/server/resource/package/server/model/model.go.tpl
+index 82f33dab8c..3114b9cc0b 100644
+--- a/server/resource/package/server/model/model.go.tpl
++++ b/server/resource/package/server/model/model.go.tpl
+@@ -8,18 +8,18 @@
+ {{- else if eq .FieldType "video" }}
+ {{.FieldName}}  string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+ {{- else if eq .FieldType "file" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else if eq .FieldType "pictures" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else if eq .FieldType "richtext" }}
+ {{.FieldName}}  *string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}}`
+ {{- else if eq .FieldType "json" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"object"`
+ {{- else if eq .FieldType "array" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else }}
+ {{.FieldName}}  *{{.FieldType}} `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+-{{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}} {{ end }}
++{{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}}{{ end }}
+ {{- end }}
+ 
+ {{ else }}
+@@ -54,18 +54,18 @@ type {{.StructName}} struct {
+     {{- else if eq .FieldType "video" }}
+     {{.FieldName}}  string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+     {{- else if eq .FieldType "file" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else if eq .FieldType "pictures" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else if eq .FieldType "richtext" }}
+     {{.FieldName}}  *string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}}`
+     {{- else if eq .FieldType "json" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"object"`
+     {{- else if eq .FieldType "array" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else }}
+     {{.FieldName}}  *{{.FieldType}} `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+-    {{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}} {{ end }}
++    {{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}}{{ end }}
+ {{- end }}
+     {{- if .AutoCreateResource }}
+     CreatedBy  uint   `gorm:"column:created_by;comment:创建者"`
+diff --git a/server/resource/package/web/api/api.js.tpl b/server/resource/package/web/api/api.js.tpl
+index 94085baa11..a41ef6f27a 100644
+--- a/server/resource/package/web/api/api.js.tpl
++++ b/server/resource/package/web/api/api.js.tpl
+@@ -4,7 +4,7 @@ import service from '@/utils/request'
+ // @Tags {{.StructName}}
+ // @Summary 创建{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "创建{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"创建成功"}"
+@@ -20,7 +20,7 @@ export const create{{.StructName}} = (data) => {
+ // @Tags {{.StructName}}
+ // @Summary 删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "删除{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"删除成功"}"
+@@ -36,7 +36,7 @@ export const delete{{.StructName}} = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 批量删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body request.IdsReq true "批量删除{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"删除成功"}"
+@@ -52,7 +52,7 @@ export const delete{{.StructName}}ByIds = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 更新{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "更新{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"更新成功"}"
+@@ -68,7 +68,7 @@ export const update{{.StructName}} = (data) => {
+ // @Tags {{.StructName}}
+ // @Summary 用id查询{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query model.{{.StructName}} true "用id查询{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"查询成功"}"
+@@ -84,7 +84,7 @@ export const find{{.StructName}} = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query request.PageInfo true "分页获取{{.Description}}列表"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"获取成功"}"
+@@ -101,7 +101,7 @@ export const get{{.StructName}}List = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 获取数据源
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"查询成功"}"
+ // @Router /{{.Abbreviation}}/find{{.StructName}}DataSource [get]
+@@ -117,7 +117,7 @@ export const get{{.StructName}}DataSource = () => {
+ 
+ // @Tags {{.StructName}}
+ // @Summary 不需要鉴权的{{.Description}}接口
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query {{.Package}}Req.{{.StructName}}Search true "分页获取{{.Description}}列表"
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+diff --git a/server/resource/plugin/server/api/api.go.template b/server/resource/plugin/server/api/api.go.template
+index bd6a5f27a6..683824081c 100644
+--- a/server/resource/plugin/server/api/api.go.template
++++ b/server/resource/plugin/server/api/api.go.template
+@@ -27,7 +27,7 @@ type {{.Abbreviation}} struct {}
+ // @Tags {{.StructName}}
+ // @Summary 创建{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "创建{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "创建成功"
+@@ -55,7 +55,7 @@ func (a *{{.Abbreviation}}) Create{{.StructName}}(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "删除{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "删除成功"
+@@ -78,7 +78,7 @@ func (a *{{.Abbreviation}}) Delete{{.StructName}}(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 批量删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{msg=string} "批量删除成功"
+ // @Router /{{.Abbreviation}}/delete{{.StructName}}ByIds [delete]
+@@ -100,7 +100,7 @@ func (a *{{.Abbreviation}}) Delete{{.StructName}}ByIds(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 更新{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "更新{{.Description}}"
+ // @Success 200 {object} response.Response{msg=string} "更新成功"
+@@ -128,9 +128,9 @@ func (a *{{.Abbreviation}}) Update{{.StructName}}(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 用id查询{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+-// @Param data query model.{{.StructName}} true "用id查询{{.Description}}"
++// @Param {{.PrimaryField.FieldJson}} query {{.PrimaryField.FieldType}} true "用id查询{{.Description}}"
+ // @Success 200 {object} response.Response{data=model.{{.StructName}},msg=string} "查询成功"
+ // @Router /{{.Abbreviation}}/find{{.StructName}} [get]
+ func (a *{{.Abbreviation}}) Find{{.StructName}}(c *gin.Context) {
+@@ -149,7 +149,7 @@ func (a *{{.Abbreviation}}) Find{{.StructName}}(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=response.PageResult,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}List [get]
+@@ -167,7 +167,7 @@ func (a *{{.Abbreviation}}) Get{{.StructName}}List(c *gin.Context) {
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query request.{{.StructName}}Search true "分页获取{{.Description}}列表"
+ // @Success 200 {object} response.Response{data=response.PageResult,msg=string} "获取成功"
+@@ -198,7 +198,7 @@ func (a *{{.Abbreviation}}) Get{{.StructName}}List(c *gin.Context) {
+ // Get{{.StructName}}DataSource 获取{{.StructName}}的数据源
+ // @Tags {{.StructName}}
+ // @Summary 获取{{.StructName}}的数据源
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "查询成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}DataSource [get]
+@@ -217,7 +217,7 @@ func (a *{{.Abbreviation}}) Get{{.StructName}}DataSource(c *gin.Context) {
+ // Get{{.StructName}}Public 不需要鉴权的{{.Description}}接口
+ // @Tags {{.StructName}}
+ // @Summary 不需要鉴权的{{.Description}}接口
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+ // @Router /{{.Abbreviation}}/get{{.StructName}}Public [get]
+diff --git a/server/resource/plugin/server/model/model.go.template b/server/resource/plugin/server/model/model.go.template
+index 2f1d35dd13..0483771614 100644
+--- a/server/resource/plugin/server/model/model.go.template
++++ b/server/resource/plugin/server/model/model.go.template
+@@ -8,18 +8,18 @@
+ {{- else if eq .FieldType "video" }}
+ {{.FieldName}}  string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+ {{- else if eq .FieldType "file" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else if eq .FieldType "pictures" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else if eq .FieldType "richtext" }}
+ {{.FieldName}}  *string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}}`
+ {{- else if eq .FieldType "json" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"object"`
+ {{- else if eq .FieldType "array" }}
+-{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++{{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+ {{- else }}
+ {{.FieldName}}  *{{.FieldType}} `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+-{{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}} {{ end }}
++{{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}}{{ end }}
+ {{- end }}
+ 
+ {{ else }}
+@@ -53,15 +53,15 @@ type {{.StructName}} struct {
+     {{- else if eq .FieldType "video" }}
+     {{.FieldName}}  string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+     {{- else if eq .FieldType "file" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else if eq .FieldType "pictures" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else if eq .FieldType "richtext" }}
+     {{.FieldName}}  *string `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}}`
+     {{- else if eq .FieldType "json" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"object"`
+     {{- else if eq .FieldType "array" }}
+-    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end -}} swaggertype:"array,object"`
++    {{.FieldName}}  datatypes.JSON `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}type:text;" {{- if .Require }} binding:"required"{{- end }} swaggertype:"array,object"`
+     {{- else }}
+     {{.FieldName}}  *{{.FieldType}} `json:"{{.FieldJson}}" form:"{{.FieldJson}}" gorm:"{{- if ne .FieldIndexType "" -}}{{ .FieldIndexType }};{{- end -}}{{- if .PrimaryKey -}}primarykey;{{- end -}}{{- if .DefaultValue -}}default:{{ .DefaultValue }};{{- end -}}column:{{.ColumnName}};comment:{{.Comment}};{{- if .DataTypeLong -}}size:{{.DataTypeLong}};{{- end -}}" {{- if .Require }} binding:"required"{{- end -}}`
+     {{- end }}  {{ if .FieldDesc }}//{{.FieldDesc}}{{ end }}
+diff --git a/server/resource/plugin/web/api/api.js.template b/server/resource/plugin/web/api/api.js.template
+index 208f386e40..0462fde8b7 100644
+--- a/server/resource/plugin/web/api/api.js.template
++++ b/server/resource/plugin/web/api/api.js.template
+@@ -3,7 +3,7 @@ import service from '@/utils/request'
+ // @Tags {{.StructName}}
+ // @Summary 创建{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "创建{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"创建成功"}"
+@@ -19,7 +19,7 @@ export const create{{.StructName}} = (data) => {
+ // @Tags {{.StructName}}
+ // @Summary 删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "删除{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"删除成功"}"
+@@ -35,7 +35,7 @@ export const delete{{.StructName}} = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 批量删除{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body request.IdsReq true "批量删除{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"删除成功"}"
+@@ -51,7 +51,7 @@ export const delete{{.StructName}}ByIds = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 更新{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data body model.{{.StructName}} true "更新{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"更新成功"}"
+@@ -67,7 +67,7 @@ export const update{{.StructName}} = (data) => {
+ // @Tags {{.StructName}}
+ // @Summary 用id查询{{.Description}}
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query model.{{.StructName}} true "用id查询{{.Description}}"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"查询成功"}"
+@@ -83,7 +83,7 @@ export const find{{.StructName}} = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 分页获取{{.Description}}列表
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query request.PageInfo true "分页获取{{.Description}}列表"
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"获取成功"}"
+@@ -100,7 +100,7 @@ export const get{{.StructName}}List = (params) => {
+ // @Tags {{.StructName}}
+ // @Summary 获取数据源
+ // @Security ApiKeyAuth
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Success 200 {string} string "{"success":true,"data":{},"msg":"查询成功"}"
+ // @Router /{{.Abbreviation}}/find{{.StructName}}DataSource [get]
+@@ -114,7 +114,7 @@ export const get{{.StructName}}DataSource = () => {
+ {{- end}}
+ // @Tags {{.StructName}}
+ // @Summary 不需要鉴权的{{.Description}}接口
+-// @accept application/json
++// @Accept application/json
+ // @Produce application/json
+ // @Param data query request.{{.StructName}}Search true "分页获取{{.Description}}列表"
+ // @Success 200 {object} response.Response{data=object,msg=string} "获取成功"
+@@ -124,4 +124,4 @@ export const get{{.StructName}}Public = () => {
+     url: '/{{.Abbreviation}}/get{{.StructName}}Public',
+     method: 'get',
+   })
+-}
+\ No newline at end of file
++}
+diff --git a/server/service/system/auto_code_package.go b/server/service/system/auto_code_package.go
+index c9b8cfe2d9..a965897b35 100644
+--- a/server/service/system/auto_code_package.go
++++ b/server/service/system/auto_code_package.go
+@@ -3,6 +3,12 @@ package system
+ import (
+ 	"context"
+ 	"fmt"
++	"go/token"
++	"os"
++	"path/filepath"
++	"strings"
++	"text/template"
++
+ 	"github.com/flipped-aurora/gin-vue-admin/server/global"
+ 	common "github.com/flipped-aurora/gin-vue-admin/server/model/common/request"
+ 	model "github.com/flipped-aurora/gin-vue-admin/server/model/system"
+@@ -10,12 +16,7 @@ import (
+ 	"github.com/flipped-aurora/gin-vue-admin/server/utils"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/utils/ast"
+ 	"github.com/pkg/errors"
+-	"go/token"
+ 	"gorm.io/gorm"
+-	"os"
+-	"path/filepath"
+-	"strings"
+-	"text/template"
+ )
+ 
+ var AutoCodePackage = new(autoCodePackage)
+@@ -159,7 +160,7 @@ func (s *autoCodePackage) All(ctx context.Context) (entities []model.SysAutoCode
+ 			//dir目录需要包含所有的dirNameMap
+ 			for k := 0; k < len(dir); k++ {
+ 				if dir[k].IsDir() {
+-					if _, ok := dirNameMap[dir[k].Name()]; ok {
++					if ok := dirNameMap[dir[k].Name()]; ok {
+ 						delete(dirNameMap, dir[k].Name())
+ 					}
+ 				}
+diff --git a/server/service/system/auto_code_template.go b/server/service/system/auto_code_template.go
+index 8d52e3172f..ae3837024a 100644
+--- a/server/service/system/auto_code_template.go
++++ b/server/service/system/auto_code_template.go
+@@ -4,20 +4,21 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"github.com/flipped-aurora/gin-vue-admin/server/global"
+-	model "github.com/flipped-aurora/gin-vue-admin/server/model/system"
+-	"github.com/flipped-aurora/gin-vue-admin/server/model/system/request"
+-	utilsAst "github.com/flipped-aurora/gin-vue-admin/server/utils/ast"
+-	"github.com/pkg/errors"
+ 	"go/ast"
+ 	"go/format"
+ 	"go/parser"
+ 	"go/token"
+-	"gorm.io/gorm"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"text/template"
++
++	"github.com/flipped-aurora/gin-vue-admin/server/global"
++	model "github.com/flipped-aurora/gin-vue-admin/server/model/system"
++	"github.com/flipped-aurora/gin-vue-admin/server/model/system/request"
++	utilsAst "github.com/flipped-aurora/gin-vue-admin/server/utils/ast"
++	"github.com/pkg/errors"
++	"gorm.io/gorm"
+ )
+ 
+ var AutoCodeTemplate = new(autoCodeTemplate)
+@@ -191,13 +192,12 @@ func (s *autoCodeTemplate) Preview(ctx context.Context, info request.AutoCode) (
+ 		return nil, errors.Wrap(err, "查询包失败!")
+ 	}
+ 	// 增加判断: 重复创建struct 或者重复的简称
+-	if AutocodeHistory.Repeat(info.BusinessDB, info.StructName, info.Abbreviation, info.Package) && !info.IsAdd  {
++	if AutocodeHistory.Repeat(info.BusinessDB, info.StructName, info.Abbreviation, info.Package) && !info.IsAdd {
+ 		return nil, errors.New("已经创建过此数据结构或重复简称,请勿重复创建!")
+ 	}
+ 
+-	codes := make(map[string]strings.Builder)
+ 	preview := make(map[string]string)
+-	codes, _, _, err = s.generate(ctx, info, entity)
++	codes, _, _, err := s.generate(ctx, info, entity)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -291,8 +291,7 @@ func (s *autoCodeTemplate) AddFunc(info request.AutoFunc) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	err = s.addTemplateToAst("router", info)
+-	return nil
++	return s.addTemplateToAst("router", info)
+ }
+ 
+ func (s *autoCodeTemplate) GetApiAndServer(info request.AutoFunc) (map[string]string, error) {
+@@ -353,10 +352,14 @@ func (s *autoCodeTemplate) addTemplateToAst(t string, info request.AutoFunc) err
+ 	}
+ 
+ 	src, err := os.ReadFile(tPath)
++	if err != nil {
++		return err
++	}
++
+ 	fileSet := token.NewFileSet()
+ 	astFile, err := parser.ParseFile(fileSet, "", src, 0)
+ 	if err != nil {
+-		fmt.Println(err)
++		return err
+ 	}
+ 	funcDecl := utilsAst.FindFunction(astFile, funcName)
+ 	stmtNode := utilsAst.CreateStmt(stmtStr)
+diff --git a/server/service/system/sys_api.go b/server/service/system/sys_api.go
+index 92c995109a..a77d1d5cb9 100644
+--- a/server/service/system/sys_api.go
++++ b/server/service/system/sys_api.go
+@@ -3,12 +3,13 @@ package system
+ import (
+ 	"errors"
+ 	"fmt"
++	"strings"
++
+ 	"github.com/flipped-aurora/gin-vue-admin/server/global"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/model/common/request"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/model/system"
+ 	systemRes "github.com/flipped-aurora/gin-vue-admin/server/model/system/response"
+ 	"gorm.io/gorm"
+-	"strings"
+ )
+ 
+ //@author: [piexlmax](https://github.com/piexlmax)
+@@ -135,7 +136,7 @@ func (apiService *ApiService) IgnoreApi(ignoreApi system.SysIgnoreApi) (err erro
+ func (apiService *ApiService) EnterSyncApi(syncApis systemRes.SysSyncApis) (err error) {
+ 	return global.GVA_DB.Transaction(func(tx *gorm.DB) error {
+ 		var txErr error
+-		if syncApis.NewApis != nil && len(syncApis.NewApis) > 0 {
++		if len(syncApis.NewApis) > 0 {
+ 			txErr = tx.Create(&syncApis.NewApis).Error
+ 			if txErr != nil {
+ 				return txErr
+diff --git a/server/service/system/sys_authority.go b/server/service/system/sys_authority.go
+index 087da6a4e5..e5a5fcbf11 100644
+--- a/server/service/system/sys_authority.go
++++ b/server/service/system/sys_authority.go
+@@ -224,7 +224,10 @@ func (authorityService *AuthorityService) GetStructAuthorityList(authorityID uin
+ 	if len(authorities) > 0 {
+ 		for k := range authorities {
+ 			list = append(list, authorities[k].AuthorityId)
+-			_, err = authorityService.GetStructAuthorityList(authorities[k].AuthorityId)
++			childrenList, err := authorityService.GetStructAuthorityList(authorities[k].AuthorityId)
++			if err == nil {
++				list = append(list, childrenList...)
++			}
+ 		}
+ 	}
+ 	if *auth.ParentId == 0 {
+diff --git a/server/service/system/sys_casbin.go b/server/service/system/sys_casbin.go
+index 3a315efbaa..6b54904c0e 100644
+--- a/server/service/system/sys_casbin.go
++++ b/server/service/system/sys_casbin.go
+@@ -87,12 +87,12 @@ func (casbinService *CasbinService) UpdateCasbinApi(oldPath string, newPath stri
+ 		"v1": newPath,
+ 		"v2": newMethod,
+ 	}).Error
+-	e := casbinService.Casbin()
+-	err = e.LoadPolicy()
+ 	if err != nil {
+ 		return err
+ 	}
+-	return err
++
++	e := casbinService.Casbin()
++	return e.LoadPolicy()
+ }
+ 
+ //@author: [piexlmax](https://github.com/piexlmax)
+diff --git a/server/service/system/sys_export_template.go b/server/service/system/sys_export_template.go
+index 19a7a45206..077ebf095a 100644
+--- a/server/service/system/sys_export_template.go
++++ b/server/service/system/sys_export_template.go
+@@ -4,6 +4,12 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
++	"mime/multipart"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++
+ 	"github.com/flipped-aurora/gin-vue-admin/server/global"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/model/common/request"
+ 	"github.com/flipped-aurora/gin-vue-admin/server/model/system"
+@@ -11,11 +17,6 @@ import (
+ 	"github.com/flipped-aurora/gin-vue-admin/server/utils"
+ 	"github.com/xuri/excelize/v2"
+ 	"gorm.io/gorm"
+-	"mime/multipart"
+-	"net/url"
+-	"strconv"
+-	"strings"
+-	"time"
+ )
+ 
+ type SysExportTemplateService struct {
+@@ -155,7 +156,7 @@ func (sysExportTemplateService *SysExportTemplateService) ExportExcel(templateID
+ 	var tableTitle []string
+ 	var selectKeyFmt []string
+ 	for _, key := range columns {
+-		selectKeyFmt = append(selectKeyFmt, fmt.Sprintf("%s", key))
++		selectKeyFmt = append(selectKeyFmt, key)
+ 		tableTitle = append(tableTitle, templateInfoMap[key])
+ 	}
+ 
+diff --git a/server/utils/upload/minio_oss.go b/server/utils/upload/minio_oss.go
+index 3a6af72ce1..7ad5008cea 100644
+--- a/server/utils/upload/minio_oss.go
++++ b/server/utils/upload/minio_oss.go
+@@ -67,7 +67,6 @@ func (m *Minio) UploadFile(file *multipart.FileHeader) (filePathres, key string,
+ 	}
+ 	f.Close() // 创建文件 defer 关闭
+ 
+-
+ 	// 对文件名进行加密存储
+ 	ext := filepath.Ext(file.Filename)
+ 	filename := utils.MD5V([]byte(strings.TrimSuffix(file.Filename, ext))) + ext
+@@ -91,8 +90,10 @@ func (m *Minio) UploadFile(file *multipart.FileHeader) (filePathres, key string,
+ }
+ 
+ func (m *Minio) DeleteFile(key string) error {
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
++	defer cancel()
++
+ 	// Delete the object from MinIO
+-	ctx, _ := context.WithTimeout(context.Background(), time.Second*5)
+ 	err := m.Client.RemoveObject(ctx, m.bucket, key, minio.RemoveObjectOptions{})
+ 	return err
+ }
+diff --git a/web/package.json b/web/package.json
+index 02180cbb34..29b85a6d64 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "gin-vue-admin",
+-  "version": "2.7.8-beta1",
++  "version": "2.7.8",
+   "private": true,
+   "scripts": {
+     "serve": "node openDocument.js && vite --host --mode development",
+diff --git a/web/src/api/autoCode.js b/web/src/api/autoCode.js
+index 016e687787..8994b3c643 100644
+--- a/web/src/api/autoCode.js
++++ b/web/src/api/autoCode.js
+@@ -162,6 +162,17 @@ export const butler = (data) => {
+   })
+ }
+ 
++
++export const eye = (data) => {
++  return service({
++    url: '/autoCode/llmAuto',
++    method: 'post',
++    data: { ...data, mode: 'eye' },
++    timeout: 1000 * 60 * 10
++  })
++}
++
++
+ export const addFunc = (data) => {
+   return service({
+     url: '/autoCode/addFunc',
+diff --git a/web/src/api/fileUploadAndDownload.js b/web/src/api/fileUploadAndDownload.js
+index 2bff5bb47e..0f260b639c 100644
+--- a/web/src/api/fileUploadAndDownload.js
++++ b/web/src/api/fileUploadAndDownload.js
+@@ -55,3 +55,13 @@ export const importURL = (data) => {
+     data
+   })
+ }
++
++
++// 上传文件 暂时用于头像上传
++export const uploadFile = (data) => {
++  return service({
++    url: "/fileUploadAndDownload/upload",
++    method: "post",
++    data,
++  });
++};
+\ No newline at end of file
+diff --git a/web/src/components/Avatar/ProfileAvatar.vue b/web/src/components/Avatar/ProfileAvatar.vue
+new file mode 100644
+index 0000000000..f0fd1180db
+--- /dev/null
++++ b/web/src/components/Avatar/ProfileAvatar.vue
+@@ -0,0 +1,120 @@
++<template>
++  <div class="profile-avatar relative w-[120px] h-[120px] rounded-full overflow-hidden cursor-pointer group">
++    <img
++      v-if="modelValue"
++      class="w-full h-full object-cover"
++      :src="getUrl(modelValue)"
++      alt="头像"
++    />
++    <div
++      v-else
++      class="w-full h-full flex flex-col items-center justify-center bg-gray-100 dark:bg-slate-700"
++    >
++      <el-icon class="text-2xl text-gray-400">
++        <avatar />
++      </el-icon>
++      <span class="mt-2 text-sm text-gray-400">点击上传</span>
++    </div>
++
++    <div 
++      class="absolute inset-0 bg-black/30 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-all duration-300"
++      @click="chooseFile"
++    >
++      <div class="text-center text-white">
++        <el-icon class="text-2xl"><camera-filled /></el-icon>
++        <div class="text-xs mt-1">更换头像</div>
++      </div>
++    </div>
++
++    <input
++      ref="fileInput"
++      type="file"
++      class="hidden"
++      accept="image/*"
++      @change="handleFileChange"
++    />
++  </div>
++</template>
++
++<script setup>
++import { ref } from 'vue'
++import { ElMessage } from 'element-plus'
++import { getUrl } from '@/utils/image'
++import service from '@/utils/request'
++
++defineOptions({
++  name: 'ProfileAvatar'
++})
++
++const { modelValue } = defineProps({
++  modelValue: {
++    type: String,
++    default: ''
++  }
++})
++
++const emit = defineEmits(['update:modelValue'])
++
++const fileInput = ref(null)
++
++const chooseFile = () => {
++  fileInput.value.click()
++}
++
++const handleFileChange = async (e) => {
++  const file = e.target.files[0]
++  if (!file) return
++
++  // 验证文件类型
++  if (!file.type.includes('image/')) {
++    ElMessage.error('请选择图片文件')
++    return
++  }
++
++  // 验证文件大小（限制为2MB）
++  if (file.size > 2 * 1024 * 1024) {
++    ElMessage.error('图片大小不能超过2MB')
++    return
++  }
++
++  try {
++    const formData = new FormData()
++    formData.append('file', file)
++    
++    const res = await service({
++      url: '/fileUploadAndDownload/upload',
++      method: 'post',
++      data: formData,
++      headers: {
++        'Content-Type': 'multipart/form-data'
++      }
++    })
++
++    if (res.code === 0 && res.data?.file?.url) {
++      emit('update:modelValue', res.data.file.url)
++      ElMessage.success('头像上传成功')
++    } else {
++      ElMessage.error(res.msg || '上传失败')
++    }
++  } catch {
++    ElMessage.error('头像上传失败，请重试')
++  } finally {
++    // 清空input，确保可以重复选择同一文件
++    e.target.value = ''
++  }
++}
++</script>
++
++<style lang="scss" scoped>
++.profile-avatar {
++  img {
++    @apply transition-transform duration-300;
++  }
++
++  &:hover {
++    img {
++      @apply scale-110;
++    }
++  }
++}
++</style> 
+\ No newline at end of file
+diff --git a/web/src/core/config.js b/web/src/core/config.js
+index 9a03f26b00..9c0137a7ce 100644
+--- a/web/src/core/config.js
++++ b/web/src/core/config.js
+@@ -17,7 +17,7 @@ export const viteLogo = (env) => {
+         `> 欢迎使用Gin-Vue-Admin，开源地址：https://github.com/flipped-aurora/gin-vue-admin`
+       )
+     )
+-    console.log(greenText(`> 当前版本:vv2.7.8-beta1`))
++    console.log(greenText(`> 当前版本:v2.7.8`))
+     console.log(greenText(`> 加群方式:微信：shouzi_1994 QQ群：470239250`))
+     console.log(
+       greenText(`> 项目地址：https://github.com/flipped-aurora/gin-vue-admin`)
+diff --git a/web/src/core/gin-vue-admin.js b/web/src/core/gin-vue-admin.js
+index ae71f1b7f9..0280e0a75a 100644
+--- a/web/src/core/gin-vue-admin.js
++++ b/web/src/core/gin-vue-admin.js
+@@ -10,7 +10,7 @@ export default {
+     register(app)
+     console.log(`
+        欢迎使用 Gin-Vue-Admin
+-       当前版本:v2.7.8-beta1
++       当前版本:v2.7.8
+        加群方式:微信：shouzi_1994 QQ群：622360840
+        项目地址：https://github.com/flipped-aurora/gin-vue-admin
+        插件市场:https://plugin.gin-vue-admin.com
+diff --git a/web/src/view/example/breakpoint/breakpoint.vue b/web/src/view/example/breakpoint/breakpoint.vue
+index ea9490e303..6c1b8c69f3 100644
+--- a/web/src/view/example/breakpoint/breakpoint.vue
++++ b/web/src/view/example/breakpoint/breakpoint.vue
+@@ -3,25 +3,27 @@
+     <div class="gva-table-box">
+       <el-divider content-position="left">大文件上传</el-divider>
+       <form id="fromCont" method="post">
+-        <div class="fileUpload" @click="inputChange">
+-          选择文件
+-          <input
+-            v-show="false"
+-            id="file"
+-            ref="FileInput"
+-            multiple="multiple"
+-            type="file"
+-            @change="choseFile"
+-          />
++        <!-- 新增按钮容器，使用 Flexbox 对齐按钮 -->
++        <div class="button-container">
++          <div class="fileUpload" @click="inputChange">
++            <span class="takeFile">选择文件</span>
++            <input
++              v-show="false"
++              id="file"
++              ref="FileInput"
++              multiple="multiple"
++              type="file"
++              @change="choseFile"
++            />
++          </div>
++          <el-button
++            :disabled="limitFileSize"
++            type="primary"
++            class="uploadBtn"
++            @click="getFile"
++          >上传文件</el-button>
+         </div>
+       </form>
+-      <el-button
+-        :disabled="limitFileSize"
+-        type="primary"
+-        class="uploadBtn"
+-        @click="getFile"
+-        >上传文件</el-button
+-      >
+       <div class="el-upload__tip">请上传不超过5MB的文件</div>
+       <div class="list">
+         <transition name="list" tag="p">
+@@ -127,25 +129,29 @@
+           })
+         } else {
+           waitUpLoad.value = [] // 秒传则没有需要上传的切片
+-          ElMessage.success('文件已秒传')
++          ElMessage.success('文件已秒传!')
+         }
+         waitNum.value = waitUpLoad.value.length // 记录长度用于百分比展示
+       }
+     } else {
+       limitFileSize.value = true
+-      ElMessage('请上传小于5M文件')
++      ElMessage('请上传小于5M文件!')
+     }
+   }
+ 
+   const getFile = () => {
+     // 确定按钮
+     if (file.value === null) {
+-      ElMessage('请先上传文件')
++      ElMessage('请先上传文件!')
+       return
+     }
++    // 检查文件上传进度
+     if (percentage.value === 100) {
++      ElMessage.success('上传已完成!')  // 添加提示消息
+       percentageFlage.value = false
++      return // 如果进度已完成，阻止继续执行后续代码
+     }
++    // 如果文件未上传完成，继续上传切片
+     sliceFile() // 上传切片
+   }
+ 
+@@ -228,36 +234,76 @@
+   #fromCont {
+     display: inline-block;
+   }
++
++  .gva-table-box {
++    display: block;
++  }
++
++  .button-container {
++    display: flex;
++    align-items: center;
++  }
++
++  .fileUpload,
++  .uploadBtn {
++    width: 90px;
++    height: 35px;
++    line-height: 35px;
++    font-size: 14px;
++    display: inline-flex;
++    justify-content: center;
++    align-items: center;
++    border-radius: 5px;
++    cursor: pointer;
++  }
++
+   .fileUpload {
+-    padding: 3px 10px;
+-    font-size: 12px;
+-    height: 20px;
+-    line-height: 20px;
++    padding: 0 15px;
++    background-color: #007bff;
++    color: #ffffff;
++    font-weight: 500;
++    transition: all 0.3s ease-in-out;
++    margin-right: 5px;
++  }
++
++  .uploadBtn {
++    background-color: #007bff;
++    color: #fff;
++    margin-left: 10px;
++  }
++
++  .fileUpload:hover {
++    background-color: #0056b3;
++  }
++
++  .uploadBtn:hover {
++    background-color: #0056b3;
++  }
++
++
++  .fileUpload:active,
++  .uploadBtn:active {
++    transform: translateY(2px);
++  }
++
++  .fileUpload input {
+     position: relative;
++    font-size: 100px;
++    right: 0;
++    top: 0;
++    opacity: 0;
+     cursor: pointer;
+-    border: 1px solid #c1c1c1;
+-    border-radius: 4px;
+-    overflow: hidden;
+-    display: inline-block;
+-    input {
+-      position: absolute;
+-      font-size: 100px;
+-      right: 0;
+-      top: 0;
+-      opacity: 0;
+-      cursor: pointer;
+-    }
++    width: 100%;
++    height: 100%;
+   }
++
++
++
+   .fileName {
+     display: inline-block;
+     vertical-align: top;
+     margin: 6px 15px 0 15px;
+   }
+-  .uploadBtn {
+-    position: relative;
+-    top: -10px;
+-    margin-left: 15px;
+-  }
+   .tips {
+     margin-top: 30px;
+     font-size: 14px;
+diff --git a/web/src/view/person/person.vue b/web/src/view/person/person.vue
+index 84e9356b71..f146483905 100644
+--- a/web/src/view/person/person.vue
++++ b/web/src/view/person/person.vue
+@@ -1,171 +1,226 @@
+ <template>
+-  <div class="gva-form-box">
+-    <div class="grid grid-cols-12 w-full gap-2">
+-      <div class="col-span-3 h-full">
+-        <div
+-          class="w-full h-full bg-white dark:bg-slate-900 px-4 py-8 rounded-lg shadow-lg box-border"
+-        >
+-          <div
+-            class="user-card px-6 text-center bg-white dark:bg-slate-900 shrink-0"
+-          >
+-            <div class="flex justify-center">
+-              <SelectImage
+-                v-model="userStore.userInfo.headerImg"
+-                file-type="image"
+-              />
++  <div class="profile-container">
++    <!-- 顶部个人信息卡片 -->
++    <div class="bg-white dark:bg-slate-800 rounded-2xl shadow-sm mb-8">
++      <!-- 顶部背景图 -->
++      <div class="h-48 bg-blue-50 dark:bg-slate-600 relative">
++        <div class="absolute inset-0 bg-pattern opacity-7"></div>
++      </div>
++
++      <!-- 个人信息区 -->
++      <div class="px-8 -mt-20 pb-8">
++        <div class="flex flex-col lg:flex-row items-start gap-8">
++          <!-- 左侧头像 -->
++          <div class="profile-avatar-wrapper flex-shrink-0 mx-auto lg:mx-0">
++            <ProfileAvatar
++              v-model="userStore.userInfo.headerImg"
++              @update:modelValue="handleAvatarChange"
++            />
++          </div>
++
++          <!-- 右侧信息 -->
++          <div class="flex-1 pt-20 w-full">
++            <div class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-4">
++              <div>
++                <div class="flex items-center gap-4 mb-4">
++                  <div v-if="!editFlag" class="text-2xl font-bold flex items-center gap-3 text-gray-800 dark:text-gray-100">
++                    {{ userStore.userInfo.nickName }}
++                    <el-icon
++                      class="cursor-pointer text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors duration-200"
++                      @click="openEdit"
++                    >
++                      <edit />
++                    </el-icon>
++                  </div>
++                  <div v-else class="flex items-center gap-3">
++                    <el-input
++                      v-model="nickName"
++                      class="w-48"
++                      size="large"
++                    />
++                    <el-button type="success" circle @click="enterEdit">
++                      <el-icon><check /></el-icon>
++                    </el-button>
++                    <el-button type="danger" circle @click="closeEdit">
++                      <el-icon><close /></el-icon>
++                    </el-button>
++                  </div>
++                </div>
++
++                <div class="flex flex-col lg:flex-row items-start lg:items-center gap-4 lg:gap-8 text-gray-500 dark:text-gray-400">
++                  <div class="flex items-center gap-2">
++                    <el-icon><location /></el-icon>
++                    <span>中国·北京市·朝阳区</span>
++                  </div>
++                  <div class="flex items-center gap-2">
++                    <el-icon><office-building /></el-icon>
++                    <span>北京反转极光科技有限公司</span>
++                  </div>
++                  <div class="flex items-center gap-2">
++                    <el-icon><user /></el-icon>
++                    <span>技术部·前端事业群</span>
++                  </div>
++                </div>
++              </div>
++
++              <div class="flex gap-4 mt-4 lg:mt-0">
++                <el-button type="primary" plain>
++                  <el-icon><message /></el-icon>
++                  发送消息
++                </el-button>
++                <el-button>
++                  <el-icon><share /></el-icon>
++                  分享主页
++                </el-button>
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- 主要内容区 -->
++    <div class="grid lg:grid-cols-12 md:grid-cols-1 gap-8">
++      <!-- 左侧信息栏 -->
++      <div class="lg:col-span-4">
++        <div class="bg-white dark:bg-slate-800 rounded-xl p-6 mb-6 profile-card">
++          <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
++            <el-icon class="text-blue-500"><info-filled /></el-icon>
++            基本信息
++          </h2>
++          <div class="space-y-4">
++            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++              <el-icon class="text-blue-500"><phone /></el-icon>
++              <span class="font-medium">手机号码：</span>
++              <span>{{ userStore.userInfo.phone || '未设置' }}</span>
++              <el-button
++                link
++                type="primary"
++                class="ml-auto"
++                @click="changePhoneFlag = true"
++              >
++                修改
++              </el-button>
+             </div>
+-            <div class="py-6 text-center">
+-              <p
+-                v-if="!editFlag"
+-                class="text-3xl flex justify-center items-center gap-4"
++            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++              <el-icon class="text-green-500"><message /></el-icon>
++              <span class="font-medium">邮箱地址：</span>
++              <span>{{ userStore.userInfo.email || '未设置' }}</span>
++              <el-button
++                link
++                type="primary"
++                class="ml-auto"
++                @click="changeEmailFlag = true"
+               >
+-                {{ userStore.userInfo.nickName }}
+-                <el-icon
+-                  class="cursor-pointer text-sm"
+-                  color="#66b1ff"
+-                  @click="openEdit"
+-                >
+-                  <edit />
+-                </el-icon>
+-              </p>
+-              <p v-if="editFlag" class="flex justify-center items-center gap-4">
+-                <el-input v-model="nickName" />
+-                <el-icon
+-                  class="cursor-pointer"
+-                  color="#67c23a"
+-                  @click="enterEdit"
+-                >
+-                  <check />
+-                </el-icon>
+-                <el-icon
+-                  class="cursor-pointer"
+-                  color="#f23c3c"
+-                  @click="closeEdit"
+-                >
+-                  <close />
+-                </el-icon>
+-              </p>
+-              <p class="text-gray-500 mt-2 text-md">
+-                这个家伙很懒，什么都没有留下
+-              </p>
++                修改
++              </el-button>
+             </div>
+-            <div class="w-full h-full text-left">
+-              <ul class="inline-block h-full w-full">
+-                <li class="info-list">
+-                  <el-icon>
+-                    <user />
+-                  </el-icon>
+-                  {{ userStore.userInfo.nickName }}
+-                </li>
+-                <el-tooltip
+-                  class="item"
+-                  effect="light"
+-                  content="北京反转极光科技有限公司-技术部-前端事业群"
+-                  placement="top"
+-                >
+-                  <li class="info-list">
+-                    <el-icon>
+-                      <data-analysis />
+-                    </el-icon>
+-                    北京反转极光科技有限公司-技术部-前端事业群
+-                  </li>
+-                </el-tooltip>
+-                <li class="info-list">
+-                  <el-icon>
+-                    <video-camera />
+-                  </el-icon>
+-                  中国·北京市·朝阳区
+-                </li>
+-                <el-tooltip
+-                  class="item"
+-                  effect="light"
+-                  content="GoLang/JavaScript/Vue/Gorm"
+-                  placement="top"
+-                >
+-                  <li class="info-list">
+-                    <el-icon>
+-                      <medal />
+-                    </el-icon>
+-                    GoLang/JavaScript/Vue/Gorm
+-                  </li>
+-                </el-tooltip>
+-              </ul>
++            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300">
++              <el-icon class="text-purple-500"><lock /></el-icon>
++              <span class="font-medium">账号密码：</span>
++              <span>已设置</span>
++              <el-button
++                link
++                type="primary"
++                class="ml-auto"
++                @click="showPassword = true"
++              >
++                修改
++              </el-button>
+             </div>
+           </div>
+         </div>
++
++        <div class="bg-white dark:bg-slate-800 rounded-xl p-6 profile-card">
++          <h2 class="text-lg font-semibold mb-4 flex items-center gap-2">
++            <el-icon class="text-blue-500"><medal /></el-icon>
++            技能特长
++          </h2>
++          <div class="flex flex-wrap gap-2">
++            <el-tag effect="plain" type="success">GoLang</el-tag>
++            <el-tag effect="plain" type="warning">JavaScript</el-tag>
++            <el-tag effect="plain" type="danger">Vue</el-tag>
++            <el-tag effect="plain" type="info">Gorm</el-tag>
++            <el-button link class="text-sm">
++              <el-icon><plus /></el-icon>
++              添加技能
++            </el-button>
++          </div>
++        </div>
+       </div>
+-      <div class="col-span-9">
+-        <div
+-          class="bg-white dark:bg-slate-900 h-full px-4 py-8 rounded-lg shadow-lg box-border"
+-        >
+-          <el-tabs v-model="activeName" @tab-click="handleClick">
+-            <el-tab-pane label="账号绑定" name="second">
+-              <ul>
+-                <li class="borderd">
+-                  <p class="pb-2.5 text-xl text-gray-600">密保手机</p>
+-                  <p class="pb-2.5 text-lg text-gray-400">
+-                    已绑定手机:{{ userStore.userInfo.phone }}
+-                    <a
+-                      href="javascript:void(0)"
+-                      class="float-right text-blue-400"
+-                      @click="changePhoneFlag = true"
+-                      >立即修改</a
+-                    >
+-                  </p>
+-                </li>
+-                <li class="borderd pt-2.5">
+-                  <p class="pb-2.5 text-xl text-gray-600">密保邮箱</p>
+-                  <p class="pb-2.5 text-lg text-gray-400">
+-                    已绑定邮箱：{{ userStore.userInfo.email }}
+-                    <a
+-                      href="javascript:void(0)"
+-                      class="float-right text-blue-400"
+-                      @click="changeEmailFlag = true"
+-                      >立即修改</a
+-                    >
+-                  </p>
+-                </li>
+-                <li class="borderd pt-2.5">
+-                  <p class="pb-2.5 text-xl text-gray-600">密保问题</p>
+-                  <p class="pb-2.5 text-lg text-gray-400">
+-                    未设置密保问题
+-                    <a
+-                      href="javascript:void(0)"
+-                      class="float-right text-blue-400"
+-                      >去设置</a
+-                    >
+-                  </p>
+-                </li>
+-                <li class="borderd pt-2.5">
+-                  <p class="pb-2.5 text-xl text-gray-600">修改密码</p>
+-                  <p class="pb-2.5 text-lg text-gray-400">
+-                    修改个人密码
+-                    <a
+-                      href="javascript:void(0)"
+-                      class="float-right text-blue-400"
+-                      @click="showPassword = true"
+-                      >修改密码</a
+-                    >
+-                  </p>
+-                </li>
+-              </ul>
++
++      <!-- 右侧内容区 -->
++      <div class="lg:col-span-8">
++        <div class="bg-white dark:bg-slate-800 rounded-xl p-6 profile-card">
++          <el-tabs class="custom-tabs">
++            <el-tab-pane>
++              <template #label>
++                <div class="flex items-center gap-2">
++                  <el-icon><data-line /></el-icon>
++                  数据统计
++                </div>
++              </template>
++              <div class="grid grid-cols-2 md:grid-cols-4 gap-4 lg:gap-6 py-6">
++                <div class="stat-card">
++                  <div class="text-2xl lg:text-4xl font-bold text-blue-500 mb-2">138</div>
++                  <div class="text-gray-500 text-sm">项目参与</div>
++                </div>
++                <div class="stat-card">
++                  <div class="text-2xl lg:text-4xl font-bold text-green-500 mb-2">2.3k</div>
++                  <div class="text-gray-500 text-sm">代码提交</div>
++                </div>
++                <div class="stat-card">
++                  <div class="text-2xl lg:text-4xl font-bold text-purple-500 mb-2">95%</div>
++                  <div class="text-gray-500 text-sm">任务完成</div>
++                </div>
++                <div class="stat-card">
++                  <div class="text-2xl lg:text-4xl font-bold text-yellow-500 mb-2">12</div>
++                  <div class="text-gray-500 text-sm">获得勋章</div>
++                </div>
++              </div>
++            </el-tab-pane>
++            <el-tab-pane>
++              <template #label>
++                <div class="flex items-center gap-2">
++                  <el-icon><calendar /></el-icon>
++                  近期动态
++                </div>
++              </template>
++              <div class="py-6">
++                <el-timeline>
++                  <el-timeline-item
++                    v-for="(activity, index) in activities"
++                    :key="index"
++                    :type="activity.type"
++                    :timestamp="activity.timestamp"
++                    :hollow="true"
++                    class="pb-6"
++                  >
++                    <h3 class="text-base font-medium mb-1">{{ activity.title }}</h3>
++                    <p class="text-gray-500 text-sm">{{ activity.content }}</p>
++                  </el-timeline-item>
++                </el-timeline>
++              </div>
+             </el-tab-pane>
+           </el-tabs>
+         </div>
+       </div>
+     </div>
+ 
++    <!-- 弹窗 -->
+     <el-dialog
+       v-model="showPassword"
+       title="修改密码"
+-      width="360px"
++      width="400px"
++      class="custom-dialog"
+       @close="clearPassword"
+     >
+       <el-form
+         ref="modifyPwdForm"
+         :model="pwdModify"
+         :rules="rules"
+-        label-width="80px"
++        label-width="90px"
++        class="py-4"
+       >
+         <el-form-item :minlength="6" label="原密码" prop="password">
+           <el-input v-model="pwdModify.password" show-password />
+@@ -185,72 +240,91 @@
+       </template>
+     </el-dialog>
+ 
+-    <el-dialog v-model="changePhoneFlag" title="绑定手机" width="600px">
+-      <el-form :model="phoneForm">
+-        <el-form-item label="手机号" label-width="120px">
+-          <el-input
+-            v-model="phoneForm.phone"
+-            placeholder="请输入手机号"
+-            autocomplete="off"
+-          />
++    <el-dialog
++      v-model="changePhoneFlag"
++      title="修改手机号"
++      width="400px"
++      class="custom-dialog"
++    >
++      <el-form :model="phoneForm" label-width="80px" class="py-4">
++        <el-form-item label="手机号">
++          <el-input v-model="phoneForm.phone" placeholder="请输入新的手机号码">
++            <template #prefix>
++              <el-icon><phone /></el-icon>
++            </template>
++          </el-input>
+         </el-form-item>
+-        <el-form-item label="验证码" label-width="120px">
+-          <div class="flex w-full gap-4">
++        <el-form-item label="验证码">
++          <div class="flex gap-4">
+             <el-input
+               v-model="phoneForm.code"
++              placeholder="请输入验证码"
+               class="flex-1"
+-              autocomplete="off"
+-              placeholder="请自行设计短信服务，此处为模拟随便写"
+-              style="width: 300px"
+-            />
+-            <el-button type="primary" :disabled="time > 0" @click="getCode">{{
+-              time > 0 ? `(${time}s)后重新获取` : '获取验证码'
+-            }}</el-button>
++            >
++              <template #prefix>
++                <el-icon><key /></el-icon>
++              </template>
++            </el-input>
++            <el-button
++              type="primary"
++              :disabled="time > 0"
++              class="w-32"
++              @click="getCode"
++            >
++              {{ time > 0 ? `${time}s` : '获取验证码' }}
++            </el-button>
+           </div>
+         </el-form-item>
+       </el-form>
+       <template #footer>
+-        <span class="dialog-footer">
+-          <el-button @click="closeChangePhone">取消</el-button>
+-          <el-button type="primary" @click="changePhone">更改</el-button>
+-        </span>
++        <div class="dialog-footer">
++          <el-button @click="closeChangePhone">取 消</el-button>
++          <el-button type="primary" @click="changePhone">确 定</el-button>
++        </div>
+       </template>
+     </el-dialog>
+ 
+-    <el-dialog v-model="changeEmailFlag" title="绑定邮箱" width="600px">
+-      <el-form :model="emailForm">
+-        <el-form-item label="邮箱" label-width="120px">
+-          <el-input
+-            v-model="emailForm.email"
+-            placeholder="请输入邮箱"
+-            autocomplete="off"
+-          />
++    <el-dialog
++      v-model="changeEmailFlag"
++      title="修改邮箱"
++      width="400px"
++      class="custom-dialog"
++    >
++      <el-form :model="emailForm" label-width="80px" class="py-4">
++        <el-form-item label="邮箱">
++          <el-input v-model="emailForm.email" placeholder="请输入新的邮箱地址">
++            <template #prefix>
++              <el-icon><message /></el-icon>
++            </template>
++          </el-input>
+         </el-form-item>
+-        <el-form-item label="验证码" label-width="120px">
+-          <div class="flex w-full gap-4">
++        <el-form-item label="验证码">
++          <div class="flex gap-4">
+             <el-input
+               v-model="emailForm.code"
++              placeholder="请输入验证码"
+               class="flex-1"
+-              placeholder="请自行设计邮件服务，此处为模拟随便写"
+-              autocomplete="off"
+-              style="width: 300px"
+-            />
++            >
++              <template #prefix>
++                <el-icon><key /></el-icon>
++              </template>
++            </el-input>
+             <el-button
+               type="primary"
+               :disabled="emailTime > 0"
++              class="w-32"
+               @click="getEmailCode"
+-              >{{
+-                emailTime > 0 ? `(${emailTime}s)后重新获取` : '获取验证码'
+-              }}</el-button
+             >
++              {{ emailTime > 0 ? `${emailTime}s` : '获取验证码' }}
++            </el-button>
+           </div>
+         </el-form-item>
+       </el-form>
+       <template #footer>
+-        <span class="dialog-footer">
+-          <el-button @click="closeChangeEmail">取消</el-button>
+-          <el-button type="primary" @click="changeEmail">更改</el-button>
+-        </span>
++        <div class="dialog-footer">
++          <el-button @click="closeChangeEmail">取 消</el-button>
++          <el-button type="primary" @click="changeEmail">确 定</el-button>
++        </div>
+       </template>
+     </el-dialog>
+   </div>
+@@ -258,16 +332,22 @@
+ 
+ <script setup>
+   import { setSelfInfo, changePassword } from '@/api/user.js'
+-  import { reactive, ref, watch } from 'vue'
++  import { reactive, ref } from 'vue'
+   import { ElMessage } from 'element-plus'
+   import { useUserStore } from '@/pinia/modules/user'
+-  import SelectImage from '@/components/selectImage/selectImage.vue'
++  import ProfileAvatar from '@/components/Avatar/ProfileAvatar.vue'
+ 
+   defineOptions({
+     name: 'Person'
+   })
+ 
+-  const activeName = ref('second')
++  const userStore = useUserStore()
++  const modifyPwdForm = ref(null)
++  const showPassword = ref(false)
++  const pwdModify = ref({})
++  const nickName = ref('')
++  const editFlag = ref(false)
++
+   const rules = reactive({
+     password: [
+       { required: true, message: '请输入密码', trigger: 'blur' },
+@@ -293,12 +373,6 @@
+     ]
+   })
+ 
+-  const userStore = useUserStore()
+-  const modifyPwdForm = ref(null)
+-  const showPassword = ref(false)
+-  const pwdModify = ref({})
+-  const nickName = ref('')
+-  const editFlag = ref(false)
+   const savePassword = async () => {
+     modifyPwdForm.value.validate((valid) => {
+       if (valid) {
+@@ -311,8 +385,6 @@
+           }
+           showPassword.value = false
+         })
+-      } else {
+-        return false
+       }
+     })
+   }
+@@ -323,23 +395,9 @@
+       newPassword: '',
+       confirmPassword: ''
+     }
+-    modifyPwdForm.value.clearValidate()
++    modifyPwdForm.value?.clearValidate()
+   }
+ 
+-  watch(
+-    () => userStore.userInfo.headerImg,
+-    async (val) => {
+-      const res = await setSelfInfo({ headerImg: val })
+-      if (res.code === 0) {
+-        userStore.ResetUserInfo({ headerImg: val })
+-        ElMessage({
+-          type: 'success',
+-          message: '设置成功'
+-        })
+-      }
+-    }
+-  )
+-
+   const openEdit = () => {
+     nickName.value = userStore.userInfo.nickName
+     editFlag.value = true
+@@ -356,19 +414,12 @@
+     })
+     if (res.code === 0) {
+       userStore.ResetUserInfo({ nickName: nickName.value })
+-      ElMessage({
+-        type: 'success',
+-        message: '设置成功'
+-      })
++      ElMessage.success('修改成功')
+     }
+     nickName.value = ''
+     editFlag.value = false
+   }
+ 
+-  const handleClick = (tab, event) => {
+-    console.log(tab, event)
+-  }
+-
+   const changePhoneFlag = ref(false)
+   const time = ref(0)
+   const phoneForm = reactive({
+@@ -434,17 +485,118 @@
+       closeChangeEmail()
+     }
+   }
++
++  const handleAvatarChange = async (newUrl) => {
++    const res = await setSelfInfo({ headerImg: newUrl })
++    if (res.code === 0) {
++      userStore.ResetUserInfo({ headerImg: newUrl })
++    }
++  }
++
++  // 添加活动数据
++  const activities = [
++    {
++      timestamp: '2024-01-10',
++      title: '完成项目里程碑',
++      content: '成功完成第三季度主要项目开发任务，获得团队一致好评',
++      type: 'primary'
++    },
++    {
++      timestamp: '2024-01-11',
++      title: '代码审核完成',
++      content: '完成核心模块代码审核，提出多项改进建议并获采纳',
++      type: 'success'
++    },
++    {
++      timestamp: '2024-01-12',
++      title: '技术分享会',
++      content: '主持团队技术分享会，分享前端性能优化经验',
++      type: 'warning'
++    },
++    {
++      timestamp: '2024-01-13',
++      title: '新功能上线',
++      content: '成功上线用户反馈的新特性，显著提升用户体验',
++      type: 'danger'
++    }
++  ]
+ </script>
+ 
+ <style lang="scss">
+-  .borderd {
+-    @apply border-b-2 border-solid border-gray-100 dark:border-gray-500 border-t-0 border-r-0 border-l-0;
+-    &:last-child {
+-      @apply border-b-0;
++  .profile-container {
++    @apply p-4 lg:p-6 min-h-screen bg-gray-50 dark:bg-slate-900;
++
++    .bg-pattern {
++      background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23000000' fill-opacity='0.1'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+     }
+-  }
+ 
+-  .info-list {
+-    @apply w-full whitespace-nowrap overflow-hidden text-ellipsis py-3 text-lg text-gray-700;
++    .profile-card {
++      @apply shadow-sm hover:shadow-md transition-shadow duration-300;
++    }
++
++    .profile-action-btn {
++      @apply bg-white/10 hover:bg-white/20 border-white/20;
++      .el-icon {
++        @apply mr-1;
++      }
++    }
++
++    .stat-card {
++      @apply p-4 lg:p-6 rounded-lg bg-gray-50 dark:bg-slate-700/50 text-center hover:shadow-md transition-all duration-300;
++    }
++
++    .custom-tabs {
++      :deep(.el-tabs__nav-wrap::after) {
++        @apply h-0.5 bg-gray-100 dark:bg-gray-700;
++      }
++      :deep(.el-tabs__active-bar) {
++        @apply h-0.5 bg-blue-500;
++      }
++      :deep(.el-tabs__item) {
++        @apply text-base font-medium px-6;
++        .el-icon {
++          @apply mr-1 text-lg;
++        }
++        &.is-active {
++          @apply text-blue-500;
++        }
++      }
++      :deep(.el-timeline-item__node--normal) {
++        @apply left-[-2px];
++      }
++      :deep(.el-timeline-item__wrapper) {
++        @apply pl-8;
++      }
++      :deep(.el-timeline-item__timestamp) {
++        @apply text-gray-400 text-sm;
++      }
++    }
++
++    .custom-dialog {
++      :deep(.el-dialog__header) {
++        @apply mb-0 pb-4 border-b border-gray-100 dark:border-gray-700;
++      }
++      :deep(.el-dialog__footer) {
++        @apply mt-0 pt-4 border-t border-gray-100 dark:border-gray-700;
++      }
++      :deep(.el-input__wrapper) {
++        @apply shadow-none;
++      }
++      :deep(.el-input__prefix) {
++        @apply mr-2;
++      }
++    }
++
++    .edit-input {
++      :deep(.el-input__wrapper) {
++        @apply bg-white/10 border-white/20 shadow-none;
++        input {
++          @apply text-white;
++          &::placeholder {
++            @apply text-white/60;
++          }
++        }
++      }
++    }
+   }
+ </style>
+diff --git a/web/src/view/systemTools/autoCode/index.vue b/web/src/view/systemTools/autoCode/index.vue
+index 47e9cda0c1..83b3d68f74 100644
+--- a/web/src/view/systemTools/autoCode/index.vue
++++ b/web/src/view/systemTools/autoCode/index.vue
+@@ -18,12 +18,38 @@
+           v-model="prompt"
+           type="textarea"
+           :rows="5"
+-          :maxlength="100"
+-          :placeholder="`现已完全免费\n试试描述你的表，让AI帮你完成。\n此功能需要到插件市场个人中心获取自己的AI-Path，把AI-Path填入config.yaml下的autocode-->ai-path，重启项目即可使用。\n按下 Ctrl+Enter 或 Cmd+Enter 直接生成`"
++          :maxlength="2000"
++          :placeholder="`现已完全免费\n试试复制一张图片然后按下ctrl+v或者commend+v\n试试描述你的表，让AI帮你完成。\n此功能需要到插件市场个人中心获取自己的AI-Path，把AI-Path填入config.yaml下的autocode-->ai-path，重启项目即可使用。\n按下 Ctrl+Enter 或 Cmd+Enter 直接生成`"
+           resize="none"
+           @focus="handleFocus"
+           @blur="handleBlur"
+         />
++
++        <div class="flex absolute right-28 bottom-2">
++          <el-tooltip effect="light">
++            <template #content>
++              <div>
++                【完全免费】前往<a
++                  class="text-blue-600"
++                  href="https://plugin.gin-vue-admin.com/#/layout/userInfo/center"
++                  target="_blank"
++              >插件市场个人中心</a
++              >申请AIPath，填入config.yaml的ai-path属性即可使用。
++              </div>
++            </template>
++            <el-button
++                :disabled="form.onlyTemplate"
++                type="primary"
++                @click="eyeFunc()"
++            >
++              <el-icon size="18">
++                <ai-gva />
++              </el-icon>
++              识图
++            </el-button>
++          </el-tooltip>
++        </div>
++
+         <div class="flex absolute right-2 bottom-2">
+           <el-tooltip effect="light">
+             <template #content>
+@@ -784,7 +810,7 @@
+     preview,
+     getMeta,
+     getPackageApi,
+-    llmAuto
++    llmAuto, butler, eye
+   } from '@/api/autoCode'
+   import { getDict } from '@/utils/dictionary'
+   import { ref, watch, toRaw, onMounted, nextTick } from 'vue'
+@@ -794,11 +820,13 @@
+   import Sortable from 'sortablejs'
+ 
+   const handleFocus = () => {
+-    document.addEventListener('keydown', handleKeydown)
++    document.addEventListener('keydown', handleKeydown);
++    document.addEventListener('paste', handlePaste);
+   }
+ 
+   const handleBlur = () => {
+-    document.removeEventListener('keydown', handleKeydown)
++    document.removeEventListener('keydown', handleKeydown);
++    document.removeEventListener('paste', handlePaste);
+   }
+ 
+   const handleKeydown = (event) => {
+@@ -807,6 +835,25 @@
+     }
+   }
+ 
++  const handlePaste = (event) => {
++    const items = event.clipboardData.items;
++    for (let i = 0; i < items.length; i++) {
++      if (items[i].type.indexOf('image') !== -1) {
++        const file = items[i].getAsFile();
++        const reader = new FileReader();
++        reader.onload =async (e) => {
++          const base64String = e.target.result;
++          const res = await eye({ picture: base64String,command: 'eye' })
++          if (res.code === 0) {
++            prompt.value = res.data
++            llmAutoFunc()
++          }
++        };
++        reader.readAsDataURL(file);
++      }
++    }
++  };
++
+   const getOnlyNumber = () => {
+     let randomNumber = ''
+     while (randomNumber.length < 16) {
+@@ -817,6 +864,32 @@
+ 
+   const prompt = ref('')
+ 
++  const eyeFunc = async () => {
++    const input = document.createElement('input');
++    input.type = 'file';
++    input.accept = 'image/*';
++
++    input.onchange = (event) => {
++      const file = event.target.files[0];
++      if (file) {
++        const reader = new FileReader();
++        reader.onload = async (e) => {
++          const base64String = e.target.result;
++
++          const res = await eye({ picture: base64String,command: 'eye' })
++          if (res.code === 0) {
++            prompt.value = res.data
++            llmAutoFunc()
++          }
++        };
++        reader.readAsDataURL(file);
++      }
++    };
++
++    input.click();
++  }
++
++
+   const llmAutoFunc = async (flag) => {
+     if (flag && !form.value.structName) {
+       ElMessage.error('请输入结构体名称')

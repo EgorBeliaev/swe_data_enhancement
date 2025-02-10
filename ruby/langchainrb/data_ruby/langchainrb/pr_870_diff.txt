@@ -1,0 +1,164 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4ce0563ba..4a24d2572 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -16,6 +16,7 @@
+ - [OPTIM] [https://github.com/patterns-ai-core/langchainrb/pull/867] Refactor `GoogleGeminiMessage#to_hash` and `OpenAIMessage#to_hash` methods.
+ - [OPTIM] [https://github.com/patterns-ai-core/langchainrb/pull/849] Simplify Langchain::LLM::AwsBedrock class
+ - [BUGFIX] [https://github.com/patterns-ai-core/langchainrb/pull/869] AnthropicMessage now correctly handles tool calls with content.
++- [OPTIM] [https://github.com/patterns-ai-core/langchainrb/pull/870] Assistant, when using Ollama (e.g.: llava model), now also accepts image_url in the message.
+ 
+ ## [0.19.0] - 2024-10-23
+ - [BREAKING] [https://github.com/patterns-ai-core/langchainrb/pull/840] Rename `chat_completion_model_name` parameter to `chat_model` in Langchain::LLM parameters.
+diff --git a/examples/ollama_inquire_about_image.rb b/examples/ollama_inquire_about_image.rb
+new file mode 100644
+index 000000000..c11d440f8
+--- /dev/null
++++ b/examples/ollama_inquire_about_image.rb
+@@ -0,0 +1,13 @@
++require_relative "../lib/langchain"
++require "faraday"
++
++llm = Langchain::LLM::Ollama.new(default_options: {chat_model: "llava"})
++
++assistant = Langchain::Assistant.new(llm: llm)
++
++response = assistant.add_message_and_run(
++  image_url: "https://gist.githubusercontent.com/andreibondarev/b6f444194d0ee7ab7302a4d83184e53e/raw/099e10af2d84638211e25866f71afa7308226365/sf-cable-car.jpg",
++  content: "Please describe this image"
++)
++
++puts response.inspect
+diff --git a/lib/langchain/assistant/llm/adapters/ollama.rb b/lib/langchain/assistant/llm/adapters/ollama.rb
+index fbc01ab93..1f287ebba 100644
+--- a/lib/langchain/assistant/llm/adapters/ollama.rb
++++ b/lib/langchain/assistant/llm/adapters/ollama.rb
+@@ -39,9 +39,7 @@ def build_chat_params(
+           # @param tool_call_id [String] The tool call ID
+           # @return [Messages::OllamaMessage] The Ollama message
+           def build_message(role:, content: nil, image_url: nil, tool_calls: [], tool_call_id: nil)
+-            Langchain.logger.warn "WARNING: Image URL is not supported by Ollama currently" if image_url
+-
+-            Messages::OllamaMessage.new(role: role, content: content, tool_calls: tool_calls, tool_call_id: tool_call_id)
++            Messages::OllamaMessage.new(role: role, content: content, image_url: image_url, tool_calls: tool_calls, tool_call_id: tool_call_id)
+           end
+ 
+           # Extract the tool call information from the OpenAI tool call hash
+diff --git a/lib/langchain/assistant/messages/ollama_message.rb b/lib/langchain/assistant/messages/ollama_message.rb
+index 0ba768935..d660ff802 100644
+--- a/lib/langchain/assistant/messages/ollama_message.rb
++++ b/lib/langchain/assistant/messages/ollama_message.rb
+@@ -18,15 +18,18 @@ class OllamaMessage < Base
+         #
+         # @param role [String] The role of the message
+         # @param content [String] The content of the message
++        # @param image_url [String] The URL of the image to include in the message
+         # @param tool_calls [Array<Hash>] The tool calls made in the message
+         # @param tool_call_id [String] The ID of the tool call
+-        def initialize(role:, content: nil, tool_calls: [], tool_call_id: nil)
++        def initialize(role:, content: nil, image_url: nil, tool_calls: [], tool_call_id: nil)
+           raise ArgumentError, "Role must be one of #{ROLES.join(", ")}" unless ROLES.include?(role)
+           raise ArgumentError, "Tool calls must be an array of hashes" unless tool_calls.is_a?(Array) && tool_calls.all? { |tool_call| tool_call.is_a?(Hash) }
++          raise ArgumentError, "image_url must be a valid url" if image_url && !URI::DEFAULT_PARSER.make_regexp.match?(image_url)
+ 
+           @role = role
+           # Some Tools return content as a JSON hence `.to_s`
+           @content = content.to_s
++          @image_url = image_url
+           @tool_calls = tool_calls
+           @tool_call_id = tool_call_id
+         end
+@@ -38,6 +41,7 @@ def to_hash
+           {}.tap do |h|
+             h[:role] = role
+             h[:content] = content if content # Content is nil for tool calls
++            h[:images] = [image.base64] if image
+             h[:tool_calls] = tool_calls if tool_calls.any?
+             h[:tool_call_id] = tool_call_id if tool_call_id
+           end
+diff --git a/lib/langchain/utils/image_wrapper.rb b/lib/langchain/utils/image_wrapper.rb
+index 4c9336b0e..cee368d4a 100644
+--- a/lib/langchain/utils/image_wrapper.rb
++++ b/lib/langchain/utils/image_wrapper.rb
+@@ -1,6 +1,7 @@
+ # frozen_string_literal: true
+ 
+ require "open-uri"
++require "base64"
+ 
+ module Langchain
+   module Utils
+diff --git a/spec/langchain/assistant/llm/adapters/ollama_spec.rb b/spec/langchain/assistant/llm/adapters/ollama_spec.rb
+index 82ee2ec28..17c6fdebf 100644
+--- a/spec/langchain/assistant/llm/adapters/ollama_spec.rb
++++ b/spec/langchain/assistant/llm/adapters/ollama_spec.rb
+@@ -29,4 +29,16 @@
+       expect(subject.tool_role).to eq("tool")
+     end
+   end
++
++  describe "#build_message" do
++    it "returns an Ollama message" do
++      expect(
++        subject.build_message(
++          role: "user",
++          content: "Hello",
++          image_url: "https://example.com/image.jpg"
++        )
++      ).to be_a(Langchain::Assistant::Messages::OllamaMessage)
++    end
++  end
+ end
+diff --git a/spec/langchain/assistant/messages/ollama_message_spec.rb b/spec/langchain/assistant/messages/ollama_message_spec.rb
+index 82d4e1687..19a171999 100644
+--- a/spec/langchain/assistant/messages/ollama_message_spec.rb
++++ b/spec/langchain/assistant/messages/ollama_message_spec.rb
+@@ -6,6 +6,7 @@
+   let(:valid_roles) { ["system", "assistant", "user", "tool"] }
+   let(:role) { "assistant" }
+   let(:content) { "This is a message" }
++  let(:image_url) { "https://example.com/image.jpg" }
+   let(:raw_response) { JSON.parse(File.read("spec/fixtures/llm/ollama/chat_with_tool_calls.json")) }
+   let(:response) { Langchain::LLM::OllamaResponse.new(raw_response) }
+   let(:tool_calls) { response.tool_calls }
+@@ -14,7 +15,7 @@
+   describe "#initialize" do
+     context "with valid arguments" do
+       it "creates an instance of OllamaMessage" do
+-        message = described_class.new(role: role, content: content, tool_calls: tool_calls, tool_call_id: tool_call_id)
++        message = described_class.new(role: role, content: content, image_url: image_url, tool_calls: tool_calls, tool_call_id: tool_call_id)
+         expect(message).to be_an_instance_of(described_class)
+       end
+     end
+@@ -34,6 +35,14 @@
+         expect { described_class.new(role: role, tool_calls: tool_calls) }.to raise_error(ArgumentError, "Tool calls must be an array of hashes")
+       end
+     end
++
++    context "with invalid image_url" do
++      let(:image_url) { "invalid_image_url" }
++
++      it "raises an ArgumentError" do
++        expect { described_class.new(role: role, image_url: image_url) }.to raise_error(ArgumentError, "image_url must be a valid url")
++      end
++    end
+   end
+ 
+   describe "#to_hash" do
+@@ -72,6 +81,16 @@
+         expect(message.to_hash).to eq({role: "assistant", content: "", tool_calls: [tool_call]})
+       end
+     end
++
++    context "with an image" do
++      let(:message) { described_class.new(role: "user", content: "Describe this image", image_url: "https://example.com/image.jpg") }
++
++      it "returns a hash with the images key" do
++        allow(message).to receive(:image).and_return(double(base64: "base64_data", mime_type: "image/jpeg"))
++
++        expect(message.to_hash).to eq({role: "user", content: "Describe this image", images: ["base64_data"]})
++      end
++    end
+   end
+ 
+   describe "#llm?" do

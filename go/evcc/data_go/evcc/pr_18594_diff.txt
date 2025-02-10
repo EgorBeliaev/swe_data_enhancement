@@ -1,0 +1,220 @@
+diff --git a/vehicle/polestar/api.go b/vehicle/polestar/api.go
+index 48d3b7a8cc..5acbfa9b2f 100644
+--- a/vehicle/polestar/api.go
++++ b/vehicle/polestar/api.go
+@@ -49,26 +49,14 @@ func (v *API) Vehicles(ctx context.Context) ([]ConsumerCar, error) {
+ 	return res.GetConsumerCarsV2, err
+ }
+ 
+-func (v *API) Status(ctx context.Context, vin string) (BatteryData, error) {
++func (v *API) CarTelemetry(ctx context.Context, vin string) (CarTelemetryData, error) {
+ 	var res struct {
+-		BatteryData `graphql:"getBatteryData(vin: $vin)"`
++		CarTelemetryData `graphql:"carTelematics(vin: $vin)"`
+ 	}
+ 
+ 	err := v.client.Query(ctx, &res, map[string]any{
+ 		"vin": vin,
+-	}, graphql.OperationName("GetBatteryData"))
++	}, graphql.OperationName("CarTelematics"))
+ 
+-	return res.BatteryData, err
+-}
+-
+-func (v *API) Odometer(ctx context.Context, vin string) (OdometerData, error) {
+-	var res struct {
+-		OdometerData `graphql:"getOdometerData(vin: $vin)"`
+-	}
+-
+-	err := v.client.Query(ctx, &res, map[string]any{
+-		"vin": vin,
+-	}, graphql.OperationName("GetOdometerData"))
+-
+-	return res.OdometerData, err
++	return res.CarTelemetryData, err
+ }
+diff --git a/vehicle/polestar/provider.go b/vehicle/polestar/provider.go
+index efaa706b33..0722101618 100644
+--- a/vehicle/polestar/provider.go
++++ b/vehicle/polestar/provider.go
+@@ -9,44 +9,38 @@ import (
+ )
+ 
+ type Provider struct {
+-	statusG func() (BatteryData, error)
+-	odoG    func() (OdometerData, error)
++	telemetryG func() (CarTelemetryData, error)
+ }
+ 
+ func NewProvider(log *util.Logger, api *API, vin string, timeout, cache time.Duration) *Provider {
+ 	v := &Provider{
+-		statusG: util.Cached(func() (BatteryData, error) {
++		telemetryG: util.Cached(func() (CarTelemetryData, error) {
+ 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+ 			defer cancel()
+-			return api.Status(ctx, vin)
+-		}, cache),
+-		odoG: util.Cached(func() (OdometerData, error) {
+-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+-			defer cancel()
+-			return api.Odometer(ctx, vin)
++			return api.CarTelemetry(ctx, vin)
+ 		}, cache),
+ 	}
+ 
+ 	return v
+ }
+ 
+-// Soc implements the api.Vehicle interface
++// SOC via car telemetry
+ func (v *Provider) Soc() (float64, error) {
+-	res, err := v.statusG()
+-	return res.BatteryChargeLevelPercentage, err
++	res, err := v.telemetryG()
++	return res.Battery.BatteryChargeLevelPercentage, err
+ }
+ 
+ var _ api.ChargeState = (*Provider)(nil)
+ 
+-// Range implements the api.VehicleRange interface
++// Range via car telemetry
+ func (v *Provider) Status() (api.ChargeStatus, error) {
+-	status, err := v.statusG()
++	status, err := v.telemetryG()
+ 
+ 	res := api.StatusA
+-	if status.ChargerConnectionStatus == "CHARGER_CONNECTION_STATUS_CONNECTED" {
++	if status.Battery.ChargerConnectionStatus == "CHARGER_CONNECTION_STATUS_CONNECTED" {
+ 		res = api.StatusB
+ 	}
+-	if status.ChargingStatus == "CHARGING_STATUS_CHARGING" {
++	if status.Battery.ChargingStatus == "CHARGING_STATUS_CHARGING" {
+ 		res = api.StatusB
+ 	}
+ 
+@@ -55,27 +49,27 @@ func (v *Provider) Status() (api.ChargeStatus, error) {
+ 
+ var _ api.VehicleRange = (*Provider)(nil)
+ 
+-// Range implements the api.VehicleRange interface
++// Range via car telemetry
+ func (v *Provider) Range() (int64, error) {
+-	res, err := v.statusG()
+-	return int64(res.EstimatedDistanceToEmptyKm), err
++	res, err := v.telemetryG()
++	return int64(res.Battery.EstimatedDistanceToEmptyKm), err
+ }
+ 
+ var _ api.VehicleOdometer = (*Provider)(nil)
+ 
+-// Odometer implements the api.VehicleOdometer interface
++// Odometer via car telemetry
+ func (v *Provider) Odometer() (float64, error) {
+-	res, err := v.odoG()
+-	return res.OdometerMeters / 1e3, err
++	res, err := v.telemetryG()
++	return res.Odometer.OdometerMeters / 1e3, err
+ }
+ 
+ var _ api.VehicleFinishTimer = (*Provider)(nil)
+ 
+-// FinishTime implements the api.VehicleFinishTimer interface
++// FinishTime via car telemetry
+ func (v *Provider) FinishTime() (time.Time, error) {
+-	res, err := v.statusG()
++	res, err := v.telemetryG()
+ 	if err != nil {
+ 		return time.Time{}, err
+ 	}
+-	return time.Now().Add(time.Duration(res.EstimatedChargingTimeToFullMinutes) * time.Minute), nil
++	return time.Now().Add(time.Duration(res.Battery.EstimatedChargingTimeToFullMinutes) * time.Minute), nil
+ }
+diff --git a/vehicle/polestar/query.gql b/vehicle/polestar/query.gql
+index b096297ca7..2103b85a0e 100644
+--- a/vehicle/polestar/query.gql
++++ b/vehicle/polestar/query.gql
+@@ -27,38 +27,37 @@ query getCars {
+ 	}
+ }
+ 
+-query GetBatteryData($vin: String!) {
+-	getBatteryData(vin: $vin) {
+-		averageEnergyConsumptionKwhPer100Km
+-		batteryChargeLevelPercentage
+-		chargerConnectionStatus
+-		chargingCurrentAmps
+-		chargingPowerWatts
+-		chargingStatus
+-		estimatedChargingTimeMinutesToTargetDistance
+-		estimatedChargingTimeToFullMinutes
+-		estimatedDistanceToEmptyKm
+-		estimatedDistanceToEmptyMiles
+-		eventUpdatedTimestamp {
+-			iso
+-			unix
++query CarTelematics($vin: String!) {
++	carTelematics(vin: $vin) {
++		battery {
++			averageEnergyConsumptionKwhPer100Km
++			batteryChargeLevelPercentage
++			chargerConnectionStatus
++			chargingCurrentAmps
++			chargingPowerWatts
++			chargingStatus
++			estimatedChargingTimeMinutesToTargetDistance
++			estimatedChargingTimeToFullMinutes
++			estimatedDistanceToEmptyKm
++			estimatedDistanceToEmptyMiles
++			eventUpdatedTimestamp {
++				iso
++				unix
++				__typename
++			}
+ 			__typename
+ 		}
+-		__typename
+-	}
+-}
+-
+-query GetOdometerData($vin: String!) {
+-	getOdometerData(vin: $vin) {
+-		averageSpeedKmPerHour
+-		eventUpdatedTimestamp {
+-			iso
+-			unix
++		odometer {
++			averageSpeedKmPerHour
++			eventUpdatedTimestamp {
++				iso
++				unix
++				__typename
++			}
++			odometerMeters
++			tripMeterAutomaticKm
++			tripMeterManualKm
+ 			__typename
+ 		}
+-		odometerMeters
+-		tripMeterAutomaticKm
+-		tripMeterManualKm
+-		__typename
+ 	}
+-}
++}
+\ No newline at end of file
+diff --git a/vehicle/polestar/types.go b/vehicle/polestar/types.go
+index 133d4d17d9..281af42b76 100644
+--- a/vehicle/polestar/types.go
++++ b/vehicle/polestar/types.go
+@@ -21,6 +21,11 @@ type OdometerData struct {
+ 	EventUpdatedTimestamp EventUpdatedTimestamp
+ }
+ 
++type CarTelemetryData struct {
++	Battery  BatteryData
++	Odometer OdometerData
++}
++
+ type EventUpdatedTimestamp struct {
+ 	ISO time.Time
+ 	// Unix int64 `json:",string"`

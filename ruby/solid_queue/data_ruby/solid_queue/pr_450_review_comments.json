@@ -1,0 +1,68 @@
+[
+    {
+        "title": "Skip warning when replacing missing fork if supervisor has PID 1"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "As this would usually mean that some process got reparented to the process with PID 1, and that's why the supervisor doesn't know about it.\r\n\r\nAddresses #442"
+    },
+    {
+        "data": {
+            "repository": {
+                "issue": {
+                    "title": "Error: \"Tried to replace forked process but it had already died\"",
+                    "body": "Hi. Getting the following error from SolidQueue:\r\n```\r\nSolidQueue-1.0.2 Tried to replace forked process but it had already died (0.1ms)  pid: 411, status: 0, pid_from_status: 411, signaled: false, stopsig: nil, termsig: nil\r\nSolidQueue-1.0.2 Tried to replace forked process but it had already died (0.0ms)  pid: 412, status: 0, pid_from_status: 412, signaled: false, stopsig: nil, termsig: nil\r\n```\r\nThere are always 2 log entries per single executed job. The pair of pid's for a single job execution appear to always be sequential. The AJ job-completed log message is sometimes before and sometimes after these 2 errors.\r\n\r\nFor context, this is coming from a dedicated SQ process with 1 worker thread and 0 dispatchers. The executed job itself uses the `grover` gem, which calls `nodejs` to run `puppeteer`, which then calls `chrome` to generate a PDF. There are definitely some subprocesses being run.\r\n\r\nI think the intent of the error message is to indicate that an SQ worker process was killed? Is it possible it's a false alert and SQ's fork/process monitoring is picking up forked/sub processes that aren't its own? I don't have a solid grasp on SQ's forking-related internals.\r\n\r\nWhere I'm having a hard time is that the jobs do appear to complete, and as noted, the AJ job-completed logs also show up. So, the idea that the worker is being killed doesn't quite make sense.\r\n\r\nThoughts? Or how can I better debug this?",
+                    "state": "CLOSED",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {
+                                    "login": "rosa"
+                                },
+                                "body": "Hey @zarqman! That error comes from [here](https://github.com/rails/solid_queue/blob/18e7b0eac82951e906695395b465b217d8b56a1a/lib/solid_queue/supervisor.rb#L163-L168), which in turns comes from [here](https://github.com/rails/solid_queue/blob/18e7b0eac82951e906695395b465b217d8b56a1a/lib/solid_queue/supervisor.rb#L140-L143), so it's always about the supervisor's child processes. The message in particular comes from [here](https://github.com/rails/solid_queue/blob/18e7b0eac82951e906695395b465b217d8b56a1a/lib/solid_queue/log_subscriber.rb#L156-L159), when the supervisor doesn't have the records for these pids in their fork list, as if they had died and had been deleted before. That, together with the `status: 0` (successful, so something that just finished whatever it was doing) makes me think this is picking the grandchildren, the processes forked by the worker because of your job \ud83e\udd14 Basically, what you said:\r\n> Is it possible it's a false alert and SQ's fork/process monitoring is picking up forked/sub processes that aren't its own?\r\n\r\nBut I thought that was not possible to do with `waitpid2` \ud83d\ude2e  That is, to wait for grandchildren to exit, you'd need to wait in each of the children. Maybe the grandchildren are somehow being reparented to the process with PID 1, which happens to be your supervisor if you're running Docker? \ud83e\udd14 "
+                            },
+                            {
+                                "author": {
+                                    "login": "zarqman"
+                                },
+                                "body": "@rosa, thanks much! That helped point me toward some things to look into. And yes, everything is running inside Docker.\r\n\r\nGrover is using `Open3.popen3` to call node, which I don't think should be a problem.\r\nPuppeteer is using node's `childProcess.spawn` api with `detached: true` ([here](https://github.com/puppeteer/puppeteer/blob/main/packages/browsers/src/launch.ts#L292-L300)) to call chrome. That seems suspect.\r\n\r\nWhen [detached](https://nodejs.org/docs/latest-v22.x/api/child_process.html#optionsdetached) is true, \r\n\r\n> the child process will be made the leader of a new process group and session. [...] By default, the parent will wait for the detached child process to exit. To prevent the parent process from waiting for a given subprocess to exit, use the subprocess.unref() method.\r\n\r\nI not at all familiar with the nuances of process groups and sessions, but if I'm reading things right, it sounds like the detached great-grandchild processes are being reparented back to pid 1 aka the supervisor. That sounds almost exactly like what you suggested above as to what could be happening.\r\n\r\nFWIW, I am not seeing any call to `unref()`, but there is a lot of other on-exit and on-signal fanciness in puppeteer, so I'm not entirely sure what it's doing. And maybe waiting for exit doesn't matter, since pid 1 will see the great-grandchild processes anyway.\r\n\r\nIt sounds like this may not be solvable in the job class itself, although I'd be happy to try something there if it might work. Given how crazy puppeteer's code is to interact with chrome, I'm highly skeptical of the ability of addressing this there.\r\n\r\nWould it be appropriate for SQ to skip the log warning when exitstatus is 0, or does that risk missing something that should be logged? Or, is there something else I can do to help test/confirm this? \r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "rosa"
+                                },
+                                "body": "Ohhhh, I see! That's super useful, @zarqman! I think skipping the log warning makes perfect sense, especially if the supervisor's PID is 1 \ud83e\udd14  I'm not sure if this same thing would happen if the supervisor was not process 1, although I have no idea about how puppeteer works, I've never used it \ud83d\ude33  \r\n\r\nBut perhaps an experiment you could try if you're up for it to see if the issue happens is to run the supervisor as a fork of another process that'd be the pid 1 in Docker, having something like this, a `bin/jobs_wrapper` file:\r\n\r\n```bash\r\nfunction shutdown_handler(){\r\n  kill -TERM $PID\r\n}\r\n\r\ntrap shutdown_handler TERM INT\r\n\r\n# Run in the background so we can trap the signal without waiting for the processes to return\r\nbin/jobs \"$@\" &\r\nPID=$!\r\n# Interrupted by the SIGQUIT\r\nwait $PID\r\ntrap - TERM INT\r\n# Waiting until supervisor @ $PID exits or we get killed after docker stop wait\r\n# So we wait again\r\nwait $PID\r\n```\r\n\r\nAnd then run `bin/jobs_wrapper` instead of `bin/jobs`, that'd get the PID 1, and the supervisor will get another PID. This would confirm whether this happens because the PID is 1 or whether it'd happen regardless. "
+                            },
+                            {
+                                "author": {
+                                    "login": "zarqman"
+                                },
+                                "body": "Thanks so much for your ongoing help! I've tested things with a wrapper and it does eliminate the supervisor error messages. I also capture a `ps` list and the output is instructive.\r\n\r\nWithout the wrapper, immediately after grover's `Open3.popen3` returns:\r\n```\r\nPID TTY STAT TIME COMMAND\r\n1 ? Ssl 0:01 solid-queue-supervisor(1.0.2): supervising 21\r\n21 ? Sl 0:00 solid-queue-worker(1.0.2): waiting for jobs in transforming\r\n43 ? Z 0:00 [chrome-headless] <defunct>\r\n44 ? Z 0:00 [chrome-headless] <defunct>\r\n112 ? R 0:00 ps ax\r\nSolidQueue-1.0.2 Tried to replace forked process but it had already died (0.0ms) pid: 43, status: 0, pid_from_status: 43, signaled: false, stopsig: nil, termsig: nil\r\nSolidQueue-1.0.2 Tried to replace forked process but it had already died (0.0ms) pid: 44, status: 0, pid_from_status: 44, signaled: false, stopsig: nil, termsig: nil\r\n```\r\n\r\nWith the wrapper, again right after `popen3`:\r\n```\r\nPID TTY STAT TIME COMMAND\r\n1 ? Ss 0:00 /bin/bash bin/wrap_transforming\r\n7 ? Sl 0:02 solid-queue-supervisor(1.0.2): supervising 15\r\n15 ? Sl 0:00 solid-queue-worker(1.0.2): waiting for jobs in transforming\r\n188 ? R 0:00 ps ax\r\n# (no 'Tried to replace' messages)\r\n```\r\n\r\nIn the unwrapped test, subsequent jobs only show the new zombied processes--the old ones are gone, indicating they are being properly cleaned up, which is good.\r\n\r\nIn the wrapped test, I never saw the zombies across a handful of tests. I'm guessing bash itself is cleaning them up?\r\n\r\nRegardless, this does seem to confirm that it's specific to when the supervisor is PID 1."
+                            },
+                            {
+                                "author": {
+                                    "login": "rosa"
+                                },
+                                "body": "Aha! Super helpful! Thanks so much for doing that. I'm going to prepare a change to skip these warnings. I think I'll do it when the supervisor has PID 1, since it seems that's likely to happen because some random processes have been reparented to it and that's why it can't find it within its forks list. "
+                            },
+                            {
+                                "author": {
+                                    "login": "rosa"
+                                },
+                                "body": "I went with this simple change, I think that would work https://github.com/rails/solid_queue/pull/450"
+                            },
+                            {
+                                "author": {
+                                    "login": "zarqman"
+                                },
+                                "body": "\ud83d\udcaf Thanks again for your help with this!"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+]

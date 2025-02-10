@@ -1,0 +1,136 @@
+diff --git a/hugolib/rss_test.go b/hugolib/rss_test.go
+index 0c3c21b90f0..34c2be39328 100644
+--- a/hugolib/rss_test.go
++++ b/hugolib/rss_test.go
+@@ -96,3 +96,51 @@ Figure:
+ 
+ 	b.AssertFileContent("public/index.xml", "img src=&#34;http://example.com/images/sunset.jpg")
+ }
++
++// Issue 13332.
++func TestRSSCanonifyURLsSubDir(t *testing.T) {
++	t.Parallel()
++
++	files := `
++-- hugo.toml --
++baseURL = 'https://example.org/subdir'
++disableKinds = ['section','sitemap','taxonomy','term']
++[markup.goldmark.renderHooks.image]
++enableDefault = true
++[markup.goldmark.renderHooks.link]
++enableDefault = true
++-- layouts/_default/_markup/render-image.html --
++{{- $u := urls.Parse .Destination -}}
++{{- $src := $u.String | relURL -}}
++<img srcset="{{ $src }}" src="{{ $src }} 2x">
++<img src="{{ $src }}">
++{{- /**/ -}}
++-- layouts/_default/home.html --
++{{ .Content }}|
++-- layouts/_default/single.html --
++{{ .Content }}|
++-- layouts/_default/rss.xml --
++{{ with site.GetPage "/s1/p2" }}
++  {{ .Content | transform.XMLEscape | safeHTML }}
++{{ end }}
++-- content/s1/p1.md --
++---
++title: p1
++---
++-- content/s1/p2/index.md --
++---
++title: p2
++---
++![alt](a.jpg)
++
++[p1](/s1/p1)
++-- content/s1/p2/a.jpg --
++`
++
++	b := Test(t, files)
++
++	b.AssertFileContent("public/index.xml", "https://example.org/subdir/s1/p1/")
++	b.AssertFileContent("public/index.xml",
++		"img src=&#34;https://example.org/subdir/a.jpg",
++		"img srcset=&#34;https://example.org/subdir/a.jpg&#34; src=&#34;https://example.org/subdir/a.jpg 2x")
++}
+diff --git a/transform/urlreplacers/absurl.go b/transform/urlreplacers/absurl.go
+index 029d94da219..17fe1532719 100644
+--- a/transform/urlreplacers/absurl.go
++++ b/transform/urlreplacers/absurl.go
+@@ -13,7 +13,9 @@
+ 
+ package urlreplacers
+ 
+-import "github.com/gohugoio/hugo/transform"
++import (
++	"github.com/gohugoio/hugo/transform"
++)
+ 
+ var ar = newAbsURLReplacer()
+ 
+diff --git a/transform/urlreplacers/absurlreplacer.go b/transform/urlreplacers/absurlreplacer.go
+index a875e6fa879..601fd9a1f17 100644
+--- a/transform/urlreplacers/absurlreplacer.go
++++ b/transform/urlreplacers/absurlreplacer.go
+@@ -16,9 +16,11 @@ package urlreplacers
+ import (
+ 	"bytes"
+ 	"io"
++	"net/url"
+ 	"unicode"
+ 	"unicode/utf8"
+ 
++	"github.com/gohugoio/hugo/common/paths"
+ 	"github.com/gohugoio/hugo/transform"
+ )
+ 
+@@ -31,6 +33,9 @@ type absurllexer struct {
+ 	// path may be set to a "." relative path
+ 	path []byte
+ 
++	// The root path, without leading slash.
++	root []byte
++
+ 	pos   int // input position
+ 	start int // item start position
+ 
+@@ -119,6 +124,9 @@ func checkCandidateBase(l *absurllexer) {
+ 	}
+ 	l.pos += relURLPrefixLen
+ 	l.w.Write(l.path)
++	if len(l.root) > 0 && bytes.HasPrefix(l.content[l.pos:], l.root) {
++		l.pos += len(l.root)
++	}
+ 	l.start = l.pos
+ }
+ 
+@@ -174,7 +182,11 @@ func checkCandidateSrcset(l *absurllexer) {
+ 	for i, f := range fields {
+ 		if f[0] == '/' {
+ 			l.w.Write(l.path)
+-			l.w.Write(f[1:])
++			n := 1
++			if len(l.root) > 0 && bytes.HasPrefix(f[n:], l.root) {
++				n += len(l.root)
++			}
++			l.w.Write(f[n:])
+ 
+ 		} else {
+ 			l.w.Write(f)
+@@ -229,10 +241,15 @@ func (l *absurllexer) replace() {
+ }
+ 
+ func doReplace(path string, ct transform.FromTo, quotes [][]byte) {
++	var root string
++	if u, err := url.Parse(path); err == nil {
++		root = paths.TrimLeading(u.Path)
++	}
+ 	lexer := &absurllexer{
+ 		content: ct.From().Bytes(),
+ 		w:       ct.To(),
+ 		path:    []byte(path),
++		root:    []byte(root),
+ 		quotes:  quotes,
+ 	}
+ 

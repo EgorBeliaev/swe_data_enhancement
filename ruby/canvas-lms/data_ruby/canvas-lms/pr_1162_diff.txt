@@ -1,0 +1,93 @@
+diff --git a/doc/api/tools_variable_substitutions.md b/doc/api/tools_variable_substitutions.md
+index 66adb4e133392..a44effe6e6d50 100644
+--- a/doc/api/tools_variable_substitutions.md
++++ b/doc/api/tools_variable_substitutions.md
+@@ -480,6 +480,15 @@ returns the current course's term start date.
+ ```
+ YYY-MM-DD HH:MM:SS -0700
+ ```
++## Canvas.term.name
++returns the current course's term name.
++
++**Availability**: **  
++**Launch Parameter**: *canvas_term_name*  
++
++```
++W1 2017
++```
+ ## CourseSection.sourcedId
+ returns the current course sis source id
+ to return the section source id use Canvas.course.sectionIds.
+diff --git a/lib/lti/variable_expander.rb b/lib/lti/variable_expander.rb
+index 0fc51b0862027..7a1ce89de8bb6 100644
+--- a/lib/lti/variable_expander.rb
++++ b/lib/lti/variable_expander.rb
+@@ -52,6 +52,7 @@ def self.default_name_expansions
+     COURSE_GUARD = -> { @context.is_a? Course }
+     TERM_START_DATE_GUARD = -> { @context.is_a?(Course) && @context.enrollment_term &&
+                                  @context.enrollment_term.start_at }
++    TERM_NAME_GUARD = -> { @context.is_a?(Course) && @context.enrollment_term&.name }
+     USER_GUARD = -> { @current_user }
+     SIS_USER_GUARD = -> { @current_user && @current_user.pseudonym && @current_user.pseudonym.sis_user_id }
+     PSEUDONYM_GUARD = -> { sis_pseudonym }
+@@ -516,6 +517,16 @@ def enabled_capability_params(enabled_capabilities)
+                        -> { @context.enrollment_term.start_at },
+                        TERM_START_DATE_GUARD
+ 
++    # returns the current course's term name.
++    # @example
++    #   ```
++    #   W1 2017
++    #   ```
++    register_expansion 'Canvas.term.name', [],
++                        -> { @context.enrollment_term.name },
++                        TERM_NAME_GUARD,
++                        default_name: 'canvas_term_name'
++
+     # returns the current course sis source id
+     # to return the section source id use Canvas.course.sectionIds
+     # @launch_parameter lis_course_section_sourcedid
+diff --git a/spec/lib/lti/capabilities_helper_spec.rb b/spec/lib/lti/capabilities_helper_spec.rb
+index 74b6e13ab623f..abafc069c9408 100644
+--- a/spec/lib/lti/capabilities_helper_spec.rb
++++ b/spec/lib/lti/capabilities_helper_spec.rb
+@@ -74,6 +74,7 @@ module Lti
+     let(:valid_enabled_caps){ %w(ToolConsumerInstance.guid Membership.role CourseSection.sourcedId) }
+     let(:supported_capabilities){
+       %w(ToolConsumerInstance.guid
++         Canvas.term.name
+          CourseSection.sourcedId
+          Membership.role
+          Person.email.primary
+diff --git a/spec/lib/lti/variable_expander_spec.rb b/spec/lib/lti/variable_expander_spec.rb
+index eca4d304a1e8e..9d94f406e1526 100644
+--- a/spec/lib/lti/variable_expander_spec.rb
++++ b/spec/lib/lti/variable_expander_spec.rb
+@@ -753,6 +753,27 @@ module Lti
+           expect(exp_hash[:test]).to eq '2015-05-21 17:01:36'
+         end
+ 
++        it 'has a functioning guard for $Canvas.term.name when term.name is not set' do
++          term = course.enrollment_term
++          exp_hash = {test: '$Canvas.term.name'}
++          variable_expander.expand_variables!(exp_hash)
++
++          unless term && term.name
++            expect(exp_hash[:test]).to eq '$Canvas.term.name'
++          end
++        end
++
++        it 'has substitution for $Canvas.term.name when term.name is set' do
++          course.enrollment_term ||= EnrollmentTerm.new
++          term = course.enrollment_term
++
++          term.name = 'W1 2017'
++          term.save
++          exp_hash = {test: '$Canvas.term.name'}
++          variable_expander.expand_variables!(exp_hash)
++          expect(exp_hash[:test]).to eq 'W1 2017'
++        end
++
+         it 'has substitution for $Canvas.externalTool.url' do
+           course.save!
+           tool = course.context_external_tools.create!(:domain => 'example.com', :consumer_key => '12345', :shared_secret => 'secret', :privacy_level => 'anonymous', :name => 'tool')

@@ -1,0 +1,400 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3a7157906..f52beb3cb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,6 @@
+ ## [Unreleased]
+ - Deprecate Langchain::LLM::GooglePalm
++- Allow setting response_object: {} parameter when initializing supported Langchain::LLM::* classes
+ 
+ ## [0.16.0] - 2024-09-19
+ - Remove `Langchain::Thread` class as it was not needed.
+diff --git a/lib/langchain/llm/azure.rb b/lib/langchain/llm/azure.rb
+index 83279f215..4c79f27e4 100644
+--- a/lib/langchain/llm/azure.rb
++++ b/lib/langchain/llm/azure.rb
+@@ -38,7 +38,8 @@ def initialize(
+         top_logprobs: {},
+         n: {default: @defaults[:n]},
+         temperature: {default: @defaults[:temperature]},
+-        user: {}
++        user: {},
++        response_format: {default: @defaults[:response_format]}
+       )
+       chat_parameters.ignore(:top_k)
+     end
+diff --git a/lib/langchain/llm/base.rb b/lib/langchain/llm/base.rb
+index 06b7aee6c..1208b7df0 100644
+--- a/lib/langchain/llm/base.rb
++++ b/lib/langchain/llm/base.rb
+@@ -26,6 +26,9 @@ class Base
+     # A client for communicating with the LLM
+     attr_accessor :client
+ 
++    # Default LLM options. Can be overridden by passing `default_options: {}` to the Langchain::LLM::* constructors.
++    attr_reader :defaults
++
+     # Ensuring backward compatibility after https://github.com/patterns-ai-core/langchainrb/pull/586
+     # TODO: Delete this method later
+     def default_dimension
+diff --git a/lib/langchain/llm/cohere.rb b/lib/langchain/llm/cohere.rb
+index 30e3d473b..1515570ec 100644
+--- a/lib/langchain/llm/cohere.rb
++++ b/lib/langchain/llm/cohere.rb
+@@ -27,7 +27,8 @@ def initialize(api_key:, default_options: {})
+       @defaults = DEFAULTS.merge(default_options)
+       chat_parameters.update(
+         model: {default: @defaults[:chat_completion_model_name]},
+-        temperature: {default: @defaults[:temperature]}
++        temperature: {default: @defaults[:temperature]},
++        response_format: {default: @defaults[:response_format]}
+       )
+       chat_parameters.remap(
+         system: :preamble,
+@@ -97,6 +98,10 @@ def chat(params = {})
+ 
+       parameters = chat_parameters.to_params(params)
+ 
++      # Cohere API requires `message:` parameter to be sent separately from `chat_history:`.
++      # We extract the last message from the messages param.
++      parameters[:message] = parameters[:chat_history].pop&.dig(:message)
++
+       response = client.chat(**parameters)
+ 
+       Langchain::LLM::CohereResponse.new(response)
+diff --git a/lib/langchain/llm/mistral_ai.rb b/lib/langchain/llm/mistral_ai.rb
+index 4e89ff14f..5a9b37aa3 100644
+--- a/lib/langchain/llm/mistral_ai.rb
++++ b/lib/langchain/llm/mistral_ai.rb
+@@ -26,7 +26,9 @@ def initialize(api_key:, default_options: {})
+       chat_parameters.update(
+         model: {default: @defaults[:chat_completion_model_name]},
+         n: {default: @defaults[:n]},
+-        safe_prompt: {}
++        safe_prompt: {},
++        temperature: {default: @defaults[:temperature]},
++        response_format: {default: @defaults[:response_format]}
+       )
+       chat_parameters.remap(seed: :random_seed)
+       chat_parameters.ignore(:n, :top_k)
+diff --git a/lib/langchain/llm/ollama.rb b/lib/langchain/llm/ollama.rb
+index f2741a470..fa7a04178 100644
+--- a/lib/langchain/llm/ollama.rb
++++ b/lib/langchain/llm/ollama.rb
+@@ -45,7 +45,8 @@ def initialize(url: "http://localhost:11434", api_key: nil, default_options: {})
+         model: {default: @defaults[:chat_completion_model_name]},
+         temperature: {default: @defaults[:temperature]},
+         template: {},
+-        stream: {default: false}
++        stream: {default: false},
++        response_format: {default: @defaults[:response_format]}
+       )
+       chat_parameters.remap(response_format: :format)
+     end
+@@ -149,7 +150,7 @@ def complete(
+         end
+       end
+ 
+-      generate_final_completion_response(responses_stream, parameters)
++      generate_final_completion_response(responses_stream, parameters[:model])
+     end
+ 
+     # Generate a chat completion
+@@ -186,7 +187,7 @@ def chat(messages:, model: nil, **params, &block)
+         end
+       end
+ 
+-      generate_final_chat_completion_response(responses_stream, parameters)
++      generate_final_chat_completion_response(responses_stream, parameters[:model])
+     end
+ 
+     #
+@@ -289,20 +290,20 @@ def json_responses_chunk_handler(&block)
+       end
+     end
+ 
+-    def generate_final_completion_response(responses_stream, parameters)
++    def generate_final_completion_response(responses_stream, model)
+       final_response = responses_stream.last.merge(
+         "response" => responses_stream.map { |resp| resp["response"] }.join
+       )
+ 
+-      OllamaResponse.new(final_response, model: parameters[:model])
++      OllamaResponse.new(final_response, model: model)
+     end
+ 
+     # BUG: If streamed, this method does not currently return the tool_calls response.
+-    def generate_final_chat_completion_response(responses_stream, parameters)
++    def generate_final_chat_completion_response(responses_stream, model)
+       final_response = responses_stream.last
+       final_response["message"]["content"] = responses_stream.map { |resp| resp.dig("message", "content") }.join
+ 
+-      OllamaResponse.new(final_response, model: parameters[:model])
++      OllamaResponse.new(final_response, model: model)
+     end
+   end
+ end
+diff --git a/lib/langchain/llm/openai.rb b/lib/langchain/llm/openai.rb
+index a21e66cce..3528f6d6a 100644
+--- a/lib/langchain/llm/openai.rb
++++ b/lib/langchain/llm/openai.rb
+@@ -26,8 +26,6 @@ class OpenAI < Base
+       "text-embedding-3-small" => 1536
+     }.freeze
+ 
+-    attr_reader :defaults
+-
+     # Initialize an OpenAI LLM instance
+     #
+     # @param api_key [String] The API key to use
+@@ -35,7 +33,7 @@ class OpenAI < Base
+     def initialize(api_key:, llm_options: {}, default_options: {})
+       depends_on "ruby-openai", req: "openai"
+ 
+-      @client = ::OpenAI::Client.new(access_token: api_key, **llm_options)
++      @client = ::OpenAI::Client.new(access_token: api_key, **llm_options, log_errors: true)
+ 
+       @defaults = DEFAULTS.merge(default_options)
+       chat_parameters.update(
+@@ -44,7 +42,8 @@ def initialize(api_key:, llm_options: {}, default_options: {})
+         top_logprobs: {},
+         n: {default: @defaults[:n]},
+         temperature: {default: @defaults[:temperature]},
+-        user: {}
++        user: {},
++        response_format: {default: @defaults[:response_format]}
+       )
+       chat_parameters.ignore(:top_k)
+     end
+diff --git a/spec/fixtures/vcr_cassettes/Langchain_LLM_Ollama_chat_returns_a_chat_completion_format_json.yml b/spec/fixtures/vcr_cassettes/Langchain_LLM_Ollama_chat_returns_a_chat_completion_format_json.yml
+new file mode 100644
+index 000000000..cc05ca5a4
+--- /dev/null
++++ b/spec/fixtures/vcr_cassettes/Langchain_LLM_Ollama_chat_returns_a_chat_completion_format_json.yml
+@@ -0,0 +1,61 @@
++---
++http_interactions:
++- request:
++    method: post
++    uri: http://localhost:11434/api/chat
++    body:
++      encoding: UTF-8
++      string: '{"messages":[{"role":"user","content":"Return data from the following
++        sentence: John is a 30 year old software engineering living in SF."}],"model":"llama3.1","stream":true,"temperature":0.0,"format":"json"}'
++    headers:
++      User-Agent:
++      - Faraday v2.9.0
++      Content-Type:
++      - application/json
++      Accept-Encoding:
++      - gzip;q=1.0,deflate;q=0.6,identity;q=0.3
++      Accept:
++      - "*/*"
++  response:
++    status:
++      code: 200
++      message: OK
++    headers:
++      Content-Type:
++      - application/x-ndjson
++      Date:
++      - Wed, 25 Sep 2024 21:25:40 GMT
++      Transfer-Encoding:
++      - chunked
++    body:
++      encoding: UTF-8
++      string: |
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.462781Z","message":{"role":"assistant","content":"{\""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.484632Z","message":{"role":"assistant","content":"Name"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.505886Z","message":{"role":"assistant","content":"\":"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.526715Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.547458Z","message":{"role":"assistant","content":"John"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.568443Z","message":{"role":"assistant","content":"\","},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.588609Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.609082Z","message":{"role":"assistant","content":"Age"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.631109Z","message":{"role":"assistant","content":"\":"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.652356Z","message":{"role":"assistant","content":" "},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.673218Z","message":{"role":"assistant","content":"30"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.693496Z","message":{"role":"assistant","content":","},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.713553Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.733703Z","message":{"role":"assistant","content":"Prof"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.754814Z","message":{"role":"assistant","content":"ession"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.776488Z","message":{"role":"assistant","content":"\":"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.800856Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.825675Z","message":{"role":"assistant","content":"Software"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.848464Z","message":{"role":"assistant","content":" Engineering"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.869586Z","message":{"role":"assistant","content":"\","},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.892073Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.914327Z","message":{"role":"assistant","content":"Location"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.937725Z","message":{"role":"assistant","content":"\":"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.960155Z","message":{"role":"assistant","content":" \""},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:40.981624Z","message":{"role":"assistant","content":"SF"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:41.003519Z","message":{"role":"assistant","content":"\"}"},"done":false}
++        {"model":"llama3.1","created_at":"2024-09-25T21:25:41.024513Z","message":{"role":"assistant","content":""},"done_reason":"stop","done":true,"total_duration":1637799583,"load_duration":39689291,"prompt_eval_count":31,"prompt_eval_duration":1032278000,"eval_count":27,"eval_duration":561716000}
++  recorded_at: Wed, 25 Sep 2024 21:25:41 GMT
++recorded_with: VCR 6.2.0
+diff --git a/spec/langchain/llm/azure_spec.rb b/spec/langchain/llm/azure_spec.rb
+index 5562faea5..9d1ff8b1e 100644
+--- a/spec/langchain/llm/azure_spec.rb
++++ b/spec/langchain/llm/azure_spec.rb
+@@ -59,5 +59,21 @@
+         expect(subject.chat_parameters[:temperature]).to eq(0.5)
+       end
+     end
++
++    context "when default_options are passed" do
++      let(:default_options) { {response_format: {type: "json_object"}} }
++
++      subject { described_class.new(api_key: "123", default_options: default_options) }
++
++      it "sets the defaults options" do
++        expect(subject.defaults[:response_format]).to eq(type: "json_object")
++      end
++
++      it "get passed to consecutive chat() call" do
++        subject
++        expect(subject.chat_client).to receive(:chat).with(parameters: hash_including({response_format: {type: "json_object"}})).and_return({})
++        subject.chat(messages: [{role: "user", content: "Hello json!"}])
++      end
++    end
+   end
+ end
+diff --git a/spec/langchain/llm/cohere_spec.rb b/spec/langchain/llm/cohere_spec.rb
+index cefb8778b..33f8a556c 100644
+--- a/spec/langchain/llm/cohere_spec.rb
++++ b/spec/langchain/llm/cohere_spec.rb
+@@ -5,6 +5,24 @@
+ RSpec.describe Langchain::LLM::Cohere do
+   let(:subject) { described_class.new(api_key: "123") }
+ 
++  describe "#initialize" do
++    context "when default_options are passed" do
++      let(:default_options) { {response_format: {type: "json_object"}} }
++
++      subject { described_class.new(api_key: "123", default_options: default_options) }
++
++      it "sets the defaults options" do
++        expect(subject.defaults[:response_format]).to eq(type: "json_object")
++      end
++
++      it "get passed to consecutive chat() call" do
++        subject
++        expect(subject.client).to receive(:chat).with(hash_including({response_format: {type: "json_object"}})).and_return({})
++        subject.chat(messages: [{role: "user", message: "Hello json!"}])
++      end
++    end
++  end
++
+   describe "#embed" do
+     before do
+       allow(subject.client).to receive(:embed).and_return(
+@@ -97,7 +115,8 @@
+           model: "command-r-plus",
+           temperature: 0.0,
+           preamble: "You are a cheerful happy chatbot!",
+-          chat_history: [{role: "user", message: "How are you?"}]
++          chat_history: [],
++          message: "How are you?"
+         )
+         .and_return(response)
+     end
+diff --git a/spec/langchain/llm/mistral_ai_spec.rb b/spec/langchain/llm/mistral_ai_spec.rb
+index 6a6de7590..6ddb45c26 100644
+--- a/spec/langchain/llm/mistral_ai_spec.rb
++++ b/spec/langchain/llm/mistral_ai_spec.rb
+@@ -5,11 +5,36 @@
+ RSpec.describe Langchain::LLM::MistralAI do
+   let(:subject) { described_class.new(api_key: "123") }
+ 
++  let(:mock_client) { instance_double(Mistral::Controllers::Client) }
++
++  before do
++    allow(Mistral).to receive(:new).and_return(mock_client)
++  end
++
++  describe "#initialize" do
++    context "when default_options are passed" do
++      let(:default_options) { {response_format: {type: "json_object"}} }
++
++      subject { described_class.new(api_key: "123", default_options: default_options) }
++
++      it "sets the defaults options" do
++        expect(subject.defaults[:response_format]).to eq(type: "json_object")
++      end
++
++      it "get passed to consecutive chat() call" do
++        allow(mock_client).to receive(:chat_completions)
++        subject.chat(messages: [{role: "user", content: "Hello json!"}])
++        expect(subject.client).to have_received(:chat_completions).with(hash_including({response_format: {type: "json_object"}}))
++      end
++    end
++  end
++
+   describe "#chat" do
+-    it "calls the client with the requested parameters" do
+-      mock_client = instance_double(Mistral::Controllers::Client)
+-      allow(Mistral).to receive(:new).and_return(mock_client)
++    before do
+       allow(mock_client).to receive(:chat_completions)
++    end
++
++    it "calls the client with the requested parameters" do
+       params = {
+         messages: [{role: "user", content: "Beep"}, {role: "assistant", content: "Boop"}, {role: "user", content: "bop"}],
+         temperature: 1,
+diff --git a/spec/langchain/llm/ollama_spec.rb b/spec/langchain/llm/ollama_spec.rb
+index 0482c13e7..4a172aa51 100644
+--- a/spec/langchain/llm/ollama_spec.rb
++++ b/spec/langchain/llm/ollama_spec.rb
+@@ -21,6 +21,24 @@
+ 
+       expect(subject.send(:client).headers).to include("Authorization" => "Bearer abc123")
+     end
++
++    context "when default_options are passed" do
++      let(:default_options) { {response_format: "json"} }
++      let(:messages) { [{role: "user", content: "Return data from the following sentence: John is a 30 year old software engineering living in SF."}] }
++      let(:response) { subject.chat(messages: messages) { |resp| streamed_responses << resp } }
++      let(:streamed_responses) { [] }
++
++      subject { described_class.new(default_options: default_options) }
++
++      it "sets the defaults options" do
++        expect(subject.defaults[:response_format]).to eq("json")
++      end
++
++      it "get passed to consecutive chat() call", vcr: {cassette_name: "Langchain_LLM_Ollama_chat_returns_a_chat_completion_format_json"} do
++        expect(client).to receive(:post).with("api/chat", hash_including(format: "json")).and_call_original
++        expect(JSON.parse(response.chat_completion)).to eq({"Name" => "John", "Age" => 30, "Profession" => "Software Engineering", "Location" => "SF"})
++      end
++    end
+   end
+ 
+   describe "#embed" do
+diff --git a/spec/langchain/llm/openai_spec.rb b/spec/langchain/llm/openai_spec.rb
+index 51b494f6c..0c23d9c02 100644
+--- a/spec/langchain/llm/openai_spec.rb
++++ b/spec/langchain/llm/openai_spec.rb
+@@ -23,6 +23,22 @@
+         expect(result.client.uri_base).to eq("http://localhost:1234")
+       end
+     end
++
++    context "when default_options are passed" do
++      let(:default_options) { {response_format: {type: "json_object"}} }
++
++      subject { described_class.new(api_key: "123", default_options: default_options) }
++
++      it "sets the defaults options" do
++        expect(subject.defaults[:response_format]).to eq(type: "json_object")
++      end
++
++      it "get passed to consecutive chat() call" do
++        subject
++        expect(subject.client).to receive(:chat).with(parameters: hash_including({response_format: {type: "json_object"}})).and_return({})
++        subject.chat(messages: [{role: "user", content: "Hello json!"}])
++      end
++    end
+   end
+ 
+   describe "#embed" do

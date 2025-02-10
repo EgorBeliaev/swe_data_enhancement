@@ -1,0 +1,383 @@
+diff --git a/.gitignore b/.gitignore
+index 96254e240..2b9a2a072 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,6 +6,8 @@
+ /tmp/*
+ /assets/css/app.css
+ /.auto-parallel-tests
++/sql.log
++/sql_query_parameterization_analysis.txt
+ 
+ # Used by rake by
+ /bin/by
+diff --git a/Gemfile b/Gemfile
+index efce1b47d..c24a6ace9 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -20,7 +20,7 @@ gem "rqrcode"
+ gem "mail"
+ gem "shellwords"
+ gem "refrigerator", ">= 1"
+-gem "sequel", ">= 5.89"
++gem "sequel", github: "jeremyevans/sequel", ref: "5336fb646a7736ce3c1f53ed954064d61e6bafe2"
+ gem "sequel_pg", ">= 1.8", require: "sequel"
+ gem "rack-unreloader", ">= 1.8"
+ gem "rake"
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 2b362a13e..adb273527 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -15,6 +15,14 @@ GIT
+     roda (3.88.0)
+       rack
+ 
++GIT
++  remote: https://github.com/jeremyevans/sequel.git
++  revision: 5336fb646a7736ce3c1f53ed954064d61e6bafe2
++  ref: 5336fb646a7736ce3c1f53ed954064d61e6bafe2
++  specs:
++    sequel (5.89.0)
++      bigdecimal
++
+ GIT
+   remote: https://github.com/ubicloud/erb-formatter.git
+   revision: a9ff0001a1eb028e2186b222aeb02b07c04f9808
+@@ -351,8 +359,6 @@ GEM
+       addressable (>= 2.3.5)
+       faraday (>= 0.17.3, < 3)
+     securerandom (0.4.1)
+-    sequel (5.89.0)
+-      bigdecimal
+     sequel-annotate (1.7.0)
+       sequel (>= 4)
+     sequel_pg (1.17.1)
+@@ -485,7 +491,7 @@ DEPENDENCIES
+   rubocop-rake
+   rubocop-rspec
+   rubocop-sequel
+-  sequel (>= 5.89)
++  sequel!
+   sequel-annotate
+   sequel_pg (>= 1.8)
+   shellwords
+diff --git a/Rakefile b/Rakefile
+index d76f0fb79..430871f81 100644
+--- a/Rakefile
++++ b/Rakefile
+@@ -244,6 +244,13 @@ end
+ 
+ # Other
+ 
++desc "Check generated SQL for parameterization"
++task "check_query_parameterization" do
++  require "rbconfig"
++  system({"CHECK_LOGGED_SQL" => "1"}, RbConfig.ruby, "-S", "rake", "frozen_sspec")
++  system(RbConfig.ruby, "bin/check_for_parameters", out: "sql_query_parameterization_analysis.txt")
++end
++
+ desc "Check that model files work when required separately"
+ task "check_separate_requires" do
+   require "rbconfig"
+diff --git a/bin/check_for_parameters b/bin/check_for_parameters
+new file mode 100755
+index 000000000..b7de79a39
+--- /dev/null
++++ b/bin/check_for_parameters
+@@ -0,0 +1,42 @@
++#!/usr/local/bin/ruby
++# frozen_string_literal: true
++
++parameterized_sql = Hash.new(0)
++other_sql = Hash.new(0)
++
++File.open("sql.log").each("\0") do |line|
++  if /\AINFO -- : \(\d\.\d*s\) (.*)\0\z/m =~ line
++    sql = $1
++
++    sql, params = sql.split("; [", 2)
++    if params || sql.start_with?("PREPARE")
++      parameterized_sql[sql] += 1
++    else
++      other_sql[sql] += 1
++    end
++  end
++end
++
++missed_params, no_expected_params = other_sql.keys.partition do |sql|
++  next if sql.match?(/ROLLBACK|BEGIN|SAVEPOINT|LIMIT 0|DEFAULT VALUES|DELETE FROM "[a-z_]*"$|SELECT \* FROM "[a-z_]*"( ORDER BY "[a-z_]*")?$|SELECT count\(\*\) AS "count" FROM'/)
++  next unless sql.match?(/SELECT|INSERT|UPDATE|DELETE/)
++
++  sql.gsub(/LIMIT \d+/, "").gsub(/OFFSET \d+/, "").match?(/[^a-z0-9_][0-9]|'/)
++end
++
++print "Summary: "
++print "Missed: #{missed_params.size}|#{missed_params.sum { |s| other_sql[s] }}, "
++print "Parameterized: #{parameterized_sql.size}|#{parameterized_sql.values.sum}, "
++puts "Not Parameterized: #{no_expected_params.size}|#{no_expected_params.sum { |s| other_sql[s] }}"
++puts
++
++puts "SQL with missed parameters:"
++puts missed_params.sort
++puts
++
++puts "Parameterized SQL:"
++puts parameterized_sql.keys.sort
++puts
++
++puts "SQL with no expected parameters:"
++puts no_expected_params.sort
+diff --git a/db.rb b/db.rb
+index a41aaf123..1e85869c7 100644
+--- a/db.rb
++++ b/db.rb
+@@ -9,7 +9,7 @@
+ Util.safe_write_to_file(db_ca_bundle_filename, Config.clover_database_root_certs)
+ max_connections = Config.db_pool - 1
+ max_connections = 1 if ENV["SHARED_CONNECTION"] == "1"
+-DB = Sequel.connect(Config.clover_database_url, max_connections:, pool_timeout: Config.database_timeout).tap do |db|
++DB = Sequel.connect(Config.clover_database_url, max_connections:, pool_timeout: Config.database_timeout, treat_string_list_as_text_array: true).tap do |db|
+   # Replace dangerous (for cidrs) Ruby IPAddr type that is otherwise
+   # used by sequel_pg.  Has come up more than once in the bug tracker:
+   #
+@@ -30,7 +30,7 @@
+ 
+ # Load Sequel Database/Global extensions here
+ # DB.extension :date_arithmetic
+-DB.extension :pg_array, :pg_json, :pg_auto_parameterize, :pg_timestamptz, :pg_range
++DB.extension :pg_array, :pg_json, :pg_auto_parameterize, :pg_auto_parameterize_in_array, :pg_timestamptz, :pg_range
+ Sequel.extension :pg_range_ops, :pg_json_ops
+ 
+ DB.extension :pg_schema_caching
+diff --git a/lib/access_control_model_tag.rb b/lib/access_control_model_tag.rb
+index ab15d94fd..258734e49 100644
+--- a/lib/access_control_model_tag.rb
++++ b/lib/access_control_model_tag.rb
+@@ -30,7 +30,7 @@ def add_members(member_ids)
+   end
+ 
+   def remove_members(member_ids)
+-    applied_dataset.where(:tag_id => id, applied_column => member_ids).delete
++    applied_dataset.where(:tag_id => id, applied_column => Sequel.any_uuid(member_ids)).delete
+   end
+ 
+   def currently_included_in
+diff --git a/lib/authorization.rb b/lib/authorization.rb
+index 0f57881fd..bab351081 100644
+--- a/lib/authorization.rb
++++ b/lib/authorization.rb
+@@ -41,7 +41,7 @@ def self.all_permissions(project_id, subject_id, object_id)
+ 
+     base_ds = DB[table]
+       .select(:tag_id, 0)
+-      .where(column => values)
++      .where(column => Sequel.any_uuid(values))
+ 
+     if project_id
+       # We only look for applied_action_tag entries with an action_tag for the project or global action_tags.
+@@ -66,7 +66,7 @@ def self.matched_policies_dataset(project_id, subject_id, actions = nil, object_
+ 
+     if actions
+       actions = Array(actions).map { ActionType::NAME_MAP.fetch(_1) }
+-      dataset = dataset.where(Sequel.or([nil, actions, recursive_tag_query(:action, actions, project_id:)].map { [:action_id, _1] }))
++      dataset = dataset.where(Sequel.or([nil, Sequel.any_uuid(actions), recursive_tag_query(:action, actions, project_id:)].map { [:action_id, _1] }))
+     end
+ 
+     if object_id
+diff --git a/model.rb b/model.rb
+index ab1c09a05..2a78e1d98 100644
+--- a/model.rb
++++ b/model.rb
+@@ -19,6 +19,19 @@
+ Sequel::Model.plugin :inspect_pk
+ Sequel::Model.plugin :static_cache_cache, "cache/static_cache.cache"
+ Sequel::Model.plugin :pg_auto_constraint_validations, cache_file: "cache/pg_auto_constraint_validations.cache"
++Sequel::Model.plugin :pg_eager_any_typed_array
++
++def Sequel.any_type(array, type)
++  Sequel.function(:ANY, Sequel.pg_array(array, type))
++end
++
++def Sequel.any_uuid(array)
++  if array.is_a?(Array)
++    any_type(array, :uuid)
++  else
++    array
++  end
++end
+ 
+ if (level = Config.database_logger_level) || Config.test?
+   require "logger"
+@@ -26,14 +39,44 @@
+   DB.loggers << LOGGER
+ end
+ 
++if ENV["CHECK_LOGGED_SQL"]
++  require "logger"
++  File.unlink("sql.log")
++  f = File.open("sql.log", "ab")
++
++  # Remove optimization that does not use parameterization
++  def (Sequel::Model).reset_fast_pk_lookup_sql = nil
++
++  # Hack to make specs pass that mock Time.now and depend
++  # on certain number of Time.now calls
++  time = Time.now
++  def time.now
++    self
++  end
++  Logger.const_set(:Time, time)
++
++  sql_logger = Logger.new(f, level: :INFO)
++  sql_logger.formatter = proc do |sev, _, _, msg|
++    "#{sev} -- : #{msg}\0"
++  end
++
++  DB.loggers << sql_logger
++end
++
+ module SequelExtensions
+   def delete(force: false, &)
+     # Do not error if this is a plain dataset that does not respond to destroy
+     return super(&) unless respond_to?(:destroy)
+ 
+-    rodaauth_in_callstack = !caller.grep(/rodauth/).empty?
+-    destroy_in_callstack = !caller.grep(/sequel\/model\/base.*_destroy_delete/).empty?
+-    unless rodaauth_in_callstack || destroy_in_callstack || force
++    caller_lines = caller
++    rodauth_in_callstack = !caller_lines.grep(/rodauth/).empty?
++    destroy_in_callstack = !caller_lines.grep(/sequel\/model\/base.*_destroy_delete/).empty?
++
++    # This can happen when fast instance deletes are disabled (when CHECK_LOGGED_SQL
++    # environment variable is set)
++    callee_in_callstack = !caller_lines.grep(/#{Regexp.escape(__FILE__)}.*delete/).empty?
++
++    unless rodauth_in_callstack || destroy_in_callstack || callee_in_callstack || force
+       raise "Calling delete is discouraged as it skips hooks such as before_destroy, which " \
+             "we use to archive records. Use destroy instead. If you know what you are doing " \
+             "and still want to use delete, you can pass force: true to trigger delete."
+diff --git a/model/dns_zone/dns_zone.rb b/model/dns_zone/dns_zone.rb
+index 7e0847ab9..560f522f3 100644
+--- a/model/dns_zone/dns_zone.rb
++++ b/model/dns_zone/dns_zone.rb
+@@ -66,7 +66,7 @@ def purge_obsolete_records
+         .having { count.function.* =~ dns_server_ids.count }.all
+ 
+       records_to_purge = obsoleted_records + seen_tombstoned_records
+-      DB[:seen_dns_records_by_dns_servers].where(dns_record_id: records_to_purge.map(&:id).uniq).delete(force: true)
++      DB[:seen_dns_records_by_dns_servers].where(dns_record_id: Sequel.any_uuid(records_to_purge.map(&:id).uniq)).delete(force: true)
+       records_to_purge.uniq(&:id).map(&:destroy)
+ 
+       update(last_purged_at: Time.now)
+diff --git a/model/load_balancer.rb b/model/load_balancer.rb
+index 56ce3c69f..a23f5482a 100644
+--- a/model/load_balancer.rb
++++ b/model/load_balancer.rb
+@@ -5,8 +5,8 @@
+ class LoadBalancer < Sequel::Model
+   many_to_one :project
+   many_to_many :vms
+-  many_to_many :active_vms, class: :Vm, left_key: :load_balancer_id, right_key: :vm_id, join_table: :load_balancers_vms, conditions: {state: ["up"]}
+-  many_to_many :vms_to_dns, class: :Vm, left_key: :load_balancer_id, right_key: :vm_id, join_table: :load_balancers_vms, conditions: Sequel.~(state: ["evacuating", "detaching"])
++  many_to_many :active_vms, class: :Vm, left_key: :load_balancer_id, right_key: :vm_id, join_table: :load_balancers_vms, conditions: {state: "up"}
++  many_to_many :vms_to_dns, class: :Vm, left_key: :load_balancer_id, right_key: :vm_id, join_table: :load_balancers_vms, conditions: Sequel.~(state: Sequel.any_type(["evacuating", "detaching"], :lb_node_state))
+   one_to_one :strand, key: :id
+   many_to_one :private_subnet
+   one_to_many :load_balancers_vms, key: :load_balancer_id, class: :LoadBalancersVms
+@@ -36,14 +36,14 @@ def add_vm(vm)
+   end
+ 
+   def detach_vm(vm)
+-    load_balancers_vms_dataset.where(vm_id: vm.id, state: ["up", "down", "evacuating"]).update(state: "detaching")
++    load_balancers_vms_dataset.where(vm_id: vm.id, state: Sequel.any_type(["up", "down", "evacuating"], :lb_node_state)).update(state: "detaching")
+     Strand.create_with_id(prog: "Vnet::CertServer", label: "remove_cert_server", stack: [{subject_id: id, vm_id: vm.id}], parent_id: id)
+     incr_update_load_balancer
+   end
+ 
+   def evacuate_vm(vm)
+     DB.transaction do
+-      load_balancers_vms_dataset.where(vm_id: vm.id, state: ["up", "down"]).update(state: "evacuating")
++      load_balancers_vms_dataset.where(vm_id: vm.id, state: Sequel.any_type(["up", "down"], :lb_node_state)).update(state: "evacuating")
+       Strand.create_with_id(prog: "Vnet::CertServer", label: "remove_cert_server", stack: [{subject_id: id, vm_id: vm.id}], parent_id: id)
+       incr_update_load_balancer
+       incr_rewrite_dns_records
+diff --git a/model/object_metatag.rb b/model/object_metatag.rb
+index 127fc1410..285dc1cb5 100644
+--- a/model/object_metatag.rb
++++ b/model/object_metatag.rb
+@@ -22,7 +22,7 @@ def self.to_meta_uuid(uuid)
+ 
+   # Designed solely for use with UBID.resolve_map
+   def self.where(id:)
+-    ObjectTag.where(id: id.map { from_meta_uuid(_1) }).map(&:metatag)
++    ObjectTag.where(id: Sequel.any_uuid(id.args[0].map { from_meta_uuid(_1) })).map(&:metatag)
+   end
+ 
+   # Designed solely for use with UBID.decode
+diff --git a/model/private_subnet.rb b/model/private_subnet.rb
+index fdf1474c5..0f1465d47 100644
+--- a/model/private_subnet.rb
++++ b/model/private_subnet.rb
+@@ -27,7 +27,7 @@ class PrivateSubnet < Sequel::Model
+ 
+   def connected_subnets
+     PrivateSubnet.where(
+-      id: DB[:connected_subnet].where(subnet_id_1: id).or(subnet_id_2: id).select(Sequel.case({{subnet_id_1: id} => :subnet_id_2}, :subnet_id_1)).all.map(&:values).flatten
++      id: DB[:connected_subnet].where(subnet_id_1: id).or(subnet_id_2: id).select(Sequel.case({{subnet_id_1: id} => :subnet_id_2}, :subnet_id_1))
+     ).all
+   end
+ 
+diff --git a/model/subject_tag.rb b/model/subject_tag.rb
+index ac55c084a..fe6a300d3 100644
+--- a/model/subject_tag.rb
++++ b/model/subject_tag.rb
+@@ -17,7 +17,7 @@ def before_destroy
+   def self.subject_id_map_for_project_and_accounts(project_id, account_ids)
+     DB[:applied_subject_tag]
+       .join(:subject_tag, id: :tag_id)
+-      .where(project_id:, subject_id: account_ids)
++      .where(project_id:, subject_id: Sequel.any_uuid(account_ids))
+       .order(:subject_id, :name)
+       .select_hash_groups(:subject_id, :name)
+   end
+diff --git a/routes/project/user.rb b/routes/project/user.rb
+index aa18b4533..eec4dbc1e 100644
+--- a/routes/project/user.rb
++++ b/routes/project/user.rb
+@@ -80,7 +80,7 @@ class Clover
+           allowed_remove_tags = dataset_authorize(@project.subject_tags_dataset, "SubjectTag:remove").to_hash(:name)
+           project_account_ids = @project
+             .accounts_dataset
+-            .where(Sequel[:accounts][:id] => account_ids)
++            .where(Sequel[:accounts][:id] => Sequel.any_uuid(account_ids))
+             .select_map(Sequel[:accounts][:id])
+           subject_tag_map = SubjectTag.subject_id_map_for_project_and_accounts(@project.id, project_account_ids)
+           project_account_ids.each do |account_id|
+diff --git a/ubid.rb b/ubid.rb
+index 27c992671..9becf6ddc 100644
+--- a/ubid.rb
++++ b/ubid.rb
+@@ -175,7 +175,7 @@ def self.resolve_map(uuids)
+       ubid.start_with?("et") ? ApiKey : class_for_ubid(ubid)
+     end.each do |model, model_uuids|
+       next unless model
+-      model.where(id: model_uuids).each do
++      model.where(id: Sequel.any_uuid(model_uuids)).each do
+         uuids[_1.id] = _1
+       end
+     end
+diff --git a/views/networking/private_subnet/show.erb b/views/networking/private_subnet/show.erb
+index 67bb822b9..70d838ee5 100644
+--- a/views/networking/private_subnet/show.erb
++++ b/views/networking/private_subnet/show.erb
+@@ -1,8 +1,8 @@
+ <% @page_title = @ps[:name]
+ 
+ perm_checks = {
+-  "Firewall:view" => Firewall.where(id: @ps[:firewalls].map { UBID.to_uuid(_1[:id]) }),
+-  "PrivateSubnet:view" => PrivateSubnet.where(id: @connected_subnets.map { UBID.to_uuid(_1[:id]) })
++  "Firewall:view" => Firewall.where(id: Sequel.any_uuid(@ps[:firewalls].map { UBID.to_uuid(_1[:id]) })),
++  "PrivateSubnet:view" => PrivateSubnet.where(id: Sequel.any_uuid(@connected_subnets.map { UBID.to_uuid(_1[:id]) }))
+ }
+ 
+ viewable_fws, viewable_subnets =

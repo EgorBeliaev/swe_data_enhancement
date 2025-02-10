@@ -1,0 +1,167 @@
+[
+    {
+        "title": "Use vcpus for VM allocation and topology"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "This patch switches the VM allocation from Cores to VCpus when selecting a host. There are two use cases motivating this change:\r\n- we have x64 hosts that have threads_per_cores ratio of 1 (GEX44). That breaks the assumption encoded in the VmSizes, per architecture type\r\n- we are going to introduce Burstable family, where relation between number of CPUs allocated for a VM and number of Cores allocated to a slice hosting that VM may vary per VM instance, regardless of the architecture.\r\n\r\nWith this change, the number of cores is computed during the allocation, based on the actual architecture of the candidate host and then updated back to the VM. In case when the VM is allocated in a slice, the number of cores is left as 0 on the VM, and instead, the number of cores is saved in the VmHostSlice, and that is subtracted from the host. At any point in time this should be true: `vm_host.used_cores == SUM(vm_host_slice.cores) + SUM(vm.cores if vm.vm_host_slice_id.nil?)`\r\n\r\nThis logic also helps us indicate who is really controlling the cores - it is either the VmHostSlice or a Vm running without the slice. Vms inside the slice, do not control the cores and relay on the slice instead.\r\n\r\nThe special case for vcpus==1 in `cloud_hypervisor_cpu_topology` is needed for Burstables, where we will have Burstable-1 size. I wanted to include this in the review together with this patch for completeness.\r\n\r\nThere is also a separate commit now to Losen the restrictions on slice allocation. We allow now projects with `use_slice_for_allocation` flag enabled to create Standard VMs on all hosts. When the host is marked with `accept_slices`, the allocation will create a VM inside a slice. When `accepts_slices` is off, the VM creation will use the earlier allocation logic."
+    },
+    {
+        "author": {
+            "login": "fdr"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jeremyevans"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "enescakir"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "enescakir"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "bsatzger"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "bsatzger"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "bsatzger"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "pykello"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "bsatzger"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "pykello"
+        },
+        "body": "* E2E succeeded: https://github.com/ubicloud/ubicloud/actions/runs/13166972069\r\n* Manually tested for cpu/core cases of 96/48 and 14/14."
+    },
+    {
+        "author": {
+            "login": "fdr"
+        },
+        "body": "note: GEX doesn't have one thread per core, it has two threads on some cores and one thread on another core. But you can degenerate the problem (with some loss in efficiency) by saying: all cores have *at least* one thread."
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": "There is one problem with tests that I need some help with. @pykello , @jeremyevans - maybe you can help\r\n\r\nAll specs are passing on the first run (COVERAGE=1) with 100% coverage. On the second run, with CLOVER_FREEZE=1 four tests are failing (see below). All four failures are due to the same reason - `vm.cores` value is not updated. That is related to my changes (change in allocator.rb:311).\r\n\r\nQ: what does CLOVER_FREEZE=1 changes that would cause this specific DB update to not run? \r\nQ: how to run individual spec with this configuration? When I try, I get an error `uninitialized constant Aws1`\r\n\r\n```\r\n 1) Scheduling::Allocator update updates resources\r\n     Failure/Error: expect(used_cores + vm.cores).to eq(vmh.used_cores)\r\n     \r\n       expected: 2\r\n            got: 1\r\n     \r\n       (compared using ==)\r\n     # ./spec/scheduling/allocator_spec.rb:556:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:51:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:50:in `block (2 levels) in <top (required)>'\r\n\r\n  2) Scheduling::Allocator update allocates correctly on GEX44 host\r\n     Failure/Error: expect(vm.cores).to eq(2)\r\n     \r\n       expected: 2\r\n            got: 0\r\n     \r\n       (compared using ==)\r\n     # ./spec/scheduling/allocator_spec.rb:757:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:51:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:50:in `block (2 levels) in <top (required)>'\r\n\r\n  3) Scheduling::Allocator update allows concurrent allocations\r\n     Failure/Error: expect(used_cores + vm1.cores + vm2.cores).to eq(vmh.used_cores)\r\n     \r\n       expected: 3\r\n            got: 1\r\n     \r\n       (compared using ==)\r\n     # ./spec/scheduling/allocator_spec.rb:593:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:51:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:50:in `block (2 levels) in <top (required)>'\r\n\r\n  4) Scheduling::Allocator update updates pci devices\r\n     Failure/Error: expect(used_cores + vm.cores).to eq(vmh.used_cores)\r\n     \r\n       expected: 2\r\n            got: 1\r\n     \r\n       (compared using ==)\r\n     # ./spec/scheduling/allocator_spec.rb:575:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:51:in `block (3 levels) in <top (required)>'\r\n     # ./spec/spec_helper.rb:50:in `block (2 levels) in <top (required)>'\r\n```"
+    },
+    {
+        "author": {
+            "login": "jeremyevans"
+        },
+        "body": "Use `FORCE_AUTOLOAD=1 CLOVER_FREEZE=1` when running individual specs.  Also, try running with `RUBYOPT=-d` to see if there is an exception being raised when running frozen that is being automatically rescued."
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": "> Use `FORCE_AUTOLOAD=1 CLOVER_FREEZE=1` when running individual specs. Also, try running with `RUBYOPT=-d` to see if there is an exception being raised when running frozen that is being automatically rescued.\r\n\r\nThanks @jeremyevans ! This helped a lot. Now that I can debug this, I can see that when running with CLOVER_FREEZE my new class VmHostCpuAllocation is not called at all. Instead, the base class VmHostAllocation is used. So, the vm.update method is never called and does not update the number of cores. When running without CLOVER_FREEZE, it all works as expected, with the subclass called. \r\n\r\nI think this is due to the freezing that is done in `loader.rb`. I am not sure if I should remove the freeze on `Scheduling::Allocator::VmHostAllocation` or is there another way to enable creation of a subclass. "
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": "I have narrowed it down to the thawed_mock.rb:112\r\n`allow_mocking(Scheduling::Allocator::VmHostAllocation, :new)`\r\nIf that line is commented out, my tests are passing in the CLOVER_FREEZE=1 mode. However, that does not solve the problem, as it breaks the tests that actually use the mocking of `new` operator. My test does not use mocking. So, I am not clear why allowing mocking also prevents the subclassing. "
+    },
+    {
+        "author": {
+            "login": "jeremyevans"
+        },
+        "body": "> I have narrowed it down to the thawed_mock.rb:112 `allow_mocking(Scheduling::Allocator::VmHostAllocation, :new)` If that line is commented out, my tests are passing in the CLOVER_FREEZE=1 mode. However, that does not solve the problem, as it breaks the tests that actually use the mocking of `new` operator. My test does not use mocking. So, I am not clear why allowing mocking also prevents the subclassing.\r\n\r\nThe way thawed_mock is implemented is it basically makes static the current receiver of the method, which will negatively affect subclassing.  I think adding `allow_mocking(Scheduling::Allocator::VmHostCpuAllocation, :new)` above the existing `allow_mocking(Scheduling::Allocator::VmHostAllocation, :new)`  should fix it."
+    },
+    {
+        "author": {
+            "login": "macieksarnowicz"
+        },
+        "body": "> The way thawed_mock is implemented is it basically makes static the current receiver of the method, which will negatively affect subclassing. I think adding `allow_mocking(Scheduling::Allocator::VmHostCpuAllocation, :new)` above the existing `allow_mocking(Scheduling::Allocator::VmHostAllocation, :new)` should fix it.\r\n\r\nThank you! This indeed fixed the problem. I had to update the tests that used mocking of the VmHostAllocaiton, but it is all working now. \r\n"
+    }
+]

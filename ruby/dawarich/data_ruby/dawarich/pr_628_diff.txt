@@ -1,0 +1,617 @@
+diff --git a/.app_version b/.app_version
+index 6aec9e54..e756a90e 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.21.4
++0.21.5
+diff --git a/.devcontainer/docker-compose.yml b/.devcontainer/docker-compose.yml
+index 5e2f006a..e0bc7867 100644
+--- a/.devcontainer/docker-compose.yml
++++ b/.devcontainer/docker-compose.yml
+@@ -26,13 +26,10 @@ services:
+       DATABASE_PASSWORD: password
+       DATABASE_NAME: dawarich_development
+       MIN_MINUTES_SPENT_IN_CITY: 60
+-      APPLICATION_HOST: localhost
+       APPLICATION_HOSTS: localhost
+       TIME_ZONE: Europe/London
+       APPLICATION_PROTOCOL: http
+       DISTANCE_UNIT: km
+-      PHOTON_API_HOST: photon.komoot.io
+-      PHOTON_API_USE_HTTPS: true
+       PROMETHEUS_EXPORTER_ENABLED: false
+       PROMETHEUS_EXPORTER_HOST: 0.0.0.0
+       PROMETHEUS_EXPORTER_PORT: 9394
+diff --git a/.env.development b/.env.development
+index 24313ecb..e083342f 100644
+--- a/.env.development
++++ b/.env.development
+@@ -4,5 +4,4 @@ DATABASE_PASSWORD=password
+ DATABASE_NAME=dawarich_development
+ DATABASE_PORT=5432
+ REDIS_URL=redis://localhost:6379/1
+-PHOTON_API_HOST='photon.komoot.io'
+ DISTANCE_UNIT='km'
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8962c791..f5e7be49 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.21.5 - 2025-01-07
++
++You may now use Geoapify API for reverse geocoding. To obtain an API key, sign up at https://myprojects.geoapify.com/ and create a new project. Make sure you have read and understood the [pricing policy](https://www.geoapify.com/pricing) and [Terms and Conditions](https://www.geoapify.com/terms-and-conditions/).
++
++### Added
++
++- Geoapify API support for reverse geocoding. Provide `GEOAPIFY_API_KEY` env var to use it.
++
++### Removed
++
++- Photon ENV vars from the `.env.development` and docker-compose.yml files.
++- `APPLICATION_HOST` env var.
++- `REVERSE_GEOCODING_ENABLED` env var.
++
+ # 0.21.4 - 2025-01-05
+ 
+ ### Fixed
+diff --git a/app/jobs/reverse_geocoding_job.rb b/app/jobs/reverse_geocoding_job.rb
+index dc49d2a2..8c2a232b 100644
+--- a/app/jobs/reverse_geocoding_job.rb
++++ b/app/jobs/reverse_geocoding_job.rb
+@@ -4,7 +4,7 @@ class ReverseGeocodingJob < ApplicationJob
+   queue_as :reverse_geocoding
+ 
+   def perform(klass, id)
+-    return unless REVERSE_GEOCODING_ENABLED
++    return unless DawarichSettings.reverse_geocoding_enabled?
+ 
+     rate_limit_for_photon_api
+ 
+@@ -18,8 +18,8 @@ def data_fetcher(klass, id)
+   end
+ 
+   def rate_limit_for_photon_api
+-    return unless PHOTON_API_HOST == 'photon.komoot.io'
++    return unless DawarichSettings.photon_enabled?
+ 
+-    sleep 1 if PHOTON_API_HOST == 'photon.komoot.io'
++    sleep 1 if DawarichSettings.photon_uses_komoot_io?
+   end
+ end
+diff --git a/app/models/place.rb b/app/models/place.rb
+index a4ff8970..2ed0aa2d 100644
+--- a/app/models/place.rb
++++ b/app/models/place.rb
+@@ -13,7 +13,7 @@ class Place < ApplicationRecord
+   enum :source, { manual: 0, photon: 1 }
+ 
+   def async_reverse_geocode
+-    return unless REVERSE_GEOCODING_ENABLED
++    return unless DawarichSettings.reverse_geocoding_enabled?
+ 
+     ReverseGeocodingJob.perform_later(self.class.to_s, id)
+   end
+diff --git a/app/models/point.rb b/app/models/point.rb
+index bec501b4..040e6d41 100644
+--- a/app/models/point.rb
++++ b/app/models/point.rb
+@@ -34,7 +34,7 @@ def recorded_at
+   end
+ 
+   def async_reverse_geocode
+-    return unless REVERSE_GEOCODING_ENABLED
++    return unless DawarichSettings.reverse_geocoding_enabled?
+ 
+     ReverseGeocodingJob.perform_later(self.class.to_s, id)
+   end
+diff --git a/app/models/visit.rb b/app/models/visit.rb
+index ddd6124f..f46d219b 100644
+--- a/app/models/visit.rb
++++ b/app/models/visit.rb
+@@ -40,7 +40,7 @@ def center
+   end
+ 
+   def async_reverse_geocode
+-    return unless REVERSE_GEOCODING_ENABLED
++    return unless DawarichSettings.reverse_geocoding_enabled?
+     return if place.blank?
+ 
+     ReverseGeocodingJob.perform_later('place', place_id)
+diff --git a/app/services/reverse_geocoding/places/fetch_data.rb b/app/services/reverse_geocoding/places/fetch_data.rb
+index 0ed4e236..9eec9de4 100644
+--- a/app/services/reverse_geocoding/places/fetch_data.rb
++++ b/app/services/reverse_geocoding/places/fetch_data.rb
+@@ -12,8 +12,8 @@ def initialize(place_id)
+   end
+ 
+   def call
+-    if ::PHOTON_API_HOST.blank?
+-      Rails.logger.warn('PHOTON_API_HOST is not set')
++    unless DawarichSettings.reverse_geocoding_enabled?
++      Rails.logger.warn('Reverse geocoding is not enabled')
+       return
+     end
+ 
+diff --git a/app/services/visits/suggest.rb b/app/services/visits/suggest.rb
+index f68bffce..4d02a45c 100644
+--- a/app/services/visits/suggest.rb
++++ b/app/services/visits/suggest.rb
+@@ -20,7 +20,7 @@ def call
+ 
+     create_visits_notification(user)
+ 
+-    return nil unless reverse_geocoding_enabled?
++    return nil unless DawarichSettings.reverse_geocoding_enabled?
+ 
+     reverse_geocode(visits)
+   end
+@@ -68,10 +68,6 @@ def reverse_geocode(visits)
+     visits.each(&:async_reverse_geocode)
+   end
+ 
+-  def reverse_geocoding_enabled?
+-    ::REVERSE_GEOCODING_ENABLED && ::PHOTON_API_HOST.present?
+-  end
+-
+   def create_visits_notification(user)
+     content = <<~CONTENT
+       New visits have been suggested based on your location data from #{Time.zone.at(start_at)} to #{Time.zone.at(end_at)}. You can review them on the <a href="#{visits_path}" class="link">Visits</a> page.
+diff --git a/app/views/stats/_stat.html.erb b/app/views/stats/_stat.html.erb
+index f8e59e04..8ac892f2 100644
+--- a/app/views/stats/_stat.html.erb
++++ b/app/views/stats/_stat.html.erb
+@@ -12,7 +12,7 @@
+       </div>
+     </div>
+     <p><%= stat.distance %><%= DISTANCE_UNIT %></p>
+-    <% if REVERSE_GEOCODING_ENABLED %>
++    <% if DawarichSettings.reverse_geocoding_enabled? %>
+       <div class="card-actions justify-end">
+         <%= countries_and_cities_stat_for_month(stat) %>
+       </div>
+diff --git a/app/views/stats/index.html.erb b/app/views/stats/index.html.erb
+index d67037de..28da8b9f 100644
+--- a/app/views/stats/index.html.erb
++++ b/app/views/stats/index.html.erb
+@@ -16,7 +16,7 @@
+       <div class="stat-title">Geopoints tracked</div>
+     </div>
+ 
+-    <% if REVERSE_GEOCODING_ENABLED %>
++    <% if DawarichSettings.reverse_geocoding_enabled? %>
+       <%= render 'stats/reverse_geocoding_stats' %>
+     <% end %>
+   </div>
+@@ -39,7 +39,7 @@
+               <%= number_with_delimiter year_distance_stat(year, current_user) %><%= DISTANCE_UNIT %>
+             <% end %>
+           </p>
+-          <% if REVERSE_GEOCODING_ENABLED %>
++          <% if DawarichSettings.reverse_geocoding_enabled? %>
+             <div class="card-actions justify-end">
+               <%= countries_and_cities_stat_for_year(year, stats) %>
+             </div>
+diff --git a/config/environments/development.rb b/config/environments/development.rb
+index dd27f7bd..29b9a038 100644
+--- a/config/environments/development.rb
++++ b/config/environments/development.rb
+@@ -86,11 +86,11 @@
+ 
+   # Raise error when a before_action's only/except options reference missing actions
+   config.action_controller.raise_on_missing_callback_actions = true
+-  config.action_mailer.default_url_options = { host: ENV.fetch('APPLICATION_HOST', 'localhost'), port: 3000 }
+-  config.hosts << ENV.fetch('APPLICATION_HOST', 'localhost')
+ 
+-  hosts = ENV.fetch('APPLICATION_HOSTS', 'localhost')
+-  config.hosts.concat(hosts.split(',')) if hosts.present?
++  hosts = ENV.fetch('APPLICATION_HOSTS', 'localhost').split(',')
++
++  config.action_mailer.default_url_options = { host: hosts.first, port: 3000 }
++  config.hosts.concat(hosts) if hosts.present?
+ 
+   config.force_ssl = ENV.fetch('APPLICATION_PROTOCOL', 'http').downcase == 'https'
+ 
+diff --git a/config/initializers/01_constants.rb b/config/initializers/01_constants.rb
+index bfa380b6..ce760238 100644
+--- a/config/initializers/01_constants.rb
++++ b/config/initializers/01_constants.rb
+@@ -1,11 +1,17 @@
+ # frozen_string_literal: true
+ 
+ MIN_MINUTES_SPENT_IN_CITY = ENV.fetch('MIN_MINUTES_SPENT_IN_CITY', 60).to_i
+-REVERSE_GEOCODING_ENABLED = ENV.fetch('REVERSE_GEOCODING_ENABLED', 'true') == 'true'
+-PHOTON_API_HOST = ENV.fetch('PHOTON_API_HOST', nil)
+-PHOTON_API_KEY = ENV.fetch('PHOTON_API_KEY', nil)
+-PHOTON_API_USE_HTTPS = ENV.fetch('PHOTON_API_USE_HTTPS', 'true') == 'true'
+ DISTANCE_UNIT = ENV.fetch('DISTANCE_UNIT', 'km').to_sym
++
+ APP_VERSION = File.read('.app_version').strip
++
+ TELEMETRY_STRING = Base64.encode64('IjVFvb8j3P9-ArqhSGav9j8YcJaQiuNIzkfOPKQDk2lvKXqb8t1NSRv50oBkaKtlrB_ZRzO9NdurpMtncV_HYQ==')
+ TELEMETRY_URL = 'https://influxdb2.frey.today/api/v2/write'
++
++# Reverse geocoding settings
++PHOTON_API_HOST = ENV.fetch('PHOTON_API_HOST', nil)
++PHOTON_API_KEY = ENV.fetch('PHOTON_API_KEY', nil)
++PHOTON_API_USE_HTTPS = ENV.fetch('PHOTON_API_USE_HTTPS', 'true') == 'true'
++
++GEOAPIFY_API_KEY = ENV.fetch('GEOAPIFY_API_KEY', nil)
++# /Reverse geocoding settings
+diff --git a/config/initializers/03_dawarich_settings.rb b/config/initializers/03_dawarich_settings.rb
+new file mode 100644
+index 00000000..87cf4817
+--- /dev/null
++++ b/config/initializers/03_dawarich_settings.rb
+@@ -0,0 +1,21 @@
++# frozen_string_literal: true
++
++class DawarichSettings
++  class << self
++    def reverse_geocoding_enabled?
++      @reverse_geocoding_enabled ||= photon_enabled? || geoapify_enabled?
++    end
++
++    def photon_enabled?
++      @photon_enabled ||= PHOTON_API_HOST.present?
++    end
++
++    def photon_uses_komoot_io?
++      @photon_uses_komoot_io ||= PHOTON_API_HOST == 'photon.komoot.io'
++    end
++
++    def geoapify_enabled?
++      @geoapify_enabled ||= GEOAPIFY_API_KEY.present?
++    end
++  end
++end
+diff --git a/config/initializers/geocoder.rb b/config/initializers/geocoder.rb
+index 837fb394..eb1a7fc4 100644
+--- a/config/initializers/geocoder.rb
++++ b/config/initializers/geocoder.rb
+@@ -12,11 +12,13 @@
+   }
+ }
+ 
+-if defined?(PHOTON_API_HOST)
++if PHOTON_API_HOST.present?
+   settings[:lookup] = :photon
+   settings[:photon] = { use_https: PHOTON_API_USE_HTTPS, host: PHOTON_API_HOST }
++  settings[:http_headers] = { 'X-Api-Key' => PHOTON_API_KEY } if defined?(PHOTON_API_KEY)
++elsif GEOAPIFY_API_KEY.present?
++  settings[:lookup] = :geoapify
++  settings[:api_key] = GEOAPIFY_API_KEY
+ end
+ 
+-settings[:http_headers] = { 'X-Api-Key' => PHOTON_API_KEY } if defined?(PHOTON_API_KEY)
+-
+ Geocoder.configure(settings)
+diff --git a/config/initializers/sidekiq.rb b/config/initializers/sidekiq.rb
+index 9e54f2ab..d9dec786 100644
+--- a/config/initializers/sidekiq.rb
++++ b/config/initializers/sidekiq.rb
+@@ -27,4 +27,4 @@
+   config.redis = { url: ENV['REDIS_URL'] }
+ end
+ 
+-Sidekiq::Queue['reverse_geocoding'].limit = 1 if Sidekiq.server? && PHOTON_API_HOST == 'photon.komoot.io'
++Sidekiq::Queue['reverse_geocoding'].limit = 1 if Sidekiq.server? && DawarichSettings.photon_uses_komoot_io?
+diff --git a/docker-compose.yml b/docker-compose.yml
+index fc46ae30..53586a39 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -62,13 +62,10 @@ services:
+       DATABASE_PASSWORD: password
+       DATABASE_NAME: dawarich_development
+       MIN_MINUTES_SPENT_IN_CITY: 60
+-      APPLICATION_HOST: localhost
+       APPLICATION_HOSTS: localhost
+       TIME_ZONE: Europe/London
+       APPLICATION_PROTOCOL: http
+       DISTANCE_UNIT: km
+-      PHOTON_API_HOST: photon.komoot.io
+-      PHOTON_API_USE_HTTPS: true
+       PROMETHEUS_EXPORTER_ENABLED: false
+       PROMETHEUS_EXPORTER_HOST: 0.0.0.0
+       PROMETHEUS_EXPORTER_PORT: 9394
+@@ -117,13 +114,10 @@ services:
+       DATABASE_USERNAME: postgres
+       DATABASE_PASSWORD: password
+       DATABASE_NAME: dawarich_development
+-      APPLICATION_HOST: localhost
+       APPLICATION_HOSTS: localhost
+       BACKGROUND_PROCESSING_CONCURRENCY: 10
+       APPLICATION_PROTOCOL: http
+       DISTANCE_UNIT: km
+-      PHOTON_API_HOST: photon.komoot.io
+-      PHOTON_API_USE_HTTPS: true
+       PROMETHEUS_EXPORTER_ENABLED: false
+       PROMETHEUS_EXPORTER_HOST: dawarich_app
+       PROMETHEUS_EXPORTER_PORT: 9394
+diff --git a/docker-compose_mounted_volumes.yml b/docker-compose_mounted_volumes.yml
+index e724aa88..09fe07d8 100644
+--- a/docker-compose_mounted_volumes.yml
++++ b/docker-compose_mounted_volumes.yml
+@@ -41,12 +41,9 @@ services:
+       DATABASE_PASSWORD: password
+       DATABASE_NAME: dawarich_development
+       MIN_MINUTES_SPENT_IN_CITY: 60
+-      APPLICATION_HOST: localhost
+       APPLICATION_HOSTS: localhost
+       APPLICATION_PROTOCOL: http
+       DISTANCE_UNIT: km
+-      PHOTON_API_HOST: photon.komoot.io
+-      PHOTON_API_USE_HTTPS: true
+     stdin_open: true
+     tty: true
+     entrypoint: dev-entrypoint.sh
+@@ -96,13 +93,10 @@ services:
+       DATABASE_USERNAME: postgres
+       DATABASE_PASSWORD: password
+       DATABASE_NAME: dawarich_development
+-      APPLICATION_HOST: localhost
+       APPLICATION_HOSTS: localhost
+       BACKGROUND_PROCESSING_CONCURRENCY: 10
+       APPLICATION_PROTOCOL: http
+       DISTANCE_UNIT: km
+-      PHOTON_API_HOST: photon.komoot.io
+-      PHOTON_API_USE_HTTPS: true
+     stdin_open: true
+     tty: true
+     entrypoint: dev-entrypoint.sh
+diff --git a/docs/how_to_setup_reverse_proxy.md b/docs/how_to_setup_reverse_proxy.md
+index 30cb691b..efaddd2d 100644
+--- a/docs/how_to_setup_reverse_proxy.md
++++ b/docs/how_to_setup_reverse_proxy.md
+@@ -14,7 +14,6 @@ dawarich_app:
+     ...
+     environment:
+       ...
+-      APPLICATION_HOST: "yourhost.com" <------------------------------ Edit this
+       APPLICATION_HOSTS: "yourhost.com,www.yourhost.com,127.0.0.1" <-- Edit this
+ ```
+ 
+@@ -25,7 +24,6 @@ dawarich_sidekiq:
+     ...
+     environment:
+       ...
+-      APPLICATION_HOST: "yourhost.com" <------------------------------ Edit this
+       APPLICATION_HOSTS: "yourhost.com,www.yourhost.com,127.0.0.1" <-- Edit this
+       ...
+ ```
+@@ -48,7 +46,7 @@ server {
+ 
+ 	brotli on;
+ 	brotli_comp_level 6;
+-	brotli_types 
++	brotli_types
+ 		text/css
+ 		text/plain
+ 		text/xml
+@@ -106,24 +104,24 @@ With the above commands entered, the configuration below should work properly.
+ ```apache
+ <VirtualHost *:80>
+ 	ServerName example.com
+-	
++
+ 	ProxyRequests Off
+ 	ProxyPreserveHost On
+-	
++
+ 	<Proxy *>
+ 		Require all granted
+ 	</Proxy>
+-	
++
+ 	Header always set X-Real-IP %{REMOTE_ADDR}s
+ 	Header always set X-Forwarded-For %{REMOTE_ADDR}s
+ 	Header always set X-Forwarded-Proto https
+ 	Header always set X-Forwarded-Server %{SERVER_NAME}s
+ 	Header always set Host %{HTTP_HOST}s
+-	
++
+ 	SetOutputFilter BROTLI
+ 	AddOutputFilterByType BROTLI_COMPRESS text/css text/plain text/xml text/javascript application/javascript application/json application/manifest+json application/vnd.api+json application/xml application/xhtml+xml application/rss+xml application/atom+xml application/vnd.ms-fontobject application/x-font-ttf application/x-font-opentype application/x-font-truetype image/svg+xml image/x-icon image/vnd.microsoft.icon font/ttf font/eot font/otf font/opentype
+ 	BrotliCompressionQuality 6
+-	
++
+ 	ProxyPass / http://127.0.0.1:3000/
+ 	ProxyPassReverse / http://127.0.0.1:3000/
+ 
+diff --git a/spec/jobs/reverse_geocoding_job_spec.rb b/spec/jobs/reverse_geocoding_job_spec.rb
+index dfd3da8e..b6420be0 100644
+--- a/spec/jobs/reverse_geocoding_job_spec.rb
++++ b/spec/jobs/reverse_geocoding_job_spec.rb
+@@ -12,8 +12,8 @@
+       allow(Geocoder).to receive(:search).and_return([double(city: 'City', country: 'Country')])
+     end
+ 
+-    context 'when REVERSE_GEOCODING_ENABLED is false' do
+-      before { stub_const('REVERSE_GEOCODING_ENABLED', false) }
++    context 'when reverse geocoding is disabled' do
++      before { allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(false) }
+ 
+       it 'does not update point' do
+         expect { perform }.not_to(change { point.reload.city })
+@@ -28,8 +28,8 @@
+       end
+     end
+ 
+-    context 'when REVERSE_GEOCODING_ENABLED is true' do
+-      before { stub_const('REVERSE_GEOCODING_ENABLED', true) }
++    context 'when reverse geocoding is enabled' do
++      before { allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(true) }
+ 
+       let(:stubbed_geocoder) { OpenStruct.new(data: { city: 'City', country: 'Country' }) }
+ 
+diff --git a/spec/lib/dawarich_settings_spec.rb b/spec/lib/dawarich_settings_spec.rb
+new file mode 100644
+index 00000000..bce61846
+--- /dev/null
++++ b/spec/lib/dawarich_settings_spec.rb
+@@ -0,0 +1,100 @@
++# frozen_string_literal: true
++
++require 'rails_helper'
++
++RSpec.describe DawarichSettings do
++  before do
++    described_class.instance_variables.each do |ivar|
++      described_class.remove_instance_variable(ivar)
++    end
++  end
++
++  describe '.reverse_geocoding_enabled?' do
++    context 'when photon is enabled' do
++      before do
++        allow(described_class).to receive(:photon_enabled?).and_return(true)
++        allow(described_class).to receive(:geoapify_enabled?).and_return(false)
++      end
++
++      it 'returns true' do
++        expect(described_class.reverse_geocoding_enabled?).to be true
++      end
++    end
++
++    context 'when geoapify is enabled' do
++      before do
++        allow(described_class).to receive(:photon_enabled?).and_return(false)
++        allow(described_class).to receive(:geoapify_enabled?).and_return(true)
++      end
++
++      it 'returns true' do
++        expect(described_class.reverse_geocoding_enabled?).to be true
++      end
++    end
++
++    context 'when neither service is enabled' do
++      before do
++        allow(described_class).to receive(:photon_enabled?).and_return(false)
++        allow(described_class).to receive(:geoapify_enabled?).and_return(false)
++      end
++
++      it 'returns false' do
++        expect(described_class.reverse_geocoding_enabled?).to be false
++      end
++    end
++  end
++
++  describe '.photon_enabled?' do
++    context 'when PHOTON_API_HOST is present' do
++      before { stub_const('PHOTON_API_HOST', 'photon.example.com') }
++
++      it 'returns true' do
++        expect(described_class.photon_enabled?).to be true
++      end
++    end
++
++    context 'when PHOTON_API_HOST is blank' do
++      before { stub_const('PHOTON_API_HOST', '') }
++
++      it 'returns false' do
++        expect(described_class.photon_enabled?).to be false
++      end
++    end
++  end
++
++  describe '.photon_uses_komoot_io?' do
++    context 'when PHOTON_API_HOST is komoot.io' do
++      before { stub_const('PHOTON_API_HOST', 'photon.komoot.io') }
++
++      it 'returns true' do
++        expect(described_class.photon_uses_komoot_io?).to be true
++      end
++    end
++
++    context 'when PHOTON_API_HOST is different' do
++      before { stub_const('PHOTON_API_HOST', 'photon.example.com') }
++
++      it 'returns false' do
++        expect(described_class.photon_uses_komoot_io?).to be false
++      end
++    end
++  end
++
++  describe '.geoapify_enabled?' do
++    context 'when GEOAPIFY_API_KEY is present' do
++      before { stub_const('GEOAPIFY_API_KEY', 'some-api-key') }
++
++      it 'returns true' do
++        expect(described_class.geoapify_enabled?).to be true
++      end
++    end
++
++    context 'when GEOAPIFY_API_KEY is blank' do
++      before { stub_const('GEOAPIFY_API_KEY', '') }
++
++      it 'returns false' do
++        expect(described_class.geoapify_enabled?).to be false
++      end
++    end
++  end
++end
+diff --git a/spec/models/place_spec.rb b/spec/models/place_spec.rb
+index 3a7bcd21..48722d9c 100644
+--- a/spec/models/place_spec.rb
++++ b/spec/models/place_spec.rb
+@@ -23,6 +23,8 @@
+     describe '#async_reverse_geocode' do
+       let(:place) { create(:place) }
+ 
++      before { allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(true) }
++
+       it 'updates address' do
+         expect { place.async_reverse_geocode }.to have_enqueued_job(ReverseGeocodingJob).with('Place', place.id)
+       end
+diff --git a/spec/models/point_spec.rb b/spec/models/point_spec.rb
+index ece3ea71..c1972838 100644
+--- a/spec/models/point_spec.rb
++++ b/spec/models/point_spec.rb
+@@ -46,6 +46,8 @@
+     describe '#async_reverse_geocode' do
+       let(:point) { build(:point) }
+ 
++      before { allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(true) }
++
+       it 'enqueues ReverseGeocodeJob with correct arguments' do
+         point.save
+ 
+diff --git a/spec/services/jobs/create_spec.rb b/spec/services/jobs/create_spec.rb
+index fb53e848..cc482b67 100644
+--- a/spec/services/jobs/create_spec.rb
++++ b/spec/services/jobs/create_spec.rb
+@@ -4,6 +4,8 @@
+ 
+ RSpec.describe Jobs::Create do
+   describe '#call' do
++    before { allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(true) }
++
+     context 'when job_name is start_reverse_geocoding' do
+       let(:user) { create(:user) }
+       let(:points) { create_list(:point, 4, user:) }
+diff --git a/spec/services/visits/suggest_spec.rb b/spec/services/visits/suggest_spec.rb
+index 00c20c81..31d76b2e 100644
+--- a/spec/services/visits/suggest_spec.rb
++++ b/spec/services/visits/suggest_spec.rb
+@@ -44,8 +44,7 @@
+ 
+     context 'when reverse geocoding is enabled' do
+       before do
+-        stub_const('REVERSE_GEOCODING_ENABLED', true)
+-        stub_const('PHOTON_API_HOST', 'http://localhost:2323')
++        allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(true)
+       end
+ 
+       it 'reverse geocodes visits' do
+@@ -57,7 +56,7 @@
+ 
+     context 'when reverse geocoding is disabled' do
+       before do
+-        stub_const('REVERSE_GEOCODING_ENABLED', false)
++        allow(DawarichSettings).to receive(:reverse_geocoding_enabled?).and_return(false)
+       end
+ 
+       it 'does not reverse geocode visits' do

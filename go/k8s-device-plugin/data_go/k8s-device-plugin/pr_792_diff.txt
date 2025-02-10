@@ -1,0 +1,712 @@
+diff --git a/go.mod b/go.mod
+index 849d36e8b..baafb94e3 100644
+--- a/go.mod
++++ b/go.mod
+@@ -8,6 +8,7 @@ require (
+ 	github.com/NVIDIA/go-nvml v0.12.4-0
+ 	github.com/NVIDIA/nvidia-container-toolkit v1.16.0
+ 	github.com/fsnotify/fsnotify v1.7.0
++	github.com/google/renameio v1.0.1
+ 	github.com/google/uuid v1.6.0
+ 	github.com/mittwald/go-helm-client v0.12.9
+ 	github.com/onsi/ginkgo/v2 v2.19.0
+diff --git a/go.sum b/go.sum
+index 73f34b121..270344d50 100644
+--- a/go.sum
++++ b/go.sum
+@@ -162,6 +162,8 @@ github.com/google/gofuzz v1.2.0 h1:xRy4A+RhZaiKjJ1bPfwQ8sedCA+YS2YcCHW6ec7JMi0=
+ github.com/google/gofuzz v1.2.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+ github.com/google/pprof v0.0.0-20240424215950-a892ee059fd6 h1:k7nVchz72niMH6YLQNvHSdIE7iqsQxK1P41mySCvssg=
+ github.com/google/pprof v0.0.0-20240424215950-a892ee059fd6/go.mod h1:kf6iHlnVGwgKolg33glAes7Yg/8iWP8ukqeldJSO7jw=
++github.com/google/renameio v1.0.1 h1:Lh/jXZmvZxb0BBeSY5VKEfidcbcbenKjZFzM/q0fSeU=
++github.com/google/renameio v1.0.1/go.mod h1:t/HQoYBZSsWSNK35C6CO/TpPLDVWvxOHboWUAweKUpk=
+ github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 h1:El6M4kTTCOh6aBiKaUGG7oYTSPP8MxqL4YI3kZKwcP4=
+ github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510/go.mod h1:pupxD2MaaD3pAXIBCelhxNneeOaAeabZDe5s4K6zSpQ=
+ github.com/google/uuid v1.1.1/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+diff --git a/internal/lm/output.go b/internal/lm/output.go
+index 684fa361a..05f7fc428 100644
+--- a/internal/lm/output.go
++++ b/internal/lm/output.go
+@@ -22,7 +22,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"os"
+-	"path/filepath"
+ 	"strings"
+ 
+ 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+@@ -32,6 +31,8 @@ import (
+ 	nfdv1alpha1 "sigs.k8s.io/node-feature-discovery/pkg/apis/nfd/v1alpha1"
+ 	nfdclientset "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
+ 
++	"github.com/google/renameio"
++
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+ 	"github.com/NVIDIA/k8s-device-plugin/internal/flags"
+ )
+@@ -85,8 +86,8 @@ func (path *toFile) Output(labels Labels) error {
+ 	if err := output.Output(labels); err != nil {
+ 		return fmt.Errorf("error writing labels to buffer: %v", err)
+ 	}
+-	err := writeFileAtomically(string(*path), buffer.Bytes(), 0644)
+-	if err != nil {
++	// write file atomically
++	if err := renameio.WriteFile(string(*path), buffer.Bytes(), 0644); err != nil {
+ 		return fmt.Errorf("error atomically writing file '%s': %w", *path, err)
+ 	}
+ 	return nil
+@@ -102,54 +103,6 @@ func (output *toWriter) Output(labels Labels) error {
+ 	return nil
+ }
+ 
+-func writeFileAtomically(path string, contents []byte, perm os.FileMode) error {
+-	absPath, err := filepath.Abs(path)
+-	if err != nil {
+-		return fmt.Errorf("failed to retrieve absolute path of output file: %v", err)
+-	}
+-
+-	absDir := filepath.Dir(absPath)
+-	tmpDir := filepath.Join(absDir, "gfd-tmp")
+-
+-	err = os.MkdirAll(tmpDir, os.ModePerm)
+-	if err != nil && !os.IsExist(err) {
+-		return fmt.Errorf("failed to create temporary directory: %v", err)
+-	}
+-	defer func() {
+-		if err != nil {
+-			os.RemoveAll(tmpDir)
+-		}
+-	}()
+-
+-	tmpFile, err := os.CreateTemp(tmpDir, "gfd-")
+-	if err != nil {
+-		return fmt.Errorf("fail to create temporary output file: %v", err)
+-	}
+-	defer func() {
+-		if err != nil {
+-			tmpFile.Close()
+-			os.Remove(tmpFile.Name())
+-		}
+-	}()
+-
+-	err = os.WriteFile(tmpFile.Name(), contents, perm)
+-	if err != nil {
+-		return fmt.Errorf("error writing temporary file '%v': %v", tmpFile.Name(), err)
+-	}
+-
+-	err = os.Rename(tmpFile.Name(), path)
+-	if err != nil {
+-		return fmt.Errorf("error moving temporary file to '%v': %v", path, err)
+-	}
+-
+-	err = os.Chmod(path, perm)
+-	if err != nil {
+-		return fmt.Errorf("error setting permissions on '%v': %v", path, err)
+-	}
+-
+-	return nil
+-}
+-
+ const nodeFeatureVendorPrefix = "nvidia-features-for"
+ 
+ type nodeFeatureObject struct {
+diff --git a/vendor/github.com/google/renameio/.golangci.yml b/vendor/github.com/google/renameio/.golangci.yml
+new file mode 100644
+index 000000000..abfb6ca0a
+--- /dev/null
++++ b/vendor/github.com/google/renameio/.golangci.yml
+@@ -0,0 +1,5 @@
++linters:
++  disable:
++  - errcheck
++  enable:
++  - gofmt
+diff --git a/vendor/github.com/google/renameio/CONTRIBUTING.md b/vendor/github.com/google/renameio/CONTRIBUTING.md
+new file mode 100644
+index 000000000..939e5341e
+--- /dev/null
++++ b/vendor/github.com/google/renameio/CONTRIBUTING.md
+@@ -0,0 +1,28 @@
++# How to Contribute
++
++We'd love to accept your patches and contributions to this project. There are
++just a few small guidelines you need to follow.
++
++## Contributor License Agreement
++
++Contributions to this project must be accompanied by a Contributor License
++Agreement. You (or your employer) retain the copyright to your contribution;
++this simply gives us permission to use and redistribute your contributions as
++part of the project. Head over to <https://cla.developers.google.com/> to see
++your current agreements on file or to sign a new one.
++
++You generally only need to submit a CLA once, so if you've already submitted one
++(even if it was for a different project), you probably don't need to do it
++again.
++
++## Code reviews
++
++All submissions, including submissions by project members, require review. We
++use GitHub pull requests for this purpose. Consult
++[GitHub Help](https://help.github.com/articles/about-pull-requests/) for more
++information on using pull requests.
++
++## Community Guidelines
++
++This project follows [Google's Open Source Community
++Guidelines](https://opensource.google.com/conduct/).
+diff --git a/vendor/github.com/google/renameio/LICENSE b/vendor/github.com/google/renameio/LICENSE
+new file mode 100644
+index 000000000..d64569567
+--- /dev/null
++++ b/vendor/github.com/google/renameio/LICENSE
+@@ -0,0 +1,202 @@
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
+diff --git a/vendor/github.com/google/renameio/README.md b/vendor/github.com/google/renameio/README.md
+new file mode 100644
+index 000000000..2c992f14e
+--- /dev/null
++++ b/vendor/github.com/google/renameio/README.md
+@@ -0,0 +1,61 @@
++[![Build Status](https://github.com/google/renameio/workflows/Test/badge.svg)](https://github.com/google/renameio/actions?query=workflow%3ATest)
++[![PkgGoDev](https://pkg.go.dev/badge/github.com/google/renameio)](https://pkg.go.dev/github.com/google/renameio)
++[![Go Report Card](https://goreportcard.com/badge/github.com/google/renameio)](https://goreportcard.com/report/github.com/google/renameio)
++
++The `renameio` Go package provides a way to atomically create or replace a file or
++symbolic link.
++
++## Atomicity vs durability
++
++`renameio` concerns itself *only* with atomicity, i.e. making sure applications
++never see unexpected file content (a half-written file, or a 0-byte file).
++
++As a practical example, consider https://manpages.debian.org/: if there is a
++power outage while the site is updating, we are okay with losing the manpages
++which were being rendered at the time of the power outage. They will be added in
++a later run of the software. We are not okay with having a manpage replaced by a
++0-byte file under any circumstances, though.
++
++## Advantages of this package
++
++There are other packages for atomically replacing files, and sometimes ad-hoc
++implementations can be found in programs.
++
++A naive approach to the problem is to create a temporary file followed by a call
++to `os.Rename()`. However, there are a number of subtleties which make the
++correct sequence of operations hard to identify:
++
++* The temporary file should be removed when an error occurs, but a remove must
++  not be attempted if the rename succeeded, as a new file might have been
++  created with the same name. This renders a throwaway `defer
++  os.Remove(t.Name())` insufficient; state must be kept.
++
++* The temporary file must be created on the same file system (same mount point)
++  for the rename to work, but the TMPDIR environment variable should still be
++  respected, e.g. to direct temporary files into a separate directory outside of
++  the webserver’s document root but on the same file system.
++
++* On POSIX operating systems, the
++  [`fsync`](https://manpages.debian.org/stretch/manpages-dev/fsync.2) system
++  call must be used to ensure that the `os.Rename()` call will not result in a
++  0-length file.
++
++This package attempts to get all of these details right, provides an intuitive,
++yet flexible API and caters to use-cases where high performance is required.
++
++## Windows support
++
++It is [not possible to reliably write files atomically on
++Windows](https://github.com/golang/go/issues/22397#issuecomment-498856679), and
++[`chmod` is not reliably supported by the Go standard library on
++Windows](https://github.com/google/renameio/issues/17).
++
++As it is not possible to provide a correct implementation, this package does not
++export any functions on Windows.
++
++## Disclaimer
++
++This is not an official Google product (experimental or otherwise), it
++is just code that happens to be owned by Google.
++
++This project is not affiliated with the Go project.
+diff --git a/vendor/github.com/google/renameio/doc.go b/vendor/github.com/google/renameio/doc.go
+new file mode 100644
+index 000000000..67416df48
+--- /dev/null
++++ b/vendor/github.com/google/renameio/doc.go
+@@ -0,0 +1,21 @@
++// Copyright 2018 Google Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package renameio provides a way to atomically create or replace a file or
++// symbolic link.
++//
++// Caveat: this package requires the file system rename(2) implementation to be
++// atomic. Notably, this is not the case when using NFS with multiple clients:
++// https://stackoverflow.com/a/41396801
++package renameio
+diff --git a/vendor/github.com/google/renameio/tempfile.go b/vendor/github.com/google/renameio/tempfile.go
+new file mode 100644
+index 000000000..0f0eaf7ee
+--- /dev/null
++++ b/vendor/github.com/google/renameio/tempfile.go
+@@ -0,0 +1,187 @@
++// Copyright 2018 Google Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !windows
++
++package renameio
++
++import (
++	"io/ioutil"
++	"os"
++	"path/filepath"
++)
++
++// TempDir checks whether os.TempDir() can be used as a temporary directory for
++// later atomically replacing files within dest. If no (os.TempDir() resides on
++// a different mount point), dest is returned.
++//
++// Note that the returned value ceases to be valid once either os.TempDir()
++// changes (e.g. on Linux, once the TMPDIR environment variable changes) or the
++// file system is unmounted.
++func TempDir(dest string) string {
++	return tempDir("", filepath.Join(dest, "renameio-TempDir"))
++}
++
++func tempDir(dir, dest string) string {
++	if dir != "" {
++		return dir // caller-specified directory always wins
++	}
++
++	// Chose the destination directory as temporary directory so that we
++	// definitely can rename the file, for which both temporary and destination
++	// file need to point to the same mount point.
++	fallback := filepath.Dir(dest)
++
++	// The user might have overridden the os.TempDir() return value by setting
++	// the TMPDIR environment variable.
++	tmpdir := os.TempDir()
++
++	testsrc, err := ioutil.TempFile(tmpdir, "."+filepath.Base(dest))
++	if err != nil {
++		return fallback
++	}
++	cleanup := true
++	defer func() {
++		if cleanup {
++			os.Remove(testsrc.Name())
++		}
++	}()
++	testsrc.Close()
++
++	testdest, err := ioutil.TempFile(filepath.Dir(dest), "."+filepath.Base(dest))
++	if err != nil {
++		return fallback
++	}
++	defer os.Remove(testdest.Name())
++	testdest.Close()
++
++	if err := os.Rename(testsrc.Name(), testdest.Name()); err != nil {
++		return fallback
++	}
++	cleanup = false // testsrc no longer exists
++	return tmpdir
++}
++
++// PendingFile is a pending temporary file, waiting to replace the destination
++// path in a call to CloseAtomicallyReplace.
++type PendingFile struct {
++	*os.File
++
++	path   string
++	done   bool
++	closed bool
++}
++
++// Cleanup is a no-op if CloseAtomicallyReplace succeeded, and otherwise closes
++// and removes the temporary file.
++//
++// This method is not safe for concurrent use by multiple goroutines.
++func (t *PendingFile) Cleanup() error {
++	if t.done {
++		return nil
++	}
++	// An error occurred. Close and remove the tempfile. Errors are returned for
++	// reporting, there is nothing the caller can recover here.
++	var closeErr error
++	if !t.closed {
++		closeErr = t.Close()
++	}
++	if err := os.Remove(t.Name()); err != nil {
++		return err
++	}
++	return closeErr
++}
++
++// CloseAtomicallyReplace closes the temporary file and atomically replaces
++// the destination file with it, i.e., a concurrent open(2) call will either
++// open the file previously located at the destination path (if any), or the
++// just written file, but the file will always be present.
++//
++// This method is not safe for concurrent use by multiple goroutines.
++func (t *PendingFile) CloseAtomicallyReplace() error {
++	// Even on an ordered file system (e.g. ext4 with data=ordered) or file
++	// systems with write barriers, we cannot skip the fsync(2) call as per
++	// Theodore Ts'o (ext2/3/4 lead developer):
++	//
++	// > data=ordered only guarantees the avoidance of stale data (e.g., the previous
++	// > contents of a data block showing up after a crash, where the previous data
++	// > could be someone's love letters, medical records, etc.). Without the fsync(2)
++	// > a zero-length file is a valid and possible outcome after the rename.
++	if err := t.Sync(); err != nil {
++		return err
++	}
++	t.closed = true
++	if err := t.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(t.Name(), t.path); err != nil {
++		return err
++	}
++	t.done = true
++	return nil
++}
++
++// TempFile wraps ioutil.TempFile for the use case of atomically creating or
++// replacing the destination file at path.
++//
++// If dir is the empty string, TempDir(filepath.Base(path)) is used. If you are
++// going to write a large number of files to the same file system, store the
++// result of TempDir(filepath.Base(path)) and pass it instead of the empty
++// string.
++//
++// The file's permissions will be 0600 by default. You can change these by
++// explicitly calling Chmod on the returned PendingFile.
++func TempFile(dir, path string) (*PendingFile, error) {
++	f, err := ioutil.TempFile(tempDir(dir, path), "."+filepath.Base(path))
++	if err != nil {
++		return nil, err
++	}
++
++	return &PendingFile{File: f, path: path}, nil
++}
++
++// Symlink wraps os.Symlink, replacing an existing symlink with the same name
++// atomically (os.Symlink fails when newname already exists, at least on Linux).
++func Symlink(oldname, newname string) error {
++	// Fast path: if newname does not exist yet, we can skip the whole dance
++	// below.
++	if err := os.Symlink(oldname, newname); err == nil || !os.IsExist(err) {
++		return err
++	}
++
++	// We need to use ioutil.TempDir, as we cannot overwrite a ioutil.TempFile,
++	// and removing+symlinking creates a TOCTOU race.
++	d, err := ioutil.TempDir(filepath.Dir(newname), "."+filepath.Base(newname))
++	if err != nil {
++		return err
++	}
++	cleanup := true
++	defer func() {
++		if cleanup {
++			os.RemoveAll(d)
++		}
++	}()
++
++	symlink := filepath.Join(d, "tmp.symlink")
++	if err := os.Symlink(oldname, symlink); err != nil {
++		return err
++	}
++
++	if err := os.Rename(symlink, newname); err != nil {
++		return err
++	}
++
++	cleanup = false
++	return os.RemoveAll(d)
++}
+diff --git a/vendor/github.com/google/renameio/writefile.go b/vendor/github.com/google/renameio/writefile.go
+new file mode 100644
+index 000000000..fbf5c7988
+--- /dev/null
++++ b/vendor/github.com/google/renameio/writefile.go
+@@ -0,0 +1,40 @@
++// Copyright 2018 Google Inc.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//      http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build !windows
++
++package renameio
++
++import "os"
++
++// WriteFile mirrors ioutil.WriteFile, replacing an existing file with the same
++// name atomically.
++func WriteFile(filename string, data []byte, perm os.FileMode) error {
++	t, err := TempFile("", filename)
++	if err != nil {
++		return err
++	}
++	defer t.Cleanup()
++
++	// Set permissions before writing data, in case the data is sensitive.
++	if err := t.Chmod(perm); err != nil {
++		return err
++	}
++
++	if _, err := t.Write(data); err != nil {
++		return err
++	}
++
++	return t.CloseAtomicallyReplace()
++}
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index cdade29ad..6b78873b7 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -247,6 +247,9 @@ github.com/google/gofuzz/bytesource
+ # github.com/google/pprof v0.0.0-20240424215950-a892ee059fd6
+ ## explicit; go 1.19
+ github.com/google/pprof/profile
++# github.com/google/renameio v1.0.1
++## explicit; go 1.13
++github.com/google/renameio
+ # github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
+ ## explicit; go 1.13
+ github.com/google/shlex

@@ -1,0 +1,769 @@
+diff --git a/cli-commands/vm.rb b/cli-commands/vm.rb
+index c81027208..ef1262769 100644
+--- a/cli-commands/vm.rb
++++ b/cli-commands/vm.rb
+@@ -2,6 +2,17 @@
+ 
+ UbiRodish.on("vm") do
+   # :nocov:
+-  autoload_subcommand_dir("cli-commands/vm") unless Config.production? || ENV["FORCE_AUTOLOAD"] == "1"
++  unless Config.production? || ENV["FORCE_AUTOLOAD"] == "1"
++    autoload_subcommand_dir("cli-commands/vm")
++    autoload_post_subcommand_dir("cli-commands/vm/post")
++  end
+   # :nocov:
++
++  args(2...)
++
++  run do |(vm_ref, *argv), opts, command|
++    @location, @vm_name, extra = vm_ref.split("/", 3)
++    raise Rodish::CommandFailure, "invalid vm reference, should be in location/(vm-name|_vm-ubid) format" if extra
++    command.run(self, opts, argv)
++  end
+ end
+diff --git a/cli-commands/vm/scp.rb b/cli-commands/vm/post/scp.rb
+similarity index 76%
+rename from cli-commands/vm/scp.rb
+rename to cli-commands/vm/post/scp.rb
+index 4f40e7c2f..50e8bc459 100644
+--- a/cli-commands/vm/scp.rb
++++ b/cli-commands/vm/post/scp.rb
+@@ -1,16 +1,16 @@
+ # frozen_string_literal: true
+ 
+-UbiRodish.on("vm", "scp") do
+-  options("ubi vm scp [options] location-name (vm-name|_vm-ubid) (local-path :remote-path|:remote-path local-path) [scp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++UbiRodish.on("vm").run_on("scp") do
++  options("ubi vm location-name/(vm-name|_vm-ubid) scp [options] (local-path :remote-path|:remote-path local-path) [scp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+ 
+-  args(4...)
++  args(2...)
+ 
+-  run do |(location, name, path1, path2, *argv), opts|
++  run do |(path1, path2, *argv), opts|
+     remote_path1 = path1[0] == ":"
+     remote_path2 = path2[0] == ":"
+ 
+     if remote_path1 ^ remote_path2
+-      handle_ssh(location, name, opts) do |user:, address:|
++      handle_ssh(opts) do |user:, address:|
+         address = "[#{address}]" if address.include?(":")
+         remote = "#{user}@#{address}"
+ 
+diff --git a/cli-commands/vm/post/sftp.rb b/cli-commands/vm/post/sftp.rb
+new file mode 100644
+index 000000000..3bd1a6d08
+--- /dev/null
++++ b/cli-commands/vm/post/sftp.rb
+@@ -0,0 +1,14 @@
++# frozen_string_literal: true
++
++UbiRodish.on("vm").run_on("sftp") do
++  options("ubi vm location-name/(vm-name|_vm-ubid) sftp [options] [-- sftp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++
++  args(0...)
++
++  run do |argv, opts|
++    handle_ssh(opts) do |user:, address:|
++      address = "[#{address}]" if address.include?(":")
++      ["sftp", *argv, "--", "#{user}@#{address}"]
++    end
++  end
++end
+diff --git a/cli-commands/vm/post/ssh.rb b/cli-commands/vm/post/ssh.rb
+new file mode 100644
+index 000000000..32b4ae34d
+--- /dev/null
++++ b/cli-commands/vm/post/ssh.rb
+@@ -0,0 +1,18 @@
++# frozen_string_literal: true
++
++UbiRodish.on("vm").run_on("ssh") do
++  options("ubi vm location-name/(vm-name|_vm-ubid) ssh [options] [-- ssh-options --] [cmd [arg, ...]]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++
++  args(0...)
++
++  run do |argv, opts|
++    handle_ssh(opts) do |user:, address:|
++      if (i = argv.index("--"))
++        options = argv[0...i]
++        argv = argv[(i + 1)...]
++      end
++
++      ["ssh", *options, "--", "#{user}@#{address}", *argv]
++    end
++  end
++end
+diff --git a/cli-commands/vm/sftp.rb b/cli-commands/vm/sftp.rb
+deleted file mode 100644
+index 96383327b..000000000
+--- a/cli-commands/vm/sftp.rb
++++ /dev/null
+@@ -1,14 +0,0 @@
+-# frozen_string_literal: true
+-
+-UbiRodish.on("vm", "sftp") do
+-  options("ubi vm sftp [options] location-name (vm-name|_vm-ubid) [sftp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+-
+-  args(2...)
+-
+-  run do |(location, name, *argv), opts|
+-    handle_ssh(location, name, opts) do |user:, address:|
+-      address = "[#{address}]" if address.include?(":")
+-      ["sftp", *argv, "--", "#{user}@#{address}"]
+-    end
+-  end
+-end
+diff --git a/cli-commands/vm/ssh.rb b/cli-commands/vm/ssh.rb
+deleted file mode 100644
+index a9a54b9b4..000000000
+--- a/cli-commands/vm/ssh.rb
++++ /dev/null
+@@ -1,18 +0,0 @@
+-# frozen_string_literal: true
+-
+-UbiRodish.on("vm", "ssh") do
+-  options("ubi vm ssh [options] location-name (vm-name|_vm-ubid) [ssh-options --] [cmd [arg, ...]]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+-
+-  args(2...)
+-
+-  run do |(location, name, *argv), opts|
+-    handle_ssh(location, name, opts) do |user:, address:|
+-      if (i = argv.index("--"))
+-        options = argv[0...i]
+-        argv = argv[(i + 1)...]
+-      end
+-
+-      ["ssh", *options, "--", "#{user}@#{address}", *argv]
+-    end
+-  end
+-end
+diff --git a/lib/rodish.rb b/lib/rodish.rb
+index 0bf6b2c6b..a5c2cb533 100644
+--- a/lib/rodish.rb
++++ b/lib/rodish.rb
+@@ -4,7 +4,7 @@
+ 
+ module Rodish
+   def self.processor(&block)
+-    Processor.new(DSL.command([].freeze, [].freeze, &block))
++    Processor.new(DSL.command([].freeze, &block))
+   end
+ 
+   class CommandExit < StandardError
+@@ -46,8 +46,8 @@ def halt(string)
+   option_parser.freeze
+ 
+   class DSL
+-    def self.command(command_path, befores, &block)
+-      command = Command.new(command_path, befores)
++    def self.command(command_path, &block)
++      command = Command.new(command_path)
+       new(command).instance_exec(&block)
+       command
+     end
+@@ -76,14 +76,19 @@ def args(args)
+     end
+ 
+     def autoload_subcommand_dir(base)
+-      Dir.glob("*.rb", base:).each do |filename|
+-        @command.subcommands[filename.chomp(".rb")] = File.expand_path(File.join(base, filename))
+-      end
++      _autoload_subcommand_dir(@command.subcommands, base)
++    end
++
++    def autoload_post_subcommand_dir(base)
++      _autoload_subcommand_dir(@command.post_subcommands, base)
+     end
+ 
+     def on(command_name, &block)
+-      command_path = @command.command_path + [command_name]
+-      @command.subcommands[command_name] = DSL.command(command_path.freeze, @command.befores, &block)
++      _on(@command.subcommands, command_name, &block)
++    end
++
++    def run_on(command_name, &block)
++      _on(@command.post_subcommands, command_name, &block)
+     end
+ 
+     def run(&block)
+@@ -91,15 +96,37 @@ def run(&block)
+     end
+ 
+     def is(command_name, args: 0, &block)
+-      on(command_name) do
++      _is(:on, command_name, args:, &block)
++    end
++
++    def run_is(command_name, args: 0, &block)
++      _is(:run_on, command_name, args:, &block)
++    end
++
++    private
++
++    def _autoload_subcommand_dir(hash, base)
++      Dir.glob("*.rb", base:).each do |filename|
++        hash[filename.chomp(".rb")] = File.expand_path(File.join(base, filename))
++      end
++    end
++
++    def _is(meth, command_name, args:, &block)
++      public_send(meth, command_name) do
+         args args
+         run(&block)
+       end
+     end
++
++    def _on(hash, command_name, &block)
++      command_path = @command.command_path + [command_name]
++      hash[command_name] = DSL.command(command_path.freeze, &block)
++    end
+   end
+ 
+   class Command
+     attr_reader :subcommands
++    attr_reader :post_subcommands
+ 
+     attr_accessor :run_block
+     attr_accessor :command_path
+@@ -108,29 +135,35 @@ class Command
+     attr_accessor :before
+     attr_accessor :num_args
+ 
+-    def initialize(command_path, befores)
++    def initialize(command_path)
+       # Development assertions:
+       # raise "command path not frozen" unless command_path.frozen?
+       # raise "befores not frozen" unless befores.frozen?
+       @command_path = command_path
+       @command_name = command_path.join(" ").freeze
+-      @befores = befores
+       @subcommands = {}
++      @post_subcommands = {}
+       @num_args = 0
+     end
+ 
+     def freeze
+       @subcommands.each_value(&:freeze)
+-      if @before
+-        @befores += [@before]
+-        @befores.freeze
+-        @before = nil
+-      end
+       @subcommands.freeze
++      @post_subcommands.each_value(&:freeze)
++      @post_subcommands.freeze
+       @option_parser.freeze
+       super
+     end
+ 
++    def run_post_subcommand(context, options, argv)
++      if argv[0] && @post_subcommands[argv[0]]
++        process_subcommand(@post_subcommands, context, options, argv)
++      else
++        raise CommandFailure, "invalid post subcommand #{argv[0]}, valid post subcommands#{subcommand_name} are: #{@post_subcommands.keys.sort.join(" ")}"
++      end
++    end
++    alias_method :run, :run_post_subcommand
++
+     def process(context, options, argv)
+       if @option_parser
+         option_key = @option_key
+@@ -145,27 +178,16 @@ def process(context, options, argv)
+         DEFAULT_OPTION_PARSER.order!(argv)
+       end
+ 
+-      if argv[0] && (subcommand = @subcommands[argv[0]])
+-        if subcommand.is_a?(String)
+-          require subcommand
+-          subcommand = @subcommands[argv[0]]
+-          unless subcommand.is_a?(Command)
+-            raise CommandFailure, "program bug, autoload of subcommand #{argv[0]} failed"
+-          end
+-        end
+-
+-        argv.shift
+-        subcommand.process(context, options, argv)
++      if argv[0] && @subcommands[argv[0]]
++        process_subcommand(@subcommands, context, options, argv)
+       elsif run_block
+         if valid_args?(argv)
+-          befores.each do |before|
+-            context.instance_exec(argv, options, &before)
+-          end
++          context.instance_exec(argv, options, &before) if before
+ 
+           if @num_args.is_a?(Integer)
+-            context.instance_exec(*argv, options, &run_block)
++            context.instance_exec(*argv, options, self, &run_block)
+           else
+-            context.instance_exec(argv, options, &run_block)
++            context.instance_exec(argv, options, self, &run_block)
+           end
+         else
+           raise CommandFailure, "invalid number of arguments#{subcommand_name} (accepts: #{@num_args}, given: #{argv.length})"
+@@ -183,14 +205,6 @@ def process(context, options, argv)
+       end
+     end
+ 
+-    def befores
+-      if @before
+-        (@befores + [@before]).freeze
+-      else
+-        @befores
+-      end
+-    end
+-
+     def each_subcommand(names = [], &block)
+       yield names, self
+       @subcommands.each do |name, command|
+@@ -200,6 +214,22 @@ def each_subcommand(names = [], &block)
+ 
+     private
+ 
++    def process_subcommand(subcommands, context, options, argv)
++      subcommand = subcommands[argv[0]]
++
++      if subcommand.is_a?(String)
++        require subcommand
++        subcommand = subcommands[argv[0]]
++        unless subcommand.is_a?(Command)
++          raise CommandFailure, "program bug, autoload of subcommand #{argv[0]} failed"
++        end
++      end
++
++      argv.shift
++      context.instance_exec(argv, options, &before) if before
++      subcommand.process(context, options, argv)
++    end
++
+     def subcommand_name
+       if @command_name.empty?
+         " for command"
+@@ -228,8 +258,13 @@ def process(argv, options: {}, context: nil)
+       @command.process(context, options, argv)
+     end
+ 
+-    def on(*command_names, command_name, &block)
+-      dsl(command_names).on(command_name, &block)
++    def on(*command_names, &block)
++      if block
++        command_name = command_names.pop
++        dsl(command_names).on(command_name, &block)
++      else
++        dsl(command_names)
++      end
+     end
+ 
+     def is(*command_names, command_name, args: 0, &block)
+diff --git a/lib/ubi_cli.rb b/lib/ubi_cli.rb
+index cb7e4b9d7..60a291f5d 100644
+--- a/lib/ubi_cli.rb
++++ b/lib/ubi_cli.rb
+@@ -21,8 +21,8 @@ def project_ubid
+     @project_ubid ||= @env["clover.project_ubid"]
+   end
+ 
+-  def handle_ssh(location, name, opts)
+-    get(project_path("location/#{location}/vm/#{name}")) do |data, res|
++  def handle_ssh(opts)
++    get(project_path("location/#{@location}/vm/#{@vm_name}")) do |data, res|
+       if (opts = opts[:vm_ssh])
+         user = opts[:user]
+         if opts[:ip4]
+diff --git a/spec/lib/rodish-example-post/o.rb b/spec/lib/rodish-example-post/o.rb
+new file mode 100644
+index 000000000..07da647e7
+--- /dev/null
++++ b/spec/lib/rodish-example-post/o.rb
+@@ -0,0 +1,5 @@
++# frozen_string_literal: true
++
++@ExampleRodish.on("k").run_is("o") do
++  push :o
++end
+diff --git a/spec/lib/rodish_spec.rb b/spec/lib/rodish_spec.rb
+index f3e0d836b..664ac7d00 100644
+--- a/spec/lib/rodish_spec.rb
++++ b/spec/lib/rodish_spec.rb
+@@ -65,6 +65,33 @@
+         end
+       end
+ 
++      on "g" do
++        args(2...)
++
++        is "j" do
++          push :j
++        end
++
++        run_is "h" do
++          push :h
++        end
++
++        run_on "i" do
++          is "k" do
++            push :k
++          end
++
++          run do
++            push :i
++          end
++        end
++
++        run do |(x, *argv), opts, command|
++          push [:g, x]
++          command.run(self, opts, argv)
++        end
++      end
++
+       run do
+         push :empty
+       end
+@@ -97,6 +124,23 @@
+         expect(res).to eq [:top, :f]
+       end
+ 
++      it "supports run_on/run_is for subcommands dispatched to during run" do
++        res = []
++        app.process(%w[g j], context: res.clear)
++        expect(res).to eq [:top, :j]
++        app.process(%w[g 1 h], context: res.clear)
++        expect(res).to eq [:top, [:g, "1"], :h]
++        app.process(%w[g 1 i], context: res.clear)
++        expect(res).to eq [:top, [:g, "1"], :i]
++        app.process(%w[g 1 i k], context: res.clear)
++        expect(res).to eq [:top, [:g, "1"], :k]
++      end
++
++      it "handles invalid subcommands dispatched to during run" do
++        res = []
++        expect { app.process(%w[g 1 l], context: res) }.to raise_error(Rodish::CommandFailure, "invalid post subcommand l, valid post subcommands for g subcommand are: h i")
++      end
++
+       it "handles options at any level they are defined" do
+         res = []
+         app.process(%w[-v a b -v 1 2], context: res.clear)
+@@ -110,30 +154,30 @@
+         expect { app.process(%w[6], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for command (accepts: 0, given: 1)")
+         expect(res).to be_empty
+         expect { app.process(%w[a b], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a b subcommand (accepts: 1..., given: 0)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[a], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 0)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[a 1], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 1)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[a 1 2 3], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 3)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[c 1], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for c subcommand (accepts: 0, given: 1)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[d], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for d subcommand (accepts: 1, given: 0)")
+-        expect(res).to be_empty
+-        expect { app.process(%w[d 1 2], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for d subcommand (accepts: 1, given: 2)")
+-        expect(res).to be_empty
++        expect(res).to eq [:top, :before_a]
++        expect { app.process(%w[a], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 0)")
++        expect(res).to eq [:top]
++        expect { app.process(%w[a 1], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 1)")
++        expect(res).to eq [:top]
++        expect { app.process(%w[a 1 2 3], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for a subcommand (accepts: 2, given: 3)")
++        expect(res).to eq [:top]
++        expect { app.process(%w[c 1], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for c subcommand (accepts: 0, given: 1)")
++        expect(res).to eq [:top]
++        expect { app.process(%w[d], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for d subcommand (accepts: 1, given: 0)")
++        expect(res).to eq [:top]
++        expect { app.process(%w[d 1 2], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for d subcommand (accepts: 1, given: 2)")
++        expect(res).to eq [:top]
+       end
+ 
+       it "raises CommandFailure for invalid subcommand" do
+         res = []
+         expect { app.process(%w[e g], context: res) }.to raise_error(Rodish::CommandFailure, "invalid subcommand g, valid subcommands for e subcommand are: f")
+-        expect(res).to be_empty
++        expect(res).to eq [:top]
+ 
+         app = described_class.processor do
+           on("f") {}
+         end
+-        expect { app.process(%w[g], context: res) }.to raise_error(Rodish::CommandFailure, "invalid subcommand g, valid subcommands for command are: f")
++        expect { app.process(%w[g], context: res.clear) }.to raise_error(Rodish::CommandFailure, "invalid subcommand g, valid subcommands for command are: f")
+         expect(res).to be_empty
+       end
+ 
+@@ -151,11 +195,11 @@
+         expect { app.process(%w[-d], context: res) }.to raise_error(Rodish::CommandFailure, /top verbose output/)
+         expect(res).to be_empty
+         expect { app.process(%w[a -d], context: res) }.to raise_error(Rodish::CommandFailure, /a verbose output/)
+-        expect(res).to be_empty
+-        expect { app.process(%w[a b -d], context: res) }.to raise_error(Rodish::CommandFailure, /b verbose output/)
+-        expect(res).to be_empty
+-        expect { app.process(%w[d -d 1 2], context: res) }.to raise_error(Rodish::CommandFailure, /top verbose output/)
+-        expect(res).to be_empty
++        expect(res).to eq [:top]
++        expect { app.process(%w[a b -d], context: res.clear) }.to raise_error(Rodish::CommandFailure, /b verbose output/)
++        expect(res).to eq [:top, :before_a]
++        expect { app.process(%w[d -d 1 2], context: res.clear) }.to raise_error(Rodish::CommandFailure, /top verbose output/)
++        expect(res).to eq [:top]
+       end
+ 
+       it "raises CommandExit for blocks that use halt" do
+@@ -168,7 +212,7 @@
+                   --version                    show program version
+                   --help                       show program help
+ 
+-          Subcommands: a c d e
++          Subcommands: a c d e g
+         USAGE
+       end
+ 
+@@ -183,7 +227,7 @@
+                   --version                    show program version
+                   --help                       show program help
+ 
+-          Subcommands: a c d e
++          Subcommands: a c d e g
+         USAGE
+         expect(usages["a"]).to eq <<~USAGE
+           Usage: example a [options] [subcommand [subcommand_options] [...]]
+@@ -204,31 +248,31 @@
+       unless frozen
+         it "supports adding subcommands after initialization" do
+           res = []
+-          expect { app.process(%w[g], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for command (accepts: 0, given: 1)")
++          expect { app.process(%w[z], context: res) }.to raise_error(Rodish::CommandFailure, "invalid number of arguments for command (accepts: 0, given: 1)")
+           expect(res).to be_empty
+ 
+-          app.on("g") do
++          app.on("z") do
+             args 1
+             run do |arg|
+-              push [:g, arg]
++              push [:z, arg]
+             end
+           end
+-          app.process(%w[g h], context: res.clear)
+-          expect(res).to eq [:top, [:g, "h"]]
++          app.process(%w[z h], context: res.clear)
++          expect(res).to eq [:top, [:z, "h"]]
+ 
+-          app.on("g", "h") do
++          app.on("z", "y") do
+             run do
+-              push :h
++              push :y
+             end
+           end
+-          app.process(%w[g h], context: res.clear)
+-          expect(res).to eq [:top, :h]
++          app.process(%w[z y], context: res.clear)
++          expect(res).to eq [:top, :y]
+ 
+-          app.is("g", "h", "i", args: 1) do |arg|
+-            push [:i, arg]
++          app.is("z", "y", "x", args: 1) do |arg|
++            push [:x, arg]
+           end
+-          app.process(%w[g h i j], context: res.clear)
+-          expect(res).to eq [:top, [:i, "j"]]
++          app.process(%w[z y x j], context: res.clear)
++          expect(res).to eq [:top, [:x, "j"]]
+         end
+ 
+         it "supports autoloading" do
+@@ -236,12 +280,22 @@
+           main.instance_variable_set(:@ExampleRodish, app)
+           app.on("k") do
+             autoload_subcommand_dir("spec/lib/rodish-example")
++            autoload_post_subcommand_dir("spec/lib/rodish-example-post")
++
++            args(2...)
++            run do |(x, *argv), opts, command|
++              push [:k, x]
++              command.run(self, opts, argv)
++            end
+           end
+ 
+           res = []
+           app.process(%w[k m], context: res.clear)
+           expect(res).to eq [:top, :m]
+ 
++          app.process(%w[k 1 o], context: res.clear)
++          expect(res).to eq [:top, [:k, "1"], :o]
++
+           expect { app.process(%w[k n], context: res) }.to raise_error(Rodish::CommandFailure, "program bug, autoload of subcommand n failed")
+         ensure
+           main.remove_instance_variable(:@ExampleRodish)
+diff --git a/spec/routes/api/cli/vm/scp_spec.rb b/spec/routes/api/cli/vm/scp_spec.rb
+index 2a17eda22..8deff2890 100644
+--- a/spec/routes/api/cli/vm/scp_spec.rb
++++ b/spec/routes/api/cli/vm/scp_spec.rb
+@@ -5,33 +5,34 @@
+ RSpec.describe Clover, "cli vm scp" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+   end
+ 
+   it "provides headers to copy local file to remote" do
+-    expect(cli_exec(["vm", "scp", @vm.display_location, @vm.name, "local", ":remote"])).to eq %w[scp -- local ubi@[128:1234::2]:remote]
++    expect(cli_exec(["vm", @ref, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@[128:1234::2]:remote]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", "scp", @vm.display_location, @vm.name, "local", ":remote"])).to eq %w[scp -- local ubi@128.0.0.1:remote]
++    expect(cli_exec(["vm", @ref, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@128.0.0.1:remote]
+   end
+ 
+   it "provides headers to copy remote file to local" do
+-    expect(cli_exec(["vm", "scp", @vm.display_location, @vm.name, ":remote", "local"])).to eq %w[scp -- ubi@[128:1234::2]:remote local]
++    expect(cli_exec(["vm", @ref, "scp", ":remote", "local"])).to eq %w[scp -- ubi@[128:1234::2]:remote local]
+   end
+ 
+   it "supports scp options" do
+-    expect(cli_exec(["vm", "scp", @vm.display_location, @vm.name, ":remote", "local", "-A"])).to eq %w[scp -A -- ubi@[128:1234::2]:remote local]
++    expect(cli_exec(["vm", @ref, "scp", ":remote", "local", "-A"])).to eq %w[scp -A -- ubi@[128:1234::2]:remote local]
+   end
+ 
+   it "returns error if both files are local" do
+-    expect(cli(["vm", "scp", @vm.display_location, @vm.name, "local", "local"], status: 400)).to eq "Only one path should be remote (start with ':')"
++    expect(cli(["vm", @ref, "scp", "local", "local"], status: 400)).to eq "Only one path should be remote (start with ':')"
+   end
+ 
+   it "returns error if both files are remote" do
+-    expect(cli(["vm", "scp", @vm.display_location, @vm.name, ":remote", ":remote"], status: 400)).to eq "Only one path should be remote (start with ':')"
++    expect(cli(["vm", @ref, "scp", ":remote", ":remote"], status: 400)).to eq "Only one path should be remote (start with ':')"
+   end
+ end
+diff --git a/spec/routes/api/cli/vm/sftp_spec.rb b/spec/routes/api/cli/vm/sftp_spec.rb
+index c02672032..dd132c709 100644
+--- a/spec/routes/api/cli/vm/sftp_spec.rb
++++ b/spec/routes/api/cli/vm/sftp_spec.rb
+@@ -5,21 +5,22 @@
+ RSpec.describe Clover, "cli vm sftp" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+   end
+ 
+   it "provides headers to connect to vm via sftp" do
+-    expect(cli_exec(["vm", "sftp", @vm.display_location, @vm.name])).to eq %w[sftp -- ubi@[128:1234::2]]
++    expect(cli_exec(["vm", @ref, "sftp"])).to eq %w[sftp -- ubi@[128:1234::2]]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", "sftp", @vm.display_location, @vm.name])).to eq %w[sftp -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "sftp"])).to eq %w[sftp -- ubi@128.0.0.1]
+   end
+ 
+   it "supports sftp options" do
+-    expect(cli_exec(["vm", "sftp", @vm.display_location, @vm.name, "-A"])).to eq %w[sftp -A -- ubi@[128:1234::2]]
++    expect(cli_exec(["vm", @ref, "sftp", "--", "-A"])).to eq %w[sftp -A -- ubi@[128:1234::2]]
+   end
+ end
+diff --git a/spec/routes/api/cli/vm/ssh_spec.rb b/spec/routes/api/cli/vm/ssh_spec.rb
+index 42568cef5..59ff51853 100644
+--- a/spec/routes/api/cli/vm/ssh_spec.rb
++++ b/spec/routes/api/cli/vm/ssh_spec.rb
+@@ -5,6 +5,7 @@
+ RSpec.describe Clover, "cli vm ssh" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+@@ -15,69 +16,70 @@
+   end
+ 
+   it "provides headers to connect to vm" do
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name])).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name])).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "uses IPv4 address if available and connection is made via IPv4" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET)
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "uses IPv6 address if connection is made via IPv6" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET6)
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "-4 option fails if VM has no IPv4 address" do
+-    expect(cli(["vm", "ssh", "-4", @vm.display_location, @vm.name], status: 400)).to eq "No valid IPv4 address for requested VM"
++    expect(cli(["vm", @ref, "ssh", "-4"], status: 400)).to eq "No valid IPv4 address for requested VM"
+   end
+ 
+   it "-4 option uses IPv4 even if connection is made via IPv6" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET6)
+-    expect(cli_exec(["vm", "ssh", "-4", @vm.display_location, @vm.name], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh", "-4"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "-6 option uses IPv6 even if connection is made via IPv4" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET)
+-    expect(cli_exec(["vm", "ssh", "-6", @vm.display_location, @vm.name], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-6"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "-u option overrides user to connect with" do
+-    expect(cli_exec(["vm", "ssh", "-ufoo", @vm.display_location, @vm.name])).to eq %w[ssh -- foo@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-ufoo"])).to eq %w[ssh -- foo@128:1234::2]
+   end
+ 
+   it "handles ssh cmd without args" do
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name, "id"])).to eq %w[ssh -- ubi@128:1234::2 id]
++    expect(cli_exec(["vm", @ref, "ssh", "id"])).to eq %w[ssh -- ubi@128:1234::2 id]
+   end
+ 
+   it "handles ssh cmd with args" do
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name, "uname", "-a"])).to eq %w[ssh -- ubi@128:1234::2 uname -a]
++    expect(cli_exec(["vm", @ref, "ssh", "uname", "-a"])).to eq %w[ssh -- ubi@128:1234::2 uname -a]
+   end
+ 
+   it "handles ssh cmd with options and without args" do
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name, "-A", "--"])).to eq %w[ssh -A -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "--", "-A", "--"])).to eq %w[ssh -A -- ubi@128:1234::2]
+   end
+ 
+   it "handles ssh cmd with options and args" do
+-    expect(cli_exec(["vm", "ssh", @vm.display_location, @vm.name, "-A", "--", "uname", "-a"])).to eq %w[ssh -A -- ubi@128:1234::2 uname -a]
++    expect(cli_exec(["vm", @ref, "ssh", "--", "-A", "--", "uname", "-a"])).to eq %w[ssh -A -- ubi@128:1234::2 uname -a]
+   end
+ 
+   it "handles multiple options" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", "ssh", "-6u", "foo", @vm.display_location, @vm.name])).to eq %w[ssh -- foo@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-6u", "foo"])).to eq %w[ssh -- foo@128:1234::2]
+   end
+ 
+-  it "handles invalid location or name" do
+-    expect(cli(["vm", "ssh", "-4", @vm.display_location, "foo"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
+-    expect(cli(["vm", "ssh", "-4", "foo", @vm.name], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++  it "handles invalid vm reference" do
++    expect(cli(["vm", "#{@vm.display_location}/foo", "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++    expect(cli(["vm", "foo/#{@vm.name}", "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++    expect(cli(["vm", "#{@vm.display_location}/#{@vm.name}/bar", "ssh", "-4"], status: 400)).to eq "invalid vm reference, should be in location/(vm-name|_vm-ubid) format"
+   end
+ end

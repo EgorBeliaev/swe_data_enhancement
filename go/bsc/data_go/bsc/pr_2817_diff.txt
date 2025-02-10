@@ -1,0 +1,223 @@
+diff --git a/cmd/geth/config.go b/cmd/geth/config.go
+index 24a6b25316..8d441e29dc 100644
+--- a/cmd/geth/config.go
++++ b/cmd/geth/config.go
+@@ -234,9 +234,6 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
+ 		params.FixedTurnLength = ctx.Uint64(utils.OverrideFixedTurnLength.Name)
+ 	}
+ 
+-	// Start metrics export if enabled
+-	utils.SetupMetrics(&cfg.Metrics)
+-
+ 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
+ 
+ 	// Create gauge with geth system and build information
+diff --git a/cmd/utils/flags.go b/cmd/utils/flags.go
+index ccafd81fcd..8a82107de2 100644
+--- a/cmd/utils/flags.go
++++ b/cmd/utils/flags.go
+@@ -2332,7 +2332,7 @@ type SetupMetricsOption func()
+ func EnableBuildInfo(gitCommit, gitDate string) SetupMetricsOption {
+ 	return func() {
+ 		// register build info into metrics
+-		metrics.NewRegisteredLabel("build-info", nil).Mark(map[string]interface{}{
++		metrics.GetOrRegisterLabel("build-info", nil).Mark(map[string]interface{}{
+ 			"version":          version.WithMeta,
+ 			"git-commit":       gitCommit,
+ 			"git-commit-date":  gitDate,
+@@ -2349,7 +2349,7 @@ func EnableMinerInfo(ctx *cli.Context, minerConfig *minerconfig.Config) SetupMet
+ 			// register miner info into metrics
+ 			minerInfo := structs.Map(minerConfig)
+ 			minerInfo[UnlockedAccountFlag.Name] = ctx.String(UnlockedAccountFlag.Name)
+-			metrics.NewRegisteredLabel("miner-info", nil).Mark(minerInfo)
++			metrics.GetOrRegisterLabel("miner-info", nil).Mark(minerInfo)
+ 		}
+ 	}
+ }
+@@ -2369,7 +2369,7 @@ func RegisterFilterAPI(stack *node.Node, backend ethapi.Backend, ethcfg *ethconf
+ func EnableNodeInfo(poolConfig *legacypool.Config, nodeInfo *p2p.NodeInfo) SetupMetricsOption {
+ 	return func() {
+ 		// register node info into metrics
+-		metrics.NewRegisteredLabel("node-info", nil).Mark(map[string]interface{}{
++		metrics.GetOrRegisterLabel("node-info", nil).Mark(map[string]interface{}{
+ 			"Enode":             nodeInfo.Enode,
+ 			"ENR":               nodeInfo.ENR,
+ 			"ID":                nodeInfo.ID,
+@@ -2389,7 +2389,7 @@ func EnableNodeTrack(ctx *cli.Context, cfg *ethconfig.Config, stack *node.Node)
+ 	nodeInfo := stack.Server().NodeInfo()
+ 	return func() {
+ 		// register node info into metrics
+-		metrics.NewRegisteredLabel("node-stats", nil).Mark(map[string]interface{}{
++		metrics.GetOrRegisterLabel("node-stats", nil).Mark(map[string]interface{}{
+ 			"NodeType":       parseNodeType(),
+ 			"ENR":            nodeInfo.ENR,
+ 			"Mining":         ctx.Bool(MiningEnabledFlag.Name),
+diff --git a/core/vote/vote_manager.go b/core/vote/vote_manager.go
+index 891785482b..aed7d29b41 100644
+--- a/core/vote/vote_manager.go
++++ b/core/vote/vote_manager.go
+@@ -4,7 +4,6 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"math/big"
+-	"sync"
+ 	"time"
+ 
+ 	"github.com/ethereum/go-ethereum/common"
+@@ -71,6 +70,7 @@ func NewVoteManager(eth Backend, chain *core.BlockChain, pool *VotePool, journal
+ 	}
+ 	log.Info("Create voteSigner successfully")
+ 	voteManager.signer = voteSigner
++	metrics.GetOrRegisterLabel("miner-info", nil).Mark(map[string]interface{}{"VoteKey": common.Bytes2Hex(voteManager.signer.PubKey[:])})
+ 
+ 	// Create voteJournal
+ 	voteJournal, err := NewVoteJournal(journalPath)
+@@ -107,7 +107,6 @@ func (voteManager *VoteManager) loop() {
+ 
+ 	startVote := true
+ 	blockCountSinceMining := 0
+-	var once sync.Once
+ 	for {
+ 		select {
+ 		case ev := <-dlEventCh:
+@@ -166,14 +165,6 @@ func (voteManager *VoteManager) loop() {
+ 				continue
+ 			}
+ 
+-			// Add VoteKey to `miner-info`
+-			once.Do(func() {
+-				minerInfo := metrics.Get("miner-info")
+-				if minerInfo != nil {
+-					minerInfo.(metrics.Label).Value()["VoteKey"] = common.Bytes2Hex(voteManager.signer.PubKey[:])
+-				}
+-			})
+-
+ 			// Vote for curBlockHeader block.
+ 			vote := &types.VoteData{
+ 				TargetNumber: curHead.Number.Uint64(),
+diff --git a/eth/backend.go b/eth/backend.go
+index b14a99e936..50c0ed0a37 100644
+--- a/eth/backend.go
++++ b/eth/backend.go
+@@ -56,7 +56,6 @@ import (
+ 	"github.com/ethereum/go-ethereum/internal/shutdowncheck"
+ 	"github.com/ethereum/go-ethereum/internal/version"
+ 	"github.com/ethereum/go-ethereum/log"
+-	"github.com/ethereum/go-ethereum/metrics"
+ 	"github.com/ethereum/go-ethereum/miner"
+ 	"github.com/ethereum/go-ethereum/node"
+ 	"github.com/ethereum/go-ethereum/p2p"
+@@ -510,11 +509,6 @@ func (s *Ethereum) StartMining() error {
+ 				return fmt.Errorf("signer missing: %v", err)
+ 			}
+ 			parlia.Authorize(eb, wallet.SignData, wallet.SignTx)
+-
+-			minerInfo := metrics.Get("miner-info")
+-			if minerInfo != nil {
+-				minerInfo.(metrics.Label).Value()["Etherbase"] = eb.String()
+-			}
+ 		}
+ 		// If mining is started, we can disable the transaction rejection mechanism
+ 		// introduced to speed sync times.
+diff --git a/metrics/exp/exp.go b/metrics/exp/exp.go
+index 6e992222e1..bee5a15ba0 100644
+--- a/metrics/exp/exp.go
++++ b/metrics/exp/exp.go
+@@ -199,7 +199,7 @@ func (exp *exp) publishResettingTimer(name string, metric *metrics.ResettingTime
+ 	exp.getFloat(name + ".99-percentile").Set(ps[3])
+ }
+ 
+-func (exp *exp) publishLabel(name string, metric metrics.Label) {
++func (exp *exp) publishLabel(name string, metric *metrics.Label) {
+ 	labels := metric.Value()
+ 	for k, v := range labels {
+ 		exp.getMap(name).Set(k, exp.interfaceToExpVal(v))
+@@ -274,7 +274,7 @@ func (exp *exp) syncToExpvar() {
+ 			exp.publishTimer(name, i)
+ 		case *metrics.ResettingTimer:
+ 			exp.publishResettingTimer(name, i)
+-		case metrics.Label:
++		case *metrics.Label:
+ 			exp.publishLabel(name, i)
+ 		default:
+ 			panic(fmt.Sprintf("unsupported type for '%s': %T", name, i))
+diff --git a/metrics/label.go b/metrics/label.go
+index f59c149d02..a78f73952b 100644
+--- a/metrics/label.go
++++ b/metrics/label.go
+@@ -1,37 +1,32 @@
+ package metrics
+ 
+-// Label hold an map[string]interface{} value that can be set arbitrarily.
+-type Label interface {
+-	Value() map[string]interface{}
+-	Mark(map[string]interface{})
++// Label is the standard implementation of a Label.
++type Label struct {
++	value map[string]interface{}
+ }
+ 
+-// NewRegisteredLabel constructs and registers a new StandardLabel.
+-func NewRegisteredLabel(name string, r Registry) Label {
+-	c := NewStandardLabel()
+-	if nil == r {
++// GetOrRegisterLabel returns an existing Label or constructs and registers a
++// new Label.
++func GetOrRegisterLabel(name string, r Registry) *Label {
++	if r == nil {
+ 		r = DefaultRegistry
+ 	}
+-	r.Register(name, c)
+-	return c
++	return r.GetOrRegister(name, NewLabel).(*Label)
+ }
+ 
+-// NewStandardLabel constructs a new StandardLabel.
+-func NewStandardLabel() *StandardLabel {
+-	return &StandardLabel{}
+-}
+-
+-// StandardLabel is the standard implementation of a Label.
+-type StandardLabel struct {
+-	value map[string]interface{}
++// NewLabel constructs a new Label.
++func NewLabel() *Label {
++	return &Label{value: make(map[string]interface{})}
+ }
+ 
+ // Value returns label values.
+-func (l *StandardLabel) Value() map[string]interface{} {
++func (l *Label) Value() map[string]interface{} {
+ 	return l.value
+ }
+ 
+ // Mark records the label.
+-func (l *StandardLabel) Mark(value map[string]interface{}) {
+-	l.value = value
++func (l *Label) Mark(value map[string]interface{}) {
++	for k, v := range value {
++		l.value[k] = v
++	}
+ }
+diff --git a/metrics/prometheus/collector.go b/metrics/prometheus/collector.go
+index 8665f1191c..de4001970e 100644
+--- a/metrics/prometheus/collector.go
++++ b/metrics/prometheus/collector.go
+@@ -70,7 +70,7 @@ func (c *collector) Add(name string, i any) error {
+ 		c.addTimer(name, m.Snapshot())
+ 	case *metrics.ResettingTimer:
+ 		c.addResettingTimer(name, m.Snapshot())
+-	case metrics.Label:
++	case *metrics.Label:
+ 		c.addLabel(name, m)
+ 	default:
+ 		return fmt.Errorf("unknown prometheus metric type %T", i)
+@@ -138,7 +138,7 @@ func (c *collector) addResettingTimer(name string, m *metrics.ResettingTimerSnap
+ 	c.buff.WriteRune('\n')
+ }
+ 
+-func (c *collector) addLabel(name string, m metrics.Label) {
++func (c *collector) addLabel(name string, m *metrics.Label) {
+ 	labels := make([]string, 0, len(m.Value()))
+ 	for k, v := range m.Value() {
+ 		labels = append(labels, fmt.Sprintf(`%s="%s"`, mutateKey(k), fmt.Sprint(v)))

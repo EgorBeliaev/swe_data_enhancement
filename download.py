@@ -19,7 +19,7 @@ import re
 
 def find_references(text):
     """Find references to issues or PRs in the given text."""
-    pattern = r'(?:Fixes|Closes|Close|Closing|Resolves|Ref|Fix|Fixing|In|in|fixes|fix|fixing|closes|close|closing|resolves|ref|issue|Issue|Bug|bug|maybe|Related|related|Relates|relates|Related to|related to):? #(\d+)'
+    pattern = r'(?:Fixes|Closes|Close|Closing|Resolves|Resolving|Ref|Fix|Fixing|In|in|fixes|fix|fixing|closes|close|closing|resolves|resolving|ref|issue|Issue|Bug|bug|maybe|Related|related|Relates|relates|Related to|related to|Addresses|addresses):? #(\d+)'
     return re.findall(pattern, json.dumps(text))
 
 def fetch_related_issues(owner, repo, issue_number):

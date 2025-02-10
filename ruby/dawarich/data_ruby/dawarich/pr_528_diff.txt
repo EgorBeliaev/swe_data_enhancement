@@ -1,0 +1,220 @@
+diff --git a/.app_version b/.app_version
+index 68d0e0ab..082b4352 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.19.6
++0.19.7
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 621769eb..ce3bb1f3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.19.7 - 2024-12-11
++
++### Fixed
++
++- Fixed a bug where upon deleting a point on the map, the confirmation dialog was shown multiple times and the point was not being deleted from the map until the page was reloaded. #435
++
++### Changed
++
++- With the "Points" layer enabled on the map, points with negative speed are now being shown in orange color. Since Overland reports negative speed for points that might be faulty, this should help you to identify them.
++- On the Points page, speed of the points with negative speed is now being shown in red color.
++
+ # 0.19.6 - 2024-12-11
+ 
+ ⚠️ This release introduces a breaking change. ⚠️
+diff --git a/app/helpers/application_helper.rb b/app/helpers/application_helper.rb
+index 08b341ef..c6258d08 100644
+--- a/app/helpers/application_helper.rb
++++ b/app/helpers/application_helper.rb
+@@ -114,4 +114,10 @@ def notification_link_color(notification)
+   def human_date(date)
+     date.strftime('%e %B %Y')
+   end
++
++  def speed_text_color(speed)
++    return 'text-default' if speed.to_i >= 0
++
++    'text-red-500'
++  end
+ end
+diff --git a/app/javascript/controllers/maps_controller.js b/app/javascript/controllers/maps_controller.js
+index 8440927a..d0bb046d 100644
+--- a/app/javascript/controllers/maps_controller.js
++++ b/app/javascript/controllers/maps_controller.js
+@@ -174,6 +174,9 @@ export default class extends Controller {
+   }
+ 
+   disconnect() {
++    if (this.handleDeleteClick) {
++      document.removeEventListener('click', this.handleDeleteClick);
++    }
+     this.map.remove();
+   }
+ 
+@@ -319,20 +322,22 @@ export default class extends Controller {
+   }
+ 
+   addEventListeners() {
+-    this.handleDeleteClick = (event) => {
+-      if (event.target && event.target.classList.contains('delete-point')) {
+-        event.preventDefault();
+-        const pointId = event.target.getAttribute('data-id');
+-
+-        if (confirm('Are you sure you want to delete this point?')) {
+-          this.deletePoint(pointId, this.apiKey);
++    // Create the handler only once and store it as an instance property
++    if (!this.handleDeleteClick) {
++      this.handleDeleteClick = (event) => {
++        if (event.target && event.target.classList.contains('delete-point')) {
++          event.preventDefault();
++          const pointId = event.target.getAttribute('data-id');
++
++          if (confirm('Are you sure you want to delete this point?')) {
++            this.deletePoint(pointId, this.apiKey);
++          }
+         }
+-      }
+-    };
++      };
+ 
+-    // Ensure only one listener is attached by removing any existing ones first
+-    this.removeEventListeners();
+-    document.addEventListener('click', this.handleDeleteClick);
++      // Add the listener only if it hasn't been added before
++      document.addEventListener('click', this.handleDeleteClick);
++    }
+ 
+     // Add an event listener for base layer change in Leaflet
+     this.map.on('baselayerchange', (event) => {
+@@ -375,23 +380,73 @@ export default class extends Controller {
+       return response.json();
+     })
+     .then(data => {
++      // Remove the marker and update all layers
+       this.removeMarker(id);
++
++      // Explicitly remove old polylines layer from map
++      if (this.polylinesLayer) {
++        this.map.removeLayer(this.polylinesLayer);
++      }
++
++      // Create new polylines layer
++      this.polylinesLayer = createPolylinesLayer(
++        this.markers,
++        this.map,
++        this.timezone,
++        this.routeOpacity,
++        this.userSettings,
++        this.distanceUnit
++      );
++
++      // Add new polylines layer to map and to layer control
++      this.polylinesLayer.addTo(this.map);
++
++      // Update the layer control
++      if (this.layerControl) {
++        this.map.removeControl(this.layerControl);
++        const controlsLayer = {
++          Points: this.markersLayer,
++          Polylines: this.polylinesLayer,
++          Heatmap: this.heatmapLayer,
++          "Fog of War": this.fogOverlay,
++          "Scratch map": this.scratchLayer,
++          Areas: this.areasLayer,
++          Photos: this.photoMarkers
++        };
++        this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
++      }
++
++      // Update heatmap
++      this.heatmapLayer.setLatLngs(this.markers.map(marker => [marker[0], marker[1], 0.2]));
++
++      // Update fog if enabled
++      if (this.map.hasLayer(this.fogOverlay)) {
++        this.updateFog(this.markers, this.clearFogRadius);
++      }
+     })
+     .catch(error => {
+       console.error('There was a problem with the delete request:', error);
++      showFlashMessage('error', 'Failed to delete point');
+     });
+   }
+ 
+   removeMarker(id) {
+-    const markerIndex = this.markersArray.findIndex(marker => marker.getPopup().getContent().includes(`data-id="${id}"`));
++    const numericId = parseInt(id);
++
++    const markerIndex = this.markersArray.findIndex(marker =>
++      marker.getPopup().getContent().includes(`data-id="${id}"`)
++    );
++
+     if (markerIndex !== -1) {
+-      this.markersArray[markerIndex].remove(); // Assuming your marker object has a remove method
++      this.markersArray[markerIndex].remove();
+       this.markersArray.splice(markerIndex, 1);
+       this.markersLayer.clearLayers();
+       this.markersLayer.addLayer(L.layerGroup(this.markersArray));
+ 
+-      // Remove from the markers data array
+-      this.markers = this.markers.filter(marker => marker[6] !== parseInt(id));
++      this.markers = this.markers.filter(marker => {
++        const markerId = parseInt(marker[6]);
++        return markerId !== numericId;
++      });
+     }
+   }
+ 
+diff --git a/app/javascript/maps/markers.js b/app/javascript/maps/markers.js
+index fccc940c..25760054 100644
+--- a/app/javascript/maps/markers.js
++++ b/app/javascript/maps/markers.js
+@@ -8,7 +8,8 @@ export function createMarkersArray(markersData, userSettings) {
+       const [lat, lon] = marker;
+ 
+       const popupContent = createPopupContent(marker, userSettings.timezone, userSettings.distanceUnit);
+-      return L.circleMarker([lat, lon], { radius: 4 }).bindPopup(popupContent);
++      let markerColor = marker[5] < 0 ? "orange" : "blue";
++      return L.circleMarker([lat, lon], { radius: 4, color: markerColor }).bindPopup(popupContent);
+     });
+   }
+ }
+@@ -40,7 +41,8 @@ export function createSimplifiedMarkers(markersData) {
+   // Now create markers for the simplified data
+   return simplifiedMarkers.map((marker) => {
+     const [lat, lon] = marker;
+-    const popupContent = this.createPopupContent(marker);
+-    return L.circleMarker([lat, lon], { radius: 4 }).bindPopup(popupContent);
++    const popupContent = createPopupContent(marker);
++    let markerColor = marker[5] < 0 ? "orange" : "blue";
++    return L.circleMarker([lat, lon], { radius: 4, color: markerColor }).bindPopup(popupContent);
+   });
+ }
+diff --git a/app/views/points/_point.html.erb b/app/views/points/_point.html.erb
+index d6ba1388..b29df387 100644
+--- a/app/views/points/_point.html.erb
++++ b/app/views/points/_point.html.erb
+@@ -13,6 +13,7 @@
+       }
+     %>
+   </td>
++  <td class='<%= speed_text_color(point.velocity) %>'><%= point.velocity %></td>
+   <td><%= point.recorded_at %></td>
+   <td><%= point.latitude %>, <%= point.longitude %></td>
+   <td></td>
+diff --git a/app/views/points/index.html.erb b/app/views/points/index.html.erb
+index f3fa0f1d..fa5fa3b2 100644
+--- a/app/views/points/index.html.erb
++++ b/app/views/points/index.html.erb
+@@ -75,6 +75,7 @@
+                 <% end %>
+                 </div>
+               </th>
++              <th>Speed, km/h</th>
+               <th>Recorded At</th>
+               <th>Coordinates</th>
+             </tr>

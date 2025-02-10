@@ -1,0 +1,912 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f52beb3cb..7979540be 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,6 +1,8 @@
+ ## [Unreleased]
+ - Deprecate Langchain::LLM::GooglePalm
+ - Allow setting response_object: {} parameter when initializing supported Langchain::LLM::* classes
++- Simplify and consolidate logging for some of the LLM providers (namely OpenAI and Google). Now most of the HTTP requests are being logged when on DEBUG level
++- Improve doc on how to set up a custom logger with a custom destination
+ 
+ ## [0.16.0] - 2024-09-19
+ - Remove `Langchain::Thread` class as it was not needed.
+diff --git a/Gemfile.lock b/Gemfile.lock
+index 605d0bbbd..03eb95bae 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -6,7 +6,6 @@ PATH
+       json-schema (~> 4)
+       matrix
+       pragmatic_segmenter (~> 0.3.0)
+-      rainbow (~> 3.1.0)
+       zeitwerk (~> 2.5)
+ 
+ GEM
+diff --git a/README.md b/README.md
+index 347c6b238..e85258e4f 100644
+--- a/README.md
++++ b/README.md
+@@ -548,11 +548,18 @@ Additional examples available: [/examples](https://github.com/andreibondarev/lan
+ 
+ ## Logging
+ 
+-Langchain.rb uses standard logging mechanisms and defaults to `:warn` level. Most messages are at info level, but we will add debug or warn statements as needed.
++Langchain.rb uses the standard Ruby [Logger](https://ruby-doc.org/stdlib-2.4.0/libdoc/logger/rdoc/Logger.html) mechanism and defaults to same `level` value (currently `Logger::DEBUG`).
++
+ To show all log messages:
+ 
+ ```ruby
+-Langchain.logger.level = :debug
++Langchain.logger.level = Logger::DEBUG
++```
++
++The logger logs to `STDOUT` by default. In order to configure the log destination (ie. log to a file) do:
++
++```ruby
++Langchain.logger = Logger.new("path/to/file", **Langchain::LOGGER_OPTIONS)
+ ```
+ 
+ ## Problems
+diff --git a/langchain.gemspec b/langchain.gemspec
+index 614604e1c..ecb0e4474 100644
+--- a/langchain.gemspec
++++ b/langchain.gemspec
+@@ -28,7 +28,6 @@ Gem::Specification.new do |spec|
+   # dependencies
+   # Not sure if we should require this as it only applies to OpenAI usecase.
+   spec.add_dependency "baran", "~> 0.1.9"
+-  spec.add_dependency "rainbow", "~> 3.1.0"
+   spec.add_dependency "json-schema", "~> 4"
+   spec.add_dependency "zeitwerk", "~> 2.5"
+   spec.add_dependency "pragmatic_segmenter", "~> 0.3.0"
+diff --git a/lib/langchain.rb b/lib/langchain.rb
+index af536aad2..e1938b12a 100644
+--- a/lib/langchain.rb
++++ b/lib/langchain.rb
+@@ -2,7 +2,6 @@
+ 
+ require "logger"
+ require "pathname"
+-require "rainbow"
+ require "zeitwerk"
+ require "uri"
+ require "json"
+@@ -92,24 +91,58 @@
+ # Langchain.logger.level = :info
+ module Langchain
+   class << self
+-    # @return [ContextualLogger]
+-    attr_reader :logger
+-
+-    # @param logger [Logger]
+-    # @return [ContextualLogger]
+-    def logger=(logger)
+-      @logger = ContextualLogger.new(logger)
+-    end
+-
++    # @return [Logger]
++    attr_accessor :logger
+     # @return [Pathname]
+     attr_reader :root
+   end
+ 
+-  self.logger ||= ::Logger.new($stdout, level: :debug)
+-
+-  @root = Pathname.new(__dir__)
+-
+   module Errors
+     class BaseError < StandardError; end
+   end
++
++  module Colorizer
++    class << self
++      def red(str)
++        "\e[31m#{str}\e[0m"
++      end
++
++      def green(str)
++        "\e[32m#{str}\e[0m"
++      end
++
++      def yellow(str)
++        "\e[33m#{str}\e[0m"
++      end
++
++      def blue(str)
++        "\e[34m#{str}\e[0m"
++      end
++
++      def colorize_logger_msg(msg, severity)
++        return msg unless msg.is_a?(String)
++
++        return red(msg) if severity.to_sym == :ERROR
++        return yellow(msg) if severity.to_sym == :WARN
++        msg
++      end
++    end
++  end
++
++  LOGGER_OPTIONS = {
++    progname: "Langchain.rb",
++
++    formatter: ->(severity, time, progname, msg) do
++      Logger::Formatter.new.call(
++        severity,
++        time,
++        "[#{progname}]",
++        Colorizer.colorize_logger_msg(msg, severity)
++      )
++    end
++  }.freeze
++
++  self.logger ||= ::Logger.new($stdout, **LOGGER_OPTIONS)
++
++  @root = Pathname.new(__dir__)
+ end
+diff --git a/lib/langchain/assistants/assistant.rb b/lib/langchain/assistants/assistant.rb
+index a4c7321be..5b5cf9a38 100644
+--- a/lib/langchain/assistants/assistant.rb
++++ b/lib/langchain/assistants/assistant.rb
+@@ -122,7 +122,7 @@ def add_messages(messages:)
+     # @return [Array<Langchain::Message>] The messages
+     def run(auto_tool_execution: false)
+       if messages.empty?
+-        Langchain.logger.warn("No messages to process")
++        Langchain.logger.warn("#{self.class} - No messages to process")
+         @state = :completed
+         return
+       end
+@@ -272,7 +272,7 @@ def process_latest_message
+     #
+     # @return [Symbol] The completed state
+     def handle_system_message
+-      Langchain.logger.warn("At least one user message is required after a system message")
++      Langchain.logger.warn("#{self.class} - At least one user message is required after a system message")
+       :completed
+     end
+ 
+@@ -287,7 +287,7 @@ def handle_llm_message
+     #
+     # @return [Symbol] The failed state
+     def handle_unexpected_message
+-      Langchain.logger.error("Unexpected message role encountered: #{messages.last.standard_role}")
++      Langchain.logger.error("#{self.class} - Unexpected message role encountered: #{messages.last.standard_role}")
+       :failed
+     end
+ 
+@@ -311,7 +311,7 @@ def set_state_for(response:)
+       elsif response.completion # Currently only used by Ollama
+         :completed
+       else
+-        Langchain.logger.error("LLM response does not contain tool calls, chat or completion response")
++        Langchain.logger.error("#{self.class} - LLM response does not contain tool calls, chat or completion response")
+         :failed
+       end
+     end
+@@ -323,7 +323,7 @@ def execute_tools
+       run_tools(messages.last.tool_calls)
+       :in_progress
+     rescue => e
+-      Langchain.logger.error("Error running tools: #{e.message}; #{e.backtrace.join('\n')}")
++      Langchain.logger.error("#{self.class} - Error running tools: #{e.message}; #{e.backtrace.join('\n')}")
+       :failed
+     end
+ 
+@@ -355,7 +355,7 @@ def initialize_instructions
+     #
+     # @return [Langchain::LLM::BaseResponse] The LLM response object
+     def chat_with_llm
+-      Langchain.logger.info("Sending a call to #{llm.class}", for: self.class)
++      Langchain.logger.debug("#{self.class} - Sending a call to #{llm.class}")
+ 
+       params = @llm_adapter.build_chat_params(
+         instructions: @instructions,
+diff --git a/lib/langchain/contextual_logger.rb b/lib/langchain/contextual_logger.rb
+deleted file mode 100644
+index 4ef84c62b..000000000
+--- a/lib/langchain/contextual_logger.rb
++++ /dev/null
+@@ -1,68 +0,0 @@
+-# frozen_string_literal: true
+-
+-module Langchain
+-  class ContextualLogger
+-    MESSAGE_COLOR_OPTIONS = {
+-      debug: {
+-        color: :white
+-      },
+-      error: {
+-        color: :red
+-      },
+-      fatal: {
+-        color: :red,
+-        background: :white,
+-        mode: :bold
+-      },
+-      unknown: {
+-        color: :white
+-      },
+-      info: {
+-        color: :white
+-      },
+-      warn: {
+-        color: :yellow,
+-        mode: :bold
+-      }
+-    }
+-
+-    def initialize(logger)
+-      @logger = logger
+-      @levels = Logger::Severity.constants.map(&:downcase)
+-    end
+-
+-    def respond_to_missing?(method, include_private = false)
+-      @logger.respond_to?(method, include_private)
+-    end
+-
+-    def method_missing(method, *args, **kwargs, &block)
+-      return @logger.send(method, *args, **kwargs, &block) unless @levels.include?(method)
+-
+-      for_class = kwargs.delete(:for)
+-      for_class_name = for_class&.name
+-
+-      log_line_parts = []
+-      log_line_parts << colorize("[Langchain.rb]", color: :yellow)
+-      log_line_parts << if for_class.respond_to?(:logger_options)
+-        colorize("[#{for_class_name}]", for_class.logger_options) + ":"
+-      elsif for_class_name
+-        "[#{for_class_name}]:"
+-      end
+-      log_line_parts << colorize(args.first, MESSAGE_COLOR_OPTIONS[method])
+-      log_line_parts << kwargs if !!kwargs && kwargs.any?
+-      log_line_parts << block.call if block
+-      log_line = log_line_parts.compact.join(" ")
+-
+-      @logger.send(
+-        method,
+-        log_line
+-      )
+-    end
+-
+-    private
+-
+-    def colorize(line, options)
+-      Langchain::Utils::Colorizer.colorize(line, options)
+-    end
+-  end
+-end
+diff --git a/lib/langchain/llm/google_gemini.rb b/lib/langchain/llm/google_gemini.rb
+index f13e34877..5a44c71ec 100644
+--- a/lib/langchain/llm/google_gemini.rb
++++ b/lib/langchain/llm/google_gemini.rb
+@@ -59,15 +59,7 @@ def chat(params = {})
+ 
+       uri = URI("https://generativelanguage.googleapis.com/v1beta/models/#{parameters[:model]}:generateContent?key=#{api_key}")
+ 
+-      request = Net::HTTP::Post.new(uri)
+-      request.content_type = "application/json"
+-      request.body = parameters.to_json
+-
+-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+-        http.request(request)
+-      end
+-
+-      parsed_response = JSON.parse(response.body)
++      parsed_response = http_post(uri, parameters)
+ 
+       wrapped_response = Langchain::LLM::GoogleGeminiResponse.new(parsed_response, model: parameters[:model])
+ 
+@@ -95,17 +87,25 @@ def embed(
+ 
+       uri = URI("https://generativelanguage.googleapis.com/v1beta/models/#{model}:embedContent?key=#{api_key}")
+ 
+-      request = Net::HTTP::Post.new(uri)
++      parsed_response = http_post(uri, params)
++
++      Langchain::LLM::GoogleGeminiResponse.new(parsed_response, model: model)
++    end
++
++    private
++
++    def http_post(url, params)
++      http = Net::HTTP.new(url.hostname, url.port)
++      http.use_ssl = url.scheme == "https"
++      http.set_debug_output(Langchain.logger) if Langchain.logger.debug?
++
++      request = Net::HTTP::Post.new(url)
+       request.content_type = "application/json"
+       request.body = params.to_json
+ 
+-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+-        http.request(request)
+-      end
+-
+-      parsed_response = JSON.parse(response.body)
++      response = http.request(request)
+ 
+-      Langchain::LLM::GoogleGeminiResponse.new(parsed_response, model: model)
++      JSON.parse(response.body)
+     end
+   end
+ end
+diff --git a/lib/langchain/llm/google_vertex_ai.rb b/lib/langchain/llm/google_vertex_ai.rb
+index 685b45fdc..a42abf4f4 100644
+--- a/lib/langchain/llm/google_vertex_ai.rb
++++ b/lib/langchain/llm/google_vertex_ai.rb
+@@ -63,16 +63,7 @@ def embed(
+ 
+       uri = URI("#{url}#{model}:predict")
+ 
+-      request = Net::HTTP::Post.new(uri)
+-      request.content_type = "application/json"
+-      request["Authorization"] = "Bearer #{@authorizer.fetch_access_token!["access_token"]}"
+-      request.body = params.to_json
+-
+-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+-        http.request(request)
+-      end
+-
+-      parsed_response = JSON.parse(response.body)
++      parsed_response = http_post(uri, params)
+ 
+       Langchain::LLM::GoogleGeminiResponse.new(parsed_response, model: model)
+     end
+@@ -96,16 +87,7 @@ def chat(params = {})
+ 
+       uri = URI("#{url}#{parameters[:model]}:generateContent")
+ 
+-      request = Net::HTTP::Post.new(uri)
+-      request.content_type = "application/json"
+-      request["Authorization"] = "Bearer #{@authorizer.fetch_access_token!["access_token"]}"
+-      request.body = parameters.to_json
+-
+-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https") do |http|
+-        http.request(request)
+-      end
+-
+-      parsed_response = JSON.parse(response.body)
++      parsed_response = http_post(uri, parameters)
+ 
+       wrapped_response = Langchain::LLM::GoogleGeminiResponse.new(parsed_response, model: parameters[:model])
+ 
+@@ -115,5 +97,22 @@ def chat(params = {})
+         raise StandardError.new(parsed_response)
+       end
+     end
++
++    private
++
++    def http_post(url, params)
++      http = Net::HTTP.new(url.hostname, url.port)
++      http.use_ssl = url.scheme == "https"
++      http.set_debug_output(Langchain.logger) if Langchain.logger.debug?
++
++      request = Net::HTTP::Post.new(url)
++      request.content_type = "application/json"
++      request["Authorization"] = "Bearer #{@authorizer.fetch_access_token!["access_token"]}"
++      request.body = params.to_json
++
++      response = http.request(request)
++
++      JSON.parse(response.body)
++    end
+   end
+ end
+diff --git a/lib/langchain/llm/openai.rb b/lib/langchain/llm/openai.rb
+index 3528f6d6a..591b36c6e 100644
+--- a/lib/langchain/llm/openai.rb
++++ b/lib/langchain/llm/openai.rb
+@@ -33,7 +33,11 @@ class OpenAI < Base
+     def initialize(api_key:, llm_options: {}, default_options: {})
+       depends_on "ruby-openai", req: "openai"
+ 
+-      @client = ::OpenAI::Client.new(access_token: api_key, **llm_options, log_errors: true)
++      llm_options[:log_errors] = Langchain.logger.debug? unless llm_options.key?(:log_errors)
++
++      @client = ::OpenAI::Client.new(access_token: api_key, **llm_options) do |f|
++        f.response :logger, Langchain.logger, {headers: true, bodies: true, errors: true}
++      end
+ 
+       @defaults = DEFAULTS.merge(default_options)
+       chat_parameters.update(
+diff --git a/lib/langchain/prompt/loading.rb b/lib/langchain/prompt/loading.rb
+index 5a4a70e12..ba2a89c7f 100644
+--- a/lib/langchain/prompt/loading.rb
++++ b/lib/langchain/prompt/loading.rb
+@@ -79,7 +79,7 @@ def load_few_shot_prompt(config)
+       def load_from_config(config)
+         # If `_type` key is not present in the configuration hash, add it with a default value of `prompt`
+         unless config.key?("_type")
+-          Langchain.logger.warn "No `_type` key found, defaulting to `prompt`"
++          Langchain.logger.warn("#{self.class} - No `_type` key found, defaulting to `prompt`")
+           config["_type"] = "prompt"
+         end
+ 
+diff --git a/lib/langchain/tool/calculator.rb b/lib/langchain/tool/calculator.rb
+index 70e9f1347..a5a8add19 100644
+--- a/lib/langchain/tool/calculator.rb
++++ b/lib/langchain/tool/calculator.rb
+@@ -28,7 +28,7 @@ def initialize
+     # @param input [String] math expression
+     # @return [String] Answer
+     def execute(input:)
+-      Langchain.logger.info("Executing \"#{input}\"", for: self.class)
++      Langchain.logger.debug("#{self.class} - Executing \"#{input}\"")
+ 
+       Eqn::Calculator.calc(input)
+     rescue Eqn::ParseError, Eqn::NoVariableValueError
+diff --git a/lib/langchain/tool/database.rb b/lib/langchain/tool/database.rb
+index 8a4355e1a..56c3ac8a7 100644
+--- a/lib/langchain/tool/database.rb
++++ b/lib/langchain/tool/database.rb
+@@ -61,7 +61,7 @@ def list_tables
+     def describe_tables(tables: [])
+       return "No tables specified" if tables.empty?
+ 
+-      Langchain.logger.info("Describing tables: #{tables}", for: self.class)
++      Langchain.logger.debug("#{self.class} - Describing tables: #{tables}")
+ 
+       tables
+         .map do |table|
+@@ -74,7 +74,7 @@ def describe_tables(tables: [])
+     #
+     # @return [String] Database schema
+     def dump_schema
+-      Langchain.logger.info("Dumping schema tables and keys", for: self.class)
++      Langchain.logger.debug("#{self.class} - Dumping schema tables and keys")
+ 
+       schemas = db.tables.map do |table|
+         describe_table(table)
+@@ -87,11 +87,11 @@ def dump_schema
+     # @param input [String] SQL query to be executed
+     # @return [Array] Results from the SQL query
+     def execute(input:)
+-      Langchain.logger.info("Executing \"#{input}\"", for: self.class)
++      Langchain.logger.debug("#{self.class} - Executing \"#{input}\"")
+ 
+       db[input].to_a
+     rescue Sequel::DatabaseError => e
+-      Langchain.logger.error(e.message, for: self.class)
++      Langchain.logger.error("#{self.class} - #{e.message}")
+       e.message # Return error to LLM
+     end
+ 
+diff --git a/lib/langchain/tool/google_search.rb b/lib/langchain/tool/google_search.rb
+index ccbb3f98f..e4ddb8f13 100644
+--- a/lib/langchain/tool/google_search.rb
++++ b/lib/langchain/tool/google_search.rb
+@@ -38,7 +38,7 @@ def initialize(api_key:)
+     # @param input [String] search query
+     # @return [String] Answer
+     def execute(input:)
+-      Langchain.logger.info("Executing \"#{input}\"", for: self.class)
++      Langchain.logger.debug("#{self.class} - Executing \"#{input}\"")
+ 
+       results = execute_search(input: input)
+ 
+diff --git a/lib/langchain/tool/news_retriever.rb b/lib/langchain/tool/news_retriever.rb
+index f960a41ea..c82a53c4d 100644
+--- a/lib/langchain/tool/news_retriever.rb
++++ b/lib/langchain/tool/news_retriever.rb
+@@ -71,7 +71,7 @@ def get_everything(
+       page_size: 5, # The API default is 20 but that's too many.
+       page: nil
+     )
+-      Langchain.logger.info("Retrieving all news", for: self.class)
++      Langchain.logger.debug("#{self.class} - Retrieving all news")
+ 
+       params = {apiKey: @api_key}
+       params[:q] = q if q
+@@ -107,7 +107,7 @@ def get_top_headlines(
+       page_size: 5,
+       page: nil
+     )
+-      Langchain.logger.info("Retrieving top news headlines", for: self.class)
++      Langchain.logger.debug("#{self.class} - Retrieving top news headlines")
+ 
+       params = {apiKey: @api_key}
+       params[:country] = country if country
+@@ -132,7 +132,7 @@ def get_sources(
+       language: nil,
+       country: nil
+     )
+-      Langchain.logger.info("Retrieving news sources", for: self.class)
++      Langchain.logger.debug("#{self.class} - Retrieving news sources")
+ 
+       params = {apiKey: @api_key}
+       params[:country] = country if country
+diff --git a/lib/langchain/tool/ruby_code_interpreter.rb b/lib/langchain/tool/ruby_code_interpreter.rb
+index 96254cde2..a19627183 100644
+--- a/lib/langchain/tool/ruby_code_interpreter.rb
++++ b/lib/langchain/tool/ruby_code_interpreter.rb
+@@ -29,7 +29,7 @@ def initialize(timeout: 30)
+     # @param input [String] ruby code expression
+     # @return [String] Answer
+     def execute(input:)
+-      Langchain.logger.info("Executing \"#{input}\"", for: self.class)
++      Langchain.logger.debug("#{self.class} - Executing \"#{input}\"")
+ 
+       safe_eval(input)
+     end
+diff --git a/lib/langchain/tool/weather.rb b/lib/langchain/tool/weather.rb
+index 154ff24c6..4f58266ce 100644
+--- a/lib/langchain/tool/weather.rb
++++ b/lib/langchain/tool/weather.rb
+@@ -44,7 +44,7 @@ def initialize(api_key:)
+     def get_current_weather(city:, state_code:, country_code: nil, units: "imperial")
+       validate_input(city: city, state_code: state_code, country_code: country_code, units: units)
+ 
+-      Langchain.logger.info("get_current_weather", for: self.class, city:, state_code:, country_code:, units:)
++      Langchain.logger.debug("#{self.class} - get_current_weather #{{city:, state_code:, country_code:, units:}}")
+ 
+       fetch_current_weather(city: city, state_code: state_code, country_code: country_code, units: units)
+     end
+@@ -74,9 +74,9 @@ def send_request(path:, params:)
+       request = Net::HTTP::Get.new(uri.request_uri)
+       request["Content-Type"] = "application/json"
+ 
+-      Langchain.logger.info("Sending request to OpenWeatherMap API", path: path, params: params.except(:appid))
++      Langchain.logger.debug("#{self.class} - Sending request to OpenWeatherMap API #{{path: path, params: params.except(:appid)}}")
+       response = http.request(request)
+-      Langchain.logger.info("Received response from OpenWeatherMap API", status: response.code)
++      Langchain.logger.debug("#{self.class} - Received response from OpenWeatherMap API #{{status: response.code}}")
+ 
+       if response.code == "200"
+         JSON.parse(response.body)
+diff --git a/lib/langchain/tool/wikipedia.rb b/lib/langchain/tool/wikipedia.rb
+index 58aa8ed93..52ffbdf79 100644
+--- a/lib/langchain/tool/wikipedia.rb
++++ b/lib/langchain/tool/wikipedia.rb
+@@ -29,7 +29,7 @@ def initialize
+     # @param input [String] search query
+     # @return [String] Answer
+     def execute(input:)
+-      Langchain.logger.info("Executing \"#{input}\"", for: self.class)
++      Langchain.logger.debug("#{self.class} - Executing \"#{input}\"")
+ 
+       page = ::Wikipedia.find(input)
+       # It would be nice to figure out a way to provide page.content but the LLM token limit is an issue
+diff --git a/lib/langchain/utils/colorizer.rb b/lib/langchain/utils/colorizer.rb
+deleted file mode 100644
+index 7f1c429f1..000000000
+--- a/lib/langchain/utils/colorizer.rb
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# frozen_string_literal: true
+-
+-module Langchain
+-  module Utils
+-    class Colorizer
+-      def self.colorize(line, options)
+-        decorated_line = Rainbow(line)
+-        options.each_pair.each do |modifier, value|
+-          decorated_line = if modifier == :mode
+-            decorated_line.public_send(value)
+-          else
+-            decorated_line.public_send(modifier, value)
+-          end
+-        end
+-        decorated_line
+-      end
+-    end
+-  end
+-end
+diff --git a/lib/langchain/vectorsearch/base.rb b/lib/langchain/vectorsearch/base.rb
+index 2fe205e89..f58199a63 100644
+--- a/lib/langchain/vectorsearch/base.rb
++++ b/lib/langchain/vectorsearch/base.rb
+@@ -194,11 +194,5 @@ def add_data(paths:, options: {}, chunker: Langchain::Chunker::Text)
+ 
+       add_texts(texts: texts)
+     end
+-
+-    def self.logger_options
+-      {
+-        color: :blue
+-      }
+-    end
+   end
+ end
+diff --git a/lib/langchain/vectorsearch/epsilla.rb b/lib/langchain/vectorsearch/epsilla.rb
+index 5ffaa8fb1..a0b2857cc 100644
+--- a/lib/langchain/vectorsearch/epsilla.rb
++++ b/lib/langchain/vectorsearch/epsilla.rb
+@@ -39,7 +39,7 @@ def initialize(url:, db_name:, db_path:, index_name:, llm:)
+             # This behavior is changed in https://github.com/epsilla-cloud/vectordb/pull/95
+             # Old behavior (HTTP 500) is preserved for backwards compatibility.
+             # It does not prevent us from using the db.
+-            Langchain.logger.info("Database already loaded")
++            Langchain.logger.debug("#{self.class} - Database already loaded")
+           else
+             raise "Failed to load database: #{response}"
+           end
+diff --git a/lib/langchain/vectorsearch/hnswlib.rb b/lib/langchain/vectorsearch/hnswlib.rb
+index 0427687b4..b658da892 100644
+--- a/lib/langchain/vectorsearch/hnswlib.rb
++++ b/lib/langchain/vectorsearch/hnswlib.rb
+@@ -114,12 +114,12 @@ def initialize_index
+       if File.exist?(path_to_index)
+         client.load_index(path_to_index)
+ 
+-        Langchain.logger.info("Successfully loaded the index at \"#{path_to_index}\"", for: self.class)
++        Langchain.logger.debug("#{self.class} - Successfully loaded the index at \"#{path_to_index}\"")
+       else
+         # Default max_elements: 100, but we constantly resize the index as new data is written to it
+         client.init_index(max_elements: 100)
+ 
+-        Langchain.logger.info("Creating a new index at \"#{path_to_index}\"", for: self.class)
++        Langchain.logger.debug("#{self.class} - Creating a new index at \"#{path_to_index}\"")
+       end
+     end
+   end
+diff --git a/spec/langchain/assistants/assistant_spec.rb b/spec/langchain/assistants/assistant_spec.rb
+index fa749ad45..f68f42593 100644
+--- a/spec/langchain/assistants/assistant_spec.rb
++++ b/spec/langchain/assistants/assistant_spec.rb
+@@ -301,14 +301,10 @@
+       context "when messages are empty" do
+         let(:instructions) { nil }
+ 
+-        before do
+-          allow_any_instance_of(Langchain::ContextualLogger).to receive(:warn).with("No messages to process")
+-        end
+-
+         it "logs a warning" do
+           expect(subject.messages).to be_empty
++          expect(Langchain.logger).to receive(:warn).with("#{described_class} - No messages to process")
+           subject.run
+-          expect(Langchain.logger).to have_received(:warn).with("No messages to process")
+         end
+       end
+     end
+@@ -649,14 +645,10 @@
+       context "when messages are empty" do
+         let(:instructions) { nil }
+ 
+-        before do
+-          allow_any_instance_of(Langchain::ContextualLogger).to receive(:warn).with("No messages to process")
+-        end
+-
+         it "logs a warning" do
+           expect(subject.messages).to be_empty
++          expect(Langchain.logger).to receive(:warn).with("#{described_class} - No messages to process")
+           subject.run
+-          expect(Langchain.logger).to have_received(:warn).with("No messages to process")
+         end
+       end
+     end
+@@ -979,14 +971,10 @@
+       context "when messages are empty" do
+         let(:instructions) { nil }
+ 
+-        before do
+-          allow_any_instance_of(Langchain::ContextualLogger).to receive(:warn).with("No messages to process")
+-        end
+-
+         it "logs a warning" do
+           expect(subject.messages).to be_empty
++          expect(Langchain.logger).to receive(:warn).with("#{described_class} - No messages to process")
+           subject.run
+-          expect(Langchain.logger).to have_received(:warn).with("No messages to process")
+         end
+       end
+     end
+@@ -1201,14 +1189,10 @@
+       context "when messages are empty" do
+         let(:instructions) { nil }
+ 
+-        before do
+-          allow_any_instance_of(Langchain::ContextualLogger).to receive(:warn).with("No messages to process")
+-        end
+-
+         it "logs a warning" do
+           expect(subject.messages).to be_empty
++          expect(Langchain.logger).to receive(:warn).with("#{described_class} - No messages to process")
+           subject.run
+-          expect(Langchain.logger).to have_received(:warn).with("No messages to process")
+         end
+       end
+     end
+diff --git a/spec/langchain/contextual_logger_spec.rb b/spec/langchain/contextual_logger_spec.rb
+deleted file mode 100644
+index 8967951c0..000000000
+--- a/spec/langchain/contextual_logger_spec.rb
++++ /dev/null
+@@ -1,69 +0,0 @@
+-# frozen_string_literal: true
+-
+-RSpec.describe Langchain::ContextualLogger do
+-  let(:logger) { double(:logger) }
+-
+-  subject { described_class.new(logger) }
+-
+-  context "without extra context" do
+-    it "#info" do
+-      expect(logger).to receive(:info).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} #{colorize("Hello World", color: :white)}
+-        LINE
+-      )
+-      subject.info("Hello World")
+-    end
+-
+-    it "#warn" do
+-      expect(logger).to receive(:warn).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} #{colorize("Hello World", color: :yellow, mode: :bold)}
+-        LINE
+-      )
+-      subject.warn("Hello World")
+-    end
+-
+-    it "#debug" do
+-      expect(logger).to receive(:debug).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} #{colorize("Hello World", color: :white)}
+-        LINE
+-      )
+-      subject.debug("Hello World")
+-    end
+-  end
+-
+-  context "with extra context" do
+-    it "#info" do
+-      expect(logger).to receive(:info).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} #{colorize("[Langchain::Vectorsearch::Pgvector]", color: :blue)}: #{colorize("Hello World", color: :white)}
+-        LINE
+-      )
+-      subject.info("Hello World", for: Langchain::Vectorsearch::Pgvector)
+-    end
+-
+-    it "#warn" do
+-      expect(logger).to receive(:warn).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} #{colorize("[Langchain::Vectorsearch::Pgvector]", color: :blue)}: #{colorize("Hello World", color: :yellow, mode: :bold)}
+-        LINE
+-      )
+-      subject.warn("Hello World", for: Langchain::Vectorsearch::Pgvector)
+-    end
+-
+-    it "doesn't have an issue with objects that don't have .logger_options" do
+-      expect(logger).to receive(:warn).with(
+-        <<~LINE.strip
+-          #{colorize("[Langchain.rb]", color: :yellow)} [Object]: #{colorize("Hello World", color: :yellow, mode: :bold)}
+-        LINE
+-      )
+-      subject.warn("Hello World", for: Object)
+-    end
+-  end
+-
+-  def colorize(line, options)
+-    Langchain::Utils::Colorizer.colorize(line, options)
+-  end
+-end
+diff --git a/spec/langchain/llm/google_gemini_spec.rb b/spec/langchain/llm/google_gemini_spec.rb
+index 7da408f13..713e28a57 100644
+--- a/spec/langchain/llm/google_gemini_spec.rb
++++ b/spec/langchain/llm/google_gemini_spec.rb
+@@ -24,7 +24,7 @@
+     let(:raw_embedding_response) { double(body: File.read("spec/fixtures/llm/google_gemini/embed.json")) }
+ 
+     before do
+-      allow(Net::HTTP).to receive(:start).and_return(raw_embedding_response)
++      allow_any_instance_of(Net::HTTP).to receive(:request).and_return(raw_embedding_response)
+     end
+ 
+     it "returns valid llm response object" do
+@@ -42,7 +42,7 @@
+     let(:params) { {messages: messages, model: "gemini-1.5-pro-latest", system: "system instruction", tool_choice: {function_calling_config: {mode: "AUTO"}}, tools: [{name: "tool1"}], temperature: 1.1, response_format: "application/json", stop: ["A", "B"], generation_config: {temperature: 1.7, top_p: 1.3, response_schema: {"type" => "object", "description" => "sample schema"}}, safety_settings: [{category: "HARM_CATEGORY_UNSPECIFIED", threshold: "BLOCK_ONLY_HIGH"}]} }
+ 
+     before do
+-      allow(Net::HTTP).to receive(:start).and_return(raw_chat_completions_response)
++      allow_any_instance_of(Net::HTTP).to receive(:request).and_return(raw_chat_completions_response)
+     end
+ 
+     it "raises an error if messages are not provided" do
+diff --git a/spec/langchain/llm/google_vertex_ai_spec.rb b/spec/langchain/llm/google_vertex_ai_spec.rb
+index 32b5b89d8..9b484a426 100644
+--- a/spec/langchain/llm/google_vertex_ai_spec.rb
++++ b/spec/langchain/llm/google_vertex_ai_spec.rb
+@@ -14,7 +14,7 @@
+         double("Google::Auth::UserRefreshCredentials", fetch_access_token!: {access_token: 123})
+       )
+ 
+-      allow(Net::HTTP).to receive(:start).and_return(raw_embedding_response)
++      allow_any_instance_of(Net::HTTP).to receive(:request).and_return(raw_embedding_response)
+     end
+ 
+     it "returns valid llm response object" do
+@@ -35,7 +35,7 @@
+         double("Google::Auth::UserRefreshCredentials", fetch_access_token!: {access_token: 123})
+       )
+ 
+-      allow(Net::HTTP).to receive(:start).and_return(raw_chat_completions_response)
++      allow_any_instance_of(Net::HTTP).to receive(:request).and_return(raw_chat_completions_response)
+     end
+ 
+     it "returns valid llm response object" do
+diff --git a/spec/langchain/llm/openai_spec.rb b/spec/langchain/llm/openai_spec.rb
+index 0c23d9c02..e04f17f9f 100644
+--- a/spec/langchain/llm/openai_spec.rb
++++ b/spec/langchain/llm/openai_spec.rb
+@@ -1,17 +1,73 @@
+ # frozen_string_literal: true
+ 
++require "openai"
++
+ RSpec.describe Langchain::LLM::OpenAI do
+-  let(:subject) { described_class.new(api_key: "123") }
++  let(:subject) { described_class.new(api_key: "123", **options) }
++
++  let(:options) { {} }
+ 
+   describe "#initialize" do
+-    context "when only required options are passed" do
+-      it "initializes the client without any errors" do
+-        expect { subject }.not_to raise_error
++    it "initializes the client without any errors" do
++      expect { subject }.not_to raise_error
++    end
++
++    it "forwards the Langchain logger to the client" do
++      f_mock = double("f_mock", response: nil)
++
++      allow(OpenAI::Client).to receive(:new) { |**, &block| block&.call(f_mock) }
++
++      subject
++
++      expect(f_mock).to have_received(:response).with(:logger, Langchain.logger, anything)
++    end
++
++    context "when log level is DEBUG" do
++      before do
++        Langchain.logger.level = Logger::DEBUG
++      end
++
++      it "configures the client to log the errors" do
++        allow(OpenAI::Client).to receive(:new).and_call_original
++        subject
++        expect(OpenAI::Client).to have_received(:new).with(hash_including(log_errors: true))
++      end
++
++      context "when overriding the 'log_errors' param" do
++        let(:options) { {llm_options: {log_errors: false}} }
++
++        it "configures the client to NOT log the errors" do
++          allow(OpenAI::Client).to receive(:new).and_call_original
++          subject
++          expect(OpenAI::Client).to have_received(:new).with(hash_including(log_errors: false))
++        end
++      end
++    end
++
++    context "when log level is not DEBUG" do
++      before do
++        Langchain.logger.level = Logger::INFO
++      end
++
++      it "configures the client to NOT log the errors" do
++        allow(OpenAI::Client).to receive(:new).and_call_original
++        subject
++        expect(OpenAI::Client).to have_received(:new).with(hash_including(log_errors: false))
++      end
++
++      context "when overriding the 'log_errors' param" do
++        let(:options) { {llm_options: {log_errors: true}} }
++
++        it "configures the client to log the errors" do
++          allow(OpenAI::Client).to receive(:new).and_call_original
++          subject
++          expect(OpenAI::Client).to have_received(:new).with(hash_including(log_errors: true))
++        end
+       end
+     end
+ 
+     context "when llm_options are passed" do
+-      let(:subject) { described_class.new(api_key: "123", llm_options: {uri_base: "http://localhost:1234"}) }
++      let(:options) { {llm_options: {uri_base: "http://localhost:1234"}} }
+ 
+       it "initializes the client without any errors" do
+         expect { subject }.not_to raise_error

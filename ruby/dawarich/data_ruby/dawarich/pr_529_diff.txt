@@ -1,0 +1,1337 @@
+diff --git a/.app_version b/.app_version
+index 082b4352..158ef578 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.19.7
++0.19.8
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ce3bb1f3..17870c4f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.19.8 - 2024-12-16
++
++### Added
++
++- `GET /api/v1/points/tracked_months` endpoint added to get list of tracked years and months.
++- `GET /api/v1/countries/visited_cities` endpoint added to get list of visited cities.
++
++### Fixed
++
++- A point popup is no longer closes when hovering over a polyline. #536
++
++### Changed
++
++- Months and years navigation is moved to a map panel on the right side of the map.
++- List of visited cities is now being shown in a map panel on the right side of the map.
++
+ # 0.19.7 - 2024-12-11
+ 
+ ### Fixed
+diff --git a/app/controllers/api/v1/countries/visited_cities_controller.rb b/app/controllers/api/v1/countries/visited_cities_controller.rb
+new file mode 100644
+index 00000000..85e53f7d
+--- /dev/null
++++ b/app/controllers/api/v1/countries/visited_cities_controller.rb
+@@ -0,0 +1,22 @@
++# frozen_string_literal: true
++
++class Api::V1::Countries::VisitedCitiesController < ApiController
++  before_action :validate_params
++
++  def index
++    start_at = DateTime.parse(params[:start_at]).to_i
++    end_at = DateTime.parse(params[:end_at]).to_i
++
++    points = current_api_user
++             .tracked_points
++             .where(timestamp: start_at..end_at)
++
++    render json: { data: CountriesAndCities.new(points).call }
++  end
++
++  private
++
++  def required_params
++    %i[start_at end_at]
++  end
++end
+diff --git a/app/controllers/api/v1/points/tracked_months_controller.rb b/app/controllers/api/v1/points/tracked_months_controller.rb
+new file mode 100644
+index 00000000..cd430879
+--- /dev/null
++++ b/app/controllers/api/v1/points/tracked_months_controller.rb
+@@ -0,0 +1,7 @@
++# frozen_string_literal: true
++
++class Api::V1::Points::TrackedMonthsController < ApiController
++  def index
++    render json: current_api_user.years_tracked
++  end
++end
+diff --git a/app/controllers/api_controller.rb b/app/controllers/api_controller.rb
+index 8e2b43e2..934cdc6b 100644
+--- a/app/controllers/api_controller.rb
++++ b/app/controllers/api_controller.rb
+@@ -15,4 +15,20 @@ def authenticate_api_key
+   def current_api_user
+     @current_api_user ||= User.find_by(api_key: params[:api_key])
+   end
++
++  def validate_params
++    missing_params = required_params.select { |param| params[param].blank? }
++
++    if missing_params.any?
++      render json: {
++        error: "Missing required parameters: #{missing_params.join(', ')}"
++      }, status: :bad_request and return
++    end
++
++    params.permit(*required_params)
++  end
++
++  def required_params
++    []
++  end
+ end
+diff --git a/app/controllers/stats_controller.rb b/app/controllers/stats_controller.rb
+index 809f1d98..2305a44e 100644
+--- a/app/controllers/stats_controller.rb
++++ b/app/controllers/stats_controller.rb
+@@ -17,8 +17,10 @@ def show
+ 
+   def update
+     current_user.years_tracked.each do |year|
+-      (1..12).each do |month|
+-        Stats::CalculatingJob.perform_later(current_user.id, year, month)
++      year[:months].each do |month|
++        Stats::CalculatingJob.perform_later(
++          current_user.id, year[:year], Date::ABBR_MONTHNAMES.index(month)
++        )
+       end
+     end
+ 
+diff --git a/app/javascript/controllers/maps_controller.js b/app/javascript/controllers/maps_controller.js
+index d0bb046d..f6ea421c 100644
+--- a/app/javascript/controllers/maps_controller.js
++++ b/app/javascript/controllers/maps_controller.js
+@@ -32,6 +32,8 @@ export default class extends Controller {
+ 
+   settingsButtonAdded = false;
+   layerControl = null;
++  visitedCitiesCache = new Map();
++  trackedMonthsCache = null;
+ 
+   connect() {
+     console.log("Map controller connected");
+@@ -171,12 +173,37 @@ export default class extends Controller {
+     if (this.liveMapEnabled) {
+       this.setupSubscription();
+     }
++
++    // Add the toggle panel button
++    this.addTogglePanelButton();
++
++    // Check if we should open the panel based on localStorage or URL params
++    const urlParams = new URLSearchParams(window.location.search);
++    const isPanelOpen = localStorage.getItem('mapPanelOpen') === 'true';
++    const hasDateParams = urlParams.has('start_at') && urlParams.has('end_at');
++
++    // Always create the panel first
++    this.toggleRightPanel();
++
++    // Then hide it if it shouldn't be open
++    if (!isPanelOpen && !hasDateParams) {
++      const panel = document.querySelector('.leaflet-right-panel');
++      if (panel) {
++        panel.style.display = 'none';
++        localStorage.setItem('mapPanelOpen', 'false');
++      }
++    }
+   }
+ 
+   disconnect() {
+     if (this.handleDeleteClick) {
+       document.removeEventListener('click', this.handleDeleteClick);
+     }
++    // Store panel state before disconnecting
++    if (this.rightPanel) {
++      const finalState = document.querySelector('.leaflet-right-panel').style.display !== 'none' ? 'true' : 'false';
++      localStorage.setItem('mapPanelOpen', finalState);
++    }
+     this.map.remove();
+   }
+ 
+@@ -898,8 +925,385 @@ export default class extends Controller {
+         ${photo.type === 'video' ? '🎥 Video' : '📷 Photo'}
+       </div>
+     `;
+-    marker.bindPopup(popupContent);
++    marker.bindPopup(popupContent, { autoClose: false });
+ 
+     this.photoMarkers.addLayer(marker);
+   }
++
++  addTogglePanelButton() {
++    const TogglePanelControl = L.Control.extend({
++      onAdd: (map) => {
++        const button = L.DomUtil.create('button', 'toggle-panel-button');
++        button.innerHTML = '📅';
++
++        button.style.backgroundColor = 'white';
++        button.style.width = '48px';
++        button.style.height = '48px';
++        button.style.border = 'none';
++        button.style.cursor = 'pointer';
++        button.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
++
++        // Disable map interactions when clicking the button
++        L.DomEvent.disableClickPropagation(button);
++
++        // Toggle panel on button click
++        L.DomEvent.on(button, 'click', () => {
++          this.toggleRightPanel();
++        });
++
++        return button;
++      }
++    });
++
++    // Add the control to the map
++    this.map.addControl(new TogglePanelControl({ position: 'topright' }));
++  }
++
++  toggleRightPanel() {
++    if (this.rightPanel) {
++      const panel = document.querySelector('.leaflet-right-panel');
++      if (panel) {
++        if (panel.style.display === 'none') {
++          panel.style.display = 'block';
++          localStorage.setItem('mapPanelOpen', 'true');
++        } else {
++          panel.style.display = 'none';
++          localStorage.setItem('mapPanelOpen', 'false');
++        }
++        return;
++      }
++    }
++
++    this.rightPanel = L.control({ position: 'topright' });
++
++    this.rightPanel.onAdd = () => {
++      const div = L.DomUtil.create('div', 'leaflet-right-panel');
++      const allMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
++
++      // Get current date from URL query parameters
++      const urlParams = new URLSearchParams(window.location.search);
++      const startDate = urlParams.get('start_at');
++      const currentYear = startDate
++        ? new Date(startDate).getFullYear().toString()
++        : new Date().getFullYear().toString();
++      const currentMonth = startDate
++        ? allMonths[new Date(startDate).getMonth()]
++        : allMonths[new Date().getMonth()];
++
++      // Initially create select with loading state and current year if available
++      div.innerHTML = `
++        <div class="panel-content">
++          <div id='years-nav'>
++            <div class="flex gap-2 mb-4">
++              <select id="year-select" class="select select-bordered w-1/2 max-w-xs">
++                ${currentYear
++                  ? `<option value="${currentYear}" selected>${currentYear}</option>`
++                  : '<option disabled selected>Loading years...</option>'}
++              </select>
++              <a href="${this.getWholeYearLink()}"
++                 id="whole-year-link"
++                 class="btn btn-default"
++                 style="color: rgb(116 128 255) !important;">
++                Whole year
++              </a>
++            </div>
++
++            <div class='grid grid-cols-3 gap-3' id="months-grid">
++              ${allMonths.map(month => `
++                <a href="#"
++                   class="btn btn-primary disabled ${month === currentMonth ? 'btn-active' : ''}"
++                   data-month-name="${month}"
++                   style="pointer-events: none; opacity: 0.6; color: rgb(116 128 255) !important;">
++                   <span class="loading loading-dots loading-md"></span>
++                </a>
++              `).join('')}
++            </div>
++          </div>
++
++        </div>
++      `;
++
++      this.fetchAndDisplayTrackedMonths(div, currentYear, currentMonth, allMonths);
++
++      div.style.backgroundColor = 'white';
++      div.style.padding = '10px';
++      div.style.border = '1px solid #ccc';
++      div.style.boxShadow = '0 1px 4px rgba(0,0,0,0.3)';
++      div.style.marginRight = '10px';
++      div.style.marginTop = '10px';
++      div.style.width = '300px';
++      div.style.maxHeight = '80vh';
++      div.style.overflowY = 'auto';
++
++      L.DomEvent.disableClickPropagation(div);
++
++      // Add container for visited cities
++      div.innerHTML += `
++        <div id="visited-cities-container" class="mt-4">
++          <h3 class="text-lg font-bold mb-2">Visited cities</h3>
++          <div id="visited-cities-list" class="space-y-2"
++               style="max-height: 300px; overflow-y: auto; overflow-x: auto; padding-right: 10px;">
++            <p class="text-gray-500">Loading visited places...</p>
++          </div>
++        </div>
++      `;
++
++      // Prevent map zoom when scrolling the cities list
++      const citiesList = div.querySelector('#visited-cities-list');
++      L.DomEvent.disableScrollPropagation(citiesList);
++
++      // Fetch visited cities when panel is first created
++      this.fetchAndDisplayVisitedCities();
++
++      // Set initial display style based on localStorage
++      const isPanelOpen = localStorage.getItem('mapPanelOpen') === 'true';
++      div.style.display = isPanelOpen ? 'block' : 'none';
++
++      return div;
++    };
++
++    this.map.addControl(this.rightPanel);
++  }
++
++  async fetchAndDisplayTrackedMonths(div, currentYear, currentMonth, allMonths) {
++    try {
++      let yearsData;
++
++      // Check cache first
++      if (this.trackedMonthsCache) {
++        yearsData = this.trackedMonthsCache;
++      } else {
++        const response = await fetch(`/api/v1/points/tracked_months?api_key=${this.apiKey}`);
++        if (!response.ok) {
++          throw new Error(`HTTP error! status: ${response.status}`);
++        }
++        yearsData = await response.json();
++        // Store in cache
++        this.trackedMonthsCache = yearsData;
++      }
++
++      const yearSelect = document.getElementById('year-select');
++
++      if (!Array.isArray(yearsData) || yearsData.length === 0) {
++        yearSelect.innerHTML = '<option disabled selected>No data available</option>';
++        return;
++      }
++
++      // Check if the current year exists in the API response
++      const currentYearData = yearsData.find(yearData => yearData.year.toString() === currentYear);
++
++      const options = yearsData
++        .filter(yearData => yearData && yearData.year)
++        .map(yearData => {
++          const months = Array.isArray(yearData.months) ? yearData.months : [];
++          const isCurrentYear = yearData.year.toString() === currentYear;
++          return `
++            <option value="${yearData.year}"
++                    data-months='${JSON.stringify(months)}'
++                    ${isCurrentYear ? 'selected' : ''}>
++              ${yearData.year}
++            </option>
++          `;
++        })
++        .join('');
++
++      yearSelect.innerHTML = `
++        <option disabled>Select year</option>
++        ${options}
++      `;
++
++      const updateMonthLinks = (selectedYear, availableMonths) => {
++        // Get current date from URL parameters
++        const urlParams = new URLSearchParams(window.location.search);
++        const startDate = urlParams.get('start_at') ? new Date(urlParams.get('start_at')) : new Date();
++        const endDate = urlParams.get('end_at') ? new Date(urlParams.get('end_at')) : new Date();
++
++        allMonths.forEach((month, index) => {
++          const monthLink = div.querySelector(`a[data-month-name="${month}"]`);
++          if (!monthLink) return;
++
++          // Update the content to show the month name instead of loading dots
++          monthLink.innerHTML = month;
++
++          // Check if this month falls within the selected date range
++          const isSelected = startDate && endDate &&
++            selectedYear === startDate.getFullYear().toString() && // Only check months for the currently selected year
++            isMonthInRange(index, startDate, endDate, parseInt(selectedYear));
++
++          if (availableMonths.includes(month)) {
++            monthLink.classList.remove('disabled');
++            monthLink.style.pointerEvents = 'auto';
++            monthLink.style.opacity = '1';
++
++            // Update the active state based on selection
++            if (isSelected) {
++              monthLink.classList.add('btn-active', 'btn-primary');
++            } else {
++              monthLink.classList.remove('btn-active', 'btn-primary');
++            }
++
++            const monthNum = (index + 1).toString().padStart(2, '0');
++            const startDate = `${selectedYear}-${monthNum}-01T00:00`;
++            const lastDay = new Date(selectedYear, index + 1, 0).getDate();
++            const endDate = `${selectedYear}-${monthNum}-${lastDay}T23:59`;
++
++            const href = `map?end_at=${encodeURIComponent(endDate)}&start_at=${encodeURIComponent(startDate)}`;
++            monthLink.setAttribute('href', href);
++          } else {
++            monthLink.classList.add('disabled');
++            monthLink.classList.remove('btn-active', 'btn-primary');
++            monthLink.style.pointerEvents = 'none';
++            monthLink.style.opacity = '0.6';
++            monthLink.setAttribute('href', '#');
++          }
++        });
++      };
++
++      // Helper function to check if a month falls within a date range
++      const isMonthInRange = (monthIndex, startDate, endDate, selectedYear) => {
++        // Create date objects for the first and last day of the month in the selected year
++        const monthStart = new Date(selectedYear, monthIndex, 1);
++        const monthEnd = new Date(selectedYear, monthIndex + 1, 0);
++
++        // Check if any part of the month overlaps with the selected date range
++        return monthStart <= endDate && monthEnd >= startDate;
++      };
++
++      yearSelect.addEventListener('change', (event) => {
++        const selectedOption = event.target.selectedOptions[0];
++        const selectedYear = selectedOption.value;
++        const availableMonths = JSON.parse(selectedOption.dataset.months || '[]');
++
++        // Update whole year link with selected year
++        const wholeYearLink = document.getElementById('whole-year-link');
++        const startDate = `${selectedYear}-01-01T00:00`;
++        const endDate = `${selectedYear}-12-31T23:59`;
++        const href = `map?end_at=${encodeURIComponent(endDate)}&start_at=${encodeURIComponent(startDate)}`;
++        wholeYearLink.setAttribute('href', href);
++
++        updateMonthLinks(selectedYear, availableMonths);
++      });
++
++      // If we have a current year, set it and update month links
++      if (currentYear && currentYearData) {
++        yearSelect.value = currentYear;
++        updateMonthLinks(currentYear, currentYearData.months);
++      }
++    } catch (error) {
++      const yearSelect = document.getElementById('year-select');
++      yearSelect.innerHTML = '<option disabled selected>Error loading years</option>';
++      console.error('Error fetching tracked months:', error);
++    }
++  }
++
++  chunk(array, size) {
++    const chunked = [];
++    for (let i = 0; i < array.length; i += size) {
++      chunked.push(array.slice(i, i + size));
++    }
++    return chunked;
++  }
++
++  getWholeYearLink() {
++    // First try to get year from URL parameters
++    const urlParams = new URLSearchParams(window.location.search);
++    let year;
++
++    if (urlParams.has('start_at')) {
++      year = new Date(urlParams.get('start_at')).getFullYear();
++    } else {
++      // If no URL params, try to get year from start_at input
++      const startAtInput = document.querySelector('input#start_at');
++      if (startAtInput && startAtInput.value) {
++        year = new Date(startAtInput.value).getFullYear();
++      } else {
++        // If no input value, use current year
++        year = new Date().getFullYear();
++      }
++    }
++
++    const startDate = `${year}-01-01T00:00`;
++    const endDate = `${year}-12-31T23:59`;
++    return `map?end_at=${encodeURIComponent(endDate)}&start_at=${encodeURIComponent(startDate)}`;
++  }
++
++  async fetchAndDisplayVisitedCities() {
++    const urlParams = new URLSearchParams(window.location.search);
++    const startAt = urlParams.get('start_at') || new Date().toISOString();
++    const endAt = urlParams.get('end_at') || new Date().toISOString();
++
++    // Create a cache key from the date range
++    const cacheKey = `${startAt}-${endAt}`;
++
++    // Check if we have cached data for this date range
++    if (this.visitedCitiesCache.has(cacheKey)) {
++      this.displayVisitedCities(this.visitedCitiesCache.get(cacheKey));
++      return;
++    }
++
++    try {
++      const response = await fetch(`/api/v1/countries/visited_cities?api_key=${this.apiKey}&start_at=${startAt}&end_at=${endAt}`, {
++        headers: {
++          'Accept': 'application/json',
++          'Content-Type': 'application/json',
++        }
++      });
++
++      if (!response.ok) {
++        throw new Error('Network response was not ok');
++      }
++
++      const data = await response.json();
++
++      // Cache the results
++      this.visitedCitiesCache.set(cacheKey, data.data);
++
++      this.displayVisitedCities(data.data);
++    } catch (error) {
++      console.error('Error fetching visited cities:', error);
++      const container = document.getElementById('visited-cities-list');
++      if (container) {
++        container.innerHTML = '<p class="text-red-500">Error loading visited places</p>';
++      }
++    }
++  }
++
++  displayVisitedCities(citiesData) {
++    const container = document.getElementById('visited-cities-list');
++    if (!container) return;
++
++    if (!citiesData || citiesData.length === 0) {
++      container.innerHTML = '<p class="text-gray-500">No places visited during this period</p>';
++      return;
++    }
++
++    const html = citiesData.map(country => `
++      <div class="mb-4" style="min-width: min-content;">
++        <h4 class="font-bold text-md">${country.country}</h4>
++        <ul class="ml-4 space-y-1">
++          ${country.cities.map(city => `
++            <li class="text-sm whitespace-nowrap">
++              ${city.city}
++              <span class="text-gray-500">
++                (${new Date(city.timestamp * 1000).toLocaleDateString()})
++              </span>
++            </li>
++          `).join('')}
++        </ul>
++      </div>
++    `).join('');
++
++    container.innerHTML = html;
++  }
++
++  formatDuration(seconds) {
++    const days = Math.floor(seconds / (24 * 60 * 60));
++    const hours = Math.floor((seconds % (24 * 60 * 60)) / (60 * 60));
++
++    if (days > 0) {
++      return `${days}d ${hours}h`;
++    }
++    return `${hours}h`;
++  }
+ }
++
+diff --git a/app/javascript/maps/markers.js b/app/javascript/maps/markers.js
+index 25760054..d1da358a 100644
+--- a/app/javascript/maps/markers.js
++++ b/app/javascript/maps/markers.js
+@@ -9,7 +9,7 @@ export function createMarkersArray(markersData, userSettings) {
+ 
+       const popupContent = createPopupContent(marker, userSettings.timezone, userSettings.distanceUnit);
+       let markerColor = marker[5] < 0 ? "orange" : "blue";
+-      return L.circleMarker([lat, lon], { radius: 4, color: markerColor }).bindPopup(popupContent);
++      return L.circleMarker([lat, lon], { radius: 4, color: markerColor }).bindPopup(popupContent, { autoClose: false });
+     });
+   }
+ }
+diff --git a/app/jobs/stats/calculating_job.rb b/app/jobs/stats/calculating_job.rb
+index 26f4756e..02da4d5e 100644
+--- a/app/jobs/stats/calculating_job.rb
++++ b/app/jobs/stats/calculating_job.rb
+@@ -6,18 +6,21 @@ class Stats::CalculatingJob < ApplicationJob
+   def perform(user_id, year, month)
+     Stats::CalculateMonth.new(user_id, year, month).call
+ 
+-    create_stats_updated_notification(user_id)
++    create_stats_updated_notification(user_id, year, month)
+   rescue StandardError => e
+     create_stats_update_failed_notification(user_id, e)
+   end
+ 
+   private
+ 
+-  def create_stats_updated_notification(user_id)
++  def create_stats_updated_notification(user_id, year, month)
+     user = User.find(user_id)
+ 
+     Notifications::Create.new(
+-      user:, kind: :info, title: 'Stats updated', content: 'Stats updated'
++      user:,
++      kind: :info,
++      title: "Stats updated: #{year}-#{month}",
++      content: "Stats updated for #{year}-#{month}"
+     ).call
+   end
+ 
+diff --git a/app/models/stat.rb b/app/models/stat.rb
+index 9376c991..6b2d56dd 100644
+--- a/app/models/stat.rb
++++ b/app/models/stat.rb
+@@ -21,20 +21,6 @@ def self.year_distance(year, user)
+     end
+   end
+ 
+-  def self.year_cities_and_countries(year, user)
+-    start_at = DateTime.new(year).beginning_of_year
+-    end_at = DateTime.new(year).end_of_year
+-
+-    points = user.tracked_points.without_raw_data.where(timestamp: start_at..end_at)
+-
+-    data = CountriesAndCities.new(points).call
+-
+-    {
+-      countries: data.map { _1[:country] }.uniq.count,
+-      cities: data.sum { _1[:cities].count }
+-    }
+-  end
+-
+   def points
+     user.tracked_points
+         .without_raw_data
+diff --git a/app/models/user.rb b/app/models/user.rb
+index a2d595cb..796cf738 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -70,10 +70,13 @@ def years_tracked
+     Rails.cache.fetch("dawarich/user_#{id}_years_tracked", expires_in: 1.day) do
+       tracked_points
+         .pluck(:timestamp)
+-        .map { |ts| Time.zone.at(ts).year }
+-        .uniq
+-        .sort
+-        .reverse
++        .map { |ts| Time.zone.at(ts) }
++        .group_by(&:year)
++        .transform_values do |dates|
++          dates.map { |date| date.strftime('%b') }.uniq.sort
++        end
++        .map { |year, months| { year: year, months: months } }
++        .sort_by { |entry| -entry[:year] } # Sort in descending order
+     end
+   end
+ 
+diff --git a/app/services/countries_and_cities.rb b/app/services/countries_and_cities.rb
+index 026484d1..0785107a 100644
+--- a/app/services/countries_and_cities.rb
++++ b/app/services/countries_and_cities.rb
+@@ -1,56 +1,54 @@
+ # frozen_string_literal: true
+ 
+ class CountriesAndCities
++  CountryData = Struct.new(:country, :cities, keyword_init: true)
++  CityData = Struct.new(:city, :points, :timestamp, :stayed_for, keyword_init: true)
++
+   def initialize(points)
+     @points = points
+   end
+ 
+   def call
+-    grouped_records = group_points
+-    mapped_with_cities = map_with_cities(grouped_records)
+-    filtered_cities = filter_cities(mapped_with_cities)
+-    normalize_result(filtered_cities)
++    points
++      .reject { |point| point.country.nil? || point.city.nil? }
++      .group_by(&:country)
++      .transform_values { |country_points| process_country_points(country_points) }
++      .map { |country, cities| CountryData.new(country: country, cities: cities) }
+   end
+ 
+   private
+ 
+   attr_reader :points
+ 
+-  def group_points
+-    points.group_by(&:country)
++  def process_country_points(country_points)
++    country_points
++      .group_by(&:city)
++      .transform_values { |city_points| create_city_data_if_valid(city_points) }
++      .values
++      .compact
+   end
+ 
+-  def map_with_cities(grouped_records)
+-    grouped_records.transform_values do |grouped_points|
+-      grouped_points
+-        .pluck(:city, :timestamp) # Extract city and timestamp
+-        .delete_if { _1.first.nil? } # Remove records without city
+-        .group_by { |city, _| city } # Group by city
+-        .transform_values do |cities|
+-          {
+-            points: cities.count,
+-            last_timestamp: cities.map(&:last).max, # Get the maximum timestamp
+-            stayed_for: ((cities.map(&:last).max - cities.map(&:last).min).to_i / 60) # Calculate the time stayed in minutes
+-          }
+-        end
+-    end
++  def create_city_data_if_valid(city_points)
++    timestamps = city_points.pluck(:timestamp)
++    duration = calculate_duration_in_minutes(timestamps)
++    city = city_points.first.city
++    points_count = city_points.size
++
++    build_city_data(city, points_count, timestamps, duration)
+   end
+ 
+-  def filter_cities(mapped_with_cities)
+-    # Remove cities where user stayed for less than 1 hour
+-    mapped_with_cities.transform_values do |cities|
+-      cities.reject { |_, data| data[:stayed_for] < MIN_MINUTES_SPENT_IN_CITY }
+-    end
++  def build_city_data(city, points_count, timestamps, duration)
++    return nil if duration < ::MIN_MINUTES_SPENT_IN_CITY
++
++    CityData.new(
++      city: city,
++      points: points_count,
++      timestamp: timestamps.max,
++      stayed_for: duration
++    )
+   end
+ 
+-  def normalize_result(hash)
+-    hash.map do |country, cities|
+-      {
+-        country:,
+-        cities: cities.map do |city, data|
+-          { city:, points: data[:points], timestamp: data[:last_timestamp], stayed_for: data[:stayed_for] }
+-        end
+-      }
+-    end
++  def calculate_duration_in_minutes(timestamps)
++    ((timestamps.max - timestamps.min).to_i / 60)
+   end
+ end
+diff --git a/app/views/map/index.html.erb b/app/views/map/index.html.erb
+index 75788972..7e36c225 100644
+--- a/app/views/map/index.html.erb
++++ b/app/views/map/index.html.erb
+@@ -1,7 +1,7 @@
+ <% content_for :title, 'Map' %>
+ 
+ <div class="flex flex-col lg:flex-row lg:space-x-4 my-5 w-full">
+-  <div class='w-full lg:w-5/6'>
++  <div class='w-full'>
+     <div class="flex flex-col space-y-4 mb-4 w-full">
+       <%= form_with url: map_path(import_id: params[:import_id]), method: :get do |f| %>
+         <div class="flex flex-col space-y-4 sm:flex-row sm:space-y-0 sm:space-x-4 sm:items-end">
+@@ -58,10 +58,6 @@
+       </div>
+     </div>
+   </div>
+-
+-  <div class='w-full lg:w-1/6 mt-8 lg:mt-0 mx-auto'>
+-    <%= render 'shared/right_sidebar' %>
+-  </div>
+ </div>
+ 
+ <%= render 'map/settings_modals' %>
+diff --git a/app/views/shared/_right_sidebar.html.erb b/app/views/shared/_right_sidebar.html.erb
+deleted file mode 100644
+index 797adaeb..00000000
+--- a/app/views/shared/_right_sidebar.html.erb
++++ /dev/null
+@@ -1,64 +0,0 @@
+-<%= sidebar_distance(@distance) %> <%= sidebar_points(@points) %>
+-
+-<div id='years-nav'>
+-  <div class="dropdown">
+-    <div tabindex="0" role="button" class="btn">Select year</div>
+-    <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+-      <% current_user.years_tracked.each do |year| %>
+-        <li><%= link_to year, map_url(year_timespan(year).merge(year: year, import_id: params[:import_id])) %></li>
+-      <% end %>
+-    </ul>
+-  </div>
+-
+-  <% @years.each do |year| %>
+-    <h3 class='text-xl'>
+-      <%= year %>
+-    </h3>
+-
+-    <div class='grid grid-cols-3 gap-3'>
+-      <% (1..12).to_a.each_slice(3) do |months| %>
+-        <% months.each do |month_number| %>
+-          <% if past?(year, month_number) && points_exist?(year, month_number, current_user) %>
+-            <%= link_to Date::ABBR_MONTHNAMES[month_number], map_url(timespan(month_number, year).merge(import_id: params[:import_id])), class: 'btn btn-default' %>
+-          <% else %>
+-            <div class='btn btn-disabled'><%= Date::ABBR_MONTHNAMES[month_number] %></div>
+-          <% end %>
+-        <% end %>
+-      <% end %>
+-    </div>
+-  <% end %>
+-</div>
+-
+-<% if REVERSE_GEOCODING_ENABLED && @countries_and_cities&.any? %>
+-  <hr class='my-5'>
+-  <h2 class='text-lg font-semibold'>Countries and cities</h2>
+-  <% @countries_and_cities.each do |country| %>
+-    <% next if country[:cities].empty? %>
+-
+-    <h2 class="text-lg font-semibold mt-5">
+-      <%= country[:country] %> (<%= country[:cities].count %> cities)
+-    </h2>
+-    <ul class="timeline timeline-vertical">
+-      <% country[:cities].each do |city| %>
+-        <li>
+-          <hr />
+-          <div class="timeline-start"><%= link_to_date(city[:timestamp]) %></div>
+-          <div class="timeline-middle">
+-            <svg
+-              xmlns="http://www.w3.org/2000/svg"
+-              viewBox="0 0 20 20"
+-              fill="currentColor"
+-              class="h-5 w-5">
+-              <path
+-                fill-rule="evenodd"
+-                d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z"
+-                clip-rule="evenodd" />
+-            </svg>
+-          </div>
+-          <div class="timeline-end timeline-box"><%= city[:city] %></div>
+-          <hr />
+-        </li>
+-      <% end %>
+-    </ul>
+-  <% end %>
+-<% end %>
+diff --git a/config/routes.rb b/config/routes.rb
+index 2c40e93d..ebad44e5 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -78,6 +78,11 @@
+ 
+       namespace :countries do
+         resources :borders, only: :index
++        resources :visited_cities, only: :index
++      end
++
++      namespace :points do
++        get 'tracked_months', to: 'tracked_months#index'
+       end
+ 
+       resources :photos, only: %i[index] do
+diff --git a/db/migrate/[timestamp]_add_index_to_points_timestamp.rb b/db/migrate/[timestamp]_add_index_to_points_timestamp.rb
+deleted file mode 100644
+index 8e4bc3fa..00000000
+--- a/db/migrate/[timestamp]_add_index_to_points_timestamp.rb
++++ /dev/null
+@@ -1,9 +0,0 @@
+-# frozen_string_literal: true
+-
+-class AddIndexToPointsTimestamp < ActiveRecord::Migration[7.2]
+-  disable_ddl_transaction!
+-
+-  def change
+-    add_index :points, %i[user_id timestamp], algorithm: :concurrently
+-  end
+-end
+diff --git a/spec/models/stat_spec.rb b/spec/models/stat_spec.rb
+index ae65afd2..af8873b6 100644
+--- a/spec/models/stat_spec.rb
++++ b/spec/models/stat_spec.rb
+@@ -13,44 +13,6 @@
+     let(:year) { 2021 }
+     let(:user) { create(:user) }
+ 
+-    describe '.year_cities_and_countries' do
+-      subject { described_class.year_cities_and_countries(year, user) }
+-
+-      let(:timestamp) { DateTime.new(year, 1, 1, 0, 0, 0) }
+-
+-      before do
+-        stub_const('MIN_MINUTES_SPENT_IN_CITY', 60)
+-      end
+-
+-      context 'when there are points' do
+-        let!(:points) do
+-          [
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp:),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 10.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 20.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 30.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 40.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 50.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 60.minutes),
+-            create(:point, user:, city: 'Berlin', country: 'Germany', timestamp: timestamp + 70.minutes),
+-            create(:point, user:, city: 'Brugges', country: 'Belgium', timestamp: timestamp + 80.minutes),
+-            create(:point, user:, city: 'Brugges', country: 'Belgium', timestamp: timestamp + 90.minutes)
+-          ]
+-        end
+-
+-        it 'returns countries and cities' do
+-          # User spent only 20 minutes in Brugges, so it should not be included
+-          expect(subject).to eq(countries: 2, cities: 1)
+-        end
+-      end
+-
+-      context 'when there are no points' do
+-        it 'returns countries and cities' do
+-          expect(subject).to eq(countries: 0, cities: 0)
+-        end
+-      end
+-    end
+-
+     describe '#distance_by_day' do
+       subject { stat.distance_by_day }
+ 
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 26bd7e27..a1059d0a 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -117,10 +117,8 @@
+     describe '#years_tracked' do
+       let!(:points) { create_list(:point, 3, user:, timestamp: DateTime.new(2024, 1, 1, 5, 0, 0)) }
+ 
+-      subject { user.years_tracked }
+-
+       it 'returns years tracked' do
+-        expect(subject).to eq([2024])
++        expect(user.years_tracked).to eq([{ year: 2024, months: ['Jan'] }])
+       end
+     end
+   end
+diff --git a/spec/requests/api/v1/countries/visited_cities_spec.rb b/spec/requests/api/v1/countries/visited_cities_spec.rb
+new file mode 100644
+index 00000000..65dbab07
+--- /dev/null
++++ b/spec/requests/api/v1/countries/visited_cities_spec.rb
+@@ -0,0 +1,17 @@
++# frozen_string_literal: true
++
++require 'rails_helper'
++
++RSpec.describe 'Api::V1::Countries::VisitedCities', type: :request do
++  describe 'GET /index' do
++    let(:user) { create(:user) }
++    let(:start_at) { '2023-01-01' }
++    let(:end_at) { '2023-12-31' }
++
++    it 'returns visited cities' do
++      get "/api/v1/countries/visited_cities?api_key=#{user.api_key}&start_at=#{start_at}&end_at=#{end_at}"
++
++      expect(response).to have_http_status(:ok)
++    end
++  end
++end
+diff --git a/spec/requests/api/v1/points/tracked_months_spec.rb b/spec/requests/api/v1/points/tracked_months_spec.rb
+new file mode 100644
+index 00000000..e654fc15
+--- /dev/null
++++ b/spec/requests/api/v1/points/tracked_months_spec.rb
+@@ -0,0 +1,15 @@
++# frozen_string_literal: true
++
++require 'rails_helper'
++
++RSpec.describe 'Api::V1::Points::TrackedMonths', type: :request do
++  describe 'GET /index' do
++    let(:user) { create(:user) }
++
++    it 'returns tracked months' do
++      get "/api/v1/points/tracked_months?api_key=#{user.api_key}"
++
++      expect(response).to have_http_status(:ok)
++    end
++  end
++end
+diff --git a/spec/requests/stats_spec.rb b/spec/requests/stats_spec.rb
+index 40c19823..224cb3b5 100644
+--- a/spec/requests/stats_spec.rb
++++ b/spec/requests/stats_spec.rb
+@@ -55,13 +55,13 @@
+       let(:stat) { create(:stat, user:, year: 2024) }
+ 
+       it 'enqueues Stats::CalculatingJob for each tracked year and month' do
+-        allow(user).to receive(:years_tracked).and_return([2024])
++        allow(user).to receive(:years_tracked).and_return([{ year: 2024, months: %w[Jan Feb] }])
+ 
+         post stats_url
+ 
+-        (1..12).each do |month|
+-          expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, month)
+-        end
++        expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 1)
++        expect(Stats::CalculatingJob).to have_been_enqueued.with(user.id, 2024, 2)
++        expect(Stats::CalculatingJob).to_not have_been_enqueued.with(user.id, 2024, 3)
+       end
+     end
+   end
+diff --git a/spec/services/countries_and_cities_spec.rb b/spec/services/countries_and_cities_spec.rb
+index 99e7664f..636823e5 100644
+--- a/spec/services/countries_and_cities_spec.rb
++++ b/spec/services/countries_and_cities_spec.rb
+@@ -36,13 +36,18 @@
+         it 'returns countries and cities' do
+           expect(countries_and_cities).to eq(
+             [
+-              {
+-                cities: [{ city: 'Berlin', points: 8, timestamp: 1609463400, stayed_for: 70 }],
+-                country: 'Germany'
+-              },
+-              {
+-                cities: [], country: 'Belgium'
+-              }
++              CountriesAndCities::CountryData.new(
++                country: 'Germany',
++                cities: [
++                  CountriesAndCities::CityData.new(
++                    city: 'Berlin', points: 8, timestamp: 1_609_463_400, stayed_for: 70
++                  )
++                ]
++              ),
++              CountriesAndCities::CountryData.new(
++                country: 'Belgium',
++                cities: []
++              )
+             ]
+           )
+         end
+@@ -62,12 +67,14 @@
+         it 'returns countries and cities' do
+           expect(countries_and_cities).to eq(
+             [
+-              {
+-                cities: [], country: 'Germany'
+-              },
+-              {
+-                cities: [], country: 'Belgium'
+-              }
++              CountriesAndCities::CountryData.new(
++                country: 'Germany',
++                cities: []
++              ),
++              CountriesAndCities::CountryData.new(
++                country: 'Belgium',
++                cities: []
++              )
+             ]
+           )
+         end
+diff --git a/spec/swagger/api/v1/countries/visited_cities_spec.rb b/spec/swagger/api/v1/countries/visited_cities_spec.rb
+new file mode 100644
+index 00000000..5d199e15
+--- /dev/null
++++ b/spec/swagger/api/v1/countries/visited_cities_spec.rb
+@@ -0,0 +1,96 @@
++# frozen_string_literal: true
++
++require 'swagger_helper'
++
++RSpec.describe 'Api::V1::Countries::VisitedCities', type: :request do
++  path '/api/v1/countries/visited_cities' do
++    get 'Get visited cities by date range' do
++      tags 'Countries'
++      description 'Returns a list of visited cities and countries based on tracked points within the specified date range'
++      produces 'application/json'
++
++      parameter name: :api_key, in: :query, type: :string, required: true
++      parameter name: :start_at,
++                in: :query,
++                type: :string,
++                format: 'date-time',
++                required: true,
++                description: 'Start date in YYYY-MM-DD format',
++                example: '2023-01-01'
++
++      parameter name: :end_at,
++                in: :query,
++                type: :string,
++                format: 'date-time',
++                required: true,
++                description: 'End date in YYYY-MM-DD format',
++                example: '2023-12-31'
++
++      response '200', 'cities found' do
++        schema type: :object,
++               properties: {
++                 data: {
++                   type: :array,
++                   description: 'Array of countries and their visited cities',
++                   items: {
++                     type: :object,
++                     properties: {
++                       country: {
++                         type: :string,
++                         example: 'Germany'
++                       },
++                       cities: {
++                         type: :array,
++                         items: {
++                           type: :object,
++                           properties: {
++                             city: {
++                               type: :string,
++                               example: 'Berlin'
++                             },
++                             points: {
++                               type: :integer,
++                               example: 4394,
++                               description: 'Number of points in the city'
++                             },
++                             timestamp: {
++                               type: :integer,
++                               example: 1_724_868_369,
++                               description: 'Timestamp of the last point in the city in seconds since Unix epoch'
++                             },
++                             stayed_for: {
++                               type: :integer,
++                               example: 24_490,
++                               description: 'Number of minutes the user stayed in the city'
++                             }
++                           }
++                         }
++                       }
++                     }
++                   }
++                 }
++               }
++
++        let(:start_at) { '2023-01-01' }
++        let(:end_at) { '2023-12-31' }
++        let(:api_key) { create(:user).api_key }
++        run_test!
++      end
++
++      response '400', 'bad request - missing parameters' do
++        schema type: :object,
++               properties: {
++                 error: {
++                   type: :string,
++                   example: 'Missing required parameters: start_at, end_at'
++                 }
++               }
++
++        let(:start_at) { nil }
++        let(:end_at) { nil }
++        let(:api_key) { create(:user).api_key }
++        run_test!
++      end
++    end
++  end
++end
+diff --git a/spec/swagger/api/v1/points/tracked_months_controller_spec.rb b/spec/swagger/api/v1/points/tracked_months_controller_spec.rb
+new file mode 100644
+index 00000000..fec4c633
+--- /dev/null
++++ b/spec/swagger/api/v1/points/tracked_months_controller_spec.rb
+@@ -0,0 +1,39 @@
++# frozen_string_literal: true
++
++require 'swagger_helper'
++
++describe 'Points Tracked Months API', type: :request do
++  path '/api/v1/points/tracked_months' do
++    get 'Returns list of tracked years and months' do
++      tags 'Points'
++      produces 'application/json'
++      parameter name: :api_key, in: :query, type: :string, required: true, description: 'API Key'
++      response '200', 'years and months found' do
++        schema type: :array,
++               items: {
++                 type: :object,
++                 properties: {
++                   year: { type: :integer, description: 'Year in YYYY format' },
++                   months: {
++                     type: :array,
++                     items: { type: :string, description: 'Three-letter month abbreviation' }
++                   }
++                 },
++                 required: %w[year months]
++               },
++               example: [{
++                 year: 2024,
++                 months: %w[Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec]
++               }]
++
++        let(:api_key) { create(:user).api_key }
++        run_test!
++      end
++
++      response '401', 'unauthorized' do
++        let(:api_key) { 'invalid' }
++        run_test!
++      end
++    end
++  end
++end
+diff --git a/swagger/v1/swagger.yaml b/swagger/v1/swagger.yaml
+index 9e6a57dd..2e6e2587 100644
+--- a/swagger/v1/swagger.yaml
++++ b/swagger/v1/swagger.yaml
+@@ -106,6 +106,84 @@ paths:
+       responses:
+         '200':
+           description: area deleted
++  "/api/v1/countries/visited_cities":
++    get:
++      summary: Get visited cities by date range
++      tags:
++      - Countries
++      description: Returns a list of visited cities and countries based on tracked
++        points within the specified date range
++      parameters:
++      - name: api_key
++        in: query
++        required: true
++        schema:
++          type: string
++      - name: start_at
++        in: query
++        format: date-time
++        required: true
++        description: Start date and time for the range (ISO 8601 format)
++        example: '2023-01-01T00:00:00Z'
++        schema:
++          type: string
++      - name: end_at
++        in: query
++        format: date-time
++        required: true
++        description: End date and time for the range (ISO 8601 format)
++        example: '2023-12-31T23:59:59Z'
++        schema:
++          type: string
++      responses:
++        '200':
++          description: cities found
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  data:
++                    type: array
++                    description: Array of countries and their visited cities
++                    items:
++                      type: object
++                      properties:
++                        country:
++                          type: string
++                          example: Germany
++                        cities:
++                          type: array
++                          items:
++                            type: object
++                            properties:
++                              city:
++                                type: string
++                                example: Berlin
++                              points:
++                                type: integer
++                                example: 4394
++                                description: Number of points in the city
++                              timestamp:
++                                type: integer
++                                example: 1724868369
++                                description: Timestamp of the last point in the city
++                                  in seconds since Unix epoch
++                              stayed_for:
++                                type: integer
++                                example: 24490
++                                description: Number of minutes the user stayed in
++                                  the city
++        '400':
++          description: bad request - missing parameters
++          content:
++            application/json:
++              schema:
++                type: object
++                properties:
++                  error:
++                    type: string
++                    example: 'Missing required parameters: start_at, end_at'
+   "/api/v1/health":
+     get:
+       summary: Retrieves application status
+@@ -460,6 +538,56 @@ paths:
+                     - photoprism
+         '404':
+           description: photo not found
++  "/api/v1/points/tracked_months":
++    get:
++      summary: Returns list of tracked years and months
++      tags:
++      - Points
++      parameters:
++      - name: api_key
++        in: query
++        required: true
++        description: API Key
++        schema:
++          type: string
++      responses:
++        '200':
++          description: years and months found
++          content:
++            application/json:
++              schema:
++                type: array
++                items:
++                  type: object
++                  properties:
++                    year:
++                      type: integer
++                      description: Year in YYYY format
++                    months:
++                      type: array
++                      items:
++                        type: string
++                        description: Three-letter month abbreviation
++                  required:
++                  - year
++                  - months
++                example:
++                - year: 2024
++                  months:
++                  - Jan
++                  - Feb
++                  - Mar
++                  - Apr
++                  - May
++                  - Jun
++                  - Jul
++                  - Aug
++                  - Sep
++                  - Oct
++                  - Nov
++                  - Dec
++        '401':
++          description: unauthorized
+   "/api/v1/points":
+     get:
+       summary: Retrieves all points

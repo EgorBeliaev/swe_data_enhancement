@@ -1,0 +1,179 @@
+diff --git a/assets/js/components/Loadpoints.vue b/assets/js/components/Loadpoints.vue
+index 5e932cb536..6fbd2b2ea1 100644
+--- a/assets/js/components/Loadpoints.vue
++++ b/assets/js/components/Loadpoints.vue
+@@ -27,7 +27,7 @@
+ 					:batteryConfigured="batteryConfigured"
+ 					class="h-100"
+ 					:class="{ 'loadpoint-unselected': !selected(index) }"
+-					@click="scrollTo(index)"
++					@click="goTo(index)"
+ 				/>
+ 			</div>
+ 		</div>
+@@ -37,7 +37,7 @@
+ 				:key="index"
+ 				class="btn btn-sm btn-link p-0 mx-1 indicator d-flex justify-content-center align-items-center evcc-default-text"
+ 				:class="{ 'indicator--selected': selected(index) }"
+-				@click="scrollTo(index)"
++				@click="goTo(index)"
+ 			>
+ 				<shopicon-filled-lightning
+ 					v-if="isCharging(loadpoint)"
+@@ -70,15 +70,25 @@ export default {
+ 		tariffGrid: Number,
+ 		tariffCo2: Number,
+ 		currency: String,
++		selectedIndex: Number,
+ 		gridConfigured: Boolean,
+ 		pvConfigured: Boolean,
+ 		batteryConfigured: Boolean,
+ 	},
++	emits: ["index-changed"],
+ 	data() {
+-		return { selectedIndex: 0, snapTimeout: null };
++		return { snapTimeout: null, scrollTimeout: null, highlightedIndex: 0 };
++	},
++	watch: {
++		selectedIndex: function (newIndex) {
++			this.scrollTo(newIndex);
++		},
+ 	},
+ 	mounted() {
+-		this.$refs.carousel.addEventListener("scroll", this.handleCarouselScroll, false);
++		if (this.selectedIndex > 0) {
++			this.$refs.carousel.scrollTo({ top: 0, left: this.left(this.selectedIndex) });
++		}
++		this.$refs.carousel.addEventListener("scroll", this.handleCarouselScroll);
+ 	},
+ 	unmounted() {
+ 		if (this.$refs.carousel) {
+@@ -89,23 +99,33 @@ export default {
+ 		handleCarouselScroll() {
+ 			const { scrollLeft } = this.$refs.carousel;
+ 			const { offsetWidth } = this.$refs.carousel.children[0];
+-			this.selectedIndex = Math.round((scrollLeft - 7.5) / offsetWidth);
++			this.highlightedIndex = Math.round((scrollLeft - 7.5) / offsetWidth);
++
++			// save scroll position to url if not changing for 2s
++			clearTimeout(this.scrollTimeout);
++			this.scrollTimeout = setTimeout(() => {
++				if (this.highlightedIndex !== this.selectedIndex) {
++					this.$emit("index-changed", this.highlightedIndex);
++				}
++			}, 2000);
++		},
++		goTo(index) {
++			this.$emit("index-changed", index);
+ 		},
+ 		isCharging(lp) {
+ 			return lp.charging && lp.chargePower > 0;
+ 		},
+ 		selected(index) {
+-			return this.selectedIndex === index;
++			return this.highlightedIndex === index;
++		},
++		left(index) {
++			return this.$refs.carousel.children[0].offsetWidth * index;
+ 		},
+ 		scrollTo(index) {
+-			if (this.selectedIndex === index) {
+-				return;
+-			}
+-			this.selectedIndex = index;
++			this.highlightedIndex = index;
+ 			const $carousel = this.$refs.carousel;
+-			const width = $carousel.children[0].offsetWidth;
+ 			$carousel.style.scrollSnapType = "none";
+-			$carousel.scrollTo({ top: 0, left: 7.5 + width * index, behavior: "smooth" });
++			$carousel.scrollTo({ top: 0, left: this.left(index), behavior: "smooth" });
+ 
+ 			clearTimeout(this.snapTimeout);
+ 			this.snapTimeout = setTimeout(() => {
+diff --git a/assets/js/components/Site.vue b/assets/js/components/Site.vue
+index a31777fb69..0f6b86bbd1 100644
+--- a/assets/js/components/Site.vue
++++ b/assets/js/components/Site.vue
+@@ -21,7 +21,7 @@
+ 				<h1 class="mb-5 text-gray fs-4">{{ $t("startupError.title") }}</h1>
+ 			</div>
+ 			<Loadpoints
+-				v-else
++				v-else-if="loadpoints.length > 0"
+ 				class="mt-1 mt-sm-2 flex-grow-1"
+ 				:loadpoints="loadpoints"
+ 				:vehicles="vehicleList"
+@@ -33,6 +33,8 @@
+ 				:pvConfigured="pvConfigured"
+ 				:batteryConfigured="batteryConfigured"
+ 				:batterySoc="batterySoc"
++				:selectedIndex="selectedLoadpointIndex"
++				@index-changed="selectedLoadpointChanged"
+ 			/>
+ 			<Footer v-bind="footer"></Footer>
+ 		</div>
+@@ -61,6 +63,7 @@ export default {
+ 	mixins: [formatter, collector],
+ 	props: {
+ 		loadpoints: Array,
++		selectedLoadpointIndex: Number,
+ 
+ 		notifications: Array,
+ 		offline: Boolean,
+@@ -164,6 +167,11 @@ export default {
+ 			};
+ 		},
+ 	},
++	methods: {
++		selectedLoadpointChanged(index) {
++			this.$router.push({ query: { lp: index + 1 } });
++		},
++	},
+ };
+ </script>
+ <style scoped>
+diff --git a/assets/js/router.js b/assets/js/router.js
+index a719af7657..a2f02be2f2 100644
+--- a/assets/js/router.js
++++ b/assets/js/router.js
+@@ -31,7 +31,16 @@ export default function setupRouter(i18n) {
+   const router = createRouter({
+     history: createWebHashHistory(),
+     routes: [
+-      { path: "/", component: () => import("./views/Main.vue"), props: true },
++      {
++        path: "/",
++        component: () => import("./views/Main.vue"),
++        props: (route) => {
++          const { lp } = route.query;
++          return {
++            selectedLoadpointIndex: lp ? parseInt(lp, 10) - 1 : undefined,
++          };
++        },
++      },
+       {
+         path: "/config",
+         component: () => import("./views/Config.vue"),
+diff --git a/assets/js/views/Main.vue b/assets/js/views/Main.vue
+index 0a2fd3f4dc..fb8d1abecb 100644
+--- a/assets/js/views/Main.vue
++++ b/assets/js/views/Main.vue
+@@ -1,5 +1,9 @@
+ <template>
+-	<Site :notifications="notifications" v-bind="state"></Site>
++	<Site
++		:notifications="notifications"
++		v-bind="state"
++		:selected-loadpoint-index="selectedLoadpointIndex"
++	/>
+ </template>
+ 
+ <script>
+@@ -11,6 +15,7 @@ export default {
+ 	components: { Site },
+ 	props: {
+ 		notifications: Array,
++		selectedLoadpointIndex: Number,
+ 	},
+ 	data: function () {
+ 		return store;

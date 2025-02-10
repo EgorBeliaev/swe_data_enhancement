@@ -1,0 +1,887 @@
+diff --git a/.app_version b/.app_version
+index a723ece7..faa5fb26 100644
+--- a/.app_version
++++ b/.app_version
+@@ -1 +1 @@
+-0.22.1
++0.22.2
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f7f7be29..93f71881 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++# 0.22.2 - 2025-01-13
++
++✨ The Fancy Routes release ✨
++
++### Added
++
++- In the Map Settings (coggle in the top left corner of the map), you can now enable/disable the Fancy Routes feature. Simply said, it will color your routes based on the speed of each segment.
++- Hovering over a polyline now shows the speed of the segment. Move cursor over a polyline to see the speed of different segments.
++- Distance and points number in the custom control to the map.
++
++### Changed
++
++- The name of the "Polylines" feature is now "Routes".
++
++⚠️ Important note on the Prometheus monitoring ⚠️
++
++In the previous release, `bin/dev` command in the default `docker-compose.yml` file was replaced with `bin/rails server -p 3000 -b ::`, but this way Dawarich won't be able to start Prometheus Exporter. If you want to use Prometheus monitoring, you need to use `bin/dev` command instead.
++
++Example:
++
++```diff
++  dawarich_app:
++    image: freikin/dawarich:latest
++...
++-    command: ['bin/rails', 'server', '-p', '3000', '-b', '::']
+++    command: ['bin/dev']
++```
++
+ # 0.22.1 - 2025-01-09
+ 
+ ### Removed
+diff --git a/app/controllers/api/v1/settings_controller.rb b/app/controllers/api/v1/settings_controller.rb
+index f87d9df7..316c201e 100644
+--- a/app/controllers/api/v1/settings_controller.rb
++++ b/app/controllers/api/v1/settings_controller.rb
+@@ -27,7 +27,8 @@ def settings_params
+       :meters_between_routes, :minutes_between_routes, :fog_of_war_meters,
+       :time_threshold_minutes, :merge_threshold_minutes, :route_opacity,
+       :preferred_map_layer, :points_rendering_mode, :live_map_enabled,
+-      :immich_url, :immich_api_key, :photoprism_url, :photoprism_api_key
++      :immich_url, :immich_api_key, :photoprism_url, :photoprism_api_key,
++      :speed_colored_routes
+     )
+   end
+ end
+diff --git a/app/controllers/map_controller.rb b/app/controllers/map_controller.rb
+index ac960928..7a7246c5 100644
+--- a/app/controllers/map_controller.rb
++++ b/app/controllers/map_controller.rb
+@@ -14,6 +14,7 @@ def index
+     @start_at = Time.zone.at(start_at)
+     @end_at = Time.zone.at(end_at)
+     @years = (@start_at.year..@end_at.year).to_a
++    @points_number = @coordinates.count
+   end
+ 
+   private
+@@ -36,7 +37,7 @@ def distance
+     @distance ||= 0
+ 
+     @coordinates.each_cons(2) do
+-      @distance += Geocoder::Calculations.distance_between([_1[0], _1[1]], [_2[0], _2[1]])
++      @distance += Geocoder::Calculations.distance_between([_1[0], _1[1]], [_2[0], _2[1]], units: DISTANCE_UNIT)
+     end
+ 
+     @distance.round(1)
+diff --git a/app/javascript/controllers/maps_controller.js b/app/javascript/controllers/maps_controller.js
+index 40893763..fa2ef5e1 100644
+--- a/app/javascript/controllers/maps_controller.js
++++ b/app/javascript/controllers/maps_controller.js
+@@ -5,8 +5,13 @@ import consumer from "../channels/consumer";
+ 
+ import { createMarkersArray } from "../maps/markers";
+ 
+-import { createPolylinesLayer } from "../maps/polylines";
+-import { updatePolylinesOpacity } from "../maps/polylines";
++import {
++  createPolylinesLayer,
++  updatePolylinesOpacity,
++  updatePolylinesColors,
++  calculateSpeed,
++  getSpeedColor
++} from "../maps/polylines";
+ 
+ import { fetchAndDrawAreas } from "../maps/areas";
+ import { handleAreaCreated } from "../maps/areas";
+@@ -27,6 +32,18 @@ import { countryCodesMap } from "../maps/country_codes";
+ 
+ import "leaflet-draw";
+ 
++function debounce(func, wait) {
++  let timeout;
++  return function executedFunction(...args) {
++    const later = () => {
++      clearTimeout(timeout);
++      func(...args);
++    };
++    clearTimeout(timeout);
++    timeout = setTimeout(later, wait);
++  };
++}
++
+ export default class extends Controller {
+   static targets = ["container"];
+ 
+@@ -48,6 +65,7 @@ export default class extends Controller {
+     this.pointsRenderingMode = this.userSettings.points_rendering_mode || "raw";
+     this.liveMapEnabled = this.userSettings.live_map_enabled || false;
+     this.countryCodesMap = countryCodesMap();
++    this.speedColoredPolylines = this.userSettings.speed_colored_routes || false;
+ 
+     this.center = this.markers[this.markers.length - 1] || [52.514568, 13.350111];
+ 
+@@ -78,7 +96,7 @@ export default class extends Controller {
+ 
+     const controlsLayer = {
+       Points: this.markersLayer,
+-      Polylines: this.polylinesLayer,
++      Routes: this.polylinesLayer,
+       Heatmap: this.heatmapLayer,
+       "Fog of War": this.fogOverlay,
+       "Scratch map": this.scratchLayer,
+@@ -86,7 +104,26 @@ export default class extends Controller {
+       Photos: this.photoMarkers
+     };
+ 
+-    // Add scale control to bottom right
++    // Add this new custom control BEFORE the scale control
++    const TestControl = L.Control.extend({
++      onAdd: (map) => {
++        const div = L.DomUtil.create('div', 'leaflet-control');
++        const distance = this.element.dataset.distance || '0';
++        const pointsNumber = this.element.dataset.points_number || '0';
++        const unit = this.distanceUnit === 'mi' ? 'mi' : 'km';
++        div.innerHTML = `${distance} ${unit} | ${pointsNumber} points`;
++        div.style.backgroundColor = 'white';
++        div.style.padding = '0 5px';
++        div.style.marginRight = '5px';
++        div.style.display = 'inline-block';
++        return div;
++      }
++    });
++
++    // Add the test control first
++    new TestControl({ position: 'bottomright' }).addTo(this.map);
++
++    // Then add scale control
+     L.control.scale({
+       position: 'bottomright',
+       imperial: this.distanceUnit === 'mi',
+@@ -439,7 +476,7 @@ export default class extends Controller {
+         this.map.removeControl(this.layerControl);
+         const controlsLayer = {
+           Points: this.markersLayer,
+-          Polylines: this.polylinesLayer,
++          Routes: this.polylinesLayer,
+           Heatmap: this.heatmapLayer,
+           "Fog of War": this.fogOverlay,
+           "Scratch map": this.scratchLayer,
+@@ -677,6 +714,12 @@ export default class extends Controller {
+             <input type="checkbox" id="live_map_enabled" name="live_map_enabled" class='w-4' style="width: 20px;" value="false" ${this.liveMapEnabledChecked(true)} />
+           </label>
+ 
++          <label for="speed_colored_routes">
++            Speed-colored routes
++            <label for="speed_colored_routes_info" class="btn-xs join-item inline">?</label>
++            <input type="checkbox" id="speed_colored_routes" name="speed_colored_routes" class='w-4' style="width: 20px;" ${this.speedColoredRoutesChecked()} />
++          </label>
++
+           <button type="submit">Update</button>
+         </form>
+       `;
+@@ -717,8 +760,13 @@ export default class extends Controller {
+     }
+   }
+ 
++  speedColoredRoutesChecked() {
++    return this.userSettings.speed_colored_routes ? 'checked' : '';
++  }
++
+   updateSettings(event) {
+     event.preventDefault();
++    console.log('Form submitted');
+ 
+     fetch(`/api/v1/settings?api_key=${this.apiKey}`, {
+       method: 'PATCH',
+@@ -732,12 +780,14 @@ export default class extends Controller {
+           time_threshold_minutes: event.target.time_threshold_minutes.value,
+           merge_threshold_minutes: event.target.merge_threshold_minutes.value,
+           points_rendering_mode: event.target.points_rendering_mode.value,
+-          live_map_enabled: event.target.live_map_enabled.checked
++          live_map_enabled: event.target.live_map_enabled.checked,
++          speed_colored_routes: event.target.speed_colored_routes.checked
+         },
+       }),
+     })
+       .then((response) => response.json())
+       .then((data) => {
++        console.log('Settings update response:', data);
+         if (data.status === 'success') {
+           showFlashMessage('notice', data.message);
+           this.updateMapWithNewSettings(data.settings);
+@@ -748,84 +798,78 @@ export default class extends Controller {
+         } else {
+           showFlashMessage('error', data.message);
+         }
++      })
++      .catch(error => {
++        console.error('Settings update error:', error);
++        showFlashMessage('error', 'Failed to update settings');
+       });
+   }
+ 
+   updateMapWithNewSettings(newSettings) {
+-    const currentLayerStates = this.getLayerControlStates();
+-
+-    // Update local state with new settings
+-    this.clearFogRadius = parseInt(newSettings.fog_of_war_meters) || 50;
+-    this.routeOpacity = parseFloat(newSettings.route_opacity) || 0.6;
+-
+-    // Preserve existing layer instances if they exist
+-    const preserveLayers = {
+-      Points:       this.markersLayer,
+-      Polylines:    this.polylinesLayer,
+-      Heatmap:      this.heatmapLayer,
+-      "Fog of War": this.fogOverlay,
+-      Areas:        this.areasLayer,
+-    };
+-
+-    // Clear all layers except base layers
+-    this.map.eachLayer((layer) => {
+-      if (!(layer instanceof L.TileLayer)) {
+-        this.map.removeLayer(layer);
+-      }
++    console.log('Updating map settings:', {
++      newSettings,
++      currentSettings: this.userSettings,
++      hasPolylines: !!this.polylinesLayer,
++      isVisible: this.polylinesLayer && this.map.hasLayer(this.polylinesLayer)
+     });
+ 
+-    // Recreate layers only if they don't exist
+-    this.markersLayer = preserveLayers.Points       || L.layerGroup(createMarkersArray(this.markers, newSettings));
+-    this.polylinesLayer = preserveLayers.Polylines  || createPolylinesLayer(this.markers, this.map, this.timezone, this.routeOpacity, this.userSettings, this.distanceUnit);
+-    this.heatmapLayer = preserveLayers.Heatmap      || L.heatLayer(this.markers.map((element) => [element[0], element[1], 0.2]), { radius: 20 });
+-    this.fogOverlay = preserveLayers["Fog of War"]  || L.layerGroup();
+-    this.areasLayer = preserveLayers.Areas          || L.layerGroup();
+-
+-    // Redraw areas
+-    fetchAndDrawAreas(this.areasLayer, this.apiKey);
+-
+-    let fogEnabled = false;
+-    document.getElementById('fog').style.display = 'none';
+-
+-    this.map.on('overlayadd', (e) => {
+-      if (e.name === 'Fog of War') {
+-        fogEnabled = true;
+-        document.getElementById('fog').style.display = 'block';
+-        this.updateFog(this.markers, this.clearFogRadius);
+-      }
+-    });
+-
+-    this.map.on('overlayremove', (e) => {
+-      if (e.name === 'Fog of War') {
+-        fogEnabled = false;
+-        document.getElementById('fog').style.display = 'none';
+-      }
+-    });
++    // Show loading indicator
++    const loadingDiv = document.createElement('div');
++    loadingDiv.className = 'map-loading-overlay';
++    loadingDiv.innerHTML = '<div class="loading loading-lg">Updating map...</div>';
++    document.body.appendChild(loadingDiv);
++
++    // Debounce the heavy operations
++    const updateLayers = debounce(() => {
++      try {
++        // Check if speed_colored_routes setting has changed
++        if (newSettings.speed_colored_routes !== this.userSettings.speed_colored_routes) {
++          if (this.polylinesLayer) {
++            updatePolylinesColors(
++              this.polylinesLayer,
++              newSettings.speed_colored_routes
++            );
++          }
++        }
+ 
+-    this.map.on('zoomend moveend', () => {
+-      if (fogEnabled) {
+-        this.updateFog(this.markers, this.clearFogRadius);
+-      }
+-    });
++        // Update opacity if changed
++        if (newSettings.route_opacity !== this.userSettings.route_opacity) {
++          const newOpacity = parseFloat(newSettings.route_opacity) || 0.6;
++          if (this.polylinesLayer) {
++            updatePolylinesOpacity(this.polylinesLayer, newOpacity);
++          }
++        }
+ 
+-    this.addLastMarker(this.map, this.markers);
+-    this.addEventListeners();
+-    this.initializeDrawControl();
+-    updatePolylinesOpacity(this.polylinesLayer, this.routeOpacity);
++        // Update the local settings
++        this.userSettings = { ...this.userSettings, ...newSettings };
++        this.routeOpacity = parseFloat(newSettings.route_opacity) || 0.6;
++        this.clearFogRadius = parseInt(newSettings.fog_of_war_meters) || 50;
+ 
+-    this.map.on('overlayadd', (e) => {
+-      if (e.name === 'Areas') {
+-        this.map.addControl(this.drawControl);
+-      }
+-    });
++        // Update layer control
++        this.map.removeControl(this.layerControl);
++        const controlsLayer = {
++          Points: this.markersLayer,
++          Routes: this.polylinesLayer,
++          Heatmap: this.heatmapLayer,
++          "Fog of War": this.fogOverlay,
++          "Scratch map": this.scratchLayer,
++          Areas: this.areasLayer,
++          Photos: this.photoMarkers
++        };
++        this.layerControl = L.control.layers(this.baseMaps(), controlsLayer).addTo(this.map);
+ 
+-    this.map.on('overlayremove', (e) => {
+-      if (e.name === 'Areas') {
+-        this.map.removeControl(this.drawControl);
++      } catch (error) {
++        console.error('Error updating map settings:', error);
++        console.error(error.stack);
++      } finally {
++        // Remove loading indicator after all updates are complete
++        setTimeout(() => {
++          document.body.removeChild(loadingDiv);
++        }, 500); // Give a small delay to ensure all batches are processed
+       }
+-    });
++    }, 250);
+ 
+-    this.applyLayerControlStates(currentLayerStates);
++    updateLayers();
+   }
+ 
+   getLayerControlStates() {
+@@ -845,7 +889,7 @@ export default class extends Controller {
+   getLayerName(layer) {
+     const controlLayers = {
+       Points: this.markersLayer,
+-      Polylines: this.polylinesLayer,
++      Routes: this.polylinesLayer,
+       Heatmap: this.heatmapLayer,
+       "Fog of War": this.fogOverlay,
+       Areas: this.areasLayer,
+@@ -865,9 +909,11 @@ export default class extends Controller {
+   }
+ 
+   applyLayerControlStates(states) {
++    console.log('Applying layer states:', states);
++
+     const layerControl = {
+       Points: this.markersLayer,
+-      Polylines: this.polylinesLayer,
++      Routes: this.polylinesLayer,
+       Heatmap: this.heatmapLayer,
+       "Fog of War": this.fogOverlay,
+       Areas: this.areasLayer,
+@@ -875,11 +921,16 @@ export default class extends Controller {
+ 
+     for (const [name, isVisible] of Object.entries(states)) {
+       const layer = layerControl[name];
+-
+-      if (isVisible && !this.map.hasLayer(layer)) {
+-        this.map.addLayer(layer);
+-      } else if (this.map.hasLayer(layer)) {
+-        this.map.removeLayer(layer);
++      console.log(`Processing layer ${name}:`, { layer, isVisible });
++
++      if (layer) {
++        if (isVisible && !this.map.hasLayer(layer)) {
++          console.log(`Adding layer ${name} to map`);
++          this.map.addLayer(layer);
++        } else if (!isVisible && this.map.hasLayer(layer)) {
++          console.log(`Removing layer ${name} from map`);
++          this.map.removeLayer(layer);
++        }
+       }
+     }
+ 
+diff --git a/app/javascript/maps/polylines.js b/app/javascript/maps/polylines.js
+index 2c09022d..e78f0223 100644
+--- a/app/javascript/maps/polylines.js
++++ b/app/javascript/maps/polylines.js
+@@ -1,15 +1,152 @@
+ import { formatDate } from "../maps/helpers";
+ import { formatDistance } from "../maps/helpers";
+-import { getUrlParameter } from "../maps/helpers";
+ import { minutesToDaysHoursMinutes } from "../maps/helpers";
+ import { haversineDistance } from "../maps/helpers";
+ 
+-export function addHighlightOnHover(polyline, map, polylineCoordinates, userSettings, distanceUnit) {
+-  const originalStyle = { color: "blue", opacity: userSettings.routeOpacity, weight: 3 };
+-  const highlightStyle = { color: "yellow", opacity: 1, weight: 5 };
++function pointToLineDistance(point, lineStart, lineEnd) {
++  const x = point.lat;
++  const y = point.lng;
++  const x1 = lineStart.lat;
++  const y1 = lineStart.lng;
++  const x2 = lineEnd.lat;
++  const y2 = lineEnd.lng;
+ 
+-  polyline.setStyle(originalStyle);
++  const A = x - x1;
++  const B = y - y1;
++  const C = x2 - x1;
++  const D = y2 - y1;
+ 
++  const dot = A * C + B * D;
++  const lenSq = C * C + D * D;
++  let param = -1;
++
++  if (lenSq !== 0) {
++    param = dot / lenSq;
++  }
++
++  let xx, yy;
++
++  if (param < 0) {
++    xx = x1;
++    yy = y1;
++  } else if (param > 1) {
++    xx = x2;
++    yy = y2;
++  } else {
++    xx = x1 + param * C;
++    yy = y1 + param * D;
++  }
++
++  const dx = x - xx;
++  const dy = y - yy;
++
++  return Math.sqrt(dx * dx + dy * dy);
++}
++
++export function calculateSpeed(point1, point2) {
++  if (!point1 || !point2 || !point1[4] || !point2[4]) {
++    console.warn('Invalid points for speed calculation:', { point1, point2 });
++    return 0;
++  }
++
++  const distanceKm = haversineDistance(point1[0], point1[1], point2[0], point2[1]); // in kilometers
++  const timeDiffSeconds = point2[4] - point1[4];
++
++  // Handle edge cases
++  if (timeDiffSeconds <= 0 || distanceKm <= 0) {
++    return 0;
++  }
++
++  const speedKmh = (distanceKm / timeDiffSeconds) * 3600; // Convert to km/h
++
++  // Cap speed at reasonable maximum (e.g., 150 km/h)
++  const MAX_SPEED = 150;
++  return Math.min(speedKmh, MAX_SPEED);
++}
++
++// Optimize getSpeedColor by pre-calculating color stops
++const colorStops = [
++  { speed: 0, color: '#00ff00' },    // Stationary/very slow (green)
++  { speed: 15, color: '#00ffff' },   // Walking/jogging (cyan)
++  { speed: 30, color: '#ff00ff' },   // Cycling/slow driving (magenta)
++  { speed: 50, color: '#ffff00' },   // Urban driving (yellow)
++  { speed: 100, color: '#ff3300' }   // Highway driving (red)
++].map(stop => ({
++  ...stop,
++  rgb: hexToRGB(stop.color)
++}));
++
++export function getSpeedColor(speedKmh, useSpeedColors) {
++  if (!useSpeedColors) {
++    return '#0000ff';
++  }
++
++  // Find the appropriate color segment
++  for (let i = 1; i < colorStops.length; i++) {
++    if (speedKmh <= colorStops[i].speed) {
++      const ratio = (speedKmh - colorStops[i-1].speed) / (colorStops[i].speed - colorStops[i-1].speed);
++      const color1 = colorStops[i-1].rgb;
++      const color2 = colorStops[i].rgb;
++
++      const r = Math.round(color1.r + (color2.r - color1.r) * ratio);
++      const g = Math.round(color1.g + (color2.g - color1.g) * ratio);
++      const b = Math.round(color1.b + (color2.b - color1.b) * ratio);
++
++      return `rgb(${r}, ${g}, ${b})`;
++    }
++  }
++
++  return colorStops[colorStops.length - 1].color;
++}
++
++// Helper function to convert hex to RGB
++function hexToRGB(hex) {
++  const r = parseInt(hex.slice(1, 3), 16);
++  const g = parseInt(hex.slice(3, 5), 16);
++  const b = parseInt(hex.slice(5, 7), 16);
++  return { r, g, b };
++}
++
++// Add new function for batch processing
++function processInBatches(items, batchSize, processFn) {
++  let index = 0;
++  const totalItems = items.length;
++
++  function processNextBatch() {
++    const batchStartTime = performance.now();
++    let processedInThisFrame = 0;
++
++    // Process as many items as possible within our time budget
++    while (index < totalItems && processedInThisFrame < 500) {
++      const end = Math.min(index + batchSize, totalItems);
++
++      // Ensure we're within bounds
++      for (let i = index; i < end; i++) {
++        if (items[i]) {  // Add null check
++          processFn(items[i]);
++        }
++      }
++
++      processedInThisFrame += (end - index);
++      index = end;
++
++      if (performance.now() - batchStartTime > 32) {
++        break;
++      }
++    }
++
++    if (index < totalItems) {
++      setTimeout(processNextBatch, 0);
++    } else {
++      // Only clear the array after all processing is complete
++      items.length = 0;
++    }
++  }
++
++  processNextBatch();
++}
++
++export function addHighlightOnHover(polylineGroup, map, polylineCoordinates, userSettings, distanceUnit) {
+   const startPoint = polylineCoordinates[0];
+   const endPoint = polylineCoordinates[polylineCoordinates.length - 1];
+ 
+@@ -28,66 +165,102 @@ export function addHighlightOnHover(polyline, map, polylineCoordinates, userSett
+   const startIcon = L.divIcon({ html: "🚥", className: "emoji-icon" });
+   const finishIcon = L.divIcon({ html: "🏁", className: "emoji-icon" });
+ 
+-  const isDebugMode = getUrlParameter("debug") === "true";
+-
+-  let popupContent = `
+-    <strong>Start:</strong> ${firstTimestamp}<br>
+-    <strong>End:</strong> ${lastTimestamp}<br>
+-    <strong>Duration:</strong> ${timeOnRoute}<br>
+-    <strong>Total Distance:</strong> ${formatDistance(totalDistance, distanceUnit)}<br>
+-  `;
+-
+-  if (isDebugMode) {
+-    const prevPoint = polylineCoordinates[0];
+-    const nextPoint = polylineCoordinates[polylineCoordinates.length - 1];
+-    const distanceToPrev = haversineDistance(prevPoint[0], prevPoint[1], startPoint[0], startPoint[1]);
+-    const distanceToNext = haversineDistance(endPoint[0], endPoint[1], nextPoint[0], nextPoint[1]);
+-
+-    const timeBetweenPrev = Math.round((startPoint[4] - prevPoint[4]) / 60);
+-    const timeBetweenNext = Math.round((endPoint[4] - nextPoint[4]) / 60);
+-    const pointsNumber = polylineCoordinates.length;
+-
+-    popupContent += `
+-      <strong>Prev Route:</strong> ${Math.round(distanceToPrev)}m and ${minutesToDaysHoursMinutes(timeBetweenPrev)} away<br>
+-      <strong>Next Route:</strong> ${Math.round(distanceToNext)}m and ${minutesToDaysHoursMinutes(timeBetweenNext)} away<br>
+-      <strong>Points:</strong> ${pointsNumber}<br>
+-    `;
+-  }
+-
+-  const startMarker = L.marker([startPoint[0], startPoint[1]], { icon: startIcon }).bindPopup(`Start: ${firstTimestamp}`);
+-  const endMarker = L.marker([endPoint[0], endPoint[1]], { icon: finishIcon }).bindPopup(popupContent);
++  const startMarker = L.marker([startPoint[0], startPoint[1]], { icon: startIcon });
++  const endMarker = L.marker([endPoint[0], endPoint[1]], { icon: finishIcon });
+ 
+   let hoverPopup = null;
+ 
+-  polyline.on("mouseover", function (e) {
+-    polyline.setStyle(highlightStyle);
++  polylineGroup.on("mouseover", function (e) {
++    let closestSegment = null;
++    let minDistance = Infinity;
++    let currentSpeed = 0;
++
++    polylineGroup.eachLayer((layer) => {
++      if (layer instanceof L.Polyline) {
++        const layerLatLngs = layer.getLatLngs();
++        const distance = pointToLineDistance(e.latlng, layerLatLngs[0], layerLatLngs[1]);
++
++        if (distance < minDistance) {
++          minDistance = distance;
++          closestSegment = layer;
++
++          const startIdx = polylineCoordinates.findIndex(p => {
++            const latMatch = Math.abs(p[0] - layerLatLngs[0].lat) < 0.0000001;
++            const lngMatch = Math.abs(p[1] - layerLatLngs[0].lng) < 0.0000001;
++            return latMatch && lngMatch;
++          });
++
++          if (startIdx !== -1 && startIdx < polylineCoordinates.length - 1) {
++            currentSpeed = calculateSpeed(
++              polylineCoordinates[startIdx],
++              polylineCoordinates[startIdx + 1]
++            );
++          }
++        }
++      }
++    });
++
++    // Apply highlight style to all segments
++    polylineGroup.eachLayer((layer) => {
++      if (layer instanceof L.Polyline) {
++        const highlightStyle = {
++          weight: 5,
++          opacity: 1
++        };
++
++        // Only change color to yellow if speed colors are disabled
++        if (!userSettings.speed_colored_routes) {
++          highlightStyle.color = '#ffff00';
++        }
++
++        layer.setStyle(highlightStyle);
++      }
++    });
++
+     startMarker.addTo(map);
+     endMarker.addTo(map);
+ 
+-    const latLng = e.latlng;
++    const popupContent = `
++      <strong>Start:</strong> ${firstTimestamp}<br>
++      <strong>End:</strong> ${lastTimestamp}<br>
++      <strong>Duration:</strong> ${timeOnRoute}<br>
++      <strong>Total Distance:</strong> ${formatDistance(totalDistance, distanceUnit)}<br>
++      <strong>Current Speed:</strong> ${Math.round(currentSpeed)} km/h
++    `;
++
+     if (hoverPopup) {
+       map.closePopup(hoverPopup);
+     }
++
+     hoverPopup = L.popup()
+-      .setLatLng(latLng)
++      .setLatLng(e.latlng)
+       .setContent(popupContent)
+       .openOn(map);
+   });
+ 
+-  polyline.on("mouseout", function () {
+-    polyline.setStyle(originalStyle);
+-    map.closePopup(hoverPopup);
++  polylineGroup.on("mouseout", function () {
++    // Restore original style
++    polylineGroup.eachLayer((layer) => {
++      if (layer instanceof L.Polyline) {
++        const originalStyle = {
++          weight: 3,
++          opacity: userSettings.route_opacity,
++          color: layer.options.originalColor // Use the stored original color
++        };
++
++        layer.setStyle(originalStyle);
++      }
++    });
++
++    if (hoverPopup) {
++      map.closePopup(hoverPopup);
++    }
+     map.removeLayer(startMarker);
+     map.removeLayer(endMarker);
+   });
+ 
+-  polyline.on("click", function () {
+-    map.fitBounds(polyline.getBounds());
+-  });
+-
+-  // Close the popup when clicking elsewhere on the map
+-  map.on("click", function () {
+-    map.closePopup(hoverPopup);
++  polylineGroup.on("click", function () {
++    map.fitBounds(polylineGroup.getBounds());
+   });
+ }
+ 
+@@ -121,26 +294,97 @@ export function createPolylinesLayer(markers, map, timezone, routeOpacity, userS
+ 
+   return L.layerGroup(
+     splitPolylines.map((polylineCoordinates) => {
+-      const latLngs = polylineCoordinates.map((point) => [point[0], point[1]]);
+-      const polyline = L.polyline(latLngs, {
+-        color: "blue",
+-        opacity: 0.6,
+-        weight: 3,
+-        zIndexOffset: 400,
+-        pane: 'overlayPane'
+-      });
++      const segmentGroup = L.featureGroup();
+ 
+-      addHighlightOnHover(polyline, map, polylineCoordinates, userSettings, distanceUnit);
++      for (let i = 0; i < polylineCoordinates.length - 1; i++) {
++        const speed = calculateSpeed(polylineCoordinates[i], polylineCoordinates[i + 1]);
+ 
+-      return polyline;
++        const color = getSpeedColor(speed, userSettings.speed_colored_routes);
++
++        const segment = L.polyline(
++          [
++            [polylineCoordinates[i][0], polylineCoordinates[i][1]],
++            [polylineCoordinates[i + 1][0], polylineCoordinates[i + 1][1]]
++          ],
++          {
++            color: color,
++            originalColor: color,
++            opacity: routeOpacity,
++            weight: 3,
++            speed: speed,  // Store the calculated speed
++            startTime: polylineCoordinates[i][4],
++            endTime: polylineCoordinates[i + 1][4]
++          }
++        );
++
++        segmentGroup.addLayer(segment);
++      }
++
++      addHighlightOnHover(segmentGroup, map, polylineCoordinates, userSettings, distanceUnit);
++
++      return segmentGroup;
+     })
+   ).addTo(map);
+ }
+ 
++export function updatePolylinesColors(polylinesLayer, useSpeedColors) {
++  const defaultStyle = {
++    color: '#0000ff',
++    originalColor: '#0000ff'
++  };
++
++  // More efficient segment collection
++  const segments = new Array();
++  polylinesLayer.eachLayer(groupLayer => {
++    if (groupLayer instanceof L.LayerGroup) {
++      groupLayer.eachLayer(segment => {
++        if (segment instanceof L.Polyline) {
++          segments.push(segment);
++        }
++      });
++    }
++  });
++
++  // Reuse style object to reduce garbage collection
++  const styleObj = {};
++
++  // Process segments in larger batches
++  processInBatches(segments, 200, (segment) => {
++    try {
++      if (!useSpeedColors) {
++        segment.setStyle(defaultStyle);
++        return;
++      }
++
++      const speed = segment.options.speed || 0;
++      const newColor = getSpeedColor(speed, true);
++
++      // Reuse style object
++      styleObj.color = newColor;
++      styleObj.originalColor = newColor;
++      segment.setStyle(styleObj);
++    } catch (error) {
++      console.error('Error processing segment:', error);
++    }
++  });
++}
++
+ export function updatePolylinesOpacity(polylinesLayer, opacity) {
+-  polylinesLayer.eachLayer((layer) => {
+-    if (layer instanceof L.Polyline) {
+-      layer.setStyle({ opacity: opacity });
++  const segments = [];
++
++  // Collect all segments first
++  polylinesLayer.eachLayer((groupLayer) => {
++    if (groupLayer instanceof L.LayerGroup) {
++      groupLayer.eachLayer((segment) => {
++        if (segment instanceof L.Polyline) {
++          segments.push(segment);
++        }
++      });
+     }
+   });
++
++  // Process segments in batches of 50
++  processInBatches(segments, 50, (segment) => {
++    segment.setStyle({ opacity: opacity });
++  });
+ }
+diff --git a/app/javascript/maps/popups.js b/app/javascript/maps/popups.js
+index 34a71224..dee74dc5 100644
+--- a/app/javascript/maps/popups.js
++++ b/app/javascript/maps/popups.js
+@@ -13,7 +13,7 @@ export function createPopupContent(marker, timezone, distanceUnit) {
+     <strong>Latitude:</strong> ${marker[0]}<br>
+     <strong>Longitude:</strong> ${marker[1]}<br>
+     <strong>Altitude:</strong> ${marker[3]}m<br>
+-    <strong>Velocity:</strong> ${marker[5]}km/h<br>
++    <strong>Speed:</strong> ${marker[5]}km/h<br>
+     <strong>Battery:</strong> ${marker[2]}%<br>
+     <strong>Id:</strong> ${marker[6]}<br>
+     <a href="#" data-id="${marker[6]}" class="delete-point">[Delete]</a>
+diff --git a/app/views/map/_settings_modals.html.erb b/app/views/map/_settings_modals.html.erb
+index 09ddd165..5a36b807 100644
+--- a/app/views/map/_settings_modals.html.erb
++++ b/app/views/map/_settings_modals.html.erb
+@@ -112,3 +112,32 @@
+   </div>
+   <label class="modal-backdrop" for="points_rendering_mode_info">Close</label>
+ </div>
++
++<input type="checkbox" id="speed_colored_routes_info" class="modal-toggle" />
++<div class="modal focus:z-99" role="dialog">
++  <div class="modal-box">
++    <h3 class="text-lg font-bold">Speed-colored routes</h3>
++    <p class="py-4">
++      This checkbox will color the routes based on the speed of each segment.
++    </p>
++    <p class="py-4">
++      Uncheck this checkbox if you want to disable the speed-colored routes.
++    </p>
++    <p class="py-4">
++      Speed coloring is based on the following color stops:
++
++      <code>
++        0 km/h — green, stationary or walking
++        <br>
++        15 km/h — cyan, jogging
++        <br>
++        30 km/h — magenta, cycling
++        <br>
++        50 km/h — yellow, urban driving
++        <br>
++        100 km/h — orange-red, highway driving
++      </code>
++    </p>
++  </div>
++  <label class="modal-backdrop" for="speed_colored_routes_info">Close</label>
++</div>
+diff --git a/app/views/map/index.html.erb b/app/views/map/index.html.erb
+index 7e36c225..d3c39f80 100644
+--- a/app/views/map/index.html.erb
++++ b/app/views/map/index.html.erb
+@@ -51,6 +51,8 @@
+         data-api_key="<%= current_user.api_key %>"
+         data-user_settings=<%= current_user.settings.to_json %>
+         data-coordinates="<%= @coordinates %>"
++        data-distance="<%= @distance %>"
++        data-points_number="<%= @points_number %>"
+         data-timezone="<%= Rails.configuration.time_zone %>">
+         <div data-maps-target="container" class="h-[25rem] rounded-lg w-full min-h-screen">
+           <div id="fog" class="fog"></div>

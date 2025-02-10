@@ -1,0 +1,930 @@
+diff --git a/tests/e2e/common/diagnostics/collector.go b/tests/e2e/common/diagnostics/collector.go
+new file mode 100644
+index 000000000..fd3635ee7
+--- /dev/null
++++ b/tests/e2e/common/diagnostics/collector.go
+@@ -0,0 +1,111 @@
++/**
++# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++**/
++
++package diagnostics
++
++import (
++	"context"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/klog/v2"
++	nfdclient "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
++	"sigs.k8s.io/yaml"
++)
++
++type Collector interface {
++	Collect(context.Context) error
++}
++
++type Config struct {
++	Clientset kubernetes.Interface
++	NfdClient *nfdclient.Clientset
++
++	artifactDir string
++	namespace   string
++
++	log io.Writer
++}
++
++func (c *Config) createFile(fp string) (io.WriteCloser, error) {
++	outfile, err := os.Create(filepath.Join(c.artifactDir, c.namespace, fp))
++	if err != nil {
++		return nil, fmt.Errorf("error creating %v: %w", fp, err)
++	}
++	return outfile, nil
++}
++
++func (c *Config) writeToFile(w io.Writer, data interface{}) error {
++	// Marshal data to YAML format
++	yamlBytes, err := yaml.Marshal(data)
++	if err != nil {
++		return fmt.Errorf("error marshalling data: %w", err)
++	}
++
++	// Write marshaled bytes to the provided io.Writer
++	_, err = w.Write(yamlBytes)
++	if err != nil {
++		return fmt.Errorf("error writing to file: %w", err)
++	}
++
++	return nil
++}
++
++func (c *Config) outputTo(filename string, objects interface{}) error {
++	outputfile, err := c.createFile(filename)
++	if err != nil {
++		return fmt.Errorf("error creating %v: %w", filename, err)
++	}
++	defer outputfile.Close()
++	if err = c.writeToFile(outputfile, objects); err != nil {
++		return fmt.Errorf("error writing to %v: %w", filename, err)
++	}
++	return nil
++}
++
++func (d *Diagnostic) Collect(ctx context.Context) error {
++	// Create the artifact directory
++	if err := os.MkdirAll(filepath.Join(d.Config.artifactDir, d.Config.namespace), os.ModePerm); err != nil {
++		return fmt.Errorf("error creating artifact directory: %w", err)
++	}
++
++	// Redirect stdout and stderr to logs
++	logFile, err := d.createFile("diagnostic_collector.log")
++	if err != nil {
++		return fmt.Errorf("error creating collector log file: %w", err)
++	}
++	defer logFile.Close()
++	d.log = logFile
++
++	// configure klog to write to the log file
++	klog.SetOutput(d.log)
++
++	if len(d.collectors) == 0 {
++		klog.Warning("No collectors to run")
++	}
++
++	// Run the collectors
++	for _, c := range d.collectors {
++		if err := c.Collect(ctx); err != nil {
++			klog.ErrorS(err, "Error running collector")
++		}
++	}
++
++	return nil
++}
+diff --git a/tests/e2e/common/diagnostics/extensions.go b/tests/e2e/common/diagnostics/extensions.go
+new file mode 100644
+index 000000000..184917b5c
+--- /dev/null
++++ b/tests/e2e/common/diagnostics/extensions.go
+@@ -0,0 +1,58 @@
++/**
++# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++**/
++
++package diagnostics
++
++import (
++	"context"
++	"fmt"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++type nodeFeatures struct {
++	*Config
++}
++
++type nodeFeatureRules struct {
++	*Config
++}
++
++func (c nodeFeatures) Collect(ctx context.Context) error {
++	nfs, err := c.NfdClient.NfdV1alpha1().NodeFeatures(c.namespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("nodefeatures.yaml", nfs); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c nodeFeatureRules) Collect(ctx context.Context) error {
++	nfrs, err := c.NfdClient.NfdV1alpha1().NodeFeatureRules().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("nodefeaturerules.yaml", nfrs); err != nil {
++		return err
++	}
++
++	return nil
++}
+diff --git a/tests/e2e/common/diagnostics/kubernetes.go b/tests/e2e/common/diagnostics/kubernetes.go
+new file mode 100644
+index 000000000..fbfef1b91
+--- /dev/null
++++ b/tests/e2e/common/diagnostics/kubernetes.go
+@@ -0,0 +1,165 @@
++/**
++# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++**/
++
++package diagnostics
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"fmt"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++)
++
++type nodes struct {
++	*Config
++}
++
++type namespaces struct {
++	*Config
++}
++
++type pods struct {
++	*Config
++}
++
++type deployments struct {
++	*Config
++}
++
++type daemonsets struct {
++	*Config
++}
++
++type jobs struct {
++	*Config
++}
++
++func (c nodes) Collect(ctx context.Context) error {
++	nodes, err := c.Clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("nodes.yaml", nodes); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c namespaces) Collect(ctx context.Context) error {
++	namespaces, err := c.Clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("namespaces.yaml", namespaces); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c daemonsets) Collect(ctx context.Context) error {
++	daemonsets, err := c.Clientset.AppsV1().DaemonSets(c.namespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("daemonsets.yaml", daemonsets); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c deployments) Collect(ctx context.Context) error {
++	deployments, err := c.Clientset.AppsV1().Deployments(c.namespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("deployments.yaml", deployments); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++func (c pods) Collect(ctx context.Context) error {
++	pods, err := c.Config.Clientset.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("pods.yaml", pods); err != nil {
++		return err
++	}
++
++	var errs error
++	for _, pod := range pods.Items {
++		errs = errors.Join(err, podLogCollector{c.Config, pod.Name}.Collect(ctx))
++	}
++
++	return errs
++}
++
++func (c jobs) Collect(ctx context.Context) error {
++	jobs, err := c.Clientset.BatchV1().Jobs(c.namespace).List(ctx, metav1.ListOptions{})
++	if err != nil {
++		return fmt.Errorf("error collecting %T: %w", c, err)
++	}
++
++	if err := c.outputTo("jobs.yaml", jobs); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++type podLogCollector struct {
++	*Config
++	name string
++}
++
++func (c podLogCollector) Collect(ctx context.Context) error {
++	podLogFile, err := c.createFile(fmt.Sprintf("%s.log", c.name))
++	if err != nil {
++		return fmt.Errorf("error creating podLogFile: %w", err)
++	}
++	defer podLogFile.Close()
++
++	req := c.Clientset.CoreV1().Pods(c.namespace).GetLogs(c.name, &v1.PodLogOptions{})
++	podLogs, err := req.Stream(ctx)
++	if err != nil {
++		return fmt.Errorf("error getting pod logs: %w", err)
++	}
++
++	buf := bufio.NewScanner(podLogs)
++	for buf.Scan() {
++		if _, err := podLogFile.Write(buf.Bytes()); err != nil {
++			return fmt.Errorf("error getting pod logs: %w", err)
++		}
++	}
++	if err := buf.Err(); err != nil {
++		return fmt.Errorf("error reading pod log: %w", err)
++	}
++
++	return nil
++}
+diff --git a/tests/e2e/common/diagnostics/options.go b/tests/e2e/common/diagnostics/options.go
+new file mode 100644
+index 000000000..891103e5e
+--- /dev/null
++++ b/tests/e2e/common/diagnostics/options.go
+@@ -0,0 +1,119 @@
++/**
++# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++**/
++
++package diagnostics
++
++import (
++	"k8s.io/client-go/kubernetes"
++	"k8s.io/klog/v2"
++	nfdclient "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
++)
++
++const (
++	// the core group
++	Pods       = "pods"
++	Nodes      = "nodes"
++	Namespaces = "namespaces"
++
++	// the apps group
++	Deployments = "deployments"
++	DaemonSets  = "daemonsets"
++
++	// the batch group
++	Jobs = "jobs"
++
++	// Supported extensions
++	NodeFeature     = "nodeFeature"
++	NodeFeatureRule = "nodeFeatureRule"
++)
++
++type Diagnostic struct {
++	*Config
++	collectors []Collector
++}
++
++type Option func(*Diagnostic)
++
++func WithNamespace(namespace string) func(*Diagnostic) {
++	return func(d *Diagnostic) {
++		d.Config.namespace = namespace
++	}
++}
++
++func WithArtifactDir(artifactDir string) func(*Diagnostic) {
++	return func(d *Diagnostic) {
++		d.Config.artifactDir = artifactDir
++	}
++}
++
++func WithKubernetesClient(clientset kubernetes.Interface) func(*Diagnostic) {
++	return func(d *Diagnostic) {
++		d.Clientset = clientset
++	}
++}
++
++func WithNFDClient(nfdClient *nfdclient.Clientset) func(*Diagnostic) {
++	return func(d *Diagnostic) {
++		d.NfdClient = nfdClient
++	}
++}
++
++func WithObjects(objects ...string) func(*Diagnostic) {
++	return func(d *Diagnostic) {
++		seen := make(map[string]bool)
++		for _, obj := range objects {
++			if seen[obj] {
++				continue
++			}
++			seen[obj] = true
++			switch obj {
++			case Nodes:
++				d.collectors = append(d.collectors, nodes{Config: d.Config})
++			case Namespaces:
++				d.collectors = append(d.collectors, namespaces{Config: d.Config})
++			case Pods:
++				d.collectors = append(d.collectors, pods{Config: d.Config})
++			case Deployments:
++				d.collectors = append(d.collectors, deployments{Config: d.Config})
++			case DaemonSets:
++				d.collectors = append(d.collectors, daemonsets{Config: d.Config})
++			case Jobs:
++				d.collectors = append(d.collectors, jobs{Config: d.Config})
++			case NodeFeature:
++				d.collectors = append(d.collectors, nodeFeatures{Config: d.Config})
++			case NodeFeatureRule:
++				d.collectors = append(d.collectors, nodeFeatureRules{Config: d.Config})
++			default:
++				klog.Warningf("Unsupported object %s", obj)
++				continue
++			}
++		}
++	}
++}
++
++func New(opts ...Option) (*Diagnostic, error) {
++	c := &Config{}
++	dc := &Diagnostic{
++		Config: c,
++	}
++
++	// use the variadic function to set the options
++	for _, opt := range opts {
++		opt(dc)
++	}
++
++	return dc, nil
++}
+diff --git a/tests/e2e/common/mustgather.go b/tests/e2e/common/mustgather.go
+deleted file mode 100644
+index 2d6028f1d..000000000
+--- a/tests/e2e/common/mustgather.go
++++ /dev/null
+@@ -1,253 +0,0 @@
+-/**
+-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-**/
+-
+-package common
+-
+-import (
+-	"context"
+-	"fmt"
+-	"os"
+-	"path/filepath"
+-
+-	"sigs.k8s.io/yaml"
+-
+-	v1 "k8s.io/api/core/v1"
+-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+-	"k8s.io/client-go/kubernetes"
+-	"k8s.io/client-go/tools/clientcmd"
+-)
+-
+-func MustGather(component, namespace, artifactDir string) error {
+-	// Get the kubeconfig
+-	kubeconfig := os.Getenv("KUBECONFIG")
+-
+-	// Create the ARTIFACT_DIR
+-	if err := os.MkdirAll(artifactDir, os.ModePerm); err != nil {
+-		return err
+-	}
+-
+-	// Redirect stdout and stderr to logs
+-	logFile, err := os.Create(filepath.Join(artifactDir, "must-gather.log"))
+-	if err != nil {
+-		return err
+-	}
+-	defer logFile.Close()
+-	errLogFile, err := os.Create(filepath.Join(artifactDir, "must-gather.stderr.log"))
+-	if err != nil {
+-		return err
+-	}
+-	defer errLogFile.Close()
+-
+-	// Create the Kubernetes client
+-	clientset, err := createKubernetesClient(kubeconfig)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating Kubernetes client: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	// Get all Nodes
+-	nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error getting nodes: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	nodesFile, err := os.Create(filepath.Join(artifactDir, "nodes.yaml"))
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating nodes.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-	defer nodesFile.Close()
+-
+-	data, err := yaml.Marshal(nodes)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error marshalling nodes: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	_, err = nodesFile.Write(data)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error writing nodes.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	// Get Namespaces
+-	namespaces, err := clientset.CoreV1().Namespaces().List(context.Background(), metav1.ListOptions{})
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error getting namespaces: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	namespacesFile, err := os.Create(filepath.Join(artifactDir, "namespaces.yaml"))
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating namespaces.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-	defer namespacesFile.Close()
+-
+-	data, err = yaml.Marshal(namespaces)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error marshalling namespaces: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	_, err = namespacesFile.Write(data)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error writing namespaces.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	// Get DaemonSets
+-	daemonSets, err := clientset.AppsV1().DaemonSets(namespace).List(context.Background(), metav1.ListOptions{})
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error getting daemonSets: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	daemonSetsFile, err := os.Create(filepath.Join(artifactDir, "daemonsets.yaml"))
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating daemonsets.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-	defer daemonSetsFile.Close()
+-
+-	data, err = yaml.Marshal(daemonSets)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error marshalling daemonSets: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	_, err = daemonSetsFile.Write(data)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error writing daemonsets.yaml: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	// Get all pods in the target namespace
+-	podList, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error getting pods: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	pods, err := os.Create(filepath.Join(artifactDir, fmt.Sprintf("%s_pods.yaml", component)))
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating %s_pods.yaml: %v\n", component, err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-	defer pods.Close()
+-
+-	data, err = yaml.Marshal(podList)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error marshalling podList: %v\n", err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-		}
+-		return err
+-	}
+-
+-	_, err = pods.Write(data)
+-	if err != nil {
+-		if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error writing %s_pods.yaml: %v\n", component, err)); lerr != nil {
+-			err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-			return err
+-		}
+-		return err
+-	}
+-
+-	// Get logs per pod
+-	for _, pod := range podList.Items {
+-		componentLogs, err := os.Create(filepath.Join(artifactDir, fmt.Sprintf("%s_logs.log", pod.Name)))
+-		if err != nil {
+-			if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error creating %s_logs.log: %v\n", pod.Name, err)); lerr != nil {
+-				err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-			}
+-			return err
+-		}
+-		defer componentLogs.Close()
+-
+-		podLogOpts := v1.PodLogOptions{}
+-		req := clientset.CoreV1().Pods(namespace).GetLogs(pod.Name, &podLogOpts)
+-		podLogs, err := req.Stream(context.Background())
+-		if err != nil {
+-			if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error getting pod logs: %v\n", err)); lerr != nil {
+-				err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-			}
+-			return err
+-		}
+-		defer podLogs.Close()
+-
+-		buf := make([]byte, 4096)
+-		for {
+-			n, err := podLogs.Read(buf)
+-			if err != nil {
+-				break
+-			}
+-			_, err = componentLogs.Write(buf[:n])
+-			if err != nil {
+-				if _, lerr := errLogFile.WriteString(fmt.Sprintf("Error writing pod logs: %v\n", err)); lerr != nil {
+-					err = fmt.Errorf("%v+ error writing to stderr log file: %v", err, lerr)
+-				}
+-				return err
+-			}
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-func createKubernetesClient(kubeconfig string) (*kubernetes.Clientset, error) {
+-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	clientset, err := kubernetes.NewForConfig(config)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return clientset, nil
+-}
+diff --git a/tests/e2e/device-plugin_test.go b/tests/e2e/device-plugin_test.go
+index 1245cd4a9..276d638ea 100644
+--- a/tests/e2e/device-plugin_test.go
++++ b/tests/e2e/device-plugin_test.go
+@@ -20,7 +20,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"os"
+-	"path/filepath"
++	"strings"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -34,6 +34,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/util/rand"
+ 
+ 	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/common"
++	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/common/diagnostics"
+ 	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/framework"
+ 	e2elog "github.com/NVIDIA/k8s-device-plugin/tests/e2e/framework/logs"
+ )
+@@ -57,8 +58,20 @@ var _ = NVDescribe("GPU Device Plugin", func() {
+ 			chartSpec       helm.ChartSpec
+ 			helmReleaseName string
+ 			kubeconfig      []byte
++
++			collectLogsFrom      []string
++			diagnosticsCollector *diagnostics.Diagnostic
+ 		)
+ 
++		defaultCollectorObjects := []string{
++			"pods",
++			"nodes",
++			"namespaces",
++			"deployments",
++			"demonsets",
++			"jobs",
++		}
++
+ 		values := helmValues.Options{
+ 			Values: []string{
+ 				fmt.Sprintf("image.repository=%s", *ImageRepo),
+@@ -71,6 +84,12 @@ var _ = NVDescribe("GPU Device Plugin", func() {
+ 			},
+ 		}
+ 
++		// check Collector objects
++		collectLogsFrom = defaultCollectorObjects
++		if *CollectLogsFrom != "" && *CollectLogsFrom != "default" {
++			collectLogsFrom = strings.Split(*CollectLogsFrom, ",")
++		}
++
+ 		BeforeAll(func(ctx context.Context) {
+ 			var err error
+ 			// Create clients for apiextensions and our CRD api
+@@ -108,9 +127,22 @@ var _ = NVDescribe("GPU Device Plugin", func() {
+ 
+ 		// Cleanup before next test run
+ 		AfterEach(func(ctx context.Context) {
+-			// Gather logs
++			// Run diagnostic collector if test failed
+ 			if CurrentSpecReport().Failed() {
+-				_ = common.MustGather("k8s-device-plugin", f.Namespace.Name, filepath.Join(*LogArtifactDir, f.UniqueName))
++				var err error
++				diagnosticsCollector, err = diagnostics.New(
++					diagnostics.WithNamespace(f.Namespace.Name),
++					diagnostics.WithArtifactDir(*LogArtifactDir),
++					diagnostics.WithKubernetesClient(f.ClientSet),
++					diagnostics.WithObjects(collectLogsFrom...),
++				)
++				if err != nil {
++					e2elog.Logf("Failed to create diagnostic collector: %v", err)
++				} else {
++					if err = diagnosticsCollector.Collect(ctx); err != nil {
++						e2elog.Logf("Diagnostic collector failed: %v", err)
++					}
++				}
+ 			}
+ 			// Delete Helm release
+ 			err := helmClient.UninstallReleaseByName(helmReleaseName)
+diff --git a/tests/e2e/e2e_test.go b/tests/e2e/e2e_test.go
+index f80098e67..207f3b713 100644
+--- a/tests/e2e/e2e_test.go
++++ b/tests/e2e/e2e_test.go
+@@ -37,6 +37,7 @@ var (
+ 	ImageRepo             = flag.String("image.repo", "", "Image repository to fetch image from")
+ 	ImageTag              = flag.String("image.tag", "", "Image tag to use")
+ 	ImagePullPolicy       = flag.String("image.pull-policy", "IfNotPresent", "Image pull policy")
++	CollectLogsFrom       = flag.String("collect-logs-from", "default", "Comma separated list of objects to collect logs from after test")
+ )
+ 
+ func TestMain(m *testing.M) {
+diff --git a/tests/e2e/gpu-feature-discovery_test.go b/tests/e2e/gpu-feature-discovery_test.go
+index c17d14dc6..2fc3facb9 100644
+--- a/tests/e2e/gpu-feature-discovery_test.go
++++ b/tests/e2e/gpu-feature-discovery_test.go
+@@ -20,7 +20,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"os"
+-	"path/filepath"
++	"strings"
+ 	"time"
+ 
+ 	. "github.com/onsi/ginkgo/v2"
+@@ -35,6 +35,7 @@ import (
+ 	nfdclient "sigs.k8s.io/node-feature-discovery/pkg/generated/clientset/versioned"
+ 
+ 	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/common"
++	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/common/diagnostics"
+ 	"github.com/NVIDIA/k8s-device-plugin/tests/e2e/framework"
+ 	e2elog "github.com/NVIDIA/k8s-device-plugin/tests/e2e/framework/logs"
+ )
+@@ -63,6 +64,15 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 		"nvidia.com/mps.capable":          "[true|false]",
+ 	}
+ 
++	defaultCollectorObjects := []string{
++		"pods",
++		"nodes",
++		"namespaces",
++		"deployments",
++		"demonsets",
++		"nodefeatures",
++	}
++
+ 	Context("When deploying GFD", Ordered, func() {
+ 		// helm-chart is required
+ 		if *HelmChart == "" {
+@@ -79,6 +89,9 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 			chartSpec       helm.ChartSpec
+ 			helmReleaseName string
+ 			kubeconfig      []byte
++
++			collectLogsFrom      []string
++			diagnosticsCollector diagnostics.Collector
+ 		)
+ 
+ 		values := helmValues.Options{
+@@ -90,6 +103,7 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 				"devicePlugin.enabled=false",
+ 			},
+ 		}
++
+ 		// checkNodeFeatureObject is a helper function to check if NodeFeature object was created
+ 		checkNodeFeatureObject := func(ctx context.Context, name string) bool {
+ 			gfdNodeFeature := fmt.Sprintf("nvidia-features-for-%s", name)
+@@ -97,6 +111,12 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 			return err == nil
+ 		}
+ 
++		// check Collector objects
++		collectLogsFrom = defaultCollectorObjects
++		if *CollectLogsFrom != "" && *CollectLogsFrom != "default" {
++			collectLogsFrom = strings.Split(*CollectLogsFrom, ",")
++		}
++
+ 		BeforeAll(func(ctx context.Context) {
+ 			var err error
+ 			// Create clients for apiextensions and our CRD api
+@@ -127,6 +147,7 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 				ValuesOptions: values,
+ 				CleanupOnFail: true,
+ 			}
++
+ 			helmClient, err = helm.NewClientFromKubeConf(opt)
+ 			Expect(err).NotTo(HaveOccurred())
+ 
+@@ -136,9 +157,23 @@ var _ = NVDescribe("GPU Feature Discovery", func() {
+ 
+ 		// Cleanup before next test run
+ 		AfterEach(func(ctx context.Context) {
+-			// Gather logs
++			// Run diagnostic collector if test failed
+ 			if CurrentSpecReport().Failed() {
+-				_ = common.MustGather("gpu-feature-discovery", f.Namespace.Name, filepath.Join(*LogArtifactDir, f.UniqueName))
++				var err error
++				diagnosticsCollector, err = diagnostics.New(
++					diagnostics.WithNamespace(f.Namespace.Name),
++					diagnostics.WithArtifactDir(*LogArtifactDir),
++					diagnostics.WithKubernetesClient(f.ClientSet),
++					diagnostics.WithNFDClient(nfdClient),
++					diagnostics.WithObjects(collectLogsFrom...),
++				)
++				if err != nil {
++					e2elog.Logf("Failed to create diagnostic collector: %v", err)
++				} else {
++					if err = diagnosticsCollector.Collect(ctx); err != nil {
++						e2elog.Logf("Diagnostic collector failed: %v", err)
++					}
++				}
+ 			}
+ 			// Delete Helm release
+ 			err := helmClient.UninstallReleaseByName(helmReleaseName)

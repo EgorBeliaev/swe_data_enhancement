@@ -1,0 +1,249 @@
+diff --git a/config/allconfig/allconfig.go b/config/allconfig/allconfig.go
+index 4d65d5f2bab..ceb63048026 100644
+--- a/config/allconfig/allconfig.go
++++ b/config/allconfig/allconfig.go
+@@ -301,6 +301,18 @@ func (c *Config) CompileConfig(logger loggers.Logger) error {
+ 		}
+ 	}
+ 
++	defaultOutputFormat := outputFormats[0]
++	c.DefaultOutputFormat = strings.ToLower(c.DefaultOutputFormat)
++	if c.DefaultOutputFormat != "" {
++		f, found := outputFormats.GetByName(c.DefaultOutputFormat)
++		if !found {
++			return fmt.Errorf("unknown default output format %q", c.DefaultOutputFormat)
++		}
++		defaultOutputFormat = f
++	} else {
++		c.DefaultOutputFormat = defaultOutputFormat.Name
++	}
++
+ 	disabledLangs := make(map[string]bool)
+ 	for _, lang := range c.DisableLanguages {
+ 		disabledLangs[lang] = true
+@@ -391,22 +403,23 @@ func (c *Config) CompileConfig(logger loggers.Logger) error {
+ 	}
+ 
+ 	c.C = &ConfigCompiled{
+-		Timeout:           timeout,
+-		BaseURL:           baseURL,
+-		BaseURLLiveReload: baseURL,
+-		DisabledKinds:     disabledKinds,
+-		DisabledLanguages: disabledLangs,
+-		IgnoredLogs:       ignoredLogIDs,
+-		KindOutputFormats: kindOutputFormats,
+-		ContentTypes:      media.DefaultContentTypes.FromTypes(c.MediaTypes.Config),
+-		CreateTitle:       helpers.GetTitleFunc(c.TitleCaseStyle),
+-		IsUglyURLSection:  isUglyURL,
+-		IgnoreFile:        ignoreFile,
+-		SegmentFilter:     c.Segments.Config.Get(func(s string) { logger.Warnf("Render segment %q not found in configuration", s) }, c.RootConfig.RenderSegments...),
+-		MainSections:      c.MainSections,
+-		Clock:             clock,
+-		HTTPCache:         httpCache,
+-		transientErr:      transientErr,
++		Timeout:             timeout,
++		BaseURL:             baseURL,
++		BaseURLLiveReload:   baseURL,
++		DisabledKinds:       disabledKinds,
++		DisabledLanguages:   disabledLangs,
++		IgnoredLogs:         ignoredLogIDs,
++		KindOutputFormats:   kindOutputFormats,
++		DefaultOutputFormat: defaultOutputFormat,
++		ContentTypes:        media.DefaultContentTypes.FromTypes(c.MediaTypes.Config),
++		CreateTitle:         helpers.GetTitleFunc(c.TitleCaseStyle),
++		IsUglyURLSection:    isUglyURL,
++		IgnoreFile:          ignoreFile,
++		SegmentFilter:       c.Segments.Config.Get(func(s string) { logger.Warnf("Render segment %q not found in configuration", s) }, c.RootConfig.RenderSegments...),
++		MainSections:        c.MainSections,
++		Clock:               clock,
++		HTTPCache:           httpCache,
++		transientErr:        transientErr,
+ 	}
+ 
+ 	for _, s := range allDecoderSetups {
+@@ -430,22 +443,23 @@ func (c *Config) IsLangDisabled(lang string) bool {
+ 
+ // ConfigCompiled holds values and functions that are derived from the config.
+ type ConfigCompiled struct {
+-	Timeout           time.Duration
+-	BaseURL           urls.BaseURL
+-	BaseURLLiveReload urls.BaseURL
+-	ServerInterface   string
+-	KindOutputFormats map[string]output.Formats
+-	ContentTypes      media.ContentTypes
+-	DisabledKinds     map[string]bool
+-	DisabledLanguages map[string]bool
+-	IgnoredLogs       map[string]bool
+-	CreateTitle       func(s string) string
+-	IsUglyURLSection  func(section string) bool
+-	IgnoreFile        func(filename string) bool
+-	SegmentFilter     segments.SegmentFilter
+-	MainSections      []string
+-	Clock             time.Time
+-	HTTPCache         httpcache.ConfigCompiled
++	Timeout             time.Duration
++	BaseURL             urls.BaseURL
++	BaseURLLiveReload   urls.BaseURL
++	ServerInterface     string
++	KindOutputFormats   map[string]output.Formats
++	DefaultOutputFormat output.Format
++	ContentTypes        media.ContentTypes
++	DisabledKinds       map[string]bool
++	DisabledLanguages   map[string]bool
++	IgnoredLogs         map[string]bool
++	CreateTitle         func(s string) string
++	IsUglyURLSection    func(section string) bool
++	IgnoreFile          func(filename string) bool
++	SegmentFilter       segments.SegmentFilter
++	MainSections        []string
++	Clock               time.Time
++	HTTPCache           httpcache.ConfigCompiled
+ 
+ 	// This is set to the last transient error found during config compilation.
+ 	// With themes/modules we compute the configuration in multiple passes, and
+@@ -505,6 +519,10 @@ type RootConfig struct {
+ 	// Set this to true to put all languages below their language ID.
+ 	DefaultContentLanguageInSubdir bool
+ 
++	// The default output format to use for the site.
++	// If not set, we will use the first output format.
++	DefaultOutputFormat string
++
+ 	// Disable generation of redirect to the default language when DefaultContentLanguageInSubdir is enabled.
+ 	DisableDefaultLanguageRedirect bool
+ 
+diff --git a/hugolib/content_render_hooks_test.go b/hugolib/content_render_hooks_test.go
+index 3e599f946b6..de8eb720f22 100644
+--- a/hugolib/content_render_hooks_test.go
++++ b/hugolib/content_render_hooks_test.go
+@@ -79,6 +79,63 @@ xml-heading: Heading in p2|
+ `)
+ }
+ 
++// Issue 13242.
++func TestRenderHooksRSSOnly(t *testing.T) {
++	files := `
++-- hugo.toml --
++baseURL = "https://example.org"
++disableKinds = ["taxonomy", "term"]
++-- layouts/index.html --
++{{ $p := site.GetPage "p1.md" }}
++{{ $p2 := site.GetPage "p2.md" }}
++P1: {{ $p.Content }}
++P2: {{ $p2.Content }}
++-- layouts/index.xml --
++{{ $p2 := site.GetPage "p2.md" }}
++{{ $p3 := site.GetPage "p3.md" }}
++P2: {{ $p2.Content }}
++P3: {{ $p3.Content }}
++-- layouts/_default/_markup/render-link.rss.xml --
++xml-link: {{ .Destination | safeURL }}|
++-- layouts/_default/_markup/render-heading.rss.xml --
++xml-heading: {{ .Text }}|
++-- content/p1.md --
++---
++title: "p1"
++---
++P1. [I'm an inline-style link](https://www.gohugo.io)
++
++# Heading in p1
++
++-- content/p2.md --
++---
++title: "p2"
++---
++P2. [I'm an inline-style link](https://www.bep.is)
++
++# Heading in p2
++
++-- content/p3.md --
++---
++title: "p3"
++outputs: ["rss"]
++---
++P3. [I'm an inline-style link](https://www.example.org)
++`
++	b := Test(t, files)
++
++	b.AssertFileContent("public/index.html", `
++P1: <p>P1. <a href="https://www.gohugo.io">I&rsquo;m an inline-style link</a></p>
++<h1 id="heading-in-p1">Heading in p1</h1>
++<h1 id="heading-in-p2">Heading in p2</h1>
++`)
++	b.AssertFileContent("public/index.xml", `
++P2: <p>P2. xml-link: https://www.bep.is|</p>
++P3: <p>P3. xml-link: https://www.example.org|</p>
++xml-heading: Heading in p2|
++`)
++}
++
+ // https://github.com/gohugoio/hugo/issues/6629
+ func TestRenderLinkWithMarkupInText(t *testing.T) {
+ 	b := newTestSitesBuilder(t)
+diff --git a/hugolib/page__per_output.go b/hugolib/page__per_output.go
+index 6ebddbe442e..7c6395e57b5 100644
+--- a/hugolib/page__per_output.go
++++ b/hugolib/page__per_output.go
+@@ -318,7 +318,9 @@ func (pco *pageContentOutput) initRenderHooks() error {
+ 				}
+ 				if found {
+ 					if isitp, ok := templ.(tpl.IsInternalTemplateProvider); ok && isitp.IsInternalTemplate() {
++
+ 						renderHookConfig := pco.po.p.s.conf.Markup.Goldmark.RenderHooks
++
+ 						switch templ.Name() {
+ 						case "_default/_markup/render-link.html":
+ 							if !renderHookConfig.Link.IsEnableDefault() {
+@@ -335,17 +337,20 @@ func (pco *pageContentOutput) initRenderHooks() error {
+ 			}
+ 
+ 			templ, found1 := getHookTemplate(pco.po.f)
+-
+ 			if !found1 || pco.po.p.reusePageOutputContent() {
++				defaultOutputFormat := pco.po.p.s.conf.C.DefaultOutputFormat
++
++				candidates := pco.po.p.s.renderFormats
++
+ 				// Some hooks may only be available in HTML, and if
+ 				// this site is configured to not have HTML output, we need to
+ 				// make sure we have a fallback. This should be very rare.
+-				candidates := pco.po.p.s.renderFormats
+ 				if pco.po.f.MediaType.FirstSuffix.Suffix != "html" {
+ 					if _, found := candidates.GetBySuffix("html"); !found {
+ 						candidates = append(candidates, output.HTMLFormat)
+ 					}
+ 				}
++
+ 				// Check if some of the other output formats would give a different template.
+ 				for _, f := range candidates {
+ 					if f.Name == pco.po.f.Name {
+@@ -354,7 +359,7 @@ func (pco *pageContentOutput) initRenderHooks() error {
+ 					templ2, found2 := getHookTemplate(f)
+ 
+ 					if found2 {
+-						if !found1 {
++						if !found1 && f.Name == defaultOutputFormat.Name {
+ 							templ = templ2
+ 							found1 = true
+ 							break
+@@ -367,6 +372,7 @@ func (pco *pageContentOutput) initRenderHooks() error {
+ 					}
+ 				}
+ 			}
++
+ 			if !found1 {
+ 				if tp == hooks.CodeBlockRendererType {
+ 					// No user provided template for code blocks, so we use the native Go version -- which is also faster.
+diff --git a/hugolib/rebuild_test.go b/hugolib/rebuild_test.go
+index 42e1b8ed521..793263e0409 100644
+--- a/hugolib/rebuild_test.go
++++ b/hugolib/rebuild_test.go
+@@ -208,7 +208,7 @@ func TestRebuildRenameTextFileInLeafBundle(t *testing.T) {
+ 		b.RenameFile("content/mysection/mysectionbundle/mysectionbundletext.txt", "content/mysection/mysectionbundle/mysectionbundletext2.txt").Build()
+ 		b.AssertFileContent("public/mysection/mysectionbundle/index.html", "mysectionbundletext2", "My Section Bundle Text 2 Content.", "Len Resources: 2|")
+ 		b.AssertRenderCountPage(8)
+-		b.AssertRenderCountContent(8)
++		b.AssertRenderCountContent(9)
+ 	})
+ }
+ 

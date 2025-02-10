@@ -1,0 +1,2157 @@
+diff --git a/cmd/gpu-feature-discovery/main.go b/cmd/gpu-feature-discovery/main.go
+index a6f229773..ad5a9e466 100644
+--- a/cmd/gpu-feature-discovery/main.go
++++ b/cmd/gpu-feature-discovery/main.go
+@@ -14,6 +14,10 @@ import (
+ 	"github.com/urfave/cli/v2"
+ 	"k8s.io/klog/v2"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	nvinfo "github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
++	"github.com/NVIDIA/go-nvml/pkg/nvml"
++
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+ 	"github.com/NVIDIA/k8s-device-plugin/internal/flags"
+ 	"github.com/NVIDIA/k8s-device-plugin/internal/info"
+@@ -166,7 +170,14 @@ func start(c *cli.Context, cfg *Config) error {
+ 		}
+ 		klog.Infof("\nRunning with config:\n%v", string(configJSON))
+ 
+-		manager := resource.NewManager(config)
++		nvmllib := nvml.New()
++		devicelib := device.New(nvmllib)
++		infolib := nvinfo.New(
++			nvinfo.WithNvmlLib(nvmllib),
++			nvinfo.WithDeviceLib(devicelib),
++		)
++
++		manager := resource.NewManager(infolib, nvmllib, devicelib, config)
+ 		vgpul := vgpu.NewVGPULib(vgpu.NewNvidiaPCILib())
+ 
+ 		var clientSets flags.ClientSets
+diff --git a/cmd/mps-control-daemon/main.go b/cmd/mps-control-daemon/main.go
+index 46c071d43..d5822e0e6 100644
+--- a/cmd/mps-control-daemon/main.go
++++ b/cmd/mps-control-daemon/main.go
+@@ -27,6 +27,10 @@ import (
+ 	"github.com/urfave/cli/v2"
+ 	"k8s.io/klog/v2"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	nvinfo "github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
++	"github.com/NVIDIA/go-nvml/pkg/nvml"
++
+ 	"github.com/NVIDIA/k8s-device-plugin/cmd/mps-control-daemon/mount"
+ 	"github.com/NVIDIA/k8s-device-plugin/cmd/mps-control-daemon/mps"
+ 	"github.com/NVIDIA/k8s-device-plugin/internal/info"
+@@ -168,9 +172,16 @@ func startDaemons(c *cli.Context, cfg *Config) ([]*mps.Daemon, bool, error) {
+ 	}
+ 	spec.DisableResourceNamingInConfig(logger.ToKlog, config)
+ 
++	nvmllib := nvml.New()
++	devicelib := device.New(nvmllib)
++	infolib := nvinfo.New(
++		nvinfo.WithNvmlLib(nvmllib),
++		nvinfo.WithDeviceLib(devicelib),
++	)
++
+ 	// Update the configuration file with default resources.
+ 	klog.Info("Updating config with default resource matching patterns.")
+-	err = rm.AddDefaultResourcesToConfig(config)
++	err = rm.AddDefaultResourcesToConfig(infolib, nvmllib, devicelib, config)
+ 	if err != nil {
+ 		return nil, false, fmt.Errorf("unable to add default resources to config: %v", err)
+ 	}
+@@ -185,7 +196,7 @@ func startDaemons(c *cli.Context, cfg *Config) ([]*mps.Daemon, bool, error) {
+ 	// Get the set of daemons.
+ 	// Note that a daemon is only created for resources with at least one device.
+ 	klog.Info("Retrieving MPS daemons.")
+-	mpsDaemons, err := mps.NewDaemons(
++	mpsDaemons, err := mps.NewDaemons(infolib, nvmllib, devicelib,
+ 		mps.WithConfig(config),
+ 	)
+ 	if err != nil {
+diff --git a/cmd/mps-control-daemon/mps/device.go b/cmd/mps-control-daemon/mps/device.go
+index 132a29e29..b1e7db14e 100644
+--- a/cmd/mps-control-daemon/mps/device.go
++++ b/cmd/mps-control-daemon/mps/device.go
+@@ -28,11 +28,11 @@ import (
+ 
+ var errInvalidDevice = errors.New("invalid device")
+ 
+-// device represents an MPS-specific alias for an rm.Device.
+-type device rm.Device
++// mpsDevice represents an MPS-specific alias for an rm.Device.
++type mpsDevice rm.Device
+ 
+ // assertReplicas checks whether the number of replicas specified is valid.
+-func (d *device) assertReplicas() error {
++func (d *mpsDevice) assertReplicas() error {
+ 	maxClients := d.maxClients()
+ 	if d.Replicas > maxClients {
+ 		return fmt.Errorf("%w maximum allowed replicas exceeded: %d > %d", errInvalidDevice, d.Replicas, maxClients)
+@@ -41,7 +41,7 @@ func (d *device) assertReplicas() error {
+ }
+ 
+ // maxClients returns the maximum number of clients supported by an MPS server.
+-func (d *device) maxClients() int {
++func (d *mpsDevice) maxClients() int {
+ 	if d.isAtLeastVolta() {
+ 		return 48
+ 	}
+@@ -49,7 +49,7 @@ func (d *device) maxClients() int {
+ }
+ 
+ // isAtLeastVolta checks whether the specified device is a volta device or newer.
+-func (d *device) isAtLeastVolta() bool {
++func (d *mpsDevice) isAtLeastVolta() bool {
+ 	vCc := "v" + strings.TrimPrefix(d.ComputeCapability, "v")
+ 	return semver.Compare(semver.Canonical(vCc), semver.Canonical("v7.5")) >= 0
+ }
+diff --git a/cmd/mps-control-daemon/mps/device_test.go b/cmd/mps-control-daemon/mps/device_test.go
+index 29313d926..17cef28ea 100644
+--- a/cmd/mps-control-daemon/mps/device_test.go
++++ b/cmd/mps-control-daemon/mps/device_test.go
+@@ -25,14 +25,14 @@ import (
+ func TestDevice(t *testing.T) {
+ 	testCases := []struct {
+ 		description            string
+-		input                  device
++		input                  mpsDevice
+ 		expectedIsAtLeastVolta bool
+ 		expectedMaxClients     int
+ 		expectedAssertReplicas error
+ 	}{
+ 		{
+ 			description: "leading v ignored",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "v7.5",
+ 			},
+ 			expectedIsAtLeastVolta: true,
+@@ -40,7 +40,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "no-leading v supported",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "7.5",
+ 			},
+ 			expectedIsAtLeastVolta: true,
+@@ -48,7 +48,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "pre-volta clients",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "7.0",
+ 			},
+ 			expectedIsAtLeastVolta: false,
+@@ -56,7 +56,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "post-volta clients",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "9.0",
+ 			},
+ 			expectedIsAtLeastVolta: true,
+@@ -64,7 +64,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "pre-volta clients exceeded",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "7.0",
+ 				Replicas:          29,
+ 			},
+@@ -74,7 +74,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "post-volta clients exceeded",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "9.0",
+ 				Replicas:          49,
+ 			},
+@@ -84,7 +84,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "pre-volta clients max",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "7.0",
+ 				Replicas:          16,
+ 			},
+@@ -93,7 +93,7 @@ func TestDevice(t *testing.T) {
+ 		},
+ 		{
+ 			description: "post-volta clients max",
+-			input: device{
++			input: mpsDevice{
+ 				ComputeCapability: "9.0",
+ 				Replicas:          48,
+ 			},
+diff --git a/cmd/mps-control-daemon/mps/manager.go b/cmd/mps-control-daemon/mps/manager.go
+index 251383364..64f2c88e1 100644
+--- a/cmd/mps-control-daemon/mps/manager.go
++++ b/cmd/mps-control-daemon/mps/manager.go
+@@ -19,6 +19,8 @@ package mps
+ import (
+ 	"fmt"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"k8s.io/klog/v2"
+ 
+@@ -31,15 +33,17 @@ type Manager interface {
+ }
+ 
+ type manager struct {
+-	config  *spec.Config
+-	nvmllib nvml.Interface
++	infolib   info.Interface
++	nvmllib   nvml.Interface
++	devicelib device.Interface
++	config    *spec.Config
+ }
+ 
+ type nullManager struct{}
+ 
+ // Daemons creates the required set of MPS daemons for the specified options.
+-func NewDaemons(opts ...Option) ([]*Daemon, error) {
+-	manager, err := New(opts...)
++func NewDaemons(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, opts ...Option) ([]*Daemon, error) {
++	manager, err := New(infolib, nvmllib, devicelib, opts...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create MPS manager: %w", err)
+ 	}
+@@ -48,8 +52,12 @@ func NewDaemons(opts ...Option) ([]*Daemon, error) {
+ 
+ // New creates a manager for MPS daemons.
+ // If MPS is not configured, a manager is returned that manages no daemons.
+-func New(opts ...Option) (Manager, error) {
+-	m := &manager{}
++func New(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, opts ...Option) (Manager, error) {
++	m := &manager{
++		infolib:   infolib,
++		nvmllib:   nvmllib,
++		devicelib: devicelib,
++	}
+ 	for _, opt := range opts {
+ 		opt(m)
+ 	}
+@@ -59,16 +67,11 @@ func New(opts ...Option) (Manager, error) {
+ 		return &nullManager{}, nil
+ 	}
+ 
+-	// TODO: This should be controllable via an option
+-	if m.nvmllib == nil {
+-		m.nvmllib = nvml.New()
+-	}
+-
+ 	return m, nil
+ }
+ 
+ func (m *manager) Daemons() ([]*Daemon, error) {
+-	resourceManagers, err := rm.NewNVMLResourceManagers(m.nvmllib, m.config)
++	resourceManagers, err := rm.NewNVMLResourceManagers(m.infolib, m.nvmllib, m.devicelib, m.config)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -91,7 +94,7 @@ func (m *manager) Daemons() ([]*Daemon, error) {
+ 				klog.Warning("MPS sharing is not supported for MIG devices; skipping daemon creation")
+ 				continue
+ 			}
+-			if err := (*device)(rmDevice).assertReplicas(); err != nil {
++			if err := (*mpsDevice)(rmDevice).assertReplicas(); err != nil {
+ 				return nil, fmt.Errorf("invalid MPS configuration: %w", err)
+ 			}
+ 		}
+diff --git a/cmd/mps-control-daemon/mps/options.go b/cmd/mps-control-daemon/mps/options.go
+index 53dbdd8c4..c6aff1fce 100644
+--- a/cmd/mps-control-daemon/mps/options.go
++++ b/cmd/mps-control-daemon/mps/options.go
+@@ -17,8 +17,6 @@
+ package mps
+ 
+ import (
+-	"github.com/NVIDIA/go-nvml/pkg/nvml"
+-
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+ )
+ 
+@@ -31,10 +29,3 @@ func WithConfig(config *spec.Config) Option {
+ 		m.config = config
+ 	}
+ }
+-
+-// WithNvmlLib sets the NVML library associated with the MPS manager.
+-func WithNvmlLib(nvmllib nvml.Interface) Option {
+-	return func(m *manager) {
+-		m.nvmllib = nvmllib
+-	}
+-}
+diff --git a/cmd/nvidia-device-plugin/main.go b/cmd/nvidia-device-plugin/main.go
+index b4598df03..79e4df351 100644
+--- a/cmd/nvidia-device-plugin/main.go
++++ b/cmd/nvidia-device-plugin/main.go
+@@ -24,7 +24,9 @@ import (
+ 	"syscall"
+ 	"time"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
+ 	nvinfo "github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
++	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"github.com/fsnotify/fsnotify"
+ 	"github.com/urfave/cli/v2"
+ 	"k8s.io/klog/v2"
+@@ -135,13 +137,13 @@ func main() {
+ 	}
+ }
+ 
+-func validateFlags(config *spec.Config) error {
++func validateFlags(infolib nvinfo.Interface, config *spec.Config) error {
+ 	deviceListStrategies, err := spec.NewDeviceListStrategies(*config.Flags.Plugin.DeviceListStrategy)
+ 	if err != nil {
+ 		return fmt.Errorf("invalid --device-list-strategy option: %v", err)
+ 	}
+ 
+-	hasNvml, _ := nvinfo.New().HasNvml()
++	hasNvml, _ := infolib.HasNvml()
+ 	if deviceListStrategies.IsCDIEnabled() && !hasNvml {
+ 		return fmt.Errorf("CDI --device-list-strategy options are only supported on NVML-based systems")
+ 	}
+@@ -167,10 +169,6 @@ func loadConfig(c *cli.Context, flags []cli.Flag) (*spec.Config, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("unable to finalize config: %v", err)
+ 	}
+-	err = validateFlags(config)
+-	if err != nil {
+-		return nil, fmt.Errorf("unable to validate flags: %v", err)
+-	}
+ 	config.Flags.GFD = nil
+ 	return config, nil
+ }
+@@ -262,9 +260,21 @@ func startPlugins(c *cli.Context, flags []cli.Flag) ([]plugin.Interface, bool, e
+ 	}
+ 	spec.DisableResourceNamingInConfig(logger.ToKlog, config)
+ 
++	nvmllib := nvml.New()
++	devicelib := device.New(nvmllib)
++	infolib := nvinfo.New(
++		nvinfo.WithNvmlLib(nvmllib),
++		nvinfo.WithDeviceLib(devicelib),
++	)
++
++	err = validateFlags(infolib, config)
++	if err != nil {
++		return nil, false, fmt.Errorf("unable to validate flags: %v", err)
++	}
++
+ 	// Update the configuration file with default resources.
+ 	klog.Info("Updating config with default resource matching patterns.")
+-	err = rm.AddDefaultResourcesToConfig(config)
++	err = rm.AddDefaultResourcesToConfig(infolib, nvmllib, devicelib, config)
+ 	if err != nil {
+ 		return nil, false, fmt.Errorf("unable to add default resources to config: %v", err)
+ 	}
+@@ -278,7 +288,7 @@ func startPlugins(c *cli.Context, flags []cli.Flag) ([]plugin.Interface, bool, e
+ 
+ 	// Get the set of plugins.
+ 	klog.Info("Retrieving plugins.")
+-	pluginManager, err := NewPluginManager(config)
++	pluginManager, err := NewPluginManager(infolib, nvmllib, devicelib, config)
+ 	if err != nil {
+ 		return nil, false, fmt.Errorf("error creating plugin manager: %v", err)
+ 	}
+diff --git a/cmd/nvidia-device-plugin/plugin-manager.go b/cmd/nvidia-device-plugin/plugin-manager.go
+index 335425a49..8b0943a65 100644
+--- a/cmd/nvidia-device-plugin/plugin-manager.go
++++ b/cmd/nvidia-device-plugin/plugin-manager.go
+@@ -19,6 +19,8 @@ package main
+ import (
+ 	"fmt"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+@@ -27,7 +29,7 @@ import (
+ )
+ 
+ // NewPluginManager creates an NVML-based plugin manager
+-func NewPluginManager(config *spec.Config) (manager.Interface, error) {
++func NewPluginManager(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) (manager.Interface, error) {
+ 	var err error
+ 	switch *config.Flags.MigStrategy {
+ 	case spec.MigStrategyNone:
+@@ -37,19 +39,16 @@ func NewPluginManager(config *spec.Config) (manager.Interface, error) {
+ 		return nil, fmt.Errorf("unknown strategy: %v", *config.Flags.MigStrategy)
+ 	}
+ 
+-	nvmllib := nvml.New()
+-
+ 	deviceListStrategies, err := spec.NewDeviceListStrategies(*config.Flags.Plugin.DeviceListStrategy)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("invalid device list strategy: %v", err)
+ 	}
+ 
+-	cdiHandler, err := cdi.New(
++	cdiHandler, err := cdi.New(infolib, nvmllib, devicelib,
+ 		cdi.WithDeviceListStrategies(deviceListStrategies),
+ 		cdi.WithDriverRoot(*config.Flags.Plugin.ContainerDriverRoot),
+ 		cdi.WithTargetDriverRoot(*config.Flags.NvidiaDriverRoot),
+ 		cdi.WithNvidiaCTKPath(*config.Flags.Plugin.NvidiaCTKPath),
+-		cdi.WithNvml(nvmllib),
+ 		cdi.WithDeviceIDStrategy(*config.Flags.Plugin.DeviceIDStrategy),
+ 		cdi.WithVendor("k8s.device-plugin.nvidia.com"),
+ 		cdi.WithGdsEnabled(*config.Flags.GDSEnabled),
+@@ -59,8 +58,7 @@ func NewPluginManager(config *spec.Config) (manager.Interface, error) {
+ 		return nil, fmt.Errorf("unable to create cdi handler: %v", err)
+ 	}
+ 
+-	m, err := manager.New(
+-		manager.WithNVML(nvmllib),
++	m, err := manager.New(infolib, nvmllib, devicelib,
+ 		manager.WithCDIHandler(cdiHandler),
+ 		manager.WithConfig(config),
+ 		manager.WithFailOnInitError(*config.Flags.FailOnInitError),
+diff --git a/go.mod b/go.mod
+index 6268755de..1cb139071 100644
+--- a/go.mod
++++ b/go.mod
+@@ -3,10 +3,10 @@ module github.com/NVIDIA/k8s-device-plugin
+ go 1.22.2
+ 
+ require (
+-	github.com/NVIDIA/go-gpuallocator v0.4.2
+-	github.com/NVIDIA/go-nvlib v0.4.0
++	github.com/NVIDIA/go-gpuallocator v0.5.0
++	github.com/NVIDIA/go-nvlib v0.5.0
+ 	github.com/NVIDIA/go-nvml v0.12.0-6
+-	github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240419094620-0aed9a16addf
++	github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240528113255-e4b46a09a77e
+ 	github.com/fsnotify/fsnotify v1.7.0
+ 	github.com/google/uuid v1.6.0
+ 	github.com/mittwald/go-helm-client v0.12.9
+diff --git a/go.sum b/go.sum
+index e0d4e376c..a779f5366 100644
+--- a/go.sum
++++ b/go.sum
+@@ -21,14 +21,14 @@ github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migc
+ github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
+ github.com/Microsoft/hcsshim v0.11.4 h1:68vKo2VN8DE9AdN4tnkWnmdhqdbpUFM8OF3Airm7fz8=
+ github.com/Microsoft/hcsshim v0.11.4/go.mod h1:smjE4dvqPX9Zldna+t5FG3rnoHhaB7QYxPRqGcpAD9w=
+-github.com/NVIDIA/go-gpuallocator v0.4.2 h1:OSW55pQKXQaL2qN+NFGtvlNzasl8wSr6vDW+4bRI4bg=
+-github.com/NVIDIA/go-gpuallocator v0.4.2/go.mod h1:op8+/A79CnWBjdl/bsk2vR40Afj+EukIF4m8cE0YUsk=
+-github.com/NVIDIA/go-nvlib v0.4.0 h1:dvuqjjSamBODFuxttPg4H/xtNVQRZOSlwFtuNKybcGI=
+-github.com/NVIDIA/go-nvlib v0.4.0/go.mod h1:87z49ULPr4GWPSGfSIp3taU4XENRYN/enIg88MzcL4k=
++github.com/NVIDIA/go-gpuallocator v0.5.0 h1:166ICvPv2dU9oZ2J3kJ4y3XdbGCi6LhXgFZJtrqeu3A=
++github.com/NVIDIA/go-gpuallocator v0.5.0/go.mod h1:zos5bTIN01hpQioOyu9oRKglrznImMQvm0bZllMmckw=
++github.com/NVIDIA/go-nvlib v0.5.0 h1:951KGrfr+p3cs89alO9z/ZxPPWKxwht9tx9rxiADoLI=
++github.com/NVIDIA/go-nvlib v0.5.0/go.mod h1:87z49ULPr4GWPSGfSIp3taU4XENRYN/enIg88MzcL4k=
+ github.com/NVIDIA/go-nvml v0.12.0-6 h1:FJYc2KrpvX+VOC/8QQvMiQMmZ/nPMRpdJO/Ik4xfcr0=
+ github.com/NVIDIA/go-nvml v0.12.0-6/go.mod h1:8Llmj+1Rr+9VGGwZuRer5N/aCjxGuR5nPb/9ebBiIEQ=
+-github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240419094620-0aed9a16addf h1:6eKsIVTytQ34X4rFoPjcW+JbJ8XvYH3ITevLED+enD8=
+-github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240419094620-0aed9a16addf/go.mod h1:92ofuEEVSg9zK6TTFHQyNhKy2nCk3S3Qe9QIATfcfHc=
++github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240528113255-e4b46a09a77e h1:1xxK51xOXiqqziqMdgEMWVmjfvRu1b265LgQQZBqRaE=
++github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240528113255-e4b46a09a77e/go.mod h1:Xzovqe8g9W8DiJe93gBD8FPjfduDpT+nfKIpc5s8IPE=
+ github.com/Shopify/logrus-bugsnag v0.0.0-20171204204709-577dee27f20d h1:UrqY+r/OJnIp5u0s1SbQ8dVfLCZJsnvazdBP5hS4iRs=
+ github.com/Shopify/logrus-bugsnag v0.0.0-20171204204709-577dee27f20d/go.mod h1:HI8ITrYtUY+O+ZhtlqUnD8+KwNPOyugEhfP9fdUIaEQ=
+ github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
+diff --git a/internal/cdi/cdi.go b/internal/cdi/cdi.go
+index edf5c459f..658feb80e 100644
+--- a/internal/cdi/cdi.go
++++ b/internal/cdi/cdi.go
+@@ -20,7 +20,8 @@ import (
+ 	"fmt"
+ 	"path/filepath"
+ 
+-	nvdevice "github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi"
+ 	transformroot "github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/transform/root"
+@@ -37,9 +38,11 @@ const (
+ 
+ // cdiHandler creates CDI specs for devices assocatied with the device plugin
+ type cdiHandler struct {
++	infolib   info.Interface
++	nvmllib   nvml.Interface
++	devicelib device.Interface
++
+ 	logger           *logrus.Logger
+-	nvml             nvml.Interface
+-	nvdevice         nvdevice.Interface
+ 	driverRoot       string
+ 	targetDriverRoot string
+ 	nvidiaCTKPath    string
+@@ -57,8 +60,12 @@ type cdiHandler struct {
+ var _ Interface = &cdiHandler{}
+ 
+ // newHandler constructs a new instance of the 'cdi' interface
+-func newHandler(opts ...Option) (Interface, error) {
+-	c := &cdiHandler{}
++func newHandler(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, opts ...Option) (Interface, error) {
++	c := &cdiHandler{
++		infolib:   infolib,
++		nvmllib:   nvmllib,
++		devicelib: devicelib,
++	}
+ 	for _, opt := range opts {
+ 		opt(c)
+ 	}
+@@ -70,12 +77,6 @@ func newHandler(opts ...Option) (Interface, error) {
+ 	if c.logger == nil {
+ 		c.logger = logrus.StandardLogger()
+ 	}
+-	if c.nvml == nil {
+-		c.nvml = nvml.New()
+-	}
+-	if c.nvdevice == nil {
+-		c.nvdevice = nvdevice.New(nvdevice.WithNvml(c.nvml))
+-	}
+ 	if c.deviceIDStrategy == "" {
+ 		c.deviceIDStrategy = "uuid"
+ 	}
+@@ -94,10 +95,11 @@ func newHandler(opts ...Option) (Interface, error) {
+ 	c.cdilibs = make(map[string]nvcdi.Interface)
+ 
+ 	c.cdilibs["gpu"], err = nvcdi.New(
++		nvcdi.WithInfoLib(c.infolib),
++		nvcdi.WithNvmlLib(c.nvmllib),
++		nvcdi.WithDeviceLib(c.devicelib),
+ 		nvcdi.WithLogger(c.logger),
+-		nvcdi.WithNvmlLib(c.nvml),
+-		nvcdi.WithDeviceLib(c.nvdevice),
+-		nvcdi.WithNVIDIACTKPath(c.nvidiaCTKPath),
++		nvcdi.WithNVIDIACDIHookPath(c.nvidiaCTKPath),
+ 		nvcdi.WithDriverRoot(c.driverRoot),
+ 		nvcdi.WithDeviceNamers(deviceNamer),
+ 		nvcdi.WithVendor(c.vendor),
+@@ -117,8 +119,9 @@ func newHandler(opts ...Option) (Interface, error) {
+ 
+ 	for _, mode := range additionalModes {
+ 		lib, err := nvcdi.New(
++			nvcdi.WithInfoLib(c.infolib),
+ 			nvcdi.WithLogger(c.logger),
+-			nvcdi.WithNVIDIACTKPath(c.nvidiaCTKPath),
++			nvcdi.WithNVIDIACDIHookPath(c.nvidiaCTKPath),
+ 			nvcdi.WithDriverRoot(c.driverRoot),
+ 			nvcdi.WithVendor(c.vendor),
+ 			nvcdi.WithMode(mode),
+@@ -138,12 +141,12 @@ func (cdi *cdiHandler) CreateSpecFile() error {
+ 		cdi.logger.Infof("Generating CDI spec for resource: %s/%s", cdi.vendor, class)
+ 
+ 		if class == "gpu" {
+-			ret := cdi.nvml.Init()
++			ret := cdi.nvmllib.Init()
+ 			if ret != nvml.SUCCESS {
+ 				return fmt.Errorf("failed to initialize NVML: %v", ret)
+ 			}
+ 			defer func() {
+-				_ = cdi.nvml.Shutdown()
++				_ = cdi.nvmllib.Shutdown()
+ 			}()
+ 		}
+ 
+diff --git a/internal/cdi/factory.go b/internal/cdi/factory.go
+index cebf4d820..0d7c33995 100644
+--- a/internal/cdi/factory.go
++++ b/internal/cdi/factory.go
+@@ -17,20 +17,20 @@
+ package cdi
+ 
+ import (
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
+ 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
++	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	"k8s.io/klog/v2"
+ )
+ 
+ // New is a factory method that creates a CDI handler for creating CDI specs.
+-func New(opts ...Option) (Interface, error) {
+-	infolib := info.New()
+-
++func New(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, opts ...Option) (Interface, error) {
+ 	hasNVML, _ := infolib.HasNvml()
+ 	if !hasNVML {
+ 		klog.Warning("No valid resources detected, creating a null CDI handler")
+ 		return NewNullHandler(), nil
+ 	}
+ 
+-	return newHandler(opts...)
++	return newHandler(infolib, nvmllib, devicelib, opts...)
+ }
+diff --git a/internal/cdi/options.go b/internal/cdi/options.go
+index 6a3e1f341..4ad3548fb 100644
+--- a/internal/cdi/options.go
++++ b/internal/cdi/options.go
+@@ -17,8 +17,6 @@
+ package cdi
+ 
+ import (
+-	"github.com/NVIDIA/go-nvml/pkg/nvml"
+-
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+ )
+ 
+@@ -53,13 +51,6 @@ func WithNvidiaCTKPath(path string) Option {
+ 	}
+ }
+ 
+-// WithNvml provides an Option to set the NVML library used by the 'cdi' interface
+-func WithNvml(nvml nvml.Interface) Option {
+-	return func(c *cdiHandler) {
+-		c.nvml = nvml
+-	}
+-}
+-
+ // WithDeviceIDStrategy provides an Option to set the device ID strategy used by the 'cdi' interface
+ func WithDeviceIDStrategy(strategy string) Option {
+ 	return func(c *cdiHandler) {
+diff --git a/internal/plugin/manager/factory.go b/internal/plugin/manager/factory.go
+index 33087ddcf..a4bdcbada 100644
+--- a/internal/plugin/manager/factory.go
++++ b/internal/plugin/manager/factory.go
+@@ -19,6 +19,7 @@ package manager
+ import (
+ 	"fmt"
+ 
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
+ 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"k8s.io/klog/v2"
+@@ -28,18 +29,24 @@ import (
+ )
+ 
+ type manager struct {
++	infolib   info.Interface
++	nvmllib   nvml.Interface
++	devicelib device.Interface
++
+ 	migStrategy     string
+ 	failOnInitError bool
+-	nvmllib         nvml.Interface
+ 
+ 	cdiHandler cdi.Interface
+ 	config     *spec.Config
+-	infolib    info.Interface
+ }
+ 
+ // New creates a new plugin manager with the supplied options.
+-func New(opts ...Option) (Interface, error) {
+-	m := &manager{}
++func New(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, opts ...Option) (Interface, error) {
++	m := &manager{
++		infolib:   infolib,
++		nvmllib:   nvmllib,
++		devicelib: devicelib,
++	}
+ 	for _, opt := range opts {
+ 		opt(m)
+ 	}
+@@ -53,10 +60,6 @@ func New(opts ...Option) (Interface, error) {
+ 		m.cdiHandler = cdi.NewNullHandler()
+ 	}
+ 
+-	if m.infolib == nil {
+-		m.infolib = info.New()
+-	}
+-
+ 	mode, err := m.resolveMode()
+ 	if err != nil {
+ 		return nil, err
+@@ -64,9 +67,6 @@ func New(opts ...Option) (Interface, error) {
+ 
+ 	switch mode {
+ 	case "nvml":
+-		if m.nvmllib == nil {
+-			m.nvmllib = nvml.New()
+-		}
+ 		ret := m.nvmllib.Init()
+ 		if ret != nvml.SUCCESS {
+ 			klog.Errorf("Failed to initialize NVML: %v.", ret)
+diff --git a/internal/plugin/manager/nvml.go b/internal/plugin/manager/nvml.go
+index 8a1c6d8e5..5aebf4573 100644
+--- a/internal/plugin/manager/nvml.go
++++ b/internal/plugin/manager/nvml.go
+@@ -27,7 +27,7 @@ type nvmlmanager manager
+ 
+ // GetPlugins returns the plugins associated with the NVML resources available on the node
+ func (m *nvmlmanager) GetPlugins() ([]plugin.Interface, error) {
+-	rms, err := rm.NewNVMLResourceManagers(m.nvmllib, m.config)
++	rms, err := rm.NewNVMLResourceManagers(m.infolib, m.nvmllib, m.devicelib, m.config)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to construct NVML resource managers: %v", err)
+ 	}
+diff --git a/internal/plugin/manager/options.go b/internal/plugin/manager/options.go
+index 28f8982ac..2be0638a4 100644
+--- a/internal/plugin/manager/options.go
++++ b/internal/plugin/manager/options.go
+@@ -17,6 +17,7 @@
+ package manager
+ 
+ import (
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+@@ -40,6 +41,13 @@ func WithNVML(nvmllib nvml.Interface) Option {
+ 	}
+ }
+ 
++// WithInfoLib sets the info lib for the manager.
++func WithInfoLib(infolib info.Interface) Option {
++	return func(m *manager) {
++		m.infolib = infolib
++	}
++}
++
+ // WithFailOnInitError sets whether the manager should fail on initialization errors
+ func WithFailOnInitError(failOnInitError bool) Option {
+ 	return func(m *manager) {
+diff --git a/internal/resource/factory.go b/internal/resource/factory.go
+index 718f854ca..34606cfeb 100644
+--- a/internal/resource/factory.go
++++ b/internal/resource/factory.go
+@@ -17,15 +17,17 @@
+ package resource
+ 
+ import (
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
+ 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
++	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"k8s.io/klog/v2"
+ 
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+ )
+ 
+ // NewManager is a factory method that creates a resource Manager based on the specified config.
+-func NewManager(config *spec.Config) Manager {
+-	return WithConfig(getManager(*config.Flags.Mode), config)
++func NewManager(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) Manager {
++	return WithConfig(getManager(infolib, nvmllib, devicelib, *config.Flags.Mode), config)
+ }
+ 
+ // WithConfig modifies a manager depending on the specified config.
+@@ -39,13 +41,13 @@ func WithConfig(manager Manager, config *spec.Config) Manager {
+ }
+ 
+ // getManager returns the resource manager depending on the system configuration.
+-func getManager(mode string) Manager {
++func getManager(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, mode string) Manager {
+ 
+-	resolved := resolveMode(mode)
++	resolved := resolveMode(infolib, mode)
+ 	switch resolved {
+ 	case "nvml":
+ 		klog.Info("Using NVML manager")
+-		return NewNVMLManager()
++		return NewNVMLManager(nvmllib, devicelib)
+ 	case "tegra":
+ 		klog.Info("Using CUDA manager")
+ 		return NewCudaManager()
+@@ -58,7 +60,7 @@ func getManager(mode string) Manager {
+ 	return NewNullManager()
+ }
+ 
+-func resolveMode(mode string) string {
++func resolveMode(infolib info.Interface, mode string) string {
+ 	if mode != "" && mode != "auto" {
+ 		return mode
+ 	}
+@@ -73,8 +75,6 @@ func resolveMode(mode string) string {
+ 		return is
+ 	}
+ 
+-	infolib := info.New()
+-
+ 	hasNVML := logWithReason(infolib.HasNvml, "NVML")
+ 	isTegra := logWithReason(infolib.HasTegraFiles, "Tegra")
+ 
+diff --git a/internal/resource/nvml-lib.go b/internal/resource/nvml-lib.go
+index 8ea6d4109..8f0f0e1a1 100644
+--- a/internal/resource/nvml-lib.go
++++ b/internal/resource/nvml-lib.go
+@@ -27,10 +27,7 @@ type nvmlLib struct {
+ }
+ 
+ // NewNVMLManager creates a new manager that uses NVML to query and manage devices
+-func NewNVMLManager() Manager {
+-	nvmllib := nvml.New()
+-	devicelib := device.New(device.WithNvml(nvmllib))
+-
++func NewNVMLManager(nvmllib nvml.Interface, devicelib device.Interface) Manager {
+ 	m := nvmlLib{
+ 		Interface: nvmllib,
+ 		devicelib: devicelib,
+diff --git a/internal/rm/device_map.go b/internal/rm/device_map.go
+index cffe83e8d..4d2e9159d 100644
+--- a/internal/rm/device_map.go
++++ b/internal/rm/device_map.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 
+ 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	spec "github.com/NVIDIA/k8s-device-plugin/api/config/v1"
+@@ -30,19 +31,27 @@ type deviceMapBuilder struct {
+ 	migStrategy         *string
+ 	resources           *spec.Resources
+ 	replicatedResources *spec.ReplicatedResources
++
++	newGPUDevice func(i int, gpu nvml.Device) (string, deviceInfo)
+ }
+ 
+ // DeviceMap stores a set of devices per resource name.
+ type DeviceMap map[spec.ResourceName]Devices
+ 
+ // NewDeviceMap creates a device map for the specified NVML library and config.
+-func NewDeviceMap(nvmllib nvml.Interface, config *spec.Config) (DeviceMap, error) {
++func NewDeviceMap(infolib info.Interface, devicelib device.Interface, config *spec.Config) (DeviceMap, error) {
+ 	b := deviceMapBuilder{
+-		Interface:           device.New(device.WithNvml(nvmllib)),
++		Interface:           devicelib,
+ 		migStrategy:         config.Flags.MigStrategy,
+ 		resources:           &config.Resources,
+ 		replicatedResources: config.Sharing.ReplicatedResources(),
++		newGPUDevice:        newNvmlGPUDevice,
++	}
++
++	if infolib.ResolvePlatform() == info.PlatformWSL {
++		b.newGPUDevice = newWslGPUDevice
+ 	}
++
+ 	return b.build()
+ }
+ 
+@@ -112,7 +121,7 @@ func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
+ 		}
+ 		for _, resource := range b.resources.GPUs {
+ 			if resource.Pattern.Matches(name) {
+-				index, info := newGPUDevice(i, gpu)
++				index, info := b.newGPUDevice(i, gpu)
+ 				return devices.setEntry(resource.Name, index, info)
+ 			}
+ 		}
+diff --git a/internal/rm/nvml_devices.go b/internal/rm/nvml_devices.go
+index 031da4989..0fa490bc1 100644
+--- a/internal/rm/nvml_devices.go
++++ b/internal/rm/nvml_devices.go
+@@ -23,7 +23,6 @@ import (
+ 	"strconv"
+ 	"strings"
+ 
+-	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	"github.com/NVIDIA/k8s-device-plugin/internal/mig"
+@@ -45,16 +44,16 @@ type nvmlMigDevice nvmlDevice
+ var _ deviceInfo = (*nvmlDevice)(nil)
+ var _ deviceInfo = (*nvmlMigDevice)(nil)
+ 
+-func newGPUDevice(i int, gpu nvml.Device) (string, deviceInfo) {
++func newNvmlGPUDevice(i int, gpu nvml.Device) (string, deviceInfo) {
+ 	index := fmt.Sprintf("%v", i)
+-	isWsl, _ := info.New().HasDXCore()
+-	if isWsl {
+-		return index, wslDevice{gpu}
+-	}
+-
+ 	return index, nvmlDevice{gpu}
+ }
+ 
++func newWslGPUDevice(i int, gpu nvml.Device) (string, deviceInfo) {
++	index := fmt.Sprintf("%v", i)
++	return index, wslDevice{gpu}
++}
++
+ func newMigDevice(i int, j int, mig nvml.Device) (string, nvmlMigDevice) {
+ 	return fmt.Sprintf("%v:%v", i, j), nvmlMigDevice{mig}
+ }
+diff --git a/internal/rm/nvml_manager.go b/internal/rm/nvml_manager.go
+index d493fd662..fac923429 100644
+--- a/internal/rm/nvml_manager.go
++++ b/internal/rm/nvml_manager.go
+@@ -20,6 +20,8 @@ import (
+ 	"fmt"
+ 
+ 	"github.com/NVIDIA/go-gpuallocator/gpuallocator"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 	"k8s.io/klog/v2"
+ 
+@@ -34,7 +36,7 @@ type nvmlResourceManager struct {
+ var _ ResourceManager = (*nvmlResourceManager)(nil)
+ 
+ // NewNVMLResourceManagers returns a set of ResourceManagers, one for each NVML resource in 'config'.
+-func NewNVMLResourceManagers(nvmllib nvml.Interface, config *spec.Config) ([]ResourceManager, error) {
++func NewNVMLResourceManagers(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) ([]ResourceManager, error) {
+ 	ret := nvmllib.Init()
+ 	if ret != nvml.SUCCESS {
+ 		return nil, fmt.Errorf("failed to initialize NVML: %v", ret)
+@@ -46,7 +48,7 @@ func NewNVMLResourceManagers(nvmllib nvml.Interface, config *spec.Config) ([]Res
+ 		}
+ 	}()
+ 
+-	deviceMap, err := NewDeviceMap(nvmllib, config)
++	deviceMap, err := NewDeviceMap(infolib, devicelib, config)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("error building device map: %v", err)
+ 	}
+diff --git a/internal/rm/rm.go b/internal/rm/rm.go
+index d8e33b9df..1fb4a36f4 100644
+--- a/internal/rm/rm.go
++++ b/internal/rm/rm.go
+@@ -46,62 +46,6 @@ type ResourceManager interface {
+ 	ValidateRequest(AnnotatedIDs) error
+ }
+ 
+-// NewResourceManagers returns a []ResourceManager, one for each resource in 'config'.
+-func NewResourceManagers(nvmllib nvml.Interface, config *spec.Config) ([]ResourceManager, error) {
+-	// logWithReason logs the output of the has* / is* checks from the info.Interface
+-	logWithReason := func(f func() (bool, string), tag string) bool {
+-		is, reason := f()
+-		if !is {
+-			tag = "non-" + tag
+-		}
+-		klog.Infof("Detected %v platform: %v", tag, reason)
+-		return is
+-	}
+-
+-	infolib := info.New()
+-
+-	hasNVML := logWithReason(infolib.HasNvml, "NVML")
+-	isTegra := logWithReason(infolib.HasTegraFiles, "Tegra")
+-
+-	if !hasNVML && !isTegra {
+-		klog.Error("Incompatible platform detected")
+-		klog.Error("If this is a GPU node, did you configure the NVIDIA Container Toolkit?")
+-		klog.Error("You can check the prerequisites at: https://github.com/NVIDIA/k8s-device-plugin#prerequisites")
+-		klog.Error("You can learn how to set the runtime at: https://github.com/NVIDIA/k8s-device-plugin#quick-start")
+-		klog.Error("If this is not a GPU node, you should set up a toleration or nodeSelector to only deploy this plugin on GPU nodes")
+-		if *config.Flags.FailOnInitError {
+-			return nil, fmt.Errorf("platform detection failed")
+-		}
+-		return nil, nil
+-	}
+-
+-	// The NVIDIA container stack does not yet support the use of integrated AND discrete GPUs on the same node.
+-	if hasNVML && isTegra {
+-		klog.Warning("Disabling Tegra-based resources on NVML system")
+-		isTegra = false
+-	}
+-
+-	var resourceManagers []ResourceManager
+-
+-	if hasNVML {
+-		nvmlManagers, err := NewNVMLResourceManagers(nvmllib, config)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to construct NVML resource managers: %v", err)
+-		}
+-		resourceManagers = append(resourceManagers, nvmlManagers...)
+-	}
+-
+-	if isTegra {
+-		tegraManagers, err := NewTegraResourceManagers(config)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to construct Tegra resource managers: %v", err)
+-		}
+-		resourceManagers = append(resourceManagers, tegraManagers...)
+-	}
+-
+-	return resourceManagers, nil
+-}
+-
+ // Resource gets the resource name associated with the ResourceManager
+ func (r *resourceManager) Resource() spec.ResourceName {
+ 	return r.resource
+@@ -150,7 +94,7 @@ func (r *resourceManager) ValidateRequest(ids AnnotatedIDs) error {
+ }
+ 
+ // AddDefaultResourcesToConfig adds default resource matching rules to config.Resources
+-func AddDefaultResourcesToConfig(config *spec.Config) error {
++func AddDefaultResourcesToConfig(infolib info.Interface, nvmllib nvml.Interface, devicelib device.Interface, config *spec.Config) error {
+ 	_ = config.Resources.AddGPUResource("*", "gpu")
+ 	if config.Flags.MigStrategy == nil {
+ 		return nil
+@@ -159,14 +103,13 @@ func AddDefaultResourcesToConfig(config *spec.Config) error {
+ 	case spec.MigStrategySingle:
+ 		return config.Resources.AddMIGResource("*", "gpu")
+ 	case spec.MigStrategyMixed:
+-		hasNVML, reason := info.New().HasNvml()
++		hasNVML, reason := infolib.HasNvml()
+ 		if !hasNVML {
+ 			klog.Warningf("mig-strategy=%q is only supported with NVML", spec.MigStrategyMixed)
+ 			klog.Warningf("NVML not detected: %v", reason)
+ 			return nil
+ 		}
+ 
+-		nvmllib := nvml.New()
+ 		ret := nvmllib.Init()
+ 		if ret != nvml.SUCCESS {
+ 			if *config.Flags.FailOnInitError {
+@@ -181,9 +124,6 @@ func AddDefaultResourcesToConfig(config *spec.Config) error {
+ 			}
+ 		}()
+ 
+-		devicelib := device.New(
+-			device.WithNvml(nvmllib),
+-		)
+ 		return devicelib.VisitMigProfiles(func(p device.MigProfile) error {
+ 			info := p.GetInfo()
+ 			if info.C != info.G {
+diff --git a/vendor/github.com/NVIDIA/go-gpuallocator/gpuallocator/device.go b/vendor/github.com/NVIDIA/go-gpuallocator/gpuallocator/device.go
+index 3a325b88e..9f17cc4ad 100644
+--- a/vendor/github.com/NVIDIA/go-gpuallocator/gpuallocator/device.go
++++ b/vendor/github.com/NVIDIA/go-gpuallocator/gpuallocator/device.go
+@@ -82,9 +82,7 @@ func NewDevices(opts ...Option) (DeviceList, error) {
+ 		o.nvmllib = nvmlNew()
+ 	}
+ 	if o.devicelib == nil {
+-		o.devicelib = device.New(
+-			device.WithNvml(o.nvmllib),
+-		)
++		o.devicelib = device.New(o.nvmllib)
+ 	}
+ 
+ 	return o.build()
+diff --git a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/api.go b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/api.go
+index 11aa139d9..c2a6517d6 100644
+--- a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/api.go
++++ b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/api.go
+@@ -38,7 +38,7 @@ type Interface interface {
+ }
+ 
+ type devicelib struct {
+-	nvml           nvml.Interface
++	nvmllib        nvml.Interface
+ 	skippedDevices map[string]struct{}
+ 	verifySymbols  *bool
+ 	migProfiles    []MigProfile
+@@ -47,14 +47,13 @@ type devicelib struct {
+ var _ Interface = &devicelib{}
+ 
+ // New creates a new instance of the 'device' interface.
+-func New(opts ...Option) Interface {
+-	d := &devicelib{}
++func New(nvmllib nvml.Interface, opts ...Option) Interface {
++	d := &devicelib{
++		nvmllib: nvmllib,
++	}
+ 	for _, opt := range opts {
+ 		opt(d)
+ 	}
+-	if d.nvml == nil {
+-		d.nvml = nvml.New()
+-	}
+ 	if d.verifySymbols == nil {
+ 		verify := true
+ 		d.verifySymbols = &verify
+@@ -68,13 +67,6 @@ func New(opts ...Option) Interface {
+ 	return d
+ }
+ 
+-// WithNvml provides an Option to set the NVML library used by the 'device' interface.
+-func WithNvml(nvml nvml.Interface) Option {
+-	return func(d *devicelib) {
+-		d.nvml = nvml
+-	}
+-}
+-
+ // WithVerifySymbols provides an option to toggle whether to verify select symbols exist in dynamic libraries before calling them.
+ func WithVerifySymbols(verify bool) Option {
+ 	return func(d *devicelib) {
+diff --git a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/device.go b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/device.go
+index 105145917..5e1510ca6 100644
+--- a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/device.go
++++ b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/device.go
+@@ -51,7 +51,7 @@ func (d *devicelib) NewDevice(dev nvml.Device) (Device, error) {
+ 
+ // NewDeviceByUUID builds a new Device from a UUID.
+ func (d *devicelib) NewDeviceByUUID(uuid string) (Device, error) {
+-	dev, ret := d.nvml.DeviceGetHandleByUUID(uuid)
++	dev, ret := d.nvmllib.DeviceGetHandleByUUID(uuid)
+ 	if ret != nvml.SUCCESS {
+ 		return nil, fmt.Errorf("error getting device handle for uuid '%v': %v", uuid, ret)
+ 	}
+@@ -334,13 +334,13 @@ func (d *device) isSkipped() (bool, error) {
+ 
+ // VisitDevices visits each top-level device and invokes a callback function for it.
+ func (d *devicelib) VisitDevices(visit func(int, Device) error) error {
+-	count, ret := d.nvml.DeviceGetCount()
++	count, ret := d.nvmllib.DeviceGetCount()
+ 	if ret != nvml.SUCCESS {
+ 		return fmt.Errorf("error getting device count: %v", ret)
+ 	}
+ 
+ 	for i := 0; i < count; i++ {
+-		device, ret := d.nvml.DeviceGetHandleByIndex(i)
++		device, ret := d.nvmllib.DeviceGetHandleByIndex(i)
+ 		if ret != nvml.SUCCESS {
+ 			return fmt.Errorf("error getting device handle for index '%v': %v", i, ret)
+ 		}
+@@ -469,5 +469,5 @@ func (d *devicelib) hasSymbol(symbol string) bool {
+ 		return true
+ 	}
+ 
+-	return d.nvml.Extensions().LookupSymbol(symbol) == nil
++	return d.nvmllib.Extensions().LookupSymbol(symbol) == nil
+ }
+diff --git a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/mig_device.go b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/mig_device.go
+index b02d41763..7145a06bc 100644
+--- a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/mig_device.go
++++ b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/device/mig_device.go
+@@ -50,7 +50,7 @@ func (d *devicelib) NewMigDevice(handle nvml.Device) (MigDevice, error) {
+ 
+ // NewMigDeviceByUUID builds a new MigDevice from a UUID.
+ func (d *devicelib) NewMigDeviceByUUID(uuid string) (MigDevice, error) {
+-	dev, ret := d.nvml.DeviceGetHandleByUUID(uuid)
++	dev, ret := d.nvmllib.DeviceGetHandleByUUID(uuid)
+ 	if ret != nvml.SUCCESS {
+ 		return nil, fmt.Errorf("error getting device handle for uuid '%v': %v", uuid, ret)
+ 	}
+diff --git a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/info/builder.go b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/info/builder.go
+index 87f20f024..616844071 100644
+--- a/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/info/builder.go
++++ b/vendor/github.com/NVIDIA/go-nvlib/pkg/nvlib/info/builder.go
+@@ -55,7 +55,7 @@ func New(opts ...Option) Interface {
+ 		)
+ 	}
+ 	if o.devicelib == nil {
+-		o.devicelib = device.New(device.WithNvml(o.nvmllib))
++		o.devicelib = device.New(o.nvmllib)
+ 	}
+ 	if o.platform == "" {
+ 		o.platform = PlatformAuto
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/graphics.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/graphics.go
+index 35b51982b..b7efec8bb 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/graphics.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/graphics.go
+@@ -36,20 +36,20 @@ import (
+ // TODO: The logic for creating DRM devices should be consolidated between this
+ // and the logic for generating CDI specs for a single device. This is only used
+ // when applying OCI spec modifications to an incoming spec in "legacy" mode.
+-func NewDRMNodesDiscoverer(logger logger.Interface, devices image.VisibleDevices, devRoot string, nvidiaCTKPath string) (Discover, error) {
++func NewDRMNodesDiscoverer(logger logger.Interface, devices image.VisibleDevices, devRoot string, nvidiaCDIHookPath string) (Discover, error) {
+ 	drmDeviceNodes, err := newDRMDeviceDiscoverer(logger, devices, devRoot)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create DRM device discoverer: %v", err)
+ 	}
+ 
+-	drmByPathSymlinks := newCreateDRMByPathSymlinks(logger, drmDeviceNodes, devRoot, nvidiaCTKPath)
++	drmByPathSymlinks := newCreateDRMByPathSymlinks(logger, drmDeviceNodes, devRoot, nvidiaCDIHookPath)
+ 
+ 	discover := Merge(drmDeviceNodes, drmByPathSymlinks)
+ 	return discover, nil
+ }
+ 
+ // NewGraphicsMountsDiscoverer creates a discoverer for the mounts required by graphics tools such as vulkan.
+-func NewGraphicsMountsDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath string) (Discover, error) {
++func NewGraphicsMountsDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath string) (Discover, error) {
+ 	libraries := NewMounts(
+ 		logger,
+ 		driver.Libraries(),
+@@ -74,7 +74,7 @@ func NewGraphicsMountsDiscoverer(logger logger.Interface, driver *root.Driver, n
+ 		},
+ 	)
+ 
+-	xorg := optionalXorgDiscoverer(logger, driver, nvidiaCTKPath)
++	xorg := optionalXorgDiscoverer(logger, driver, nvidiaCDIHookPath)
+ 
+ 	discover := Merge(
+ 		libraries,
+@@ -87,19 +87,19 @@ func NewGraphicsMountsDiscoverer(logger logger.Interface, driver *root.Driver, n
+ 
+ type drmDevicesByPath struct {
+ 	None
+-	logger        logger.Interface
+-	nvidiaCTKPath string
+-	devRoot       string
+-	devicesFrom   Discover
++	logger            logger.Interface
++	nvidiaCDIHookPath string
++	devRoot           string
++	devicesFrom       Discover
+ }
+ 
+ // newCreateDRMByPathSymlinks creates a discoverer for a hook to create the by-path symlinks for DRM devices discovered by the specified devices discoverer
+-func newCreateDRMByPathSymlinks(logger logger.Interface, devices Discover, devRoot string, nvidiaCTKPath string) Discover {
++func newCreateDRMByPathSymlinks(logger logger.Interface, devices Discover, devRoot string, nvidiaCDIHookPath string) Discover {
+ 	d := drmDevicesByPath{
+-		logger:        logger,
+-		nvidiaCTKPath: nvidiaCTKPath,
+-		devRoot:       devRoot,
+-		devicesFrom:   devices,
++		logger:            logger,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
++		devRoot:           devRoot,
++		devicesFrom:       devices,
+ 	}
+ 
+ 	return &d
+@@ -127,8 +127,8 @@ func (d drmDevicesByPath) Hooks() ([]Hook, error) {
+ 		args = append(args, "--link", l)
+ 	}
+ 
+-	hook := CreateNvidiaCTKHook(
+-		d.nvidiaCTKPath,
++	hook := CreateNvidiaCDIHook(
++		d.nvidiaCDIHookPath,
+ 		"create-symlinks",
+ 		args...,
+ 	)
+@@ -233,17 +233,17 @@ func newDRMDeviceFilter(devices image.VisibleDevices, devRoot string) (Filter, e
+ }
+ 
+ type xorgHooks struct {
+-	libraries     Discover
+-	driverVersion string
+-	nvidiaCTKPath string
++	libraries         Discover
++	driverVersion     string
++	nvidiaCDIHookPath string
+ }
+ 
+ var _ Discover = (*xorgHooks)(nil)
+ 
+ // optionalXorgDiscoverer creates a discoverer for Xorg libraries.
+ // If the creation of the discoverer fails, a None discoverer is returned.
+-func optionalXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath string) Discover {
+-	xorg, err := newXorgDiscoverer(logger, driver, nvidiaCTKPath)
++func optionalXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath string) Discover {
++	xorg, err := newXorgDiscoverer(logger, driver, nvidiaCDIHookPath)
+ 	if err != nil {
+ 		logger.Warningf("Failed to create Xorg discoverer: %v; skipping xorg libraries", err)
+ 		return None{}
+@@ -251,7 +251,7 @@ func optionalXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidia
+ 	return xorg
+ }
+ 
+-func newXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath string) (Discover, error) {
++func newXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath string) (Discover, error) {
+ 	libCudaPaths, err := cuda.New(
+ 		driver.Libraries(),
+ 	).Locate(".*.*")
+@@ -281,9 +281,9 @@ func newXorgDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPa
+ 		},
+ 	)
+ 	xorgHooks := xorgHooks{
+-		libraries:     xorgLibs,
+-		driverVersion: version,
+-		nvidiaCTKPath: nvidiaCTKPath,
++		libraries:         xorgLibs,
++		driverVersion:     version,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
+ 	}
+ 
+ 	xorgConfig := NewMounts(
+@@ -332,7 +332,7 @@ func (m xorgHooks) Hooks() ([]Hook, error) {
+ 	link := strings.TrimSuffix(target, "."+m.driverVersion)
+ 	links := []string{fmt.Sprintf("%s::%s", filepath.Base(target), link)}
+ 	symlinkHook := CreateCreateSymlinkHook(
+-		m.nvidiaCTKPath,
++		m.nvidiaCDIHookPath,
+ 		links,
+ 	)
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/hooks.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/hooks.go
+index d68ecdbd0..4259ccf86 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/hooks.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/hooks.go
+@@ -41,7 +41,7 @@ func (h Hook) Hooks() ([]Hook, error) {
+ }
+ 
+ // CreateCreateSymlinkHook creates a hook which creates a symlink from link -> target.
+-func CreateCreateSymlinkHook(nvidiaCTKPath string, links []string) Discover {
++func CreateCreateSymlinkHook(nvidiaCDIHookPath string, links []string) Discover {
+ 	if len(links) == 0 {
+ 		return None{}
+ 	}
+@@ -50,18 +50,31 @@ func CreateCreateSymlinkHook(nvidiaCTKPath string, links []string) Discover {
+ 	for _, link := range links {
+ 		args = append(args, "--link", link)
+ 	}
+-	return CreateNvidiaCTKHook(
+-		nvidiaCTKPath,
++	return CreateNvidiaCDIHook(
++		nvidiaCDIHookPath,
+ 		"create-symlinks",
+ 		args...,
+ 	)
+ }
+ 
+-// CreateNvidiaCTKHook creates a hook which invokes the NVIDIA Container CLI hook subcommand.
+-func CreateNvidiaCTKHook(nvidiaCTKPath string, hookName string, additionalArgs ...string) Hook {
++// CreateNvidiaCDIHook creates a hook which invokes the NVIDIA Container CLI hook subcommand.
++func CreateNvidiaCDIHook(nvidiaCDIHookPath string, hookName string, additionalArgs ...string) Hook {
++	return cdiHook(nvidiaCDIHookPath).Create(hookName, additionalArgs...)
++}
++
++type cdiHook string
++
++func (c cdiHook) Create(name string, args ...string) Hook {
+ 	return Hook{
+ 		Lifecycle: cdi.CreateContainerHook,
+-		Path:      nvidiaCTKPath,
+-		Args:      append([]string{filepath.Base(nvidiaCTKPath), "hook", hookName}, additionalArgs...),
++		Path:      string(c),
++		Args:      append(c.requiredArgs(name), args...),
++	}
++}
++func (c cdiHook) requiredArgs(name string) []string {
++	base := filepath.Base(string(c))
++	if base == "nvidia-ctk" {
++		return []string{base, "hook", name}
+ 	}
++	return []string{base, name}
+ }
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/ldconfig.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/ldconfig.go
+index a1182ed29..b81b9be59 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/ldconfig.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/discover/ldconfig.go
+@@ -25,12 +25,12 @@ import (
+ )
+ 
+ // NewLDCacheUpdateHook creates a discoverer that updates the ldcache for the specified mounts. A logger can also be specified
+-func NewLDCacheUpdateHook(logger logger.Interface, mounts Discover, nvidiaCTKPath, ldconfigPath string) (Discover, error) {
++func NewLDCacheUpdateHook(logger logger.Interface, mounts Discover, nvidiaCDIHookPath, ldconfigPath string) (Discover, error) {
+ 	d := ldconfig{
+-		logger:        logger,
+-		nvidiaCTKPath: nvidiaCTKPath,
+-		ldconfigPath:  ldconfigPath,
+-		mountsFrom:    mounts,
++		logger:            logger,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
++		ldconfigPath:      ldconfigPath,
++		mountsFrom:        mounts,
+ 	}
+ 
+ 	return &d, nil
+@@ -38,10 +38,10 @@ func NewLDCacheUpdateHook(logger logger.Interface, mounts Discover, nvidiaCTKPat
+ 
+ type ldconfig struct {
+ 	None
+-	logger        logger.Interface
+-	nvidiaCTKPath string
+-	ldconfigPath  string
+-	mountsFrom    Discover
++	logger            logger.Interface
++	nvidiaCDIHookPath string
++	ldconfigPath      string
++	mountsFrom        Discover
+ }
+ 
+ // Hooks checks the required mounts for libraries and returns a hook to update the LDcache for the discovered paths.
+@@ -51,7 +51,7 @@ func (d ldconfig) Hooks() ([]Hook, error) {
+ 		return nil, fmt.Errorf("failed to discover mounts for ldcache update: %v", err)
+ 	}
+ 	h := CreateLDCacheUpdateHook(
+-		d.nvidiaCTKPath,
++		d.nvidiaCDIHookPath,
+ 		d.ldconfigPath,
+ 		getLibraryPaths(mounts),
+ 	)
+@@ -70,7 +70,7 @@ func CreateLDCacheUpdateHook(executable string, ldconfig string, libraries []str
+ 		args = append(args, "--folder", f)
+ 	}
+ 
+-	hook := CreateNvidiaCTKHook(
++	hook := CreateNvidiaCDIHook(
+ 		executable,
+ 		"update-ldcache",
+ 		args...,
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/symlinks.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/symlinks.go
+index 283b2f4d9..37b07e6dc 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/symlinks.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/symlinks.go
+@@ -28,10 +28,10 @@ import (
+ 
+ type symlinkHook struct {
+ 	discover.None
+-	logger        logger.Interface
+-	nvidiaCTKPath string
+-	targets       []string
+-	mountsFrom    discover.Discover
++	logger            logger.Interface
++	nvidiaCDIHookPath string
++	targets           []string
++	mountsFrom        discover.Discover
+ 
+ 	// The following can be overridden for testing
+ 	symlinkChainLocator lookup.Locator
+@@ -42,7 +42,7 @@ type symlinkHook struct {
+ func (o tegraOptions) createCSVSymlinkHooks(targets []string, mounts discover.Discover) discover.Discover {
+ 	return symlinkHook{
+ 		logger:              o.logger,
+-		nvidiaCTKPath:       o.nvidiaCTKPath,
++		nvidiaCDIHookPath:   o.nvidiaCDIHookPath,
+ 		targets:             targets,
+ 		mountsFrom:          mounts,
+ 		symlinkChainLocator: o.symlinkChainLocator,
+@@ -60,7 +60,7 @@ func (d symlinkHook) Hooks() ([]discover.Hook, error) {
+ 	csvSymlinks := d.getCSVFileSymlinks()
+ 
+ 	return discover.CreateCreateSymlinkHook(
+-		d.nvidiaCTKPath,
++		d.nvidiaCDIHookPath,
+ 		append(csvSymlinks, specificLinks...),
+ 	).Hooks()
+ }
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/tegra.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/tegra.go
+index 771b31f29..1031fc726 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/tegra.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/internal/platform-support/tegra/tegra.go
+@@ -30,7 +30,7 @@ type tegraOptions struct {
+ 	csvFiles           []string
+ 	driverRoot         string
+ 	devRoot            string
+-	nvidiaCTKPath      string
++	nvidiaCDIHookPath  string
+ 	ldconfigPath       string
+ 	librarySearchPaths []string
+ 	ignorePatterns     ignoreMountSpecPatterns
+@@ -80,7 +80,7 @@ func New(opts ...Option) (discover.Discover, error) {
+ 		return nil, fmt.Errorf("failed to create CSV discoverer: %v", err)
+ 	}
+ 
+-	ldcacheUpdateHook, err := discover.NewLDCacheUpdateHook(o.logger, csvDiscoverer, o.nvidiaCTKPath, o.ldconfigPath)
++	ldcacheUpdateHook, err := discover.NewLDCacheUpdateHook(o.logger, csvDiscoverer, o.nvidiaCDIHookPath, o.ldconfigPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create ldcach update hook discoverer: %v", err)
+ 	}
+@@ -133,10 +133,10 @@ func WithCSVFiles(csvFiles []string) Option {
+ 	}
+ }
+ 
+-// WithNVIDIACTKPath sets the path to the nvidia-container-toolkit binary.
+-func WithNVIDIACTKPath(nvidiaCTKPath string) Option {
++// WithNVIDIACDIHookPath sets the path to the nvidia-cdi-hook binary.
++func WithNVIDIACDIHookPath(nvidiaCDIHookPath string) Option {
+ 	return func(o *tegraOptions) {
+-		o.nvidiaCTKPath = nvidiaCTKPath
++		o.nvidiaCDIHookPath = nvidiaCDIHookPath
+ 	}
+ }
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/common-nvml.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/common-nvml.go
+index f4bfe30a2..4dd1bc357 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/common-nvml.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/common-nvml.go
+@@ -36,12 +36,12 @@ func (l *nvmllib) newCommonNVMLDiscoverer() (discover.Discover, error) {
+ 		},
+ 	)
+ 
+-	graphicsMounts, err := discover.NewGraphicsMountsDiscoverer(l.logger, l.driver, l.nvidiaCTKPath)
++	graphicsMounts, err := discover.NewGraphicsMountsDiscoverer(l.logger, l.driver, l.nvidiaCDIHookPath)
+ 	if err != nil {
+ 		l.logger.Warningf("failed to create discoverer for graphics mounts: %v", err)
+ 	}
+ 
+-	driverFiles, err := NewDriverDiscoverer(l.logger, l.driver, l.nvidiaCTKPath, l.ldconfigPath, l.nvmllib)
++	driverFiles, err := NewDriverDiscoverer(l.logger, l.driver, l.nvidiaCDIHookPath, l.ldconfigPath, l.nvmllib)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create discoverer for driver files: %v", err)
+ 	}
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-nvml.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-nvml.go
+index 993740039..8fb398887 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-nvml.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-nvml.go
+@@ -34,7 +34,7 @@ import (
+ 
+ // NewDriverDiscoverer creates a discoverer for the libraries and binaries associated with a driver installation.
+ // The supplied NVML Library is used to query the expected driver version.
+-func NewDriverDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath string, ldconfigPath string, nvmllib nvml.Interface) (discover.Discover, error) {
++func NewDriverDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath string, ldconfigPath string, nvmllib nvml.Interface) (discover.Discover, error) {
+ 	if r := nvmllib.Init(); r != nvml.SUCCESS {
+ 		return nil, fmt.Errorf("failed to initialize NVML: %v", r)
+ 	}
+@@ -49,11 +49,11 @@ func NewDriverDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTK
+ 		return nil, fmt.Errorf("failed to determine driver version: %v", r)
+ 	}
+ 
+-	return newDriverVersionDiscoverer(logger, driver, nvidiaCTKPath, ldconfigPath, version)
++	return newDriverVersionDiscoverer(logger, driver, nvidiaCDIHookPath, ldconfigPath, version)
+ }
+ 
+-func newDriverVersionDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath, ldconfigPath, version string) (discover.Discover, error) {
+-	libraries, err := NewDriverLibraryDiscoverer(logger, driver, nvidiaCTKPath, ldconfigPath, version)
++func newDriverVersionDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath, ldconfigPath, version string) (discover.Discover, error) {
++	libraries, err := NewDriverLibraryDiscoverer(logger, driver, nvidiaCDIHookPath, ldconfigPath, version)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create discoverer for driver libraries: %v", err)
+ 	}
+@@ -81,7 +81,7 @@ func newDriverVersionDiscoverer(logger logger.Interface, driver *root.Driver, nv
+ }
+ 
+ // NewDriverLibraryDiscoverer creates a discoverer for the libraries associated with the specified driver version.
+-func NewDriverLibraryDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCTKPath, ldconfigPath, version string) (discover.Discover, error) {
++func NewDriverLibraryDiscoverer(logger logger.Interface, driver *root.Driver, nvidiaCDIHookPath, ldconfigPath, version string) (discover.Discover, error) {
+ 	libraryPaths, err := getVersionLibs(logger, driver, version)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get libraries for driver version: %v", err)
+@@ -97,7 +97,7 @@ func NewDriverLibraryDiscoverer(logger logger.Interface, driver *root.Driver, nv
+ 		libraryPaths,
+ 	)
+ 
+-	hooks, _ := discover.NewLDCacheUpdateHook(logger, libraries, nvidiaCTKPath, ldconfigPath)
++	hooks, _ := discover.NewLDCacheUpdateHook(logger, libraries, nvidiaCDIHookPath, ldconfigPath)
+ 
+ 	d := discover.Merge(
+ 		libraries,
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-wsl.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-wsl.go
+index e87bcb036..d184d7779 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-wsl.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/driver-wsl.go
+@@ -39,7 +39,7 @@ var requiredDriverStoreFiles = []string{
+ }
+ 
+ // newWSLDriverDiscoverer returns a Discoverer for WSL2 drivers.
+-func newWSLDriverDiscoverer(logger logger.Interface, driverRoot string, nvidiaCTKPath, ldconfigPath string) (discover.Discover, error) {
++func newWSLDriverDiscoverer(logger logger.Interface, driverRoot string, nvidiaCDIHookPath, ldconfigPath string) (discover.Discover, error) {
+ 	err := dxcore.Init()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to initialize dxcore: %v", err)
+@@ -56,11 +56,11 @@ func newWSLDriverDiscoverer(logger logger.Interface, driverRoot string, nvidiaCT
+ 	}
+ 	logger.Infof("Using WSL driver store paths: %v", driverStorePaths)
+ 
+-	return newWSLDriverStoreDiscoverer(logger, driverRoot, nvidiaCTKPath, ldconfigPath, driverStorePaths)
++	return newWSLDriverStoreDiscoverer(logger, driverRoot, nvidiaCDIHookPath, ldconfigPath, driverStorePaths)
+ }
+ 
+ // newWSLDriverStoreDiscoverer returns a Discoverer for WSL2 drivers in the driver store associated with a dxcore adapter.
+-func newWSLDriverStoreDiscoverer(logger logger.Interface, driverRoot string, nvidiaCTKPath string, ldconfigPath string, driverStorePaths []string) (discover.Discover, error) {
++func newWSLDriverStoreDiscoverer(logger logger.Interface, driverRoot string, nvidiaCDIHookPath string, ldconfigPath string, driverStorePaths []string) (discover.Discover, error) {
+ 	var searchPaths []string
+ 	seen := make(map[string]bool)
+ 	for _, path := range driverStorePaths {
+@@ -88,12 +88,12 @@ func newWSLDriverStoreDiscoverer(logger logger.Interface, driverRoot string, nvi
+ 	)
+ 
+ 	symlinkHook := nvidiaSMISimlinkHook{
+-		logger:        logger,
+-		mountsFrom:    libraries,
+-		nvidiaCTKPath: nvidiaCTKPath,
++		logger:            logger,
++		mountsFrom:        libraries,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
+ 	}
+ 
+-	ldcacheHook, _ := discover.NewLDCacheUpdateHook(logger, libraries, nvidiaCTKPath, ldconfigPath)
++	ldcacheHook, _ := discover.NewLDCacheUpdateHook(logger, libraries, nvidiaCDIHookPath, ldconfigPath)
+ 
+ 	d := discover.Merge(
+ 		libraries,
+@@ -106,9 +106,9 @@ func newWSLDriverStoreDiscoverer(logger logger.Interface, driverRoot string, nvi
+ 
+ type nvidiaSMISimlinkHook struct {
+ 	discover.None
+-	logger        logger.Interface
+-	mountsFrom    discover.Discover
+-	nvidiaCTKPath string
++	logger            logger.Interface
++	mountsFrom        discover.Discover
++	nvidiaCDIHookPath string
+ }
+ 
+ // Hooks returns a hook that creates a symlink to nvidia-smi in the driver store.
+@@ -135,7 +135,7 @@ func (m nvidiaSMISimlinkHook) Hooks() ([]discover.Hook, error) {
+ 	}
+ 	link := "/usr/bin/nvidia-smi"
+ 	links := []string{fmt.Sprintf("%s::%s", target, link)}
+-	symlinkHook := discover.CreateCreateSymlinkHook(m.nvidiaCTKPath, links)
++	symlinkHook := discover.CreateCreateSymlinkHook(m.nvidiaCDIHookPath, links)
+ 
+ 	return symlinkHook.Hooks()
+ }
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/full-gpu-nvml.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/full-gpu-nvml.go
+index c73277573..aa46c4c6d 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/full-gpu-nvml.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/full-gpu-nvml.go
+@@ -58,7 +58,7 @@ func (l *nvmllib) GetGPUDeviceSpecs(i int, d device.Device) ([]specs.Device, err
+ 
+ // GetGPUDeviceEdits returns the CDI edits for the full GPU represented by 'device'.
+ func (l *nvmllib) GetGPUDeviceEdits(d device.Device) (*cdi.ContainerEdits, error) {
+-	device, err := newFullGPUDiscoverer(l.logger, l.devRoot, l.nvidiaCTKPath, d)
++	device, err := newFullGPUDiscoverer(l.logger, l.devRoot, l.nvidiaCDIHookPath, d)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create device discoverer: %v", err)
+ 	}
+@@ -73,17 +73,17 @@ func (l *nvmllib) GetGPUDeviceEdits(d device.Device) (*cdi.ContainerEdits, error
+ 
+ // byPathHookDiscoverer discovers the entities required for injecting by-path DRM device links
+ type byPathHookDiscoverer struct {
+-	logger        logger.Interface
+-	devRoot       string
+-	nvidiaCTKPath string
+-	pciBusID      string
+-	deviceNodes   discover.Discover
++	logger            logger.Interface
++	devRoot           string
++	nvidiaCDIHookPath string
++	pciBusID          string
++	deviceNodes       discover.Discover
+ }
+ 
+ var _ discover.Discover = (*byPathHookDiscoverer)(nil)
+ 
+ // newFullGPUDiscoverer creates a discoverer for the full GPU defined by the specified device.
+-func newFullGPUDiscoverer(logger logger.Interface, devRoot string, nvidiaCTKPath string, d device.Device) (discover.Discover, error) {
++func newFullGPUDiscoverer(logger logger.Interface, devRoot string, nvidiaCDIHookPath string, d device.Device) (discover.Discover, error) {
+ 	// TODO: The functionality to get device paths should be integrated into the go-nvlib/pkg/device.Device interface.
+ 	// This will allow reuse here and in other code where the paths are queried such as the NVIDIA device plugin.
+ 	minor, ret := d.GetMinorNumber()
+@@ -112,17 +112,17 @@ func newFullGPUDiscoverer(logger logger.Interface, devRoot string, nvidiaCTKPath
+ 	)
+ 
+ 	byPathHooks := &byPathHookDiscoverer{
+-		logger:        logger,
+-		devRoot:       devRoot,
+-		nvidiaCTKPath: nvidiaCTKPath,
+-		pciBusID:      pciBusID,
+-		deviceNodes:   deviceNodes,
++		logger:            logger,
++		devRoot:           devRoot,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
++		pciBusID:          pciBusID,
++		deviceNodes:       deviceNodes,
+ 	}
+ 
+ 	deviceFolderPermissionHooks := newDeviceFolderPermissionHookDiscoverer(
+ 		logger,
+ 		devRoot,
+-		nvidiaCTKPath,
++		nvidiaCDIHookPath,
+ 		deviceNodes,
+ 	)
+ 
+@@ -157,8 +157,8 @@ func (d *byPathHookDiscoverer) Hooks() ([]discover.Hook, error) {
+ 		args = append(args, "--link", l)
+ 	}
+ 
+-	hook := discover.CreateNvidiaCTKHook(
+-		d.nvidiaCTKPath,
++	hook := discover.CreateNvidiaCDIHook(
++		d.nvidiaCDIHookPath,
+ 		"create-symlinks",
+ 		args...,
+ 	)
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-csv.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-csv.go
+index 4acc5cd6f..649b801ae 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-csv.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-csv.go
+@@ -44,7 +44,7 @@ func (l *csvlib) GetAllDeviceSpecs() ([]specs.Device, error) {
+ 		tegra.WithLogger(l.logger),
+ 		tegra.WithDriverRoot(l.driverRoot),
+ 		tegra.WithDevRoot(l.devRoot),
+-		tegra.WithNVIDIACTKPath(l.nvidiaCTKPath),
++		tegra.WithNVIDIACDIHookPath(l.nvidiaCDIHookPath),
+ 		tegra.WithLdconfigPath(l.ldconfigPath),
+ 		tegra.WithCSVFiles(l.csvFiles),
+ 		tegra.WithLibrarySearchPaths(l.librarySearchPaths...),
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-nvml.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-nvml.go
+index 952366510..ab7cb8ba2 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-nvml.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-nvml.go
+@@ -80,7 +80,17 @@ func (l *nvmllib) GetCommonEdits() (*cdi.ContainerEdits, error) {
+ // GetDeviceSpecsByID returns the CDI device specs for the GPU(s) represented by
+ // the provided identifiers, where an identifier is an index or UUID of a valid
+ // GPU device.
+-func (l *nvmllib) GetDeviceSpecsByID(identifiers ...string) ([]specs.Device, error) {
++// Deprecated: Use GetDeviceSpecsBy instead.
++func (l *nvmllib) GetDeviceSpecsByID(ids ...string) ([]specs.Device, error) {
++	var identifiers []device.Identifier
++	for _, id := range ids {
++		identifiers = append(identifiers, device.Identifier(id))
++	}
++	return l.GetDeviceSpecsBy(identifiers...)
++}
++
++// GetDeviceSpecsBy is not supported for the gdslib specs.
++func (l *nvmllib) GetDeviceSpecsBy(identifiers ...device.Identifier) ([]specs.Device, error) {
+ 	for _, id := range identifiers {
+ 		if id == "all" {
+ 			return l.GetAllDeviceSpecs()
+@@ -109,7 +119,7 @@ func (l *nvmllib) GetDeviceSpecsByID(identifiers ...string) ([]specs.Device, err
+ 			return nil, fmt.Errorf("failed to get CDI device edits for identifier %q: %w", identifiers[i], err)
+ 		}
+ 		deviceSpec := specs.Device{
+-			Name:           identifiers[i],
++			Name:           string(identifiers[i]),
+ 			ContainerEdits: *deviceEdits.ContainerEdits,
+ 		}
+ 		deviceSpecs = append(deviceSpecs, deviceSpec)
+@@ -119,7 +129,7 @@ func (l *nvmllib) GetDeviceSpecsByID(identifiers ...string) ([]specs.Device, err
+ }
+ 
+ // TODO: move this to go-nvlib?
+-func (l *nvmllib) getNVMLDevicesByID(identifiers ...string) ([]nvml.Device, error) {
++func (l *nvmllib) getNVMLDevicesByID(identifiers ...device.Identifier) ([]nvml.Device, error) {
+ 	var devices []nvml.Device
+ 	for _, id := range identifiers {
+ 		dev, err := l.getNVMLDeviceByID(id)
+@@ -131,25 +141,24 @@ func (l *nvmllib) getNVMLDevicesByID(identifiers ...string) ([]nvml.Device, erro
+ 	return devices, nil
+ }
+ 
+-func (l *nvmllib) getNVMLDeviceByID(id string) (nvml.Device, error) {
++func (l *nvmllib) getNVMLDeviceByID(id device.Identifier) (nvml.Device, error) {
+ 	var err error
+-	devID := device.Identifier(id)
+ 
+-	if devID.IsUUID() {
+-		return l.nvmllib.DeviceGetHandleByUUID(id)
++	if id.IsUUID() {
++		return l.nvmllib.DeviceGetHandleByUUID(string(id))
+ 	}
+ 
+-	if devID.IsGpuIndex() {
+-		if idx, err := strconv.Atoi(id); err == nil {
++	if id.IsGpuIndex() {
++		if idx, err := strconv.Atoi(string(id)); err == nil {
+ 			return l.nvmllib.DeviceGetHandleByIndex(idx)
+ 		}
+ 		return nil, fmt.Errorf("failed to convert device index to an int: %w", err)
+ 	}
+ 
+-	if devID.IsMigIndex() {
++	if id.IsMigIndex() {
+ 		var gpuIdx, migIdx int
+ 		var parent nvml.Device
+-		split := strings.SplitN(id, ":", 2)
++		split := strings.SplitN(string(id), ":", 2)
+ 		if gpuIdx, err = strconv.Atoi(split[0]); err != nil {
+ 			return nil, fmt.Errorf("failed to convert device index to an int: %w", err)
+ 		}
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-wsl.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-wsl.go
+index 5e8ea97b6..1c96c5383 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-wsl.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib-wsl.go
+@@ -54,7 +54,7 @@ func (l *wsllib) GetAllDeviceSpecs() ([]specs.Device, error) {
+ 
+ // GetCommonEdits generates a CDI specification that can be used for ANY devices
+ func (l *wsllib) GetCommonEdits() (*cdi.ContainerEdits, error) {
+-	driver, err := newWSLDriverDiscoverer(l.logger, l.driverRoot, l.nvidiaCTKPath, l.ldconfigPath)
++	driver, err := newWSLDriverDiscoverer(l.logger, l.driverRoot, l.nvidiaCDIHookPath, l.ldconfigPath)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create discoverer for WSL driver: %v", err)
+ 	}
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib.go
+index 7f07fd7e7..249bd311b 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/lib.go
+@@ -48,7 +48,7 @@ type nvcdilib struct {
+ 	deviceNamers       DeviceNamers
+ 	driverRoot         string
+ 	devRoot            string
+-	nvidiaCTKPath      string
++	nvidiaCDIHookPath  string
+ 	ldconfigPath       string
+ 	configSearchPaths  []string
+ 	librarySearchPaths []string
+@@ -81,24 +81,34 @@ func New(opts ...Option) (Interface, error) {
+ 		indexNamer, _ := NewDeviceNamer(DeviceNameStrategyIndex)
+ 		l.deviceNamers = []DeviceNamer{indexNamer}
+ 	}
++	if l.nvidiaCDIHookPath == "" {
++		l.nvidiaCDIHookPath = "/usr/bin/nvidia-cdi-hook"
++	}
+ 	if l.driverRoot == "" {
+ 		l.driverRoot = "/"
+ 	}
+ 	if l.devRoot == "" {
+ 		l.devRoot = l.driverRoot
+ 	}
+-	if l.nvidiaCTKPath == "" {
+-		l.nvidiaCTKPath = "/usr/bin/nvidia-ctk"
+-	}
+-	if l.infolib == nil {
+-		l.infolib = info.New()
+-	}
+-
+ 	l.driver = root.New(
+ 		root.WithLogger(l.logger),
+ 		root.WithDriverRoot(l.driverRoot),
+ 		root.WithLibrarySearchPaths(l.librarySearchPaths...),
+ 	)
++	if l.nvmllib == nil {
++		l.nvmllib = nvml.New()
++	}
++	if l.devicelib == nil {
++		l.devicelib = device.New(l.nvmllib)
++	}
++	if l.infolib == nil {
++		l.infolib = info.New(
++			info.WithRoot(l.driverRoot),
++			info.WithLogger(l.logger),
++			info.WithNvmlLib(l.nvmllib),
++			info.WithDeviceLib(l.devicelib),
++		)
++	}
+ 
+ 	var lib Interface
+ 	switch l.resolveMode() {
+@@ -113,13 +123,6 @@ func New(opts ...Option) (Interface, error) {
+ 		}
+ 		lib = (*managementlib)(l)
+ 	case ModeNvml:
+-		if l.nvmllib == nil {
+-			l.nvmllib = nvml.New()
+-		}
+-		if l.devicelib == nil {
+-			l.devicelib = device.New(device.WithNvml(l.nvmllib))
+-		}
+-
+ 		lib = (*nvmllib)(l)
+ 	case ModeWsl:
+ 		lib = (*wsllib)(l)
+@@ -184,26 +187,19 @@ func (l *nvcdilib) resolveMode() (rmode string) {
+ 		return l.mode
+ 	}
+ 	defer func() {
+-		l.logger.Infof("Auto-detected mode as %q", rmode)
++		l.logger.Infof("Auto-detected mode as '%v'", rmode)
+ 	}()
+ 
+-	isWSL, reason := l.infolib.HasDXCore()
+-	l.logger.Debugf("Is WSL-based system? %v: %v", isWSL, reason)
+-
+-	if isWSL {
+-		return ModeWsl
+-	}
+-
+-	isNvml, reason := l.infolib.HasNvml()
+-	l.logger.Debugf("Is NVML-based system? %v: %v", isNvml, reason)
+-
+-	isTegra, reason := l.infolib.IsTegraSystem()
+-	l.logger.Debugf("Is Tegra-based system? %v: %v", isTegra, reason)
+-
+-	if isTegra && !isNvml {
++	platform := l.infolib.ResolvePlatform()
++	switch platform {
++	case info.PlatformNVML:
++		return ModeNvml
++	case info.PlatformTegra:
+ 		return ModeCSV
++	case info.PlatformWSL:
++		return ModeWsl
+ 	}
+-
++	l.logger.Warningf("Unsupported platform detected: %v; assuming %v", platform, ModeNvml)
+ 	return ModeNvml
+ }
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/management.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/management.go
+index c906db2ce..4648e5bb0 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/management.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/management.go
+@@ -66,7 +66,7 @@ func (m *managementlib) GetCommonEdits() (*cdi.ContainerEdits, error) {
+ 		return nil, fmt.Errorf("failed to get CUDA version: %v", err)
+ 	}
+ 
+-	driver, err := newDriverVersionDiscoverer(m.logger, m.driver, m.nvidiaCTKPath, m.ldconfigPath, version)
++	driver, err := newDriverVersionDiscoverer(m.logger, m.driver, m.nvidiaCDIHookPath, m.ldconfigPath, version)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create driver library discoverer: %v", err)
+ 	}
+@@ -123,7 +123,7 @@ func (m *managementlib) newManagementDeviceDiscoverer() (discover.Discover, erro
+ 	deviceFolderPermissionHooks := newDeviceFolderPermissionHookDiscoverer(
+ 		m.logger,
+ 		m.devRoot,
+-		m.nvidiaCTKPath,
++		m.nvidiaCDIHookPath,
+ 		deviceNodes,
+ 	)
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/options.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/options.go
+index 89992a54b..417687b96 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/options.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/options.go
+@@ -18,6 +18,7 @@ package nvcdi
+ 
+ import (
+ 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
++	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
+ 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+ 
+ 	"github.com/NVIDIA/nvidia-container-toolkit/internal/logger"
+@@ -34,6 +35,13 @@ func WithDeviceLib(devicelib device.Interface) Option {
+ 	}
+ }
+ 
++// WithInfoLib sets the info library for CDI spec generation.
++func WithInfoLib(infolib info.Interface) Option {
++	return func(l *nvcdilib) {
++		l.infolib = infolib
++	}
++}
++
+ // WithDeviceNamers sets the device namer for the library
+ func WithDeviceNamers(namers ...DeviceNamer) Option {
+ 	return func(l *nvcdilib) {
+@@ -63,9 +71,16 @@ func WithLogger(logger logger.Interface) Option {
+ }
+ 
+ // WithNVIDIACTKPath sets the path to the NVIDIA Container Toolkit CLI path for the library
++//
++// Deprecated: Use WithNVIDIACDIHookPath instead.
+ func WithNVIDIACTKPath(path string) Option {
++	return WithNVIDIACDIHookPath(path)
++}
++
++// WithNVIDIACDIHookPath sets the path to the NVIDIA Container Toolkit CLI path for the library
++func WithNVIDIACDIHookPath(path string) Option {
+ 	return func(l *nvcdilib) {
+-		l.nvidiaCTKPath = path
++		l.nvidiaCDIHookPath = path
+ 	}
+ }
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/api.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/api.go
+index b91072c5c..918f56f21 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/api.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/api.go
+@@ -24,6 +24,8 @@ import (
+ 
+ const (
+ 	// DetectMinimumVersion is a constant that triggers a spec to detect the minimum required version.
++	//
++	// Deprecated: DetectMinimumVersion is deprecated and will be removed.
+ 	DetectMinimumVersion = "DETECT_MINIMUM_VERSION"
+ 
+ 	// FormatJSON indicates a JSON output format
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/builder.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/builder.go
+index 8fb80a68a..ec8cc1441 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/builder.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/builder.go
+@@ -39,6 +39,8 @@ type builder struct {
+ 	mergedDeviceOptions []transform.MergedDeviceOption
+ 	noSimplify          bool
+ 	permissions         os.FileMode
++
++	transformOnSave transform.Transformer
+ }
+ 
+ // newBuilder creates a new spec builder with the supplied options
+@@ -47,15 +49,23 @@ func newBuilder(opts ...Option) *builder {
+ 	for _, opt := range opts {
+ 		opt(s)
+ 	}
++
+ 	if s.raw != nil {
+ 		s.noSimplify = true
+ 		vendor, class := parser.ParseQualifier(s.raw.Kind)
+-		s.vendor = vendor
+-		s.class = class
++		if s.vendor == "" {
++			s.vendor = vendor
++		}
++		if s.class == "" {
++			s.class = class
++		}
++		if s.version == "" || s.version == DetectMinimumVersion {
++			s.version = s.raw.Version
++		}
+ 	}
+-
+-	if s.version == "" {
+-		s.version = DetectMinimumVersion
++	if s.version == "" || s.version == DetectMinimumVersion {
++		s.transformOnSave = &setMinimumRequiredVersion{}
++		s.version = cdi.CurrentVersion
+ 	}
+ 	if s.vendor == "" {
+ 		s.vendor = "nvidia.com"
+@@ -83,13 +93,8 @@ func (o *builder) Build() (*spec, error) {
+ 			ContainerEdits: o.edits,
+ 		}
+ 	}
+-
+-	if raw.Version == DetectMinimumVersion {
+-		minVersion, err := cdi.MinimumRequiredVersion(raw)
+-		if err != nil {
+-			return nil, fmt.Errorf("failed to get minimum required CDI spec version: %v", err)
+-		}
+-		raw.Version = minVersion
++	if raw.Version == "" {
++		raw.Version = o.version
+ 	}
+ 
+ 	if !o.noSimplify {
+@@ -110,11 +115,11 @@ func (o *builder) Build() (*spec, error) {
+ 	}
+ 
+ 	s := spec{
+-		Spec:        raw,
+-		format:      o.format,
+-		permissions: o.permissions,
++		Spec:            raw,
++		format:          o.format,
++		permissions:     o.permissions,
++		transformOnSave: o.transformOnSave,
+ 	}
+-
+ 	return &s, nil
+ }
+ 
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/set-minimum-version.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/set-minimum-version.go
+new file mode 100644
+index 000000000..69969c0b5
+--- /dev/null
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/set-minimum-version.go
+@@ -0,0 +1,35 @@
++/**
++# Copyright 2024 NVIDIA CORPORATION
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++**/
++
++package spec
++
++import (
++	"fmt"
++
++	"tags.cncf.io/container-device-interface/pkg/cdi"
++	"tags.cncf.io/container-device-interface/specs-go"
++)
++
++type setMinimumRequiredVersion struct{}
++
++func (d setMinimumRequiredVersion) Transform(spec *specs.Spec) error {
++	minVersion, err := cdi.MinimumRequiredVersion(spec)
++	if err != nil {
++		return fmt.Errorf("failed to get minimum required CDI spec version: %v", err)
++	}
++	spec.Version = minVersion
++	return nil
++}
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/spec.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/spec.go
+index c27c4de31..28cccc518 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/spec.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/spec/spec.go
+@@ -24,12 +24,15 @@ import (
+ 
+ 	"tags.cncf.io/container-device-interface/pkg/cdi"
+ 	"tags.cncf.io/container-device-interface/specs-go"
++
++	"github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/transform"
+ )
+ 
+ type spec struct {
+ 	*specs.Spec
+-	format      string
+-	permissions os.FileMode
++	format          string
++	permissions     os.FileMode
++	transformOnSave transform.Transformer
+ }
+ 
+ var _ Interface = (*spec)(nil)
+@@ -41,6 +44,12 @@ func New(opts ...Option) (Interface, error) {
+ 
+ // Save writes the spec to the specified path and overwrites the file if it exists.
+ func (s *spec) Save(path string) error {
++	if s.transformOnSave != nil {
++		err := s.transformOnSave.Transform(s.Raw())
++		if err != nil {
++			return fmt.Errorf("error applying transform: %w", err)
++		}
++	}
+ 	path, err := s.normalizePath(path)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to normalize path: %w", err)
+diff --git a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/workarounds-device-folder-permissions.go b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/workarounds-device-folder-permissions.go
+index e183ed6e2..511eb1fce 100644
+--- a/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/workarounds-device-folder-permissions.go
++++ b/vendor/github.com/NVIDIA/nvidia-container-toolkit/pkg/nvcdi/workarounds-device-folder-permissions.go
+@@ -25,10 +25,10 @@ import (
+ )
+ 
+ type deviceFolderPermissions struct {
+-	logger        logger.Interface
+-	devRoot       string
+-	nvidiaCTKPath string
+-	devices       discover.Discover
++	logger            logger.Interface
++	devRoot           string
++	nvidiaCDIHookPath string
++	devices           discover.Discover
+ }
+ 
+ var _ discover.Discover = (*deviceFolderPermissions)(nil)
+@@ -39,12 +39,12 @@ var _ discover.Discover = (*deviceFolderPermissions)(nil)
+ // The nested devices that are applicable to the NVIDIA GPU devices are:
+ //   - DRM devices at /dev/dri/*
+ //   - NVIDIA Caps devices at /dev/nvidia-caps/*
+-func newDeviceFolderPermissionHookDiscoverer(logger logger.Interface, devRoot string, nvidiaCTKPath string, devices discover.Discover) discover.Discover {
++func newDeviceFolderPermissionHookDiscoverer(logger logger.Interface, devRoot string, nvidiaCDIHookPath string, devices discover.Discover) discover.Discover {
+ 	d := &deviceFolderPermissions{
+-		logger:        logger,
+-		devRoot:       devRoot,
+-		nvidiaCTKPath: nvidiaCTKPath,
+-		devices:       devices,
++		logger:            logger,
++		devRoot:           devRoot,
++		nvidiaCDIHookPath: nvidiaCDIHookPath,
++		devices:           devices,
+ 	}
+ 
+ 	return d
+@@ -70,8 +70,8 @@ func (d *deviceFolderPermissions) Hooks() ([]discover.Hook, error) {
+ 		args = append(args, "--path", folder)
+ 	}
+ 
+-	hook := discover.CreateNvidiaCTKHook(
+-		d.nvidiaCTKPath,
++	hook := discover.CreateNvidiaCDIHook(
++		d.nvidiaCDIHookPath,
+ 		"chmod",
+ 		args...,
+ 	)
+diff --git a/vendor/modules.txt b/vendor/modules.txt
+index 8bc760401..cc1ff52d3 100644
+--- a/vendor/modules.txt
++++ b/vendor/modules.txt
+@@ -27,11 +27,11 @@ github.com/Masterminds/squirrel
+ # github.com/Microsoft/hcsshim v0.11.4
+ ## explicit; go 1.18
+ github.com/Microsoft/hcsshim/osversion
+-# github.com/NVIDIA/go-gpuallocator v0.4.2
++# github.com/NVIDIA/go-gpuallocator v0.5.0
+ ## explicit; go 1.20
+ github.com/NVIDIA/go-gpuallocator/gpuallocator
+ github.com/NVIDIA/go-gpuallocator/internal/links
+-# github.com/NVIDIA/go-nvlib v0.4.0
++# github.com/NVIDIA/go-nvlib v0.5.0
+ ## explicit; go 1.20
+ github.com/NVIDIA/go-nvlib/pkg/nvlib/device
+ github.com/NVIDIA/go-nvlib/pkg/nvlib/info
+@@ -43,7 +43,7 @@ github.com/NVIDIA/go-nvlib/pkg/pciids
+ ## explicit; go 1.20
+ github.com/NVIDIA/go-nvml/pkg/dl
+ github.com/NVIDIA/go-nvml/pkg/nvml
+-# github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240419094620-0aed9a16addf
++# github.com/NVIDIA/nvidia-container-toolkit v1.15.1-0.20240528113255-e4b46a09a77e
+ ## explicit; go 1.20
+ github.com/NVIDIA/nvidia-container-toolkit/internal/config/image
+ github.com/NVIDIA/nvidia-container-toolkit/internal/discover

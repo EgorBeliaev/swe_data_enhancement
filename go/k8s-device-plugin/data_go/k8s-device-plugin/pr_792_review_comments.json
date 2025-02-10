@@ -1,0 +1,67 @@
+[
+    {
+        "title": "[gfd] Fixing logic of atomically file writing"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "fix #791\r\n\r\nThe current implementation of the [writeFileAtomically](https://github.com/NVIDIA/k8s-device-plugin/blob/35ad18080eded1889dc1eaee1132debddfd6757c/internal/lm/output.go#L105) function contains a bug - the `os.Chmod` function is called after `os.Rename`, causing a moment when the target file (`features.d/gfd`) has incorrect permissions (`0600` instead of `0644`):\r\n```bash\r\nE0629 17:29:25.340196       1 local.go:266] source local failed reading file 'gfd': open /etc/kubernetes/node-feature-discovery/features.d/gfd: permission denied\r\n```\r\n\r\nTo fix this issue, the order of the calls needs to be changed to: `os.Chmod -> os.Rename`"
+    },
+    {
+        "author": {
+            "login": "elezar"
+        },
+        "body": "Thanks for this fix @belo4ya."
+    },
+    {
+        "author": {
+            "login": "elezar"
+        },
+        "body": "With regards to:\r\n> The only thing is, the temporary file will be created in $TMPDIR instead of /etc/kubernetes/node-feature-discovery/features.d/gfd-tmp/ (I don't think this is a problem, but it's worth mentioning).\r\n\r\nLet's squash these two commits into a single commit and include this note in the commit message along with additional context on the fixed bug (something like your description would be great)."
+    },
+    {
+        "author": {
+            "login": "elezar"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "belo4ya"
+        },
+        "body": "What do you think about using [github.com/google/renameio](https://github.com/google/renameio) instead of our own implementation of atomic file writing?\r\n```go\r\nimport \"github.com/google/renameio\"\r\n\r\nfunc writeFileAtomically(path string, contents []byte, perm os.FileMode) error {\r\n\treturn renameio.WriteFile(path, contents, perm)\r\n}\r\n```\r\n\r\n[github.com/google/renameio](https://github.com/google/renameio) is stable, has no dependencies, is quite popular ([used by 4.3k](https://github.com/google/renameio/network/dependents)), and performs its task well."
+    },
+    {
+        "author": {
+            "login": "elezar"
+        },
+        "body": "@belo4ya thanks for the fix. I think we would be ok with using `renameio`. Feel free to update this PR to switch to that instead. Alternatively we can do so as a follow-up."
+    },
+    {
+        "author": {
+            "login": "belo4ya"
+        },
+        "body": "Done. I replaced the function `writeFileAtomically` with `renameio.WriteFile`.\r\n\r\nThe only thing is, the temporary file will be created in `$TMPDIR` instead of `/etc/kubernetes/node-feature-discovery/features.d/gfd-tmp/` (I don't think this is a problem, but it's worth mentioning)."
+    },
+    {
+        "author": {
+            "login": "belo4ya"
+        },
+        "body": "@elezar, done."
+    },
+    {
+        "data": {
+            "repository": {
+                "issue": {
+                    "title": "[gfd] Incorrect implementation of atomic writing to a file when exporting features by gpu-feature-discovery",
+                    "body": "### 1. Quick Debug Information\r\n* OS/Version: Ubuntu 18.04.6, Ubuntu 22.04.2\r\n\r\n### 2. Issue description\r\n\r\nWe use the node-feature-discovery and gpu-feature-discovery features to monitor GPU issues, including cases when the number of available GPUs on a node unexpectedly decreases: Target Number == `nvidia.com/gpu.count` == Node Allocatable.\r\n\r\nWe have noticed that sometimes (albeit rarely) all the features (labels `nvidia.com/*`) exported by gpu-feature-discovery disappear from the node. During one of these moments, we noticed the following line in the nfd-worker logs:\r\n```log\r\nE0629 17:29:25.340196       1 local.go:266] source local failed reading file 'gfd': open /etc/kubernetes/node-feature-discovery/features.d/gfd: permission denied\r\n```\r\n\r\nWe suspect that this error occurs due to an incorrect implementation of the atomic file writing logic in the function [writeFileAtomically](https://github.com/NVIDIA/k8s-device-plugin/blob/35ad18080eded1889dc1eaee1132debddfd6757c/internal/lm/output.go#L105). The issue is that the `os.Chmod` command is executed after the `os.Rename` command, causing a moment when the `features.d/gfd` file has incorrect permissions (`0600` (default for a file created with [os.CreateTemp](https://cs.opensource.google/go/go/+/master:src/os/tempfile.go;l=49?q=CreateTemp&ss=go%2Fgo)) instead of `0644`).\r\n\r\n### 3. Additional information that might help better understand your environment and reproduce the bug\r\n\r\nThe incorrectness of the current implementation of [writeFileAtomically](https://github.com/NVIDIA/k8s-device-plugin/blob/35ad18080eded1889dc1eaee1132debddfd6757c/internal/lm/output.go#L105) can be easily reproduced with the following example:\r\n\r\nFor more deterministic behavior, I added `time.Sleep(1 * time.Millisecond)` between the `os.Rename` and `os.Chmod` calls (but the error also reproduces without this, it just takes a bit longer to occur):\r\n\r\n<details>\r\n<summary>writer/main.go</summary>\r\n\r\n```go\r\n...\r\nconst (\r\n\tfilePath = \"/<abs/path/to>/gfd\"\r\n\tcontent  = `\r\nnvidia.com/gpu.machine=VMware7,1\r\nnvidia.com/gpu.product=Tesla-V100-PCIE-32GB\r\n`\r\n)\r\n\r\nfunc main() {\r\n\tfor {\r\n\t\t_ = writeFileAtomically(filePath, []byte(content), 0644)\r\n\t}\r\n}\r\n\r\n// from https://github.com/NVIDIA/k8s-device-plugin/blob/35ad18080eded1889dc1eaee1132debddfd6757c/internal/lm/output.go#L105\r\nfunc writeFileAtomically(path string, contents []byte, perm os.FileMode) error {\r\n\tabsPath, err := filepath.Abs(path)\r\n\tif err != nil {\r\n\t\treturn fmt.Errorf(\"failed to retrieve absolute path of output file: %v\", err)\r\n\t}\r\n\r\n\tabsDir := filepath.Dir(absPath)\r\n\ttmpDir := filepath.Join(absDir, \"gfd-tmp\")\r\n\r\n\terr = os.MkdirAll(tmpDir, os.ModePerm)\r\n\tif err != nil && !os.IsExist(err) {\r\n\t\treturn fmt.Errorf(\"failed to create temporary directory: %v\", err)\r\n\t}\r\n\tdefer func() {\r\n\t\tif err != nil {\r\n\t\t\tos.RemoveAll(tmpDir)\r\n\t\t}\r\n\t}()\r\n\r\n\ttmpFile, err := os.CreateTemp(tmpDir, \"gfd-\")\r\n\tif err != nil {\r\n\t\treturn fmt.Errorf(\"fail to create temporary output file: %v\", err)\r\n\t}\r\n\tdefer func() {\r\n\t\tif err != nil {\r\n\t\t\ttmpFile.Close()\r\n\t\t\tos.Remove(tmpFile.Name())\r\n\t\t}\r\n\t}()\r\n\r\n\terr = os.WriteFile(tmpFile.Name(), contents, perm)\r\n\tif err != nil {\r\n\t\treturn fmt.Errorf(\"error writing temporary file '%v': %v\", tmpFile.Name(), err)\r\n\t}\r\n\r\n\terr = os.Rename(tmpFile.Name(), path)\r\n\tif err != nil {\r\n\t\treturn fmt.Errorf(\"error moving temporary file to '%v': %v\", path, err)\r\n\t}\r\n\r\n\ttime.Sleep(1 * time.Millisecond) // added for better error reproduction\r\n\r\n\terr = os.Chmod(path, perm)\r\n\tif err != nil {\r\n\t\treturn fmt.Errorf(\"error setting permissions on '%v': %v\", path, err)\r\n\t}\r\n\r\n\treturn nil\r\n}\r\n\r\n```\r\n\r\n</details>\r\n\r\nThe [nfd-worker when reading the file](https://github.com/kubernetes-sigs/node-feature-discovery/blob/0418e7ddf33424b150c68ca8fe71fcfc98440039/source/local/local.go#L438) simply calls the `os.ReadFile` function:\r\n\r\n<details>\r\n<summary>reader/main.go</summary>\r\n\r\n```go\r\n...\r\nconst filePath = \"/<abs/path/to>/gfd\"\r\n\r\nfunc main() {\r\n\tfor {\r\n\t\t_, err := os.ReadFile(filePath)\r\n\t\tif err != nil {\r\n\t\t\tlog.Println(err)\r\n\t\t}\r\n\t}\r\n}\r\n\r\n```\r\n\r\n</details>\r\n\r\nLet's run it and see the expected error:\r\n\r\n```bash\r\n#terminal 1\r\ngo run writer/main.go\r\n\r\n#terminal 2: run as another user since tmpFile has mode 0600 by default\r\nsudo -u <another user> go run reader/main.go\r\n\r\n#2024/06/30 01:55:00 open /<abs/path/to>/gfd: permission denied\r\n#2024/06/30 01:55:00 open /<abs/path/to>/gfd: permission denied\r\n#2024/06/30 01:55:00 open /<abs/path/to>/gfd: permission denied\r\n#...\r\n```\r\n\r\n### 4. Additional information\r\n\r\nFixing this issue is simple. Just change the order of the `os.Rename` and `os.Chmod` calls to `os.Chmod -> os.Rename` in the [writeFileAtomically](https://github.com/NVIDIA/k8s-device-plugin/blob/35ad18080eded1889dc1eaee1132debddfd6757c/internal/lm/output.go#L105) function - #792 \r\n\r\nI found another Issue that mentions this problem - #325. However, it also mentions an issue with selinux files, so I decided to open this separate Issue.",
+                    "state": "CLOSED",
+                    "comments": {
+                        "nodes": []
+                    }
+                }
+            }
+        }
+    }
+]

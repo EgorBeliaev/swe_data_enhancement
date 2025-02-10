@@ -1,0 +1,446 @@
+diff --git a/commands/server.go b/commands/server.go
+index 08ecd5bac7d..828c78a3afa 100644
+--- a/commands/server.go
++++ b/commands/server.go
+@@ -84,6 +84,10 @@ const (
+ 	configChangeGoWork = "go work file"
+ )
+ 
++const (
++	hugoHeaderRedirect = "X-Hugo-Redirect"
++)
++
+ func newHugoBuilder(r *rootCommand, s *serverCommand, onConfigLoaded ...func(reloaded bool) error) *hugoBuilder {
+ 	var visitedURLs *types.EvictingQueue[string]
+ 	if s != nil && !s.disableFastRender {
+@@ -307,67 +311,65 @@ func (f *fileServer) createEndpoint(i int) (*http.ServeMux, net.Listener, string
+ 				w.Header().Set(header.Key, header.Value)
+ 			}
+ 
+-			if redirect := serverConfig.MatchRedirect(requestURI); !redirect.IsZero() {
+-				// fullName := filepath.Join(dir, filepath.FromSlash(path.Clean("/"+name)))
+-				doRedirect := true
+-				// This matches Netlify's behavior and is needed for SPA behavior.
+-				// See https://docs.netlify.com/routing/redirects/rewrites-proxies/
+-				if !redirect.Force {
+-					path := filepath.Clean(strings.TrimPrefix(requestURI, baseURL.Path()))
+-					if root != "" {
+-						path = filepath.Join(root, path)
+-					}
+-					var fs afero.Fs
+-					f.c.withConf(func(conf *commonConfig) {
+-						fs = conf.fs.PublishDirServer
+-					})
++			if canRedirect(requestURI, r) {
++				if redirect := serverConfig.MatchRedirect(requestURI, r.Header); !redirect.IsZero() {
++					doRedirect := true
++					// This matches Netlify's behavior and is needed for SPA behavior.
++					// See https://docs.netlify.com/routing/redirects/rewrites-proxies/
++					if !redirect.Force {
++						path := filepath.Clean(strings.TrimPrefix(requestURI, baseURL.Path()))
++						if root != "" {
++							path = filepath.Join(root, path)
++						}
++						var fs afero.Fs
++						f.c.withConf(func(conf *commonConfig) {
++							fs = conf.fs.PublishDirServer
++						})
+ 
+-					fi, err := fs.Stat(path)
++						fi, err := fs.Stat(path)
+ 
+-					if err == nil {
+-						if fi.IsDir() {
+-							// There will be overlapping directories, so we
+-							// need to check for a file.
+-							_, err = fs.Stat(filepath.Join(path, "index.html"))
+-							doRedirect = err != nil
+-						} else {
+-							doRedirect = false
++						if err == nil {
++							if fi.IsDir() {
++								// There will be overlapping directories, so we
++								// need to check for a file.
++								_, err = fs.Stat(filepath.Join(path, "index.html"))
++								doRedirect = err != nil
++							} else {
++								doRedirect = false
++							}
+ 						}
+ 					}
+-				}
+ 
+-				if doRedirect {
+-					switch redirect.Status {
+-					case 404:
+-						w.WriteHeader(404)
+-						file, err := fs.Open(strings.TrimPrefix(redirect.To, baseURL.Path()))
+-						if err == nil {
+-							defer file.Close()
+-							io.Copy(w, file)
+-						} else {
+-							fmt.Fprintln(w, "<h1>Page Not Found</h1>")
+-						}
+-						return
+-					case 200:
+-						if r2 := f.rewriteRequest(r, strings.TrimPrefix(redirect.To, baseURL.Path())); r2 != nil {
+-							requestURI = redirect.To
+-							r = r2
+-						}
+-					default:
+-						w.Header().Set("Content-Type", "")
+-						http.Redirect(w, r, redirect.To, redirect.Status)
+-						return
++					if doRedirect {
++						w.Header().Set(hugoHeaderRedirect, "true")
++						switch redirect.Status {
++						case 404:
++							w.WriteHeader(404)
++							file, err := fs.Open(strings.TrimPrefix(redirect.To, baseURL.Path()))
++							if err == nil {
++								defer file.Close()
++								io.Copy(w, file)
++							} else {
++								fmt.Fprintln(w, "<h1>Page Not Found</h1>")
++							}
++							return
++						case 200:
++							if r2 := f.rewriteRequest(r, strings.TrimPrefix(redirect.To, baseURL.Path())); r2 != nil {
++								requestURI = redirect.To
++								r = r2
++							}
++						default:
++							w.Header().Set("Content-Type", "")
++							http.Redirect(w, r, redirect.To, redirect.Status)
++							return
+ 
++						}
+ 					}
+ 				}
+-
+ 			}
+ 
+ 			if f.c.fastRenderMode && f.c.errState.buildErr() == nil {
+-				// Sec-Fetch-Mode should be sent by all recent browser versions, see https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Sec-Fetch-Mode#navigate
+-				// Fall back to the file extension if not set.
+-				// The main take here is that we don't want to have CSS/JS files etc. partake in this logic.
+-				if r.Header.Get("Sec-Fetch-Mode") == "navigate" || strings.HasSuffix(requestURI, "/") || strings.HasSuffix(requestURI, "html") || strings.HasSuffix(requestURI, "htm") {
++				if isNavigation(requestURI, r) {
+ 					if !f.c.visitedURLs.Contains(requestURI) {
+ 						// If not already on stack, re-render that single page.
+ 						if err := f.c.partialReRender(requestURI); err != nil {
+@@ -1233,3 +1235,24 @@ func formatByteCount(b uint64) string {
+ 	return fmt.Sprintf("%.1f %cB",
+ 		float64(b)/float64(div), "kMGTPE"[exp])
+ }
++
++func canRedirect(requestURIWithoutQuery string, r *http.Request) bool {
++	if r.Header.Get(hugoHeaderRedirect) != "" {
++		return false
++	}
++	return isNavigation(requestURIWithoutQuery, r)
++}
++
++// Sec-Fetch-Mode should be sent by all recent browser versions, see https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Sec-Fetch-Mode#navigate
++// Fall back to the file extension if not set.
++// The main take here is that we don't want to have CSS/JS files etc. partake in this logic.
++func isNavigation(requestURIWithoutQuery string, r *http.Request) bool {
++	return r.Header.Get("Sec-Fetch-Mode") == "navigate" || isPropablyHTMLRequest(requestURIWithoutQuery)
++}
++
++func isPropablyHTMLRequest(requestURIWithoutQuery string) bool {
++	if strings.HasSuffix(requestURIWithoutQuery, "/") || strings.HasSuffix(requestURIWithoutQuery, "html") || strings.HasSuffix(requestURIWithoutQuery, "htm") {
++		return true
++	}
++	return !strings.Contains(requestURIWithoutQuery, ".")
++}
+diff --git a/config/commonConfig.go b/config/commonConfig.go
+index 9dea4a2fcea..9125f256ab1 100644
+--- a/config/commonConfig.go
++++ b/config/commonConfig.go
+@@ -15,6 +15,7 @@ package config
+ 
+ import (
+ 	"fmt"
++	"net/http"
+ 	"regexp"
+ 	"sort"
+ 	"strings"
+@@ -226,7 +227,22 @@ type Server struct {
+ 	Redirects []Redirect
+ 
+ 	compiledHeaders   []glob.Glob
+-	compiledRedirects []glob.Glob
++	compiledRedirects []redirect
++}
++
++type redirect struct {
++	from    glob.Glob
++	fromRe  *regexp.Regexp
++	headers map[string]glob.Glob
++}
++
++func (r redirect) matchHeader(header http.Header) bool {
++	for k, v := range r.headers {
++		if !v.Match(header.Get(k)) {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ func (s *Server) CompileConfig(logger loggers.Logger) error {
+@@ -234,10 +250,41 @@ func (s *Server) CompileConfig(logger loggers.Logger) error {
+ 		return nil
+ 	}
+ 	for _, h := range s.Headers {
+-		s.compiledHeaders = append(s.compiledHeaders, glob.MustCompile(h.For))
++		g, err := glob.Compile(h.For)
++		if err != nil {
++			return fmt.Errorf("failed to compile Headers glob %q: %w", h.For, err)
++		}
++		s.compiledHeaders = append(s.compiledHeaders, g)
+ 	}
+ 	for _, r := range s.Redirects {
+-		s.compiledRedirects = append(s.compiledRedirects, glob.MustCompile(r.From))
++		if r.From == "" && r.FromRe == "" {
++			return fmt.Errorf("redirects must have either From or FromRe set")
++		}
++		rd := redirect{
++			headers: make(map[string]glob.Glob),
++		}
++		if r.From != "" {
++			g, err := glob.Compile(r.From)
++			if err != nil {
++				return fmt.Errorf("failed to compile Redirect glob %q: %w", r.From, err)
++			}
++			rd.from = g
++		}
++		if r.FromRe != "" {
++			re, err := regexp.Compile(r.FromRe)
++			if err != nil {
++				return fmt.Errorf("failed to compile Redirect regexp %q: %w", r.FromRe, err)
++			}
++			rd.fromRe = re
++		}
++		for k, v := range r.FromHeaders {
++			g, err := glob.Compile(v)
++			if err != nil {
++				return fmt.Errorf("failed to compile Redirect header glob %q: %w", v, err)
++			}
++			rd.headers[k] = g
++		}
++		s.compiledRedirects = append(s.compiledRedirects, rd)
+ 	}
+ 
+ 	return nil
+@@ -266,22 +313,42 @@ func (s *Server) MatchHeaders(pattern string) []types.KeyValueStr {
+ 	return matches
+ }
+ 
+-func (s *Server) MatchRedirect(pattern string) Redirect {
++func (s *Server) MatchRedirect(pattern string, header http.Header) Redirect {
+ 	if s.compiledRedirects == nil {
+ 		return Redirect{}
+ 	}
+ 
+ 	pattern = strings.TrimSuffix(pattern, "index.html")
+ 
+-	for i, g := range s.compiledRedirects {
++	for i, r := range s.compiledRedirects {
+ 		redir := s.Redirects[i]
+ 
+-		// No redirect to self.
+-		if redir.To == pattern {
+-			return Redirect{}
++		var found bool
++
++		if r.from != nil {
++			if r.from.Match(pattern) {
++				found = header == nil || r.matchHeader(header)
++				// We need to do regexp group replacements if needed.
++			}
+ 		}
+ 
+-		if g.Match(pattern) {
++		if r.fromRe != nil {
++			m := r.fromRe.FindStringSubmatch(pattern)
++			if m != nil {
++				if !found {
++					found = header == nil || r.matchHeader(header)
++				}
++
++				if found {
++					// Replace $1, $2 etc. in To.
++					for i, g := range m[1:] {
++						redir.To = strings.ReplaceAll(redir.To, fmt.Sprintf("$%d", i+1), g)
++					}
++				}
++			}
++		}
++
++		if found {
+ 			return redir
+ 		}
+ 	}
+@@ -295,8 +362,22 @@ type Headers struct {
+ }
+ 
+ type Redirect struct {
++	// From is the Glob pattern to match.
++	// One of From or FromRe must be set.
+ 	From string
+-	To   string
++
++	// FromRe is the regexp to match.
++	// This regexp can contain group matches (e.g. $1) that can be used in the To field.
++	// One of From or FromRe must be set.
++	FromRe string
++
++	// To is the target URL.
++	To string
++
++	// Headers to match for the redirect.
++	// This maps the HTTP header name to a Glob pattern with values to match.
++	// If the map is empty, the redirect will always be triggered.
++	FromHeaders map[string]string
+ 
+ 	// HTTP status code to use for the redirect.
+ 	// A status code of 200 will trigger a URL rewrite.
+@@ -383,17 +464,7 @@ func DecodeServer(cfg Provider) (Server, error) {
+ 	_ = mapstructure.WeakDecode(cfg.GetStringMap("server"), s)
+ 
+ 	for i, redir := range s.Redirects {
+-		// Get it in line with the Hugo server for OK responses.
+-		// We currently treat the 404 as a special case, they are always "ugly", so keep them as is.
+-		if redir.Status != 404 {
+-			redir.To = strings.TrimSuffix(redir.To, "index.html")
+-			if !strings.HasPrefix(redir.To, "https") && !strings.HasSuffix(redir.To, "/") {
+-				// There are some tricky infinite loop situations when dealing
+-				// when the target does not have a trailing slash.
+-				// This can certainly be handled better, but not time for that now.
+-				return Server{}, fmt.Errorf("unsupported redirect to value %q in server config; currently this must be either a remote destination or a local folder, e.g. \"/blog/\" or \"/blog/index.html\"", redir.To)
+-			}
+-		}
++		redir.To = strings.TrimSuffix(redir.To, "index.html")
+ 		s.Redirects[i] = redir
+ 	}
+ 
+@@ -401,7 +472,7 @@ func DecodeServer(cfg Provider) (Server, error) {
+ 		// Set up a default redirect for 404s.
+ 		s.Redirects = []Redirect{
+ 			{
+-				From:   "**",
++				From:   "/**",
+ 				To:     "/404.html",
+ 				Status: 404,
+ 			},
+diff --git a/config/commonConfig_test.go b/config/commonConfig_test.go
+index 425d3e970c3..ce68cec15b0 100644
+--- a/config/commonConfig_test.go
++++ b/config/commonConfig_test.go
+@@ -71,17 +71,33 @@ X-Content-Type-Options = "nosniff"
+ 
+ [[server.redirects]]
+ from = "/foo/**"
+-to = "/foo/index.html"
++to = "/baz/index.html"
+ status = 200
+ 
+ [[server.redirects]]
+-from = "/google/**"
+-to = "https://google.com/"
+-status = 301
++from = "/loop/**"
++to = "/loop/foo/"
++status = 200
++
++[[server.redirects]]
++from = "/b/**"
++fromRe = "/b/(.*)/"
++to = "/baz/$1/"
++status = 200
++
++[[server.redirects]]
++fromRe = "/c/(.*)/"
++to = "/boo/$1/"
++status = 200
++
++[[server.redirects]]
++fromRe = "/d/(.*)/"
++to = "/boo/$1/"
++status = 200
+ 
+ [[server.redirects]]
+-from = "/**"
+-to = "/default/index.html"
++from = "/google/**"
++to = "https://google.com/"
+ status = 301
+ 
+ 
+@@ -100,45 +116,35 @@ status = 301
+ 		{Key: "X-XSS-Protection", Value: "1; mode=block"},
+ 	})
+ 
+-	c.Assert(s.MatchRedirect("/foo/bar/baz"), qt.DeepEquals, Redirect{
++	c.Assert(s.MatchRedirect("/foo/bar/baz", nil), qt.DeepEquals, Redirect{
+ 		From:   "/foo/**",
+-		To:     "/foo/",
++		To:     "/baz/",
+ 		Status: 200,
+ 	})
+ 
+-	c.Assert(s.MatchRedirect("/someother"), qt.DeepEquals, Redirect{
+-		From:   "/**",
+-		To:     "/default/",
+-		Status: 301,
++	c.Assert(s.MatchRedirect("/foo/bar/", nil), qt.DeepEquals, Redirect{
++		From:   "/foo/**",
++		To:     "/baz/",
++		Status: 200,
+ 	})
+ 
+-	c.Assert(s.MatchRedirect("/google/foo"), qt.DeepEquals, Redirect{
++	c.Assert(s.MatchRedirect("/b/c/", nil), qt.DeepEquals, Redirect{
++		From:   "/b/**",
++		FromRe: "/b/(.*)/",
++		To:     "/baz/c/",
++		Status: 200,
++	})
++
++	c.Assert(s.MatchRedirect("/c/d/", nil).To, qt.Equals, "/boo/d/")
++	c.Assert(s.MatchRedirect("/c/d/e/", nil).To, qt.Equals, "/boo/d/e/")
++
++	c.Assert(s.MatchRedirect("/someother", nil), qt.DeepEquals, Redirect{})
++
++	c.Assert(s.MatchRedirect("/google/foo", nil), qt.DeepEquals, Redirect{
+ 		From:   "/google/**",
+ 		To:     "https://google.com/",
+ 		Status: 301,
+ 	})
+-
+-	// No redirect loop, please.
+-	c.Assert(s.MatchRedirect("/default/index.html"), qt.DeepEquals, Redirect{})
+-	c.Assert(s.MatchRedirect("/default/"), qt.DeepEquals, Redirect{})
+-
+-	for _, errorCase := range []string{
+-		`[[server.redirects]]
+-from = "/**"
+-to = "/file"
+-status = 301`,
+-		`[[server.redirects]]
+-from = "/**"
+-to = "/foo/file.html"
+-status = 301`,
+-	} {
+-
+-		cfg, err := FromConfigString(errorCase, "toml")
+-		c.Assert(err, qt.IsNil)
+-		_, err = DecodeServer(cfg)
+-		c.Assert(err, qt.Not(qt.IsNil))
+-
+-	}
+ }
+ 
+ func TestBuildConfigCacheBusters(t *testing.T) {

@@ -1,0 +1,233 @@
+diff --git a/cli-commands/vm.rb b/cli-commands/vm.rb
+index 13178744d..ef1262769 100644
+--- a/cli-commands/vm.rb
++++ b/cli-commands/vm.rb
+@@ -8,11 +8,11 @@
+   end
+   # :nocov:
+ 
+-  args(3...)
++  args(2...)
+ 
+-  run do |(location, vm_name, *argv), opts, command|
+-    @location = location
+-    @vm_name = vm_name
++  run do |(vm_ref, *argv), opts, command|
++    @location, @vm_name, extra = vm_ref.split("/", 3)
++    raise Rodish::CommandFailure, "invalid vm reference, should be in location/(vm-name|_vm-ubid) format" if extra
+     command.run(self, opts, argv)
+   end
+ end
+diff --git a/cli-commands/vm/post/scp.rb b/cli-commands/vm/post/scp.rb
+index 42e77f7f5..50e8bc459 100644
+--- a/cli-commands/vm/post/scp.rb
++++ b/cli-commands/vm/post/scp.rb
+@@ -1,7 +1,7 @@
+ # frozen_string_literal: true
+ 
+ UbiRodish.on("vm").run_on("scp") do
+-  options("ubi vm location-name (vm-name|_vm-ubid) scp [options] (local-path :remote-path|:remote-path local-path) [scp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++  options("ubi vm location-name/(vm-name|_vm-ubid) scp [options] (local-path :remote-path|:remote-path local-path) [scp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+ 
+   args(2...)
+ 
+diff --git a/cli-commands/vm/post/sftp.rb b/cli-commands/vm/post/sftp.rb
+index ed0deeb93..3bd1a6d08 100644
+--- a/cli-commands/vm/post/sftp.rb
++++ b/cli-commands/vm/post/sftp.rb
+@@ -1,7 +1,7 @@
+ # frozen_string_literal: true
+ 
+ UbiRodish.on("vm").run_on("sftp") do
+-  options("ubi vm location-name (vm-name|_vm-ubid) sftp [options] [-- sftp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++  options("ubi vm location-name/(vm-name|_vm-ubid) sftp [options] [-- sftp-options]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+ 
+   args(0...)
+ 
+diff --git a/cli-commands/vm/post/ssh.rb b/cli-commands/vm/post/ssh.rb
+index 1cb902c27..32b4ae34d 100644
+--- a/cli-commands/vm/post/ssh.rb
++++ b/cli-commands/vm/post/ssh.rb
+@@ -1,7 +1,7 @@
+ # frozen_string_literal: true
+ 
+ UbiRodish.on("vm").run_on("ssh") do
+-  options("ubi vm location-name (vm-name|_vm-ubid) ssh [options] [-- ssh-options --] [cmd [arg, ...]]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
++  options("ubi vm location-name/(vm-name|_vm-ubid) ssh [options] [-- ssh-options --] [cmd [arg, ...]]", key: :vm_ssh, &UbiCli::SSHISH_OPTS)
+ 
+   args(0...)
+ 
+diff --git a/spec/routes/api/cli/vm/scp_spec.rb b/spec/routes/api/cli/vm/scp_spec.rb
+index 999072705..8deff2890 100644
+--- a/spec/routes/api/cli/vm/scp_spec.rb
++++ b/spec/routes/api/cli/vm/scp_spec.rb
+@@ -5,33 +5,34 @@
+ RSpec.describe Clover, "cli vm scp" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+   end
+ 
+   it "provides headers to copy local file to remote" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@[128:1234::2]:remote]
++    expect(cli_exec(["vm", @ref, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@[128:1234::2]:remote]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@128.0.0.1:remote]
++    expect(cli_exec(["vm", @ref, "scp", "local", ":remote"])).to eq %w[scp -- local ubi@128.0.0.1:remote]
+   end
+ 
+   it "provides headers to copy remote file to local" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "scp", ":remote", "local"])).to eq %w[scp -- ubi@[128:1234::2]:remote local]
++    expect(cli_exec(["vm", @ref, "scp", ":remote", "local"])).to eq %w[scp -- ubi@[128:1234::2]:remote local]
+   end
+ 
+   it "supports scp options" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "scp", ":remote", "local", "-A"])).to eq %w[scp -A -- ubi@[128:1234::2]:remote local]
++    expect(cli_exec(["vm", @ref, "scp", ":remote", "local", "-A"])).to eq %w[scp -A -- ubi@[128:1234::2]:remote local]
+   end
+ 
+   it "returns error if both files are local" do
+-    expect(cli(["vm", @vm.display_location, @vm.name, "scp", "local", "local"], status: 400)).to eq "Only one path should be remote (start with ':')"
++    expect(cli(["vm", @ref, "scp", "local", "local"], status: 400)).to eq "Only one path should be remote (start with ':')"
+   end
+ 
+   it "returns error if both files are remote" do
+-    expect(cli(["vm", @vm.display_location, @vm.name, "scp", ":remote", ":remote"], status: 400)).to eq "Only one path should be remote (start with ':')"
++    expect(cli(["vm", @ref, "scp", ":remote", ":remote"], status: 400)).to eq "Only one path should be remote (start with ':')"
+   end
+ end
+diff --git a/spec/routes/api/cli/vm/sftp_spec.rb b/spec/routes/api/cli/vm/sftp_spec.rb
+index 36fe15b19..dd132c709 100644
+--- a/spec/routes/api/cli/vm/sftp_spec.rb
++++ b/spec/routes/api/cli/vm/sftp_spec.rb
+@@ -5,21 +5,22 @@
+ RSpec.describe Clover, "cli vm sftp" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+   end
+ 
+   it "provides headers to connect to vm via sftp" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "sftp"])).to eq %w[sftp -- ubi@[128:1234::2]]
++    expect(cli_exec(["vm", @ref, "sftp"])).to eq %w[sftp -- ubi@[128:1234::2]]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "sftp"])).to eq %w[sftp -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "sftp"])).to eq %w[sftp -- ubi@128.0.0.1]
+   end
+ 
+   it "supports sftp options" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "sftp", "--", "-A"])).to eq %w[sftp -A -- ubi@[128:1234::2]]
++    expect(cli_exec(["vm", @ref, "sftp", "--", "-A"])).to eq %w[sftp -A -- ubi@[128:1234::2]]
+   end
+ end
+diff --git a/spec/routes/api/cli/vm/ssh_spec.rb b/spec/routes/api/cli/vm/ssh_spec.rb
+index 2c5054305..59ff51853 100644
+--- a/spec/routes/api/cli/vm/ssh_spec.rb
++++ b/spec/routes/api/cli/vm/ssh_spec.rb
+@@ -5,6 +5,7 @@
+ RSpec.describe Clover, "cli vm ssh" do
+   before do
+     @vm = create_vm(project_id: @project.id, ephemeral_net6: "128:1234::0/64")
++    @ref = [@vm.display_location, @vm.name].join("/")
+     subnet = @project.default_private_subnet(@vm.location)
+     nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "test-nic").subject
+     nic.update(vm_id: @vm.id)
+@@ -15,69 +16,70 @@
+   end
+ 
+   it "provides headers to connect to vm" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh"])).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "IPv4 address is used by default if available" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh"])).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh"])).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "uses IPv4 address if available and connection is made via IPv4" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET)
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "uses IPv6 address if connection is made via IPv6" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET6)
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "-4 option fails if VM has no IPv4 address" do
+-    expect(cli(["vm", @vm.display_location, @vm.name, "ssh", "-4"], status: 400)).to eq "No valid IPv4 address for requested VM"
++    expect(cli(["vm", @ref, "ssh", "-4"], status: 400)).to eq "No valid IPv4 address for requested VM"
+   end
+ 
+   it "-4 option uses IPv4 even if connection is made via IPv6" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET6)
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "-4"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
++    expect(cli_exec(["vm", @ref, "ssh", "-4"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128.0.0.1]
+   end
+ 
+   it "-6 option uses IPv6 even if connection is made via IPv4" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+     @socket = UDPSocket.new(Socket::AF_INET)
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "-6"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-6"], env: {"puma.socket" => @socket})).to eq %w[ssh -- ubi@128:1234::2]
+   end
+ 
+   it "-u option overrides user to connect with" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "-ufoo"])).to eq %w[ssh -- foo@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-ufoo"])).to eq %w[ssh -- foo@128:1234::2]
+   end
+ 
+   it "handles ssh cmd without args" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "id"])).to eq %w[ssh -- ubi@128:1234::2 id]
++    expect(cli_exec(["vm", @ref, "ssh", "id"])).to eq %w[ssh -- ubi@128:1234::2 id]
+   end
+ 
+   it "handles ssh cmd with args" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "uname", "-a"])).to eq %w[ssh -- ubi@128:1234::2 uname -a]
++    expect(cli_exec(["vm", @ref, "ssh", "uname", "-a"])).to eq %w[ssh -- ubi@128:1234::2 uname -a]
+   end
+ 
+   it "handles ssh cmd with options and without args" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "--", "-A", "--"])).to eq %w[ssh -A -- ubi@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "--", "-A", "--"])).to eq %w[ssh -A -- ubi@128:1234::2]
+   end
+ 
+   it "handles ssh cmd with options and args" do
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "--", "-A", "--", "uname", "-a"])).to eq %w[ssh -A -- ubi@128:1234::2 uname -a]
++    expect(cli_exec(["vm", @ref, "ssh", "--", "-A", "--", "uname", "-a"])).to eq %w[ssh -A -- ubi@128:1234::2 uname -a]
+   end
+ 
+   it "handles multiple options" do
+     add_ipv4_to_vm(@vm, "128.0.0.1")
+-    expect(cli_exec(["vm", @vm.display_location, @vm.name, "ssh", "-6u", "foo"])).to eq %w[ssh -- foo@128:1234::2]
++    expect(cli_exec(["vm", @ref, "ssh", "-6u", "foo"])).to eq %w[ssh -- foo@128:1234::2]
+   end
+ 
+-  it "handles invalid location or name" do
+-    expect(cli(["vm", @vm.display_location, "foo", "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
+-    expect(cli(["vm", "foo", @vm.name, "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++  it "handles invalid vm reference" do
++    expect(cli(["vm", "#{@vm.display_location}/foo", "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++    expect(cli(["vm", "foo/#{@vm.name}", "ssh", "-4"], status: 404)).to eq "Error: unexpected response status: 404\nDetails: Sorry, we couldn’t find the resource you’re looking for."
++    expect(cli(["vm", "#{@vm.display_location}/#{@vm.name}/bar", "ssh", "-4"], status: 400)).to eq "invalid vm reference, should be in location/(vm-name|_vm-ubid) format"
+   end
+ end

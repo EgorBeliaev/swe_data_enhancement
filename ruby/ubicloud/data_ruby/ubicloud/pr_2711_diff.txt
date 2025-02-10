@@ -1,0 +1,332 @@
+diff --git a/cache/index.cache b/cache/index.cache
+index b59d21d06..a2da6dee2 100644
+Binary files a/cache/index.cache and b/cache/index.cache differ
+diff --git a/cache/schema.cache b/cache/schema.cache
+index aa0f3979e..54dffa537 100644
+Binary files a/cache/schema.cache and b/cache/schema.cache differ
+diff --git a/migrate/20250130_kubernetes_vm_size.rb b/migrate/20250130_kubernetes_vm_size.rb
+new file mode 100644
+index 000000000..1cc162705
+--- /dev/null
++++ b/migrate/20250130_kubernetes_vm_size.rb
+@@ -0,0 +1,15 @@
++# frozen_string_literal: true
++
++Sequel.migration do
++  change do
++    alter_table(:kubernetes_nodepool) do
++      add_column(:target_node_size, :text, collate: '"C"', null: false)
++      add_column(:target_node_storage_size_gib, :bigint, null: true)
++    end
++
++    alter_table(:kubernetes_cluster) do
++      add_column(:target_node_size, :text, collate: '"C"', null: false)
++      add_column(:target_node_storage_size_gib, :bigint, null: true)
++    end
++  end
++end
+diff --git a/model/kubernetes/kubernetes_cluster.rb b/model/kubernetes/kubernetes_cluster.rb
+index 5ef21e3d8..0e4f1c960 100644
+--- a/model/kubernetes/kubernetes_cluster.rb
++++ b/model/kubernetes/kubernetes_cluster.rb
+@@ -42,15 +42,17 @@ def sshable
+ 
+ # Table: kubernetes_cluster
+ # Columns:
+-#  id                | uuid                     | PRIMARY KEY
+-#  name              | text                     | NOT NULL
+-#  cp_node_count     | integer                  | NOT NULL
+-#  version           | text                     | NOT NULL
+-#  location          | text                     | NOT NULL
+-#  created_at        | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
+-#  project_id        | uuid                     | NOT NULL
+-#  private_subnet_id | uuid                     | NOT NULL
+-#  api_server_lb_id  | uuid                     |
++#  id                           | uuid                     | PRIMARY KEY
++#  name                         | text                     | NOT NULL
++#  cp_node_count                | integer                  | NOT NULL
++#  version                      | text                     | NOT NULL
++#  location                     | text                     | NOT NULL
++#  created_at                   | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
++#  project_id                   | uuid                     | NOT NULL
++#  private_subnet_id            | uuid                     | NOT NULL
++#  api_server_lb_id             | uuid                     |
++#  target_node_size             | text                     | NOT NULL
++#  target_node_storage_size_gib | bigint                   |
+ # Indexes:
+ #  kubernetes_cluster_pkey                          | PRIMARY KEY btree (id)
+ #  kubernetes_cluster_project_id_location_name_uidx | UNIQUE btree (project_id, location, name)
+diff --git a/model/kubernetes/kubernetes_nodepool.rb b/model/kubernetes/kubernetes_nodepool.rb
+index 222f544b1..b4920f530 100644
+--- a/model/kubernetes/kubernetes_nodepool.rb
++++ b/model/kubernetes/kubernetes_nodepool.rb
+@@ -15,11 +15,13 @@ class KubernetesNodepool < Sequel::Model
+ 
+ # Table: kubernetes_nodepool
+ # Columns:
+-#  id                    | uuid                     | PRIMARY KEY
+-#  name                  | text                     | NOT NULL
+-#  node_count            | integer                  | NOT NULL
+-#  created_at            | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
+-#  kubernetes_cluster_id | uuid                     | NOT NULL
++#  id                           | uuid                     | PRIMARY KEY
++#  name                         | text                     | NOT NULL
++#  node_count                   | integer                  | NOT NULL
++#  created_at                   | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
++#  kubernetes_cluster_id        | uuid                     | NOT NULL
++#  target_node_size             | text                     | NOT NULL
++#  target_node_storage_size_gib | bigint                   |
+ # Indexes:
+ #  kubernetes_nodepool_pkey | PRIMARY KEY btree (id)
+ # Foreign key constraints:
+diff --git a/prog/kubernetes/kubernetes_cluster_nexus.rb b/prog/kubernetes/kubernetes_cluster_nexus.rb
+index 8c9d1d1f3..d53dbedb8 100644
+--- a/prog/kubernetes/kubernetes_cluster_nexus.rb
++++ b/prog/kubernetes/kubernetes_cluster_nexus.rb
+@@ -3,7 +3,7 @@
+ class Prog::Kubernetes::KubernetesClusterNexus < Prog::Base
+   subject_is :kubernetes_cluster
+ 
+-  def self.assemble(name:, version:, private_subnet_id:, project_id:, location:, cp_node_count: 3)
++  def self.assemble(name:, version:, private_subnet_id:, project_id:, location:, cp_node_count: 3, target_node_size: "standard-2", target_node_storage_size_gib: nil)
+     DB.transaction do
+       unless (project = Project[project_id])
+         fail "No existing project"
+@@ -23,7 +23,7 @@ def self.assemble(name:, version:, private_subnet_id:, project_id:, location:, c
+       # TODO: Move resources (vms, subnet, LB, etc.) into own project
+       # TODO: Validate node count
+ 
+-      kc = KubernetesCluster.create_with_id(name:, version:, cp_node_count:, private_subnet_id:, location:, project_id: project.id)
++      kc = KubernetesCluster.create_with_id(name:, version:, cp_node_count:, private_subnet_id:, location:, target_node_size:, target_node_storage_size_gib:, project_id: project.id)
+ 
+       Strand.create(prog: "Kubernetes::KubernetesClusterNexus", label: "start") { _1.id = kc.id }
+     end
+diff --git a/prog/kubernetes/kubernetes_nodepool_nexus.rb b/prog/kubernetes/kubernetes_nodepool_nexus.rb
+index a0f903263..74a530472 100644
+--- a/prog/kubernetes/kubernetes_nodepool_nexus.rb
++++ b/prog/kubernetes/kubernetes_nodepool_nexus.rb
+@@ -3,13 +3,13 @@
+ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
+   subject_is :kubernetes_nodepool
+ 
+-  def self.assemble(name:, node_count:, kubernetes_cluster_id:)
++  def self.assemble(name:, node_count:, kubernetes_cluster_id:, target_node_size: "standard-2", target_node_storage_size_gib: nil)
+     DB.transaction do
+       unless KubernetesCluster[kubernetes_cluster_id]
+         fail "No existing cluster"
+       end
+ 
+-      kn = KubernetesNodepool.create(name:, node_count:, kubernetes_cluster_id:)
++      kn = KubernetesNodepool.create(name:, node_count:, kubernetes_cluster_id:, target_node_size:, target_node_storage_size_gib:)
+ 
+       Strand.create(prog: "Kubernetes::KubernetesNodepoolNexus", label: "start") { _1.id = kn.id }
+     end
+diff --git a/prog/kubernetes/provision_kubernetes_node.rb b/prog/kubernetes/provision_kubernetes_node.rb
+index a5f28dfda..1308fd2b8 100644
+--- a/prog/kubernetes/provision_kubernetes_node.rb
++++ b/prog/kubernetes/provision_kubernetes_node.rb
+@@ -20,19 +20,25 @@ def write_hosts_file_if_needed(ip = nil)
+   end
+ 
+   label def start
+-    name = if kubernetes_nodepool
+-      "#{kubernetes_nodepool.name}-#{SecureRandom.alphanumeric(5).downcase}"
++    name, vm_size, storage_size_gib = if kubernetes_nodepool
++      ["#{kubernetes_nodepool.name}-#{SecureRandom.alphanumeric(5).downcase}",
++        kubernetes_nodepool.target_node_size,
++        kubernetes_nodepool.target_node_storage_size_gib]
+     else
+-      "#{kubernetes_cluster.name.downcase}-control-plane-#{SecureRandom.alphanumeric(5).downcase}"
++      ["#{kubernetes_cluster.name.downcase}-control-plane-#{SecureRandom.alphanumeric(5).downcase}",
++        kubernetes_cluster.target_node_size,
++        kubernetes_cluster.target_node_storage_size_gib]
+     end
+ 
++    storage_volumes = [{encrypted: true, size_gib: storage_size_gib}] if storage_size_gib
++
+     vm = Prog::Vm::Nexus.assemble_with_sshable(
+       "ubi",
+       kubernetes_cluster.project.id,
+-      # we should reiterate how we name the vm. some how correlate it to the vm's info.
+       name: name,
+       location: kubernetes_cluster.location,
+-      size: "standard-2",
++      size: vm_size,
++      storage_volumes: storage_volumes,
+       boot_image: "ubuntu-jammy",
+       private_subnet_id: kubernetes_cluster.private_subnet_id,
+       enable_ip4: true
+diff --git a/spec/model/kubernetes/kubernetes_cluster_spec.rb b/spec/model/kubernetes/kubernetes_cluster_spec.rb
+index b6eb6b068..00b4a9651 100644
+--- a/spec/model/kubernetes/kubernetes_cluster_spec.rb
++++ b/spec/model/kubernetes/kubernetes_cluster_spec.rb
+@@ -10,7 +10,8 @@
+       location: "hetzner-fsn1",
+       cp_node_count: 3,
+       project_id: "2d720de2-91fc-82d2-bc07-a945bddb39e8",
+-      private_subnet_id: "c87aefff-2e77-86d9-86b5-ef9fbb4e7fee"
++      private_subnet_id: "c87aefff-2e77-86d9-86b5-ef9fbb4e7fee",
++      target_node_size: "standard-2"
+     )
+   }
+ 
+diff --git a/spec/prog/kubernetes/kubernetes_cluster_nexus_spec.rb b/spec/prog/kubernetes/kubernetes_cluster_nexus_spec.rb
+index e7e73c9cd..baa746513 100644
+--- a/spec/prog/kubernetes/kubernetes_cluster_nexus_spec.rb
++++ b/spec/prog/kubernetes/kubernetes_cluster_nexus_spec.rb
+@@ -15,9 +15,10 @@
+       cp_node_count: 3,
+       private_subnet_id: subnet.id,
+       location: "hetzner-fsn1",
+-      project_id: project.id
++      project_id: project.id,
++      target_node_size: "standard-2"
+     )
+-    KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id)
++    KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-2")
+ 
+     lb = LoadBalancer.create(private_subnet_id: subnet.id, name: "somelb", src_port: 123, dst_port: 456, health_check_endpoint: "/foo", project_id: project.id)
+     kc.add_cp_vm(create_vm)
+@@ -53,16 +54,25 @@
+     end
+ 
+     it "creates a kubernetes cluster" do
+-      st = described_class.assemble(name: "k8stest", version: "v1.32", private_subnet_id: subnet.id, project_id: project.id, location: "hetzner-fsn1", cp_node_count: 3)
+-
+-      expect(st.subject.name).to eq "k8stest"
+-      expect(st.subject.ubid).to start_with("kc")
+-      expect(st.subject.version).to eq "v1.32"
+-      expect(st.subject.location).to eq "hetzner-fsn1"
+-      expect(st.subject.cp_node_count).to eq 3
+-      expect(st.subject.private_subnet.id).to eq subnet.id
+-      expect(st.subject.project.id).to eq project.id
+-      expect(st.subject.strand.label).to eq "start"
++      st = described_class.assemble(name: "k8stest", version: "v1.32", private_subnet_id: subnet.id, project_id: project.id, location: "hetzner-fsn1", cp_node_count: 3, target_node_size: "standard-8", target_node_storage_size_gib: 100)
++
++      kc = st.subject
++      expect(kc.name).to eq "k8stest"
++      expect(kc.ubid).to start_with("kc")
++      expect(kc.version).to eq "v1.32"
++      expect(kc.location).to eq "hetzner-fsn1"
++      expect(kc.cp_node_count).to eq 3
++      expect(kc.private_subnet.id).to eq subnet.id
++      expect(kc.project.id).to eq project.id
++      expect(kc.strand.label).to eq "start"
++      expect(kc.target_node_size).to eq "standard-8"
++      expect(kc.target_node_storage_size_gib).to eq 100
++    end
++
++    it "can have null as storage size" do
++      st = described_class.assemble(name: "k8stest", version: "v1.32", private_subnet_id: subnet.id, project_id: project.id, location: "hetzner-fsn1", cp_node_count: 3, target_node_size: "standard-8", target_node_storage_size_gib: nil)
++
++      expect(st.subject.target_node_storage_size_gib).to be_nil
+     end
+   end
+ 
+diff --git a/spec/prog/kubernetes/kubernetes_nodepool_nexus_spec.rb b/spec/prog/kubernetes/kubernetes_nodepool_nexus_spec.rb
+index 9fbebe698..659bbd2cb 100644
+--- a/spec/prog/kubernetes/kubernetes_nodepool_nexus_spec.rb
++++ b/spec/prog/kubernetes/kubernetes_nodepool_nexus_spec.rb
+@@ -15,7 +15,8 @@
+       cp_node_count: 3,
+       private_subnet_id: subnet.id,
+       location: "hetzner-fsn1",
+-      project_id: project.id
++      project_id: project.id,
++      target_node_size: "standard-2"
+     )
+ 
+     lb = LoadBalancer.create(private_subnet_id: subnet.id, name: "somelb", src_port: 123, dst_port: 456, health_check_endpoint: "/foo", project_id: project.id)
+@@ -25,7 +26,7 @@
+     kc
+   }
+ 
+-  let(:kn) { KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id) }
++  let(:kn) { KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-2") }
+ 
+   before do
+     allow(nx).to receive(:kubernetes_nodepool).and_return(kn)
+@@ -39,13 +40,22 @@
+     end
+ 
+     it "creates a kubernetes nodepool" do
+-      st = described_class.assemble(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id)
++      st = described_class.assemble(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-4", target_node_storage_size_gib: 37)
++      kn = st.subject
+ 
+-      expect(st.subject.name).to eq "k8stest-np"
+-      expect(st.subject.ubid).to start_with("kn")
+-      expect(st.subject.kubernetes_cluster_id).to eq kc.id
+-      expect(st.subject.node_count).to eq 2
++      expect(kn.name).to eq "k8stest-np"
++      expect(kn.ubid).to start_with("kn")
++      expect(kn.kubernetes_cluster_id).to eq kc.id
++      expect(kn.node_count).to eq 2
+       expect(st.label).to eq "start"
++      expect(kn.target_node_size).to eq "standard-4"
++      expect(kn.target_node_storage_size_gib).to eq 37
++    end
++
++    it "can have null as storage size" do
++      st = described_class.assemble(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-4", target_node_storage_size_gib: nil)
++
++      expect(st.subject.target_node_storage_size_gib).to be_nil
+     end
+   end
+ 
+diff --git a/spec/prog/kubernetes/provision_kubernetes_node_spec.rb b/spec/prog/kubernetes/provision_kubernetes_node_spec.rb
+index f176429ed..244715d4d 100644
+--- a/spec/prog/kubernetes/provision_kubernetes_node_spec.rb
++++ b/spec/prog/kubernetes/provision_kubernetes_node_spec.rb
+@@ -14,7 +14,9 @@
+       cp_node_count: 3,
+       private_subnet_id: subnet.id,
+       location: "hetzner-fsn1",
+-      project_id: project.id
++      project_id: project.id,
++      target_node_size: "standard-4",
++      target_node_storage_size_gib: 37
+     )
+ 
+     lb = LoadBalancer.create(private_subnet_id: subnet.id, name: "somelb", src_port: 123, dst_port: 456, health_check_endpoint: "/foo", project_id: project.id)
+@@ -25,7 +27,7 @@
+     kc
+   }
+ 
+-  let(:kubernetes_nodepool) { KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kubernetes_cluster.id) }
++  let(:kubernetes_nodepool) { KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kubernetes_cluster.id, target_node_size: "standard-8", target_node_storage_size_gib: 78) }
+ 
+   before do
+     allow(prog).to receive_messages(kubernetes_cluster: kubernetes_cluster, frame: {"vm_id" => create_vm.id})
+@@ -86,6 +88,8 @@
+       new_vm = kubernetes_cluster.cp_vms.last
+       expect(new_vm.name).to start_with("k8scluster-control-plane-")
+       expect(new_vm.sshable).not_to be_nil
++      expect(new_vm.vcpus).to eq(4)
++      expect(new_vm.strand.stack.first["storage_volumes"].first["size_gib"]).to eq(37)
+     end
+ 
+     it "creates a worker VM and hops if a nodepool is given" do
+@@ -99,6 +103,22 @@
+       new_vm = kubernetes_nodepool.vms.last
+       expect(new_vm.name).to start_with("k8stest-np-")
+       expect(new_vm.sshable).not_to be_nil
++      expect(new_vm.vcpus).to eq(8)
++      expect(new_vm.strand.stack.first["storage_volumes"].first["size_gib"]).to eq(78)
++    end
++
++    it "assigns the default storage size if not specified" do
++      kubernetes_cluster.update(target_node_storage_size_gib: nil)
++      expect(kubernetes_cluster.api_server_lb).to receive(:add_vm)
++
++      expect(kubernetes_cluster.cp_vms.count).to eq(2)
++
++      expect { prog.start }.to hop("install_software")
++
++      expect(kubernetes_cluster.cp_vms.count).to eq(3)
++
++      new_vm = kubernetes_cluster.cp_vms.last
++      expect(new_vm.strand.stack.first["storage_volumes"].first["size_gib"]).to eq 80
+     end
+   end
+ 

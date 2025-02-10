@@ -1,0 +1,175 @@
+diff --git a/Gemfile b/Gemfile
+index f28ca3fd9..6a180a749 100644
+--- a/Gemfile
++++ b/Gemfile
+@@ -13,7 +13,7 @@ gem "netaddr"
+ gem "tilt", ">= 2.6"
+ gem "erubi", ">= 1.5"
+ gem "puma", ">= 6.2.2"
+-gem "roda", github: "jeremyevans/roda", ref: "67fc63f683b2f7cc95a2443257756b7d5cbce18f"
++gem "roda", github: "jeremyevans/roda", ref: "7c51b9b50bc1ab9021c6ef23cd162fa26f6ecdea"
+ gem "rodauth", ">= 2.38"
+ gem "rotp"
+ gem "rqrcode"
+diff --git a/Gemfile.lock b/Gemfile.lock
+index a90fa40b3..27980c380 100644
+--- a/Gemfile.lock
++++ b/Gemfile.lock
+@@ -9,8 +9,8 @@ GIT
+ 
+ GIT
+   remote: https://github.com/jeremyevans/roda.git
+-  revision: 67fc63f683b2f7cc95a2443257756b7d5cbce18f
+-  ref: 67fc63f683b2f7cc95a2443257756b7d5cbce18f
++  revision: 7c51b9b50bc1ab9021c6ef23cd162fa26f6ecdea
++  ref: 7c51b9b50bc1ab9021c6ef23cd162fa26f6ecdea
+   specs:
+     roda (3.88.0)
+       rack
+diff --git a/lib/email_renderer.rb b/lib/email_renderer.rb
+new file mode 100644
+index 000000000..4bacec394
+--- /dev/null
++++ b/lib/email_renderer.rb
+@@ -0,0 +1,32 @@
++# frozen_string_literal: true
++
++require "roda"
++require "tilt"
++require "tilt/erubi"
++
++class EmailRenderer < Roda
++  plugin :render, escape: true, template_opts: {chain_appends: !defined?(SimpleCov), freeze: true, skip_compiled_encoding_detection: true, scope_class: self, default_fixed_locals: "()", extract_fixed_locals: true}, assume_fixed_locals: true
++  plugin :part
++  plugin :mailer, terminal: true
++
++  route do |r|
++    r.mail "" do |receiver, subject, greeting: nil, body: nil, button_title: nil, button_link: nil, cc: nil, attachments: []|
++      no_mail! if Array(receiver).compact.empty?
++      from Config.mail_from
++      to receiver
++      subject subject
++      cc cc
++
++      attachments.each do |name, file|
++        add_file filename: name, content: file
++      end
++
++      text_part "#{greeting}\n#{Array(body).join("\n")}\n#{button_link}"
++
++      html_part(
++        part("email/layout", subject:, greeting:, body:, button_title:, button_link:),
++        "Content-Type" => "text/html; charset=UTF-8"
++      )
++    end
++  end
++end
+diff --git a/lib/util.rb b/lib/util.rb
+index d808d18cc..15a303b76 100644
+--- a/lib/util.rb
++++ b/lib/util.rb
+@@ -83,32 +83,7 @@ def self.safe_write_to_file(filename, content)
+     end
+   end
+ 
+-  def self.send_email(receiver, subject, greeting: nil, body: nil, button_title: nil, button_link: nil, cc: nil, attachments: [])
+-    html = EmailRenderer.new.render "email/layout", locals: {subject: subject, greeting: greeting, body: body, button_title: button_title, button_link: button_link}
+-    Mail.deliver do
+-      from Config.mail_from
+-      to receiver
+-      subject subject
+-      cc cc
+-
+-      attachments.each do |name, file|
+-        add_file filename: name, content: file
+-      end
+-
+-      text_part do
+-        body "#{greeting}\n#{Array(body).join("\n")}\n#{button_link}"
+-      end
+-
+-      html_part do
+-        content_type "text/html; charset=UTF-8"
+-        body html
+-      end
+-    end
+-  end
+-end
+-
+-class EmailRenderer
+-  def render(template, locals: {})
+-    Tilt::ErubiTemplate.new("views/#{template}.erb", escape: true, chain_appends: true, freeze: true, skip_compiled_encoding_detection: true).render(self, locals)
++  def self.send_email(...)
++    EmailRenderer.sendmail("/", ...)
+   end
+ end
+diff --git a/spec/model/invoice_spec.rb b/spec/model/invoice_spec.rb
+index 6294302b3..4c9535a88 100644
+--- a/spec/model/invoice_spec.rb
++++ b/spec/model/invoice_spec.rb
+@@ -70,7 +70,7 @@
+     end
+ 
+     it "not charge if all payment methods fails" do
+-      invoice.content["billing_info"] = {"id" => billing_info.id}
++      invoice.content["billing_info"] = {"id" => billing_info.id, "email" => "foo@example.com"}
+       payment_method1 = PaymentMethod.create_with_id(billing_info_id: billing_info.id, stripe_id: "pm_1", order: 1)
+       payment_method2 = PaymentMethod.create_with_id(billing_info_id: billing_info.id, stripe_id: "pm_2", order: 2)
+ 
+diff --git a/views/email/button.erb b/views/email/button.erb
+index 3b1b6c7c7..2a6fe3790 100644
+--- a/views/email/button.erb
++++ b/views/email/button.erb
+@@ -1,4 +1,4 @@
+-<table class="action" align="center" width="100%" cellpadding="0" cellspacing="0" role="presentation">
++<%# locals: (title:, link:) %><table class="action" align="center" width="100%" cellpadding="0" cellspacing="0" role="presentation">
+   <tr>
+     <td align="center">
+       <table width="100%" border="0" cellpadding="0" cellspacing="0" role="presentation">
+diff --git a/views/email/footer.erb b/views/email/footer.erb
+index 33c7081be..04c28fe91 100644
+--- a/views/email/footer.erb
++++ b/views/email/footer.erb
+@@ -12,7 +12,7 @@
+         </td>
+         <td align="right">
+           <a href="https://github.com/ubicloud/ubicloud" class="icon">
+-            <%== render("components/icon", locals: { name: "github", classes: "" }) %>
++            <%== part("components/icon", name: "github", classes: "") %>
+           </a>
+         </td>
+       </tr>
+diff --git a/views/email/layout.erb b/views/email/layout.erb
+index 2159e026f..935c1d77c 100644
+--- a/views/email/layout.erb
++++ b/views/email/layout.erb
+@@ -1,4 +1,4 @@
+-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
++<%# locals: (subject:, greeting:, body:, button_title:, button_link:) %><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+ "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+ <html xmlns="http://www.w3.org/1999/xhtml">
+   <head>
+@@ -7,9 +7,7 @@
+     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+     <meta name="color-scheme" content="light">
+     <meta name="supported-color-schemes" content="light">
+-    <style>
+-    </style>
+-    <%== render("email/style") %>
++    <%== File.read("views/email/style.html") %>
+   </head>
+   <body>
+ 
+@@ -33,7 +31,7 @@
+                       <% end %>
+ 
+                       <% if button_link %>
+-                        <%== render("email/button", locals: { title: button_title, link: button_link }) %>
++                        <%== part("email/button", title: button_title, link: button_link) %>
+                       <% end %>
+                       <p>
+                         Regards,<br>
+diff --git a/views/email/style.erb b/views/email/style.html
+similarity index 100%
+rename from views/email/style.erb
+rename to views/email/style.html

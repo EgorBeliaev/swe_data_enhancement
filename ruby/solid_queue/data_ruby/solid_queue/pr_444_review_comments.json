@@ -1,0 +1,89 @@
+[
+    {
+        "title": "Specialize Dispatcher and Worker looping"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "The Worker and Dispatcher share the same poll loop logic (Poller#start_loop) while having different functional requirements. The Worker is polling despite not being able to execute new jobs if at capacity. The Dispatcher does require polling, but is reliant on shared logic in Poller#start_loop for a Dispatcher specific optimization.\r\n \r\nThis PR allows the Worker to switch from polling to wake-on-event when its at capacity and eliminates the overhead of Worker#poll (really Worker#claim_executions) when it's known ahead of time #poll will be a no-op.\r\n\r\nChanges:\r\n    \r\nMove the logic controlling the sleep interval from Poller#start_loop into Worker#poll and Dispatcher#poll by requiring #poll to return the `delay` value passed into interruptible_sleep.\r\n    \r\nPoller#start_loop:\r\n\r\n- Removes the test based on the number of rows processed by #poll. This was Dispatcher specific logic.\r\n\r\nWorker#poll:\r\n\r\n- When Worker at full capacity: return a large value (10.minutes) effectively transforming Poller#start_loop from polling to wake-on-event.\r\n- When Worker < capacity: return `polling_interval` and maintain the poll timing until ReadyExecutions become available.\r\n\r\nDispatcher#poll:\r\n\r\n- When `due` ScheduledExecutions < batch_size: return `polling_interval` and maintain the existing poll timing.\r\n- When `due` ScheduledExecutions >= batch_size: return 0 and do not sleep between loops until all `due` ScheduledExecutions are processed. Loop via poll requests with sleep 0 (instead of simple loop in #poll) to check for shutdown requests between loops.\r\n"
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "Thanks @hms!\r\n\r\n> eliminates the overhead of Worker#poll (really Worker#claim_executions) when it's known ahead of time #poll will be a no-op.\r\n\r\nThis overhead is minimal, though. Active Record does effectively a no-op when the limit you pass is 0, which is why I did this, in favour of simpler code \ud83e\udd14 "
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": "Agreed,claimed_executions is clever and does limit by 0.  But not before going through ReadyExecution.claim which has to do a little work.  \n\nAdmittedly, this is a minor performance improvement at best.  But it does free SQ down the road for optimizations that might not as easily take advantage of the limit 0 trick. "
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": "@rosa\r\n\r\nUnfortunately, this was one in a series of planned PRs and its parent #425, needs a bit of cleanup.  Since I have to do a small amount of git surgery deal with the unnecessary dependency on #425, if you don't believe this change brings enough value, I'm happy to withdraw the PR.  Otherwise, I'll rebase it on main (which I should have done in the first place).  "
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "> Agreed,claimed_executions is clever and does limit by 0. But not before going through ReadyExecution.claim which has to do a little work.\r\n\r\nThat's true! Perhaps the easiest would be to handle the limit 0 case in `ReadyExecution.claim` \ud83e\udd14 \r\n\r\nAbout `Dispatcher#poll`\r\n\r\n> When due `ScheduledExecutions < batch_size`: return `polling_interval` and maintain the existing poll timing.\r\n\r\nI think this would be a bit different from before in that it'll wait no matter what if there are fewer scheduled jobs than the `batch_size`, even if new jobs have become due while dispatching the previous, smaller than `batch_size`, batch. Not a big deal in any case, depending on `batch_size` and `polling_interval`, but the dispatching will be slower \ud83e\udd14 "
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": "@rosa \r\n\r\nI think there are two issues to help frame the way I'm thinking about these proposed changes:\r\n\r\n- Should the Poller#start_loop be \"smart\" -- have some logic controlling the loop (like it does now)?\r\n- if Poller#start_loop is just responsible for looping and checking for shutdown, where should the \"smarts\", if any, belong?\r\n\r\nWith this PR:\r\n\r\n- Poller#start_loop doesn't have any logic specific to the client: Dispatcher, Worker.  It is a \"dumb\" loop.\r\n- Dispatcher/Worker#poll drives the required looping behaviors via logic expressed in 1 simple line of code.\r\n- It's more clear and efficient to make looping decisions in #poll than optimizations (specific to looping) in queries (see comments below)\r\n\r\n### Addressing your feedback on Worker changes:\r\n\r\n> That's true! Perhaps the easiest would be to handle the limit 0 case in ReadyExecution.claim \ud83e\udd14\r\n\r\nI believe this reflects our divergence on the third bullet above. When Pool.idle? == false then #claim_executions does not change any SQ state making it a no-op.  While all of the database engines have gotten a lot smarter about cutting off the query post parsing and prior to execution when limit(0) is detected, it's still has to parse (not sure if Rails is smart enough to use prepared query here) and the query request represents a network round trip for non-sqlite implementations -- every Worker.polling_interval.   \r\n\r\nOn \"Big Iron\", say that spiffy new and over provisioned Dell that David is always blogging about \ud83d\ude0f, the DB overhead is almost nothing.  But on my tiny little slice of Heroku (or any other small VSP), it represents something that's measurable that returns zero value. We have the heartbeat for proof-of-life \ud83d\ude07.\r\n\r\nSo, entering an extended interruptible_sleep instead of polling is effectively the same as the current implementation (just with less polling).\r\n\r\n### Addressing your feedback on Dispatcher changes:\r\n\r\n> I think this would be a bit different from before in that it'll wait no matter what if there are fewer scheduled jobs than the batch_size, even if new jobs have become due while dispatching the previous, smaller than batch_size, batch. Not a big deal in any case, depending on batch_size and polling_interval, but the dispatching will be slower \ud83e\udd14\r\n\r\nI think the use-case I missed \ud83d\ude1e  is where even just one of the dispatched jobs was on a priority queue that had the resources to be processed within the Dispatcher.polling_interval window.  Then, the current PR implementation could represent a degradation of service. \r\n\r\nChanging from:\r\n`batch.size < batch_size ? polling_interval : 0.seconds`\r\nto:\r\n`batch.size.zero? ? polling_interval : 0.seconds`\r\n\r\nreturns the original priority queue performance profile.  I'll make that correction and resubmit.\r\n\r\n"
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "Ok, sounds good! Thanks for taking the time to write down these arguments \ud83d\ude47\u200d\u2640\ufe0f Agree on the changes!"
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": "@rosa \r\n\r\nPR feedback addressed.  As usual, thank you for all of your time helping me get these changes right."
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "Thanks a lot to you for your thoughtful explanations and changes! \ud83d\ude4f  \r\n\r\nI think this is ready, just would need some rebasing/cherry-picking to separate the changes about polling from the rest. "
+    },
+    {
+        "author": {
+            "login": "hms"
+        },
+        "body": "@rosa \r\n\r\nRebased without the extra code that's not part of this PR.  \r\n\r\nAlso, turns out I did write a test to prove that Dispatcher#poll returning 0 did, in fact, sleep 0 -- although the confirmation is more via side-effect that direct test (see dispatcher_test.rb \"sleeps `0.seconds` between polls if there are any read to dispatch jobs\")."
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "Thanks a lot @hms! I'm going to run this for a bit in production before merging \ud83d\ude4f "
+    },
+    {
+        "author": {
+            "login": "rosa"
+        },
+        "body": "We've been running this in production for 2 days and it's working well \ud83d\udc4d  Thanks @hms!"
+    }
+]

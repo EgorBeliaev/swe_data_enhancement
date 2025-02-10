@@ -1,0 +1,273 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b15c015c6..d7bdb4c35 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,4 +1,5 @@
+ ## [Unreleased]
++- Added support for streaming with Anthropic
+ - Bump anthropic gem
+ - Default Langchain::LLM::Anthropic chat model is "claude-3-5-sonnet-20240620" now
+ 
+diff --git a/README.md b/README.md
+index 893f1ca50..39a308cc8 100644
+--- a/README.md
++++ b/README.md
+@@ -525,6 +525,8 @@ assistant.add_message(content: "Hello")
+ assistant.run(auto_tool_execution: true)
+ ```
+ 
++Note that streaming is not currently supported for all LLMs.
++
+ ### Configuration
+ * `llm`: The LLM instance to use (required)
+ * `tools`: An array of tool instances (optional)
+diff --git a/lib/langchain/llm/anthropic.rb b/lib/langchain/llm/anthropic.rb
+index bd7a7cc2d..feedc75d0 100644
+--- a/lib/langchain/llm/anthropic.rb
++++ b/lib/langchain/llm/anthropic.rb
+@@ -100,7 +100,7 @@ def complete(
+     # @option params [Integer] :top_k Only sample from the top K options for each subsequent token
+     # @option params [Float] :top_p Use nucleus sampling.
+     # @return [Langchain::LLM::AnthropicResponse] The chat completion
+-    def chat(params = {})
++    def chat(params = {}, &block)
+       set_extra_headers! if params[:tools]
+ 
+       parameters = chat_parameters.to_params(params)
+@@ -109,8 +109,19 @@ def chat(params = {})
+       raise ArgumentError.new("model argument is required") if parameters[:model].empty?
+       raise ArgumentError.new("max_tokens argument is required") if parameters[:max_tokens].nil?
+ 
++      if block
++        @response_chunks = []
++        parameters[:stream] = proc do |chunk|
++          @response_chunks << chunk
++          yield chunk
++        end
++      end
++
+       response = client.messages(parameters: parameters)
+ 
++      response = response_from_chunks if block
++      reset_response_chunks
++
+       Langchain::LLM::AnthropicResponse.new(response)
+     end
+ 
+@@ -123,8 +134,53 @@ def with_api_error_handling
+       response
+     end
+ 
++    def response_from_chunks
++      grouped_chunks = @response_chunks.group_by { |chunk| chunk["index"] }.except(nil)
++
++      usage = @response_chunks.find { |chunk| chunk["type"] == "message_delta" }&.dig("usage")
++      stop_reason = @response_chunks.find { |chunk| chunk["type"] == "message_delta" }&.dig("delta", "stop_reason")
++
++      content = grouped_chunks.map do |_index, chunks|
++        text = chunks.map { |chunk| chunk.dig("delta", "text") }.join
++        if !text.nil? && !text.empty?
++          {"type" => "text", "text" => text}
++        else
++          tool_calls_from_choice_chunks(chunks)
++        end
++      end.flatten
++
++      @response_chunks.first&.slice("id", "object", "created", "model")
++        &.merge!(
++          {
++            "content" => content,
++            "usage" => usage,
++            "role" => "assistant",
++            "stop_reason" => stop_reason
++          }
++        )
++    end
++
++    def tool_calls_from_choice_chunks(chunks)
++      return unless (first_block = chunks.find { |chunk| chunk.dig("content_block", "type") == "tool_use" })
++
++      chunks.group_by { |chunk| chunk["index"] }.map do |index, chunks|
++        input = chunks.select { |chunk| chunk.dig("delta", "partial_json") }
++          .map! { |chunk| chunk.dig("delta", "partial_json") }.join
++        {
++          "id" => first_block.dig("content_block", "id"),
++          "type" => "tool_use",
++          "name" => first_block.dig("content_block", "name"),
++          "input" => JSON.parse(input).transform_keys(&:to_sym)
++        }
++      end.compact
++    end
++
+     private
+ 
++    def reset_response_chunks
++      @response_chunks = []
++    end
++
+     def set_extra_headers!
+       ::Anthropic.configuration.extra_headers = {"anthropic-beta": "tools-2024-05-16"}
+     end
+diff --git a/spec/fixtures/llm/anthropic/chat_stream.json b/spec/fixtures/llm/anthropic/chat_stream.json
+new file mode 100644
+index 000000000..333ec2441
+--- /dev/null
++++ b/spec/fixtures/llm/anthropic/chat_stream.json
+@@ -0,0 +1,62 @@
++[
++  {
++    "type": "message_start",
++    "message": {
++      "id": "msg_019s6T825xb66ZLwPWmvH875",
++      "type": "message",
++      "role": "assistant",
++      "model": "claude-3-sonnet-20240229",
++      "content": [],
++      "stop_reason": null,
++      "stop_sequence": null,
++      "usage": {
++        "input_tokens": 5,
++        "output_tokens": 10
++      }
++    }
++  },
++  {
++    "type": "content_block_start",
++    "index": 0,
++    "content_block": {
++      "type": "text",
++      "text": ""
++    }
++  },
++  {
++    "type": "ping"
++  },
++  {
++    "type": "content_block_delta",
++    "index": 0,
++    "delta": {
++      "type": "text_delta",
++      "text": "Life is"
++    }
++  },
++  {
++    "type": "content_block_delta",
++    "index": 0,
++    "delta": {
++      "type": "text_delta",
++      "text": " pretty good"
++    }
++  },
++  {
++    "type": "content_block_stop",
++    "index": 0
++  },
++  {
++    "type": "message_delta",
++    "delta": {
++      "stop_reason": "max_tokens",
++      "stop_sequence": null
++    },
++    "usage": {
++      "output_tokens": 10
++    }
++  },
++  {
++    "type": "message_stop"
++  }
++]
+diff --git a/spec/fixtures/llm/anthropic/chat_stream_with_tool_calls.json b/spec/fixtures/llm/anthropic/chat_stream_with_tool_calls.json
+new file mode 100644
+index 000000000..bb7f3c69b
+--- /dev/null
++++ b/spec/fixtures/llm/anthropic/chat_stream_with_tool_calls.json
+@@ -0,0 +1,32 @@
++[
++  {"type":"message_start","message":{"id":"msg_014p7gG3wDgGV9EUtLvnow3U","type":"message","role":"assistant","model":"claude-3-haiku-20240307","stop_sequence":null,"usage":{"input_tokens":472,"output_tokens":2},"content":[],"stop_reason":null}},
++  {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},
++  {"type": "ping"},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Okay"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":","}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" let"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"'s"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" check"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" the"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" weather"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" for"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" San"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Francisco"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":","}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" CA"}},
++  {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":":"}},
++  {"type":"content_block_stop","index":0},
++  {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"San"}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" Francisc"}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" CA\""}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":", "}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"unit\": \"fah"}},
++  {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"renheit\"}"}},
++  {"type":"content_block_stop","index":1},
++  {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":89}},
++  {"type":"message_stop"}
++]
+diff --git a/spec/langchain/llm/anthropic_spec.rb b/spec/langchain/llm/anthropic_spec.rb
+index f7bbf2831..26d870125 100644
+--- a/spec/langchain/llm/anthropic_spec.rb
++++ b/spec/langchain/llm/anthropic_spec.rb
+@@ -81,5 +81,52 @@
+         ).to eq("claude-3-sonnet-20240229")
+       end
+     end
++
++    context "with streaming" do
++      let(:fixture) { File.read("spec/fixtures/llm/anthropic/chat_stream.json") }
++      let(:response) { JSON.parse(fixture) }
++      let(:stream_handler) { proc { _1 } }
++
++      before do
++        allow(subject.client).to receive(:messages) do |parameters|
++          response.each do |chunk|
++            parameters[:parameters][:stream].call(chunk)
++          end
++        end.and_return("This response will be overritten.")
++      end
++
++      it "handles streaming responses correctly" do
++        rsp = subject.chat(messages: messages, &stream_handler)
++        expect(rsp).to be_a(Langchain::LLM::AnthropicResponse)
++        expect(rsp.completion_tokens).to eq(10)
++        expect(rsp.total_tokens).to eq(10)
++        expect(rsp.chat_completion).to eq("Life is pretty good")
++      end
++    end
++
++    context "with streaming tools" do
++      let(:fixture) { File.read("spec/fixtures/llm/anthropic/chat_stream_with_tool_calls.json") }
++      let(:response) { JSON.parse(fixture) }
++      let(:stream_handler) { proc { _1 } }
++
++      before do
++        allow(subject.client).to receive(:messages) do |parameters|
++          response.each do |chunk|
++            parameters[:parameters][:stream].call(chunk)
++          end
++        end.and_return("This response will be overritten.")
++      end
++
++      it "handles streaming responses correctly" do
++        rsp = subject.chat(messages: messages, &stream_handler)
++        expect(rsp).to be_a(Langchain::LLM::AnthropicResponse)
++        expect(rsp.completion_tokens).to eq(89)
++        expect(rsp.total_tokens).to eq(89)
++        expect(rsp.chat_completion).to eq("Okay, let's check the weather for San Francisco, CA:")
++
++        expect(rsp.tool_calls.first["name"]).to eq("get_weather")
++        expect(rsp.tool_calls.first["input"]).to eq({location: "San Francisco, CA", unit: "fahrenheit"})
++      end
++    end
+   end
+ end
