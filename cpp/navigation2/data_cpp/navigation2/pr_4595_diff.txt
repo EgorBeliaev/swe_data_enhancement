@@ -1,0 +1,737 @@
+diff --git a/nav2_behavior_tree/CMakeLists.txt b/nav2_behavior_tree/CMakeLists.txt
+index b33948bf901..8f45cd318f3 100644
+--- a/nav2_behavior_tree/CMakeLists.txt
++++ b/nav2_behavior_tree/CMakeLists.txt
+@@ -176,6 +176,9 @@ list(APPEND plugin_libs nav2_navigate_through_poses_action_bt_node)
+ add_library(nav2_remove_passed_goals_action_bt_node SHARED plugins/action/remove_passed_goals_action.cpp)
+ list(APPEND plugin_libs nav2_remove_passed_goals_action_bt_node)
+ 
++add_library(nav2_remove_in_collision_goals_action_bt_node SHARED plugins/action/remove_in_collision_goals_action.cpp)
++list(APPEND plugin_libs nav2_remove_in_collision_goals_action_bt_node)
++
+ add_library(nav2_get_pose_from_path_action_bt_node SHARED plugins/action/get_pose_from_path_action.cpp)
+ list(APPEND plugin_libs nav2_get_pose_from_path_action_bt_node)
+ 
+diff --git a/nav2_behavior_tree/include/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.hpp b/nav2_behavior_tree/include/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.hpp
+new file mode 100644
+index 00000000000..73aab1bd8cd
+--- /dev/null
++++ b/nav2_behavior_tree/include/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.hpp
+@@ -0,0 +1,72 @@
++// Copyright (c) 2024 Angsa Robotics
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef NAV2_BEHAVIOR_TREE__PLUGINS__ACTION__REMOVE_IN_COLLISION_GOALS_ACTION_HPP_
++#define NAV2_BEHAVIOR_TREE__PLUGINS__ACTION__REMOVE_IN_COLLISION_GOALS_ACTION_HPP_
++
++#include <vector>
++#include <memory>
++#include <string>
++
++#include "rclcpp/rclcpp.hpp"
++#include "geometry_msgs/msg/pose_stamped.hpp"
++#include "nav2_behavior_tree/bt_service_node.hpp"
++#include "nav2_msgs/srv/get_costs.hpp"
++
++namespace nav2_behavior_tree
++{
++
++class RemoveInCollisionGoals : public BtServiceNode<nav2_msgs::srv::GetCosts>
++{
++public:
++  typedef std::vector<geometry_msgs::msg::PoseStamped> Goals;
++
++  /**
++   * @brief A constructor for nav2_behavior_tree::RemoveInCollisionGoals
++   * @param service_node_name Service name this node creates a client for
++   * @param conf BT node configuration
++   */
++  RemoveInCollisionGoals(
++    const std::string & service_node_name,
++    const BT::NodeConfiguration & conf);
++
++  /**
++   * @brief The main override required by a BT service
++   * @return BT::NodeStatus Status of tick execution
++   */
++  void on_tick() override;
++
++  BT::NodeStatus on_completion(std::shared_ptr<nav2_msgs::srv::GetCosts::Response> response)
++  override;
++
++  static BT::PortsList providedPorts()
++  {
++    return providedBasicPorts({
++        BT::InputPort<Goals>("input_goals", "Original goals to remove from"),
++        BT::InputPort<double>("cost_threshold", 254.0,
++          "Cost threshold for considering a goal in collision"),
++        BT::InputPort<bool>("use_footprint", true, "Whether to use footprint cost"),
++        BT::OutputPort<Goals>("output_goals", "Goals with in-collision goals removed"),
++    });
++  }
++
++private:
++  bool use_footprint_;
++  double cost_threshold_;
++  Goals input_goals_;
++};
++
++}  // namespace nav2_behavior_tree
++
++#endif  // NAV2_BEHAVIOR_TREE__PLUGINS__ACTION__REMOVE_IN_COLLISION_GOALS_ACTION_HPP_
+diff --git a/nav2_behavior_tree/nav2_tree_nodes.xml b/nav2_behavior_tree/nav2_tree_nodes.xml
+index 925e9c35797..71c20ee4ecc 100644
+--- a/nav2_behavior_tree/nav2_tree_nodes.xml
++++ b/nav2_behavior_tree/nav2_tree_nodes.xml
+@@ -100,6 +100,14 @@
+       <output_port name="output_goals">Set of goals after removing any passed</output_port>
+     </Action>
+ 
++    <Action ID="RemoveInCollisionGoals">
++      <input_port name="service_name">Costmap service name responsible for getting the cost</input_port>
++      <input_port name="input_goals">A vector of goals to check if in collision</input_port>
++      <input_port name="use_footprint">Whether to use the footprint cost or the point cost.</input_port>
++      <input_port name="cost_threshold">The cost threshold above which a waypoint is considered in collision and should be removed.</input_port>
++      <output_port name="output_goals">A vector of goals containing only those that are not in collision.</output_port>
++    </Action>
++
+     <Action ID="SmoothPath">
+       <input_port name="smoother_id" default="SmoothPath"/>
+       <input_port name="unsmoothed_path">Path to be smoothed</input_port>
+diff --git a/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.cpp b/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.cpp
+new file mode 100644
+index 00000000000..2fe8395ad4c
+--- /dev/null
++++ b/nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.cpp
+@@ -0,0 +1,77 @@
++// Copyright (c) 2024 Angsa Robotics
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <string>
++#include <memory>
++#include <limits>
++
++#include "nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.hpp"
++#include "nav2_behavior_tree/bt_utils.hpp"
++#include "tf2/utils.h"
++#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
++
++namespace nav2_behavior_tree
++{
++
++RemoveInCollisionGoals::RemoveInCollisionGoals(
++  const std::string & service_node_name,
++  const BT::NodeConfiguration & conf)
++: BtServiceNode<nav2_msgs::srv::GetCosts>(service_node_name, conf,
++    "/global_costmap/get_cost_global_costmap")
++{}
++
++
++void RemoveInCollisionGoals::on_tick()
++{
++  getInput("use_footprint", use_footprint_);
++  getInput("cost_threshold", cost_threshold_);
++  getInput("input_goals", input_goals_);
++
++  if (input_goals_.empty()) {
++    setOutput("output_goals", input_goals_);
++    should_send_request_ = false;
++    return;
++  }
++  request_ = std::make_shared<nav2_msgs::srv::GetCosts::Request>();
++  request_->use_footprint = use_footprint_;
++
++  for (const auto & goal : input_goals_) {
++    geometry_msgs::msg::Pose2D pose;
++    pose.x = goal.pose.position.x;
++    pose.y = goal.pose.position.y;
++    pose.theta = tf2::getYaw(goal.pose.orientation);
++    request_->poses.push_back(pose);
++  }
++}
++
++BT::NodeStatus RemoveInCollisionGoals::on_completion(
++  std::shared_ptr<nav2_msgs::srv::GetCosts::Response> response)
++{
++  Goals valid_goal_poses;
++  for (size_t i = 0; i < response->costs.size(); ++i) {
++    if (response->costs[i] < cost_threshold_) {
++      valid_goal_poses.push_back(input_goals_[i]);
++    }
++  }
++  setOutput("output_goals", valid_goal_poses);
++  return BT::NodeStatus::SUCCESS;
++}
++
++}   // namespace nav2_behavior_tree
++
++#include "behaviortree_cpp/bt_factory.h"
++BT_REGISTER_NODES(factory)
++{
++  factory.registerNodeType<nav2_behavior_tree::RemoveInCollisionGoals>("RemoveInCollisionGoals");
++}
+diff --git a/nav2_behavior_tree/plugins/action/remove_passed_goals_action.cpp b/nav2_behavior_tree/plugins/action/remove_passed_goals_action.cpp
+index 86f5fffd6b2..1b0e449431a 100644
+--- a/nav2_behavior_tree/plugins/action/remove_passed_goals_action.cpp
++++ b/nav2_behavior_tree/plugins/action/remove_passed_goals_action.cpp
+@@ -43,6 +43,7 @@ void RemovePassedGoals::initialize()
+ 
+   robot_base_frame_ = BT::deconflictPortAndParamFrame<std::string>(
+     node, "robot_base_frame", this);
++  initialized_ = true;
+ }
+ 
+ inline BT::NodeStatus RemovePassedGoals::tick()
+diff --git a/nav2_behavior_tree/test/plugins/action/CMakeLists.txt b/nav2_behavior_tree/test/plugins/action/CMakeLists.txt
+index 1be5a262ba2..e538e63cd02 100644
+--- a/nav2_behavior_tree/test/plugins/action/CMakeLists.txt
++++ b/nav2_behavior_tree/test/plugins/action/CMakeLists.txt
+@@ -51,6 +51,10 @@ plugin_add_test(test_truncate_path_local_action test_truncate_path_local_action.
+ 
+ plugin_add_test(test_remove_passed_goals_action test_remove_passed_goals_action.cpp nav2_remove_passed_goals_action_bt_node)
+ 
++plugin_add_test(test_remove_in_collision_goals_action
++  test_remove_in_collision_goals_action.cpp
++  nav2_remove_in_collision_goals_action_bt_node)
++
+ plugin_add_test(test_get_pose_from_path_action test_get_pose_from_path_action.cpp nav2_get_pose_from_path_action_bt_node)
+ 
+ plugin_add_test(test_planner_selector_node test_planner_selector_node.cpp nav2_planner_selector_bt_node)
+diff --git a/nav2_behavior_tree/test/plugins/action/test_remove_in_collision_goals_action.cpp b/nav2_behavior_tree/test/plugins/action/test_remove_in_collision_goals_action.cpp
+new file mode 100644
+index 00000000000..dbb4889298d
+--- /dev/null
++++ b/nav2_behavior_tree/test/plugins/action/test_remove_in_collision_goals_action.cpp
+@@ -0,0 +1,180 @@
++// Copyright (c) 2024 Angsa Robotics
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include <gtest/gtest.h>
++#include <memory>
++#include <set>
++#include <string>
++#include <vector>
++
++#include "behaviortree_cpp/bt_factory.h"
++
++#include "utils/test_service.hpp"
++#include "nav2_behavior_tree/plugins/action/remove_in_collision_goals_action.hpp"
++#include "utils/test_behavior_tree_fixture.hpp"
++
++
++class RemoveInCollisionGoalsService : public TestService<nav2_msgs::srv::GetCosts>
++{
++public:
++  RemoveInCollisionGoalsService()
++  : TestService("/global_costmap/get_cost_global_costmap")
++  {}
++
++  virtual void handle_service(
++    const std::shared_ptr<rmw_request_id_t> request_header,
++    const std::shared_ptr<nav2_msgs::srv::GetCosts::Request> request,
++    const std::shared_ptr<nav2_msgs::srv::GetCosts::Response> response)
++  {
++    (void)request_header;
++    (void)request;
++    response->costs = {100, 50, 5, 254};
++  }
++};
++
++
++class RemoveInCollisionGoalsTestFixture : public ::testing::Test
++{
++public:
++  static void SetUpTestCase()
++  {
++    node_ = std::make_shared<rclcpp::Node>("in_collision_goals_test_fixture");
++    factory_ = std::make_shared<BT::BehaviorTreeFactory>();
++
++    config_ = new BT::NodeConfiguration();
++
++    // Create the blackboard that will be shared by all of the nodes in the tree
++    config_->blackboard = BT::Blackboard::create();
++    // Put items on the blackboard
++    config_->blackboard->set(
++      "node",
++      node_);
++    config_->blackboard->set<std::chrono::milliseconds>(
++      "server_timeout",
++      std::chrono::milliseconds(20));
++    config_->blackboard->set<std::chrono::milliseconds>(
++      "bt_loop_duration",
++      std::chrono::milliseconds(10));
++    config_->blackboard->set<std::chrono::milliseconds>(
++      "wait_for_service_timeout",
++      std::chrono::milliseconds(1000));
++
++    BT::NodeBuilder builder =
++      [](const std::string & name, const BT::NodeConfiguration & config)
++      {
++        return std::make_unique<nav2_behavior_tree::RemoveInCollisionGoals>(
++          name, config);
++      };
++
++    factory_->registerBuilder<nav2_behavior_tree::RemoveInCollisionGoals>(
++      "RemoveInCollisionGoals", builder);
++  }
++
++  static void TearDownTestCase()
++  {
++    delete config_;
++    config_ = nullptr;
++    node_.reset();
++    server_.reset();
++    factory_.reset();
++  }
++
++  void TearDown() override
++  {
++    tree_.reset();
++  }
++  static std::shared_ptr<RemoveInCollisionGoalsService> server_;
++
++protected:
++  static rclcpp::Node::SharedPtr node_;
++  static BT::NodeConfiguration * config_;
++  static std::shared_ptr<BT::BehaviorTreeFactory> factory_;
++  static std::shared_ptr<BT::Tree> tree_;
++};
++
++rclcpp::Node::SharedPtr RemoveInCollisionGoalsTestFixture::node_ = nullptr;
++
++BT::NodeConfiguration * RemoveInCollisionGoalsTestFixture::config_ = nullptr;
++std::shared_ptr<RemoveInCollisionGoalsService>
++RemoveInCollisionGoalsTestFixture::server_ = nullptr;
++std::shared_ptr<BT::BehaviorTreeFactory> RemoveInCollisionGoalsTestFixture::factory_ = nullptr;
++std::shared_ptr<BT::Tree> RemoveInCollisionGoalsTestFixture::tree_ = nullptr;
++
++TEST_F(RemoveInCollisionGoalsTestFixture, test_tick_remove_in_collision_goals)
++{
++  // create tree
++  std::string xml_txt =
++    R"(
++      <root BTCPP_format="4">
++        <BehaviorTree ID="MainTree">
++          <RemoveInCollisionGoals service_name="/global_costmap/get_cost_global_costmap" input_goals="{goals}" output_goals="{goals}" cost_threshold="253"/>
++        </BehaviorTree>
++      </root>)";
++
++  tree_ = std::make_shared<BT::Tree>(factory_->createTreeFromText(xml_txt, config_->blackboard));
++
++  // create new goal and set it on blackboard
++  std::vector<geometry_msgs::msg::PoseStamped> poses;
++  poses.resize(4);
++  poses[0].pose.position.x = 0.0;
++  poses[0].pose.position.y = 0.0;
++
++  poses[1].pose.position.x = 0.5;
++  poses[1].pose.position.y = 0.0;
++
++  poses[2].pose.position.x = 1.0;
++  poses[2].pose.position.y = 0.0;
++
++  poses[3].pose.position.x = 2.0;
++  poses[3].pose.position.y = 0.0;
++
++  config_->blackboard->set("goals", poses);
++
++  // tick until node succeeds
++  while (tree_->rootNode()->status() != BT::NodeStatus::SUCCESS) {
++    tree_->rootNode()->executeTick();
++  }
++
++  // check that it removed the point in range
++  std::vector<geometry_msgs::msg::PoseStamped> output_poses;
++  EXPECT_TRUE(config_->blackboard->get("goals", output_poses));
++
++  EXPECT_EQ(output_poses.size(), 3u);
++  EXPECT_EQ(output_poses[0], poses[0]);
++  EXPECT_EQ(output_poses[1], poses[1]);
++  EXPECT_EQ(output_poses[2], poses[2]);
++}
++
++int main(int argc, char ** argv)
++{
++  ::testing::InitGoogleTest(&argc, argv);
++
++  // initialize ROS
++  rclcpp::init(argc, argv);
++
++  // initialize service and spin on new thread
++  RemoveInCollisionGoalsTestFixture::server_ =
++    std::make_shared<RemoveInCollisionGoalsService>();
++  std::thread server_thread([]() {
++      rclcpp::spin(RemoveInCollisionGoalsTestFixture::server_);
++    });
++
++  int all_successful = RUN_ALL_TESTS();
++
++  // shutdown ROS
++  rclcpp::shutdown();
++  server_thread.join();
++
++  return all_successful;
++}
+diff --git a/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d_ros.hpp b/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d_ros.hpp
+index c95a19902d1..33feaa700df 100644
+--- a/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d_ros.hpp
++++ b/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d_ros.hpp
+@@ -52,7 +52,7 @@
+ #include "nav2_costmap_2d/layered_costmap.hpp"
+ #include "nav2_costmap_2d/layer.hpp"
+ #include "nav2_util/lifecycle_node.hpp"
+-#include "nav2_msgs/srv/get_cost.hpp"
++#include "nav2_msgs/srv/get_costs.hpp"
+ #include "pluginlib/class_loader.hpp"
+ #include "tf2/convert.h"
+ #include "tf2/LinearMath/Transform.h"
+@@ -345,10 +345,10 @@ class Costmap2DROS : public nav2_util::LifecycleNode
+    * @param request x and y coordinates in map
+    * @param response cost of the point
+   */
+-  void getCostCallback(
++  void getCostsCallback(
+     const std::shared_ptr<rmw_request_id_t>,
+-    const std::shared_ptr<nav2_msgs::srv::GetCost::Request> request,
+-    const std::shared_ptr<nav2_msgs::srv::GetCost::Response> response);
++    const std::shared_ptr<nav2_msgs::srv::GetCosts::Request> request,
++    const std::shared_ptr<nav2_msgs::srv::GetCosts::Response> response);
+ 
+ protected:
+   // Publishers and subscribers
+@@ -425,7 +425,7 @@ class Costmap2DROS : public nav2_util::LifecycleNode
+   std::vector<geometry_msgs::msg::Point> padded_footprint_;
+ 
+   // Services
+-  rclcpp::Service<nav2_msgs::srv::GetCost>::SharedPtr get_cost_service_;
++  rclcpp::Service<nav2_msgs::srv::GetCosts>::SharedPtr get_cost_service_;
+   std::unique_ptr<ClearCostmapService> clear_costmap_service_;
+ 
+   // Dynamic parameters handler
+diff --git a/nav2_costmap_2d/src/costmap_2d_ros.cpp b/nav2_costmap_2d/src/costmap_2d_ros.cpp
+index 0fdfb5d2b8c..dcf6d50b7a0 100644
+--- a/nav2_costmap_2d/src/costmap_2d_ros.cpp
++++ b/nav2_costmap_2d/src/costmap_2d_ros.cpp
+@@ -252,9 +252,9 @@ Costmap2DROS::on_configure(const rclcpp_lifecycle::State & /*state*/)
+   }
+ 
+   // Service to get the cost at a point
+-  get_cost_service_ = create_service<nav2_msgs::srv::GetCost>(
++  get_cost_service_ = create_service<nav2_msgs::srv::GetCosts>(
+     "get_cost_" + getName(),
+-    std::bind(&Costmap2DROS::getCostCallback, this, std::placeholders::_1, std::placeholders::_2,
++    std::bind(&Costmap2DROS::getCostsCallback, this, std::placeholders::_1, std::placeholders::_2,
+       std::placeholders::_3));
+ 
+   // Add cleaning service
+@@ -825,34 +825,40 @@ Costmap2DROS::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
+   return result;
+ }
+ 
+-void Costmap2DROS::getCostCallback(
++void Costmap2DROS::getCostsCallback(
+   const std::shared_ptr<rmw_request_id_t>,
+-  const std::shared_ptr<nav2_msgs::srv::GetCost::Request> request,
+-  const std::shared_ptr<nav2_msgs::srv::GetCost::Response> response)
++  const std::shared_ptr<nav2_msgs::srv::GetCosts::Request> request,
++  const std::shared_ptr<nav2_msgs::srv::GetCosts::Response> response)
+ {
+   unsigned int mx, my;
+ 
+   Costmap2D * costmap = layered_costmap_->getCostmap();
+ 
+-  if (request->use_footprint) {
+-    Footprint footprint = layered_costmap_->getFootprint();
+-    FootprintCollisionChecker<Costmap2D *> collision_checker(costmap);
++  for (const auto & pose : request->poses) {
++    bool in_bounds = costmap->worldToMap(pose.x, pose.y, mx, my);
+ 
+-    RCLCPP_INFO(
+-      get_logger(), "Received request to get cost at footprint pose (%.2f, %.2f, %.2f)",
+-      request->x, request->y, request->theta);
++    if (!in_bounds) {
++      response->costs.push_back(-1.0);
++      continue;
++    }
+ 
+-    response->cost = collision_checker.footprintCostAtPose(
+-      request->x, request->y, request->theta, footprint);
+-  } else if (costmap->worldToMap(request->x, request->y, mx, my)) {
+-    RCLCPP_INFO(
+-      get_logger(), "Received request to get cost at point (%f, %f)", request->x, request->y);
++    if (request->use_footprint) {
++      Footprint footprint = layered_costmap_->getFootprint();
++      FootprintCollisionChecker<Costmap2D *> collision_checker(costmap);
+ 
+-    // Get the cost at the map coordinates
+-    response->cost = static_cast<float>(costmap->getCost(mx, my));
+-  } else {
+-    RCLCPP_WARN(get_logger(), "Point (%f, %f) is out of bounds", request->x, request->y);
+-    response->cost = -1.0;
++      RCLCPP_DEBUG(
++        get_logger(), "Received request to get cost at footprint pose (%.2f, %.2f, %.2f)",
++        pose.x, pose.y, pose.theta);
++
++      response->costs.push_back(
++        collision_checker.footprintCostAtPose(pose.x, pose.y, pose.theta, footprint));
++    } else {
++      RCLCPP_DEBUG(
++        get_logger(), "Received request to get cost at point (%f, %f)", pose.x, pose.y);
++
++      // Get the cost at the map coordinates
++      response->costs.push_back(static_cast<float>(costmap->getCost(mx, my)));
++    }
+   }
+ }
+ 
+diff --git a/nav2_costmap_2d/test/unit/costmap_cost_service_test.cpp b/nav2_costmap_2d/test/unit/costmap_cost_service_test.cpp
+index 8563d6dd16d..803e2a1f8e7 100644
+--- a/nav2_costmap_2d/test/unit/costmap_cost_service_test.cpp
++++ b/nav2_costmap_2d/test/unit/costmap_cost_service_test.cpp
+@@ -18,7 +18,7 @@
+ #include <chrono>
+ 
+ #include <rclcpp/rclcpp.hpp>
+-#include "nav2_msgs/srv/get_cost.hpp"
++#include "nav2_msgs/srv/get_costs.hpp"
+ #include "nav2_costmap_2d/costmap_2d_ros.hpp"
+ 
+ class RclCppFixture
+@@ -37,21 +37,23 @@ class GetCostServiceTest : public ::testing::Test
+   void SetUp() override
+   {
+     costmap_ = std::make_shared<nav2_costmap_2d::Costmap2DROS>("costmap");
+-    client_ = costmap_->create_client<nav2_msgs::srv::GetCost>(
++    client_ = costmap_->create_client<nav2_msgs::srv::GetCosts>(
+       "/costmap/get_cost_costmap");
+     costmap_->on_configure(rclcpp_lifecycle::State());
+     ASSERT_TRUE(client_->wait_for_service(10s));
+   }
+ 
+   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_;
+-  rclcpp::Client<nav2_msgs::srv::GetCost>::SharedPtr client_;
++  rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedPtr client_;
+ };
+ 
+ TEST_F(GetCostServiceTest, TestWithoutFootprint)
+ {
+-  auto request = std::make_shared<nav2_msgs::srv::GetCost::Request>();
+-  request->x = 0.5;
+-  request->y = 1.0;
++  auto request = std::make_shared<nav2_msgs::srv::GetCosts::Request>();
++  geometry_msgs::msg::Pose2D pose;
++  pose.x = 0.5;
++  pose.y = 1.0;
++  request->poses.push_back(pose);
+   request->use_footprint = false;
+ 
+   auto result_future = client_->async_send_request(request);
+@@ -60,8 +62,8 @@ TEST_F(GetCostServiceTest, TestWithoutFootprint)
+       result_future) == rclcpp::FutureReturnCode::SUCCESS)
+   {
+     auto response = result_future.get();
+-    EXPECT_GE(response->cost, 0.0) << "Cost is less than 0";
+-    EXPECT_LE(response->cost, 255.0) << "Cost is greater than 255";
++    EXPECT_GE(response->costs[0], 0.0) << "Cost is less than 0";
++    EXPECT_LE(response->costs[0], 255.0) << "Cost is greater than 255";
+   } else {
+     FAIL() << "Failed to call service";
+   }
+@@ -69,10 +71,12 @@ TEST_F(GetCostServiceTest, TestWithoutFootprint)
+ 
+ TEST_F(GetCostServiceTest, TestWithFootprint)
+ {
+-  auto request = std::make_shared<nav2_msgs::srv::GetCost::Request>();
+-  request->x = 1.0;
+-  request->y = 1.0;
+-  request->theta = 0.5;
++  auto request = std::make_shared<nav2_msgs::srv::GetCosts::Request>();
++  geometry_msgs::msg::Pose2D pose;
++  pose.x = 0.5;
++  pose.y = 1.0;
++  pose.theta = 0.5;
++  request->poses.push_back(pose);
+   request->use_footprint = true;
+ 
+   auto result_future = client_->async_send_request(request);
+@@ -81,8 +85,8 @@ TEST_F(GetCostServiceTest, TestWithFootprint)
+       result_future) == rclcpp::FutureReturnCode::SUCCESS)
+   {
+     auto response = result_future.get();
+-    EXPECT_GE(response->cost, 0.0) << "Cost is less than 0";
+-    EXPECT_LE(response->cost, 255.0) << "Cost is greater than 255";
++    EXPECT_GE(response->costs[0], 0.0) << "Cost is less than 0";
++    EXPECT_LE(response->costs[0], 255.0) << "Cost is greater than 255";
+   } else {
+     FAIL() << "Failed to call service";
+   }
+diff --git a/nav2_msgs/CMakeLists.txt b/nav2_msgs/CMakeLists.txt
+index 8cee7cdb7f2..a9f93b5ecbc 100644
+--- a/nav2_msgs/CMakeLists.txt
++++ b/nav2_msgs/CMakeLists.txt
+@@ -30,7 +30,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
+   "msg/Particle.msg"
+   "msg/ParticleCloud.msg"
+   "msg/MissedWaypoint.msg"
+-  "srv/GetCost.srv"
++  "srv/GetCosts.srv"
+   "srv/GetCostmap.srv"
+   "srv/IsPathValid.srv"
+   "srv/ClearCostmapExceptRegion.srv"
+diff --git a/nav2_msgs/srv/GetCost.srv b/nav2_msgs/srv/GetCost.srv
+deleted file mode 100644
+index 577654f55cd..00000000000
+--- a/nav2_msgs/srv/GetCost.srv
++++ /dev/null
+@@ -1,8 +0,0 @@
+-# Get costmap cost at given point
+-
+-bool use_footprint
+-float32 x
+-float32 y
+-float32 theta
+----
+-float32 cost
+\ No newline at end of file
+diff --git a/nav2_msgs/srv/GetCosts.srv b/nav2_msgs/srv/GetCosts.srv
+new file mode 100644
+index 00000000000..0328d476397
+--- /dev/null
++++ b/nav2_msgs/srv/GetCosts.srv
+@@ -0,0 +1,6 @@
++# Get costmap costs at given poses
++
++bool use_footprint
++geometry_msgs/Pose2D[] poses
++---
++float32[] costs
+\ No newline at end of file
+diff --git a/nav2_rviz_plugins/include/nav2_rviz_plugins/costmap_cost_tool.hpp b/nav2_rviz_plugins/include/nav2_rviz_plugins/costmap_cost_tool.hpp
+index b70529f11a7..a14a9f98b54 100644
+--- a/nav2_rviz_plugins/include/nav2_rviz_plugins/costmap_cost_tool.hpp
++++ b/nav2_rviz_plugins/include/nav2_rviz_plugins/costmap_cost_tool.hpp
+@@ -17,7 +17,7 @@
+ 
+ #include <memory>
+ 
+-#include <nav2_msgs/srv/get_cost.hpp>
++#include <nav2_msgs/srv/get_costs.hpp>
+ #include <rviz_common/ros_integration/ros_node_abstraction_iface.hpp>
+ #include <rviz_common/tool.hpp>
+ #include <rviz_default_plugins/tools/point/point_tool.hpp>
+@@ -41,15 +41,15 @@ class CostmapCostTool : public rviz_common::Tool
+ 
+   void callCostService(float x, float y);
+ 
+-  void handleLocalCostResponse(rclcpp::Client<nav2_msgs::srv::GetCost>::SharedFuture);
+-  void handleGlobalCostResponse(rclcpp::Client<nav2_msgs::srv::GetCost>::SharedFuture);
++  void handleLocalCostResponse(rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedFuture);
++  void handleGlobalCostResponse(rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedFuture);
+ 
+ private Q_SLOTS:
+   void updateAutoDeactivate();
+ 
+ private:
+-  rclcpp::Client<nav2_msgs::srv::GetCost>::SharedPtr local_cost_client_;
+-  rclcpp::Client<nav2_msgs::srv::GetCost>::SharedPtr global_cost_client_;
++  rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedPtr local_cost_client_;
++  rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedPtr global_cost_client_;
+   // The Node pointer that we need to keep alive for the duration of this plugin.
+   std::shared_ptr<rviz_common::ros_integration::RosNodeAbstractionIface> node_ptr_;
+ 
+diff --git a/nav2_rviz_plugins/src/costmap_cost_tool.cpp b/nav2_rviz_plugins/src/costmap_cost_tool.cpp
+index 5873b54f457..d5ef5658745 100644
+--- a/nav2_rviz_plugins/src/costmap_cost_tool.cpp
++++ b/nav2_rviz_plugins/src/costmap_cost_tool.cpp
+@@ -54,9 +54,9 @@ void CostmapCostTool::onInitialize()
+   rclcpp::Node::SharedPtr node = node_ptr_->get_raw_node();
+ 
+   local_cost_client_ =
+-    node->create_client<nav2_msgs::srv::GetCost>("/local_costmap/get_cost_local_costmap");
++    node->create_client<nav2_msgs::srv::GetCosts>("/local_costmap/get_cost_local_costmap");
+   global_cost_client_ =
+-    node->create_client<nav2_msgs::srv::GetCost>("/global_costmap/get_cost_global_costmap");
++    node->create_client<nav2_msgs::srv::GetCosts>("/global_costmap/get_cost_global_costmap");
+ }
+ 
+ void CostmapCostTool::activate() {}
+@@ -95,9 +95,12 @@ int CostmapCostTool::processMouseEvent(rviz_common::ViewportMouseEvent & event)
+ void CostmapCostTool::callCostService(float x, float y)
+ {
+   // Create request for local costmap
+-  auto request = std::make_shared<nav2_msgs::srv::GetCost::Request>();
+-  request->x = x;
+-  request->y = y;
++  auto request = std::make_shared<nav2_msgs::srv::GetCosts::Request>();
++  geometry_msgs::msg::Pose2D pose;
++  pose.x = x;
++  pose.y = y;
++  request->poses.push_back(pose);
++  request->use_footprint = false;
+ 
+   // Call local costmap service
+   if (local_cost_client_->wait_for_service(std::chrono::seconds(1))) {
+@@ -113,24 +116,24 @@ void CostmapCostTool::callCostService(float x, float y)
+ }
+ 
+ void CostmapCostTool::handleLocalCostResponse(
+-  rclcpp::Client<nav2_msgs::srv::GetCost>::SharedFuture future)
++  rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedFuture future)
+ {
+   rclcpp::Node::SharedPtr node = node_ptr_->get_raw_node();
+   auto response = future.get();
+-  if (response->cost != -1) {
+-    RCLCPP_INFO(node->get_logger(), "Local costmap cost: %.1f", response->cost);
++  if (response->costs[0] != -1) {
++    RCLCPP_INFO(node->get_logger(), "Local costmap cost: %.1f", response->costs[0]);
+   } else {
+     RCLCPP_ERROR(node->get_logger(), "Failed to get local costmap cost");
+   }
+ }
+ 
+ void CostmapCostTool::handleGlobalCostResponse(
+-  rclcpp::Client<nav2_msgs::srv::GetCost>::SharedFuture future)
++  rclcpp::Client<nav2_msgs::srv::GetCosts>::SharedFuture future)
+ {
+   rclcpp::Node::SharedPtr node = node_ptr_->get_raw_node();
+   auto response = future.get();
+-  if (response->cost != -1) {
+-    RCLCPP_INFO(node->get_logger(), "Global costmap cost: %.1f", response->cost);
++  if (response->costs[0] != -1) {
++    RCLCPP_INFO(node->get_logger(), "Global costmap cost: %.1f", response->costs[0]);
+   } else {
+     RCLCPP_ERROR(node->get_logger(), "Failed to get global costmap cost");
+   }

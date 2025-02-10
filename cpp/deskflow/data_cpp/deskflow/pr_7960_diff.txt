@@ -1,0 +1,127 @@
+diff --git a/src/lib/platform/MSWindowsClipboard.cpp b/src/lib/platform/MSWindowsClipboard.cpp
+index a4740e57619..4efe71a88c6 100644
+--- a/src/lib/platform/MSWindowsClipboard.cpp
++++ b/src/lib/platform/MSWindowsClipboard.cpp
+@@ -96,6 +96,11 @@ bool MSWindowsClipboard::empty()
+ 
+ void MSWindowsClipboard::add(EFormat format, const String &data)
+ {
++  // exit early if there is no data to prevent spurious "failed to convert clipboard data" errors
++  if (data.empty()) {
++    LOG((CLOG_DEBUG "not adding 0 bytes to clipboard format: %d", format));
++    return;
++  }
+   bool isSucceeded = false;
+   // convert data to win32 form
+   for (ConverterList::const_iterator index = m_converters.begin(); index != m_converters.end(); ++index) {
+diff --git a/src/lib/platform/MSWindowsScreen.cpp b/src/lib/platform/MSWindowsScreen.cpp
+index e9647fb2184..f94c93c5f53 100644
+--- a/src/lib/platform/MSWindowsScreen.cpp
++++ b/src/lib/platform/MSWindowsScreen.cpp
+@@ -119,7 +119,7 @@ MSWindowsScreen::MSWindowsScreen(
+       m_screensaverNotify(false),
+       m_screensaverActive(false),
+       m_window(NULL),
+-      m_nextClipboardWindow(NULL),
++      m_clipboardSequenceNumber(0),
+       m_ownClipboard(false),
+       m_desks(NULL),
+       m_keyState(NULL),
+@@ -237,7 +237,9 @@ void MSWindowsScreen::enable()
+   );
+ 
+   // install our clipboard snooper
+-  m_nextClipboardWindow = SetClipboardViewer(m_window);
++  if (!AddClipboardFormatListener(m_window)) {
++    LOG((CLOG_DEBUG "failed to add the clipboard format listener: %d", GetLastError()));
++  }
+ 
+   // track the active desk and (re)install the hooks
+   m_desks->enable();
+@@ -268,8 +270,9 @@ void MSWindowsScreen::disable()
+   m_keyState->disable();
+ 
+   // stop snooping the clipboard
+-  ChangeClipboardChain(m_window, m_nextClipboardWindow);
+-  m_nextClipboardWindow = NULL;
++  if (!RemoveClipboardFormatListener(m_window)) {
++    LOG((CLOG_DEBUG "failed to remove the clipboard format listener: %d", GetLastError()));
++  }
+ 
+   // uninstall fix timer
+   if (m_fixTimer != NULL) {
+@@ -1021,23 +1024,20 @@ bool MSWindowsScreen::onPreDispatchPrimary(HWND, UINT message, WPARAM wParam, LP
+ bool MSWindowsScreen::onEvent(HWND, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *result)
+ {
+   switch (msg) {
+-  case WM_DRAWCLIPBOARD:
+-    // first pass on the message
+-    if (m_nextClipboardWindow != NULL) {
+-      SendMessage(m_nextClipboardWindow, msg, wParam, lParam);
+-    }
+ 
+-    // now handle the message
+-    return onClipboardChange();
++  case WM_CLIPBOARDUPDATE: {
++    DWORD clipboardSequenceNumber = GetClipboardSequenceNumber();
++    LOG(
++        (CLOG_DEBUG "clipboard update: sequence number %d, current %d", clipboardSequenceNumber,
++         m_clipboardSequenceNumber)
++    );
+ 
+-  case WM_CHANGECBCHAIN:
+-    if (m_nextClipboardWindow == (HWND)wParam) {
+-      m_nextClipboardWindow = (HWND)lParam;
+-      LOG((CLOG_DEBUG "clipboard chain: new next: 0x%08x", m_nextClipboardWindow));
+-    } else if (m_nextClipboardWindow != NULL) {
+-      SendMessage(m_nextClipboardWindow, msg, wParam, lParam);
++    if (clipboardSequenceNumber && (clipboardSequenceNumber != m_clipboardSequenceNumber)) {
++      m_clipboardSequenceNumber = clipboardSequenceNumber;
++      onClipboardChange();
+     }
+-    return true;
++    return 0; // message processed
++  }
+ 
+   case WM_DISPLAYCHANGE:
+     return onDisplayChange();
+@@ -1430,7 +1430,7 @@ bool MSWindowsScreen::onDisplayChange()
+   return true;
+ }
+ 
+-bool MSWindowsScreen::onClipboardChange()
++void MSWindowsScreen::onClipboardChange()
+ {
+   // now notify client that somebody changed the clipboard (unless
+   // we're the owner).
+@@ -1445,8 +1445,6 @@ bool MSWindowsScreen::onClipboardChange()
+     LOG((CLOG_DEBUG "clipboard changed: %s owned", kAppId));
+     m_ownClipboard = true;
+   }
+-
+-  return true;
+ }
+ 
+ void MSWindowsScreen::warpCursorNoFlush(SInt32 x, SInt32 y)
+diff --git a/src/lib/platform/MSWindowsScreen.h b/src/lib/platform/MSWindowsScreen.h
+index d7284973f75..6b038135208 100644
+--- a/src/lib/platform/MSWindowsScreen.h
++++ b/src/lib/platform/MSWindowsScreen.h
+@@ -192,7 +192,7 @@ class MSWindowsScreen : public PlatformScreen
+   bool onMouseWheel(SInt32 xDelta, SInt32 yDelta);
+   bool onScreensaver(bool activated);
+   bool onDisplayChange();
+-  bool onClipboardChange();
++  void onClipboardChange();
+ 
+   // warp cursor without discarding queued events
+   void warpCursorNoFlush(SInt32 x, SInt32 y);
+@@ -314,7 +314,7 @@ class MSWindowsScreen : public PlatformScreen
+   // clipboard stuff.  our window is used mainly as a clipboard
+   // owner and as a link in the clipboard viewer chain.
+   HWND m_window;
+-  HWND m_nextClipboardWindow;
++  DWORD m_clipboardSequenceNumber;
+   bool m_ownClipboard;
+ 
+   // one desk per desktop and a cond var to communicate with it

@@ -1,0 +1,131 @@
+[
+    {
+        "title": "Update HNSW cost estimatation to utilize search and index info"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "Previously, the cost estimation formula for a HNSW index scan utilized\r\na methodology that only factored in the entry level for an HNSW scan\r\nand the \"m\" index parameter, which reflects the number of tuples (or\r\nvectors) to scan at each step of a HNSW graph traversal. While this\r\nwould bias the PostgreSQL query planner to choose an HNSW index scan\r\nover other available paths, this could lead to potential suboptimal\r\nindex selection, for example, choosing to use a HNSW index instead of\r\nan available B-tree index that has better selectivity.\r\n\r\nThe number of tuples scanned during HNSW graph traversal is principally\r\ninfluenced by these factors:\r\n\r\n * The number of tuples stored in the index\r\n * `m` - the number of tuples that are scanned in each step of the graph\r\n   traversal\r\n * `hnsw.ef_search` - which influences the total number of steps it\r\n   takes for the scan to converge on the approximated nearest neighbors\r\n\r\nThrough testing different source models for vectors, we also observed\r\nthat the correlation of vectors in mdoels would impact this convergence.\r\nFor this first iteration, we've opted to hardcode a constant scaling\r\nfactor and set it to `0.55`, though a future commit may turn this into\r\na configurable parameter.\r\n\r\nThe high-level formula for estimating the cost of a HNSW index scan is\r\nas such:\r\n\r\n```\r\n(entryLevel * m) + (layer0TuplesMax * layer0Selectivity)\r\n```\r\n\r\nwhere\r\n\r\n- `(entryLevel * m)` is the lower bound of tuples to scan, as it\r\naccounts for the graph traversal to layer 0 (L0). (L1 and above has an ef=1)\r\n- `layer0TuplesMax` is an estimate of the maximum number of tuples to\r\nscan at L0. This accounts for tuples that may end up being discarded due\r\nto them already being visited. Testing shows that the number of steps\r\nuntil converge is similar to the value of `hnsw.ef_search`, thus we can\r\nestimate tuples max at `hnsw.ef_search * m * 2`\r\n- `layer0Selectivity` - estimates the percentage of tuples that will\r\nactually be scanned during the index traversal, multipled by the scaling\r\nfactor\r\n\r\nIn addition to the `m` build parameter and `hsnw.ef_search`, costs\r\nestimates can be influenced by standard PostgreSQL costing parameters,\r\nthough adjusting those (e.g. `random_page_cost`) should be done with\r\ncare.\r\n\r\nCo-authored-by: @ankane"
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Awesome, thanks for driving this @jkatz! This should significantly improve index selection.\r\n\r\nAdded some comments inline."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Great, added a few more comments. I think the `+ 1` approach would be slightly better since the index can fulfill the query (the first path is more designed to prevent something the index can't do)."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Added some more comments, but I can handle the style-related ones in a follow-up commit if that's easier."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "Note: I've fixed a previous test failure (it was a TODO that's now resolved with the updated cost estimation model :smile:). However, the active failure is interesting. The failing query is:\r\n\r\n```sql\r\nEXPLAIN ANALYZE SELECT i FROM tst WHERE v <-> '$query' < 1 ORDER BY v <-> '$query';\r\n```\r\n\r\nThe dataset size is 10K vectors, and to explicitly state, this is a query with a filter that is ordering the vectors but doesn't have an explicit limit. `hnsw.ef_search` is `40`.\r\n\r\nPreviously, the costing was such that PostgreSQL estimated the sequential scan was cheaper and opted for that.\r\nWith the current patch, PostgreSQL estimates the index scan is cheaper (by almost less than a single cost unit \ud83d\ude28) and opts to use that. This may very well be the fastest scan path, but (untested theory) in streaming mode would this end up using the full index scan, which would certainly be more expensive than a sequential scan?\r\n\r\nI have a locally modified version of the patch that borrows similar selectivity logic to IVFFlat (`MIN(our estimate, PostgreSQL's selectivity estimate)`) but PostgreSQL still opted for the sequential scan.\r\n\r\nPrimarily posting this as a FYI. I'm still pulling a few threads."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "@ankane Pushed changes inline with feedback. One discussion point will be the check to push the costs up to the max if tuples is 0.\r\n\r\nI'm...OK-ish to go with your suggestion (add `1` to the total number), but arguably if we have no tuples, we shouldn't even bother considering the index scan. Adding 1 is certainly a cheap operation, but it'd be cheaper in that case to not even go through all the operations. OTOH, we then have to check that condition every time, and given it's unlikely we'd encounter that case (UPDATE: I added an `unlikely` clause), it may just be better to \"add 1\"."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "@ankane All feedback should now be addressed."
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Thanks, looks great. Last remaining comment:\r\n\r\n> I think the + 1 approach would be slightly better since the index can fulfill the query (the first path is more designed to prevent something the index can't do)."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "@ankane Done."
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "@ankane Addressed the feedback. I adjusted the parens, but ensuring it aligns to the formula.\n\n![image](https://github.com/user-attachments/assets/a8701046-b873-4be1-9ff7-e0338328d8c4)"
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Awesome, thank you! And huge thanks for all of the work that went into deriving the formula!!"
+    },
+    {
+        "author": {
+            "login": "jkatz"
+        },
+        "body": "@ankane \ud83c\udf89Thanks! Looking forward to describing more of the data...and adding the scaling factor parameter \ud83d\ude09 "
+    }
+]

@@ -1,0 +1,293 @@
+diff --git a/cmd/zdb/zdb.c b/cmd/zdb/zdb.c
+index 0179a2714cab..3eb8a8a58839 100644
+--- a/cmd/zdb/zdb.c
++++ b/cmd/zdb/zdb.c
+@@ -1967,17 +1967,53 @@ dump_dedup_ratio(const ddt_stat_t *dds)
+ static void
+ dump_ddt_log(ddt_t *ddt)
+ {
++	if (ddt->ddt_version != DDT_VERSION_FDT ||
++	    !(ddt->ddt_flags & DDT_FLAG_LOG))
++		return;
++
+ 	for (int n = 0; n < 2; n++) {
+ 		ddt_log_t *ddl = &ddt->ddt_log[n];
+ 
+-		uint64_t count = avl_numnodes(&ddl->ddl_tree);
+-		if (count == 0)
+-			continue;
++		char flagstr[64] = {0};
++		if (ddl->ddl_flags > 0) {
++			flagstr[0] = ' ';
++			int c = 1;
++			if (ddl->ddl_flags & DDL_FLAG_FLUSHING)
++				c += strlcpy(&flagstr[c], " FLUSHING",
++				    sizeof (flagstr) - c);
++			if (ddl->ddl_flags & DDL_FLAG_CHECKPOINT)
++				c += strlcpy(&flagstr[c], " CHECKPOINT",
++				    sizeof (flagstr) - c);
++			if (ddl->ddl_flags &
++			    ~(DDL_FLAG_FLUSHING|DDL_FLAG_CHECKPOINT))
++				c += strlcpy(&flagstr[c], " UNKNOWN",
++				    sizeof (flagstr) - c);
++			flagstr[1] = '[';
++			flagstr[c++] = ']';
++		}
+ 
+-		printf(DMU_POOL_DDT_LOG ": %lu log entries\n",
+-		    zio_checksum_table[ddt->ddt_checksum].ci_name, n, count);
++		uint64_t count = avl_numnodes(&ddl->ddl_tree);
+ 
+-		if (dump_opt['D'] < 4)
++		printf(DMU_POOL_DDT_LOG ": flags=0x%02x%s; obj=%llu; "
++		    "len=%llu; txg=%llu; entries=%llu\n",
++		    zio_checksum_table[ddt->ddt_checksum].ci_name, n,
++		    ddl->ddl_flags, flagstr,
++		    (u_longlong_t)ddl->ddl_object,
++		    (u_longlong_t)ddl->ddl_length,
++		    (u_longlong_t)ddl->ddl_first_txg, (u_longlong_t)count);
++
++		if (ddl->ddl_flags & DDL_FLAG_CHECKPOINT) {
++			const ddt_key_t *ddk = &ddl->ddl_checkpoint;
++			printf("    checkpoint: "
++			    "%016llx:%016llx:%016llx:%016llx:%016llx\n",
++			    (u_longlong_t)ddk->ddk_cksum.zc_word[0],
++			    (u_longlong_t)ddk->ddk_cksum.zc_word[1],
++			    (u_longlong_t)ddk->ddk_cksum.zc_word[2],
++			    (u_longlong_t)ddk->ddk_cksum.zc_word[3],
++			    (u_longlong_t)ddk->ddk_prop);
++		}
++
++		if (count == 0 || dump_opt['D'] < 4)
+ 			continue;
+ 
+ 		ddt_lightweight_entry_t ddlwe;
+@@ -1991,7 +2027,7 @@ dump_ddt_log(ddt_t *ddt)
+ }
+ 
+ static void
+-dump_ddt(ddt_t *ddt, ddt_type_t type, ddt_class_t class)
++dump_ddt_object(ddt_t *ddt, ddt_type_t type, ddt_class_t class)
+ {
+ 	char name[DDT_NAMELEN];
+ 	ddt_lightweight_entry_t ddlwe;
+@@ -2016,11 +2052,8 @@ dump_ddt(ddt_t *ddt, ddt_type_t type, ddt_class_t class)
+ 
+ 	ddt_object_name(ddt, type, class, name);
+ 
+-	(void) printf("%s: %llu entries, size %llu on disk, %llu in core\n",
+-	    name,
+-	    (u_longlong_t)count,
+-	    (u_longlong_t)dspace,
+-	    (u_longlong_t)mspace);
++	(void) printf("%s: dspace=%llu; mspace=%llu; entries=%llu\n", name,
++	    (u_longlong_t)dspace, (u_longlong_t)mspace, (u_longlong_t)count);
+ 
+ 	if (dump_opt['D'] < 3)
+ 		return;
+@@ -2043,24 +2076,52 @@ dump_ddt(ddt_t *ddt, ddt_type_t type, ddt_class_t class)
+ 	(void) printf("\n");
+ }
+ 
++static void
++dump_ddt(ddt_t *ddt)
++{
++	if (!ddt || ddt->ddt_version == DDT_VERSION_UNCONFIGURED)
++		return;
++
++	char flagstr[64] = {0};
++	if (ddt->ddt_flags > 0) {
++		flagstr[0] = ' ';
++		int c = 1;
++		if (ddt->ddt_flags & DDT_FLAG_FLAT)
++			c += strlcpy(&flagstr[c], " FLAT",
++			    sizeof (flagstr) - c);
++		if (ddt->ddt_flags & DDT_FLAG_LOG)
++			c += strlcpy(&flagstr[c], " LOG",
++			    sizeof (flagstr) - c);
++		if (ddt->ddt_flags & ~DDT_FLAG_MASK)
++			c += strlcpy(&flagstr[c], " UNKNOWN",
++			    sizeof (flagstr) - c);
++		flagstr[1] = '[';
++		flagstr[c] = ']';
++	}
++
++	printf("DDT-%s: version=%llu [%s]; flags=0x%02llx%s; rootobj=%llu\n",
++	    zio_checksum_table[ddt->ddt_checksum].ci_name,
++	    (u_longlong_t)ddt->ddt_version,
++	    (ddt->ddt_version == 0) ? "LEGACY" :
++	    (ddt->ddt_version == 1) ? "FDT" : "UNKNOWN",
++	    (u_longlong_t)ddt->ddt_flags, flagstr,
++	    (u_longlong_t)ddt->ddt_dir_object);
++
++	for (ddt_type_t type = 0; type < DDT_TYPES; type++)
++		for (ddt_class_t class = 0; class < DDT_CLASSES; class++)
++			dump_ddt_object(ddt, type, class);
++
++	dump_ddt_log(ddt);
++}
++
+ static void
+ dump_all_ddts(spa_t *spa)
+ {
+ 	ddt_histogram_t ddh_total = {{{0}}};
+ 	ddt_stat_t dds_total = {0};
+ 
+-	for (enum zio_checksum c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++) {
+-		ddt_t *ddt = spa->spa_ddt[c];
+-		if (!ddt || ddt->ddt_version == DDT_VERSION_UNCONFIGURED)
+-			continue;
+-		for (ddt_type_t type = 0; type < DDT_TYPES; type++) {
+-			for (ddt_class_t class = 0; class < DDT_CLASSES;
+-			    class++) {
+-				dump_ddt(ddt, type, class);
+-			}
+-		}
+-		dump_ddt_log(ddt);
+-	}
++	for (enum zio_checksum c = 0; c < ZIO_CHECKSUM_FUNCTIONS; c++)
++		dump_ddt(spa->spa_ddt[c]);
+ 
+ 	ddt_get_dedup_stats(spa, &dds_total);
+ 
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_fdt_create.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_fdt_create.ksh
+index 4f6e5805bb3a..3b17de5a4073 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_fdt_create.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_fdt_create.ksh
+@@ -70,7 +70,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "active"
+ 
+ # four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # single containing object in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256 | wc -l) -eq 1
+@@ -84,7 +84,7 @@ log_must cp /$TESTPOOL/file1 /$TESTPOOL/file2
+ log_must zpool sync
+ 
+ # now four entries in the duplicate table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate:.*entries=4'"
+ 
+ # now two DDT ZAPs in the container object; DDT ZAPs aren't cleaned up until
+ # the entire logical table is destroyed
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_fdt_import.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_fdt_import.ksh
+index 259eaddc0843..faa9b7e044cd 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_fdt_import.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_fdt_import.ksh
+@@ -70,7 +70,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "active"
+ 
+ # four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # single containing object in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256 | wc -l) -eq 1
+@@ -107,7 +107,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "active"
+ 
+ # four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # single containing object in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256 | wc -l) -eq 1
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_create.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_create.ksh
+index e3efcf5c8b36..9e524ddbe28e 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_create.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_create.ksh
+@@ -63,7 +63,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "disabled"
+ 
+ # should be four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # should be just one DDT ZAP in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256-zap- | wc -l) -eq 1
+@@ -73,7 +73,7 @@ log_must cp /$TESTPOOL/file1 /$TESTPOOL/file2
+ log_must zpool sync
+ 
+ # now four entries in the duplicate table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate:.*entries=4'"
+ 
+ # now two DDT ZAPs in the MOS; DDT ZAPs aren't cleaned up until the entire
+ # logical table is destroyed
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_mixed.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_mixed.ksh
+index 114cf0266e12..fd3b01e8cd2c 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_mixed.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_mixed.ksh
+@@ -71,7 +71,7 @@ log_must dd if=/dev/urandom of=/$TESTPOOL/ds1/file1 bs=128k count=4
+ log_must zpool sync
+ 
+ # should be four entries in the skein unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-skein-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-skein-zap-unique:.*entries=4'"
+ 
+ # should be just one DDT ZAP in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-.*-zap- | wc -l) -eq 1
+@@ -90,7 +90,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "active"
+ 
+ # now also four entries in the blake3 unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-blake3-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-blake3-zap-unique:.*entries=4'"
+ 
+ # two entries in the MOS: the legacy skein DDT ZAP, and the containing dir for
+ # the blake3 FDT table
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_upgrade.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_upgrade.ksh
+index c36463134fde..7a1e8006db16 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_upgrade.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_fdt_upgrade.ksh
+@@ -71,7 +71,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "disabled"
+ 
+ # should be four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # should be just one DDT ZAP in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256-zap- | wc -l) -eq 1
+@@ -90,7 +90,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "enabled"
+ 
+ # now four entries in the duplicate table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-duplicate:.*entries=4'"
+ 
+ # now two DDT ZAPs in the MOS; DDT ZAPs aren't cleaned up until the entire
+ # logical table is destroyed
+@@ -117,7 +117,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "active"
+ 
+ # four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # single containing object in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256 | wc -l) -eq 1
+diff --git a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_import.ksh b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_import.ksh
+index a7b667eaf882..4de46e89fc05 100755
+--- a/tests/zfs-tests/tests/functional/dedup/dedup_legacy_import.ksh
++++ b/tests/zfs-tests/tests/functional/dedup/dedup_legacy_import.ksh
+@@ -63,7 +63,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "disabled"
+ 
+ # should be four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # should be just one DDT ZAP in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256-zap- | wc -l) -eq 1
+@@ -96,7 +96,7 @@ log_must zpool sync
+ log_must test $(get_pool_prop feature@fast_dedup $TESTPOOL) = "disabled"
+ 
+ # should be four entries in the unique table
+-log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique: 4 entries'"
++log_must eval "zdb -D $TESTPOOL | grep -q 'DDT-sha256-zap-unique:.*entries=4'"
+ 
+ # should be just one DDT ZAP in the MOS
+ log_must test $(zdb -dddd $TESTPOOL 1 | grep DDT-sha256-zap- | wc -l) -eq 1

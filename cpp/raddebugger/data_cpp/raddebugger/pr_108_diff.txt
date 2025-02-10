@@ -1,0 +1,179 @@
+diff --git a/src/render/d3d11/generated/render_d3d11.meta.h b/src/render/d3d11/generated/render_d3d11.meta.h
+index fbf3ca08c..2435a241d 100644
+--- a/src/render/d3d11/generated/render_d3d11.meta.h
++++ b/src/render/d3d11/generated/render_d3d11.meta.h
+@@ -227,6 +227,7 @@ str8_lit_comp(
+ "  float4 position        : SV_POSITION;\n"
+ "  float2 texcoord        : TEX;\n"
+ "  float2 sdf_sample_pos  : SDF;\n"
++"  nointerpolation float2 rect_half_size : RHS;\n"
+ "  float corner_radius    : RAD;\n"
+ "};\n"
+ "\n"
+@@ -271,6 +272,7 @@ str8_lit_comp(
+ "    v2p.position = float4(vertex_position__scr.x, -vertex_position__scr.y, 0.f, 1.f);\n"
+ "    v2p.texcoord = vertex_position__pct;\n"
+ "    v2p.sdf_sample_pos = (2.f * cornercoords__pct - 1.f) * rect_half_size;\n"
++"    v2p.rect_half_size = rect_half_size - 2.f;\n"
+ "    v2p.corner_radius = corner_radii__px[c2v.vertex_id];\n"
+ "  }\n"
+ "  return v2p;\n"
+@@ -282,33 +284,28 @@ str8_lit_comp(
+ "ps_main(Vertex2Pixel v2p) : SV_TARGET\n"
+ "{\n"
+ "  // rjf: blend weighted texture samples into color\n"
+-"  float4 color = kernel[0].x * stage_t2d.Sample(stage_sampler, v2p.texcoord);\n"
+-"  color.a = kernel[0].x;\n"
++"  float3 color = kernel[0].x * stage_t2d.Sample(stage_sampler, v2p.texcoord).rgb;\n"
+ "  \n"
+ "  for(uint i = 1; i < blur_count; i += 1)\n"
+ "  {\n"
+ "    float weight = kernel[i].x;\n"
+ "    float offset = kernel[i].y;\n"
+-"    float4 min_sample = stage_t2d.Sample(stage_sampler, v2p.texcoord - offset * direction);\n"
+-"    float4 max_sample = stage_t2d.Sample(stage_sampler, v2p.texcoord + offset * direction);\n"
+-"    min_sample.a = 1.f;\n"
+-"    max_sample.a = 1.f;\n"
+-"    color += min_sample * weight;\n"
+-"    color += max_sample * weight;\n"
++"    color += weight * stage_t2d.Sample(stage_sampler, v2p.texcoord - offset * direction).rgb;\n"
++"    color += weight * stage_t2d.Sample(stage_sampler, v2p.texcoord + offset * direction).rgb;\n"
+ "  }\n"
+ "  \n"
+-"  // rjf: determine SDF sample position\n"
+-"  float2 rect_half_size = float2((rect.z-rect.x)/2, (rect.w-rect.y)/2);\n"
+-"  float2 sdf_sample_pos = v2p.sdf_sample_pos;\n"
+-"  \n"
+ "  // rjf: sample for corners\n"
+-"  float corner_sdf_s = rect_sdf(sdf_sample_pos, rect_half_size - 2.f, v2p.corner_radius);\n"
++"  float corner_sdf_s = rect_sdf(v2p.sdf_sample_pos, v2p.rect_half_size, v2p.corner_radius);\n"
+ "  float corner_sdf_t = 1-smoothstep(0, 2, corner_sdf_s);\n"
+ "  \n"
+ "  // rjf: weight output color by sdf\n"
+-"  color.a *= corner_sdf_t;\n"
++"  // this is doing alpha testing, leave blurring only where mostly opaque pixels are\n"
++"  if (corner_sdf_t < 0.9f)\n"
++"  {\n"
++"    discard;\n"
++"  }\n"
+ "  \n"
+-"  return color;\n"
++"  return float4(color, 1.f);\n"
+ "}\n"
+ ""
+ );
+diff --git a/src/render/d3d11/render_d3d11.cpp b/src/render/d3d11/render_d3d11.cpp
+index dcfc5801c..cdd6ea66b 100644
+--- a/src/render/d3d11/render_d3d11.cpp
++++ b/src/render/d3d11/render_d3d11.cpp
+@@ -232,6 +232,15 @@ r_init(CmdLine *cmdln)
+     error = r_d3d11_state->device->CreateBlendState(&desc, &r_d3d11_state->main_blend_state);
+   }
+   
++  {
++    D3D11_BLEND_DESC desc = {0};
++    {
++      desc.RenderTarget[0].BlendEnable           = FALSE;
++      desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
++    }
++    error = r_d3d11_state->device->CreateBlendState(&desc, &r_d3d11_state->no_blend_state);
++  }
++
+   //- rjf: create nearest-neighbor sampler
+   {
+     D3D11_SAMPLER_DESC desc = zero_struct;
+@@ -1190,7 +1199,7 @@ r_window_submit(OS_Handle window, R_Handle window_equip, R_PassList *passes)
+ 
+           // rjf: setup output merger
+           d_ctx->OMSetDepthStencilState(r_d3d11_state->noop_depth_stencil, 0);
+-          d_ctx->OMSetBlendState(r_d3d11_state->main_blend_state, 0, 0xffffffff);
++          d_ctx->OMSetBlendState(r_d3d11_state->no_blend_state, 0, 0xffffffff);
+ 
+           // rjf: set up viewport
+           Vec2S32 resolution = wnd->last_resolution;
+@@ -1263,8 +1272,8 @@ r_window_submit(OS_Handle window, R_Handle window_equip, R_PassList *passes)
+                   // zw elements are not used, a bit of waste but it allows for simpler shader code
+                   uniforms.kernel[(idx+1)/2] = v4f32(w, (F32)idx + t, 0, 0);
+               }
+-              uniforms.kernel[0].x = weights[0];
+             }
++            uniforms.kernel[0].x = weights[0];
+ 
+             // technically we need just direction be different
+             // but there are 256 bytes of usable space anyway for each constant buffer chunk
+diff --git a/src/render/d3d11/render_d3d11.h b/src/render/d3d11/render_d3d11.h
+index ca08fc790..0be2f1451 100644
+--- a/src/render/d3d11/render_d3d11.h
++++ b/src/render/d3d11/render_d3d11.h
+@@ -134,6 +134,7 @@ struct R_D3D11_State
+   IDXGIFactory2           *dxgi_factory;
+   ID3D11RasterizerState1  *main_rasterizer;
+   ID3D11BlendState        *main_blend_state;
++  ID3D11BlendState        *no_blend_state;
+   ID3D11SamplerState      *samplers[R_Tex2DSampleKind_COUNT];
+   ID3D11DepthStencilState *noop_depth_stencil;
+   ID3D11DepthStencilState *plain_depth_stencil;
+diff --git a/src/render/d3d11/render_d3d11.mdesk b/src/render/d3d11/render_d3d11.mdesk
+index fb4a51f7f..6d051c940 100644
+--- a/src/render/d3d11/render_d3d11.mdesk
++++ b/src/render/d3d11/render_d3d11.mdesk
+@@ -226,6 +226,7 @@ struct Vertex2Pixel
+   float4 position        : SV_POSITION;
+   float2 texcoord        : TEX;
+   float2 sdf_sample_pos  : SDF;
++  nointerpolation float2 rect_half_size : RHS;
+   float corner_radius    : RAD;
+ };
+ 
+@@ -270,6 +271,7 @@ vs_main(CPU2Vertex c2v)
+     v2p.position = float4(vertex_position__scr.x, -vertex_position__scr.y, 0.f, 1.f);
+     v2p.texcoord = vertex_position__pct;
+     v2p.sdf_sample_pos = (2.f * cornercoords__pct - 1.f) * rect_half_size;
++    v2p.rect_half_size = rect_half_size - 2.f;
+     v2p.corner_radius = corner_radii__px[c2v.vertex_id];
+   }
+   return v2p;
+@@ -281,33 +283,28 @@ float4
+ ps_main(Vertex2Pixel v2p) : SV_TARGET
+ {
+   // rjf: blend weighted texture samples into color
+-  float4 color = kernel[0].x * stage_t2d.Sample(stage_sampler, v2p.texcoord);
+-  color.a = kernel[0].x;
++  float3 color = kernel[0].x * stage_t2d.Sample(stage_sampler, v2p.texcoord).rgb;
+   
+   for(uint i = 1; i < blur_count; i += 1)
+   {
+     float weight = kernel[i].x;
+     float offset = kernel[i].y;
+-    float4 min_sample = stage_t2d.Sample(stage_sampler, v2p.texcoord - offset * direction);
+-    float4 max_sample = stage_t2d.Sample(stage_sampler, v2p.texcoord + offset * direction);
+-    min_sample.a = 1.f;
+-    max_sample.a = 1.f;
+-    color += min_sample * weight;
+-    color += max_sample * weight;
++    color += weight * stage_t2d.Sample(stage_sampler, v2p.texcoord - offset * direction).rgb;
++    color += weight * stage_t2d.Sample(stage_sampler, v2p.texcoord + offset * direction).rgb;
+   }
+   
+-  // rjf: determine SDF sample position
+-  float2 rect_half_size = float2((rect.z-rect.x)/2, (rect.w-rect.y)/2);
+-  float2 sdf_sample_pos = v2p.sdf_sample_pos;
+-  
+   // rjf: sample for corners
+-  float corner_sdf_s = rect_sdf(sdf_sample_pos, rect_half_size - 2.f, v2p.corner_radius);
++  float corner_sdf_s = rect_sdf(v2p.sdf_sample_pos, v2p.rect_half_size, v2p.corner_radius);
+   float corner_sdf_t = 1-smoothstep(0, 2, corner_sdf_s);
+   
+   // rjf: weight output color by sdf
+-  color.a *= corner_sdf_t;
++  // this is doing alpha testing, leave blurring only where mostly opaque pixels are
++  if (corner_sdf_t < 0.9f)
++  {
++    discard;
++  }
+   
+-  return color;
++  return float4(color, 1.f);
+ }
+ """
+ 

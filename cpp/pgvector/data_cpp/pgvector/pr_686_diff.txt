@@ -1,0 +1,204 @@
+diff --git a/src/hnsw.c b/src/hnsw.c
+index 0b6640ad..c2579c19 100644
+--- a/src/hnsw.c
++++ b/src/hnsw.c
+@@ -100,10 +100,8 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ {
+ 	GenericCosts costs;
+ 	int			m;
+-	int			entryLevel;
+-	int			layer0TuplesMax;
+-	double		layer0Selectivity;
+-	double		scalingFactor = 0.55;
++	double		ratio;
++	double		startupPages;
+ 	double		spc_seq_page_cost;
+ 	Relation	index;
+ 
+@@ -120,6 +118,8 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 
+ 	MemSet(&costs, 0, sizeof(costs));
+ 
++	genericcostestimate(root, path, loop_count, &costs);
++
+ 	index = index_open(path->indexinfo->indexoid, NoLock);
+ 	HnswGetMetaPageInfo(index, &m, NULL);
+ 	index_close(index, NoLock);
+@@ -151,30 +151,38 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	 * at L0, accounting for previously visited tuples, multiplied by the
+ 	 * "scalingFactor" (currently hardcoded).
+ 	 */
+-	entryLevel = (int) (log(path->indexinfo->tuples + 1) * HnswGetMl(m));
+-	layer0TuplesMax = HnswGetLayerM(m, 0) * hnsw_ef_search;
+-	layer0Selectivity = (scalingFactor * log(path->indexinfo->tuples + 1)) /
+-		(log(m) * (1 + log(hnsw_ef_search)));
++	if (path->indexinfo->tuples > 0)
++	{
++		double		scalingFactor = 0.55;
++		int			entryLevel = (int) (log(path->indexinfo->tuples) * HnswGetMl(m));
++		int			layer0TuplesMax = HnswGetLayerM(m, 0) * hnsw_ef_search;
++		double		layer0Selectivity = scalingFactor * log(path->indexinfo->tuples) / (log(m) * (1 + log(hnsw_ef_search)));
+ 
+-	costs.numIndexTuples = (entryLevel * m) +
+-		(layer0TuplesMax * layer0Selectivity);
++		ratio = (entryLevel * m + layer0TuplesMax * layer0Selectivity) / path->indexinfo->tuples;
+ 
+-	genericcostestimate(root, path, loop_count, &costs);
++		if (ratio > 1)
++			ratio = 1;
++	}
++	else
++		ratio = 1;
+ 
+ 	get_tablespace_page_costs(path->indexinfo->reltablespace, NULL, &spc_seq_page_cost);
+ 
++	/* Startup cost is cost before returning the first row */
++	costs.indexStartupCost = costs.indexTotalCost * ratio;
++
+ 	/* Adjust cost if needed since TOAST not included in seq scan cost */
+-	if (costs.numIndexPages > path->indexinfo->rel->pages)
++	startupPages = costs.numIndexPages * ratio;
++	if (startupPages > path->indexinfo->rel->pages && ratio < 0.5)
+ 	{
+ 		/* Change all page cost from random to sequential */
+-		costs.indexTotalCost -= costs.numIndexPages * (costs.spc_random_page_cost - spc_seq_page_cost);
++		costs.indexStartupCost -= startupPages * (costs.spc_random_page_cost - spc_seq_page_cost);
+ 
+ 		/* Remove cost of extra pages */
+-		costs.indexTotalCost -= (costs.numIndexPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
++		costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+ 	}
+ 
+-	/* Use total cost since most work happens before first tuple is returned */
+-	*indexStartupCost = costs.indexTotalCost;
++	*indexStartupCost = costs.indexStartupCost;
+ 	*indexTotalCost = costs.indexTotalCost;
+ 	*indexSelectivity = costs.indexSelectivity;
+ 	*indexCorrelation = costs.indexCorrelation;
+diff --git a/src/ivfflat.c b/src/ivfflat.c
+index 986e19db..395040d5 100644
+--- a/src/ivfflat.c
++++ b/src/ivfflat.c
+@@ -69,6 +69,8 @@ ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	GenericCosts costs;
+ 	int			lists;
+ 	double		ratio;
++	double		sequentialRatio = 0.5;
++	double		startupPages;
+ 	double		spc_seq_page_cost;
+ 	Relation	index;
+ 
+@@ -85,6 +87,8 @@ ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 
+ 	MemSet(&costs, 0, sizeof(costs));
+ 
++	genericcostestimate(root, path, loop_count, &costs);
++
+ 	index = index_open(path->indexinfo->indexoid, NoLock);
+ 	IvfflatGetMetaPageInfo(index, &lists, NULL);
+ 	index_close(index, NoLock);
+@@ -94,34 +98,26 @@ ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
+ 	if (ratio > 1.0)
+ 		ratio = 1.0;
+ 
+-	/*
+-	 * This gives us the subset of tuples to visit. This value is passed into
+-	 * the generic cost estimator to determine the number of pages to visit
+-	 * during the index scan.
+-	 */
+-	costs.numIndexTuples = path->indexinfo->tuples * ratio;
++	get_tablespace_page_costs(path->indexinfo->reltablespace, NULL, &spc_seq_page_cost);
+ 
+-	genericcostestimate(root, path, loop_count, &costs);
++	/* Change some page cost from random to sequential */
++	costs.indexTotalCost -= sequentialRatio * costs.numIndexPages * (costs.spc_random_page_cost - spc_seq_page_cost);
+ 
+-	get_tablespace_page_costs(path->indexinfo->reltablespace, NULL, &spc_seq_page_cost);
++	/* Startup cost is cost before returning the first row */
++	costs.indexStartupCost = costs.indexTotalCost * ratio;
+ 
+ 	/* Adjust cost if needed since TOAST not included in seq scan cost */
+-	if (costs.numIndexPages > path->indexinfo->rel->pages && ratio < 0.5)
++	startupPages = costs.numIndexPages * ratio;
++	if (startupPages > path->indexinfo->rel->pages && ratio < 0.5)
+ 	{
+-		/* Change all page cost from random to sequential */
+-		costs.indexTotalCost -= costs.numIndexPages * (costs.spc_random_page_cost - spc_seq_page_cost);
++		/* Change rest of page cost from random to sequential */
++		costs.indexStartupCost -= (1 - sequentialRatio) * startupPages * (costs.spc_random_page_cost - spc_seq_page_cost);
+ 
+ 		/* Remove cost of extra pages */
+-		costs.indexTotalCost -= (costs.numIndexPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+-	}
+-	else
+-	{
+-		/* Change some page cost from random to sequential */
+-		costs.indexTotalCost -= 0.5 * costs.numIndexPages * (costs.spc_random_page_cost - spc_seq_page_cost);
++		costs.indexStartupCost -= (startupPages - path->indexinfo->rel->pages) * spc_seq_page_cost;
+ 	}
+ 
+-	/* Use total cost since most work happens before first tuple is returned */
+-	*indexStartupCost = costs.indexTotalCost;
++	*indexStartupCost = costs.indexStartupCost;
+ 	*indexTotalCost = costs.indexTotalCost;
+ 	*indexSelectivity = costs.indexSelectivity;
+ 	*indexCorrelation = costs.indexCorrelation;
+diff --git a/test/t/017_hnsw_filtering.pl b/test/t/017_hnsw_filtering.pl
+index 9dbdcf31..afa2a1c6 100644
+--- a/test/t/017_hnsw_filtering.pl
++++ b/test/t/017_hnsw_filtering.pl
+@@ -41,8 +41,7 @@
+ my $explain = $node->safe_psql("postgres", qq(
+ 	EXPLAIN ANALYZE SELECT i FROM tst WHERE c = $c ORDER BY v <-> '$query' LIMIT $limit;
+ ));
+-# TODO Do not use index
+-like($explain, qr/Index Scan using idx/);
++like($explain, qr/Seq Scan/);
+ 
+ # Test attribute filtering with few rows removed
+ $explain = $node->safe_psql("postgres", qq(
+@@ -60,8 +59,7 @@
+ $explain = $node->safe_psql("postgres", qq(
+ 	EXPLAIN ANALYZE SELECT i FROM tst WHERE c < 1 ORDER BY v <-> '$query' LIMIT $limit;
+ ));
+-# TODO Do not use index
+-like($explain, qr/Index Scan using idx/);
++like($explain, qr/Seq Scan/);
+ 
+ # Test attribute filtering with few rows removed like
+ $explain = $node->safe_psql("postgres", qq(
+diff --git a/test/t/039_hnsw_cost.pl b/test/t/039_hnsw_cost.pl
+index a26c09a8..97ea5e7c 100644
+--- a/test/t/039_hnsw_cost.pl
++++ b/test/t/039_hnsw_cost.pl
+@@ -17,12 +17,11 @@
+ for my $dim (@dims)
+ {
+ 	my $array_sql = join(",", ('random()') x $dim);
+-	my $n = $dim == 384 ? 3000 : 1000;
+ 
+ 	# Create table and index
+ 	$node->safe_psql("postgres", "CREATE TABLE tst (i int4, v vector($dim));");
+ 	$node->safe_psql("postgres",
+-		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, $n) i;"
++		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(1, 2000) i;"
+ 	);
+ 	$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops);");
+ 	$node->safe_psql("postgres", "ANALYZE tst;");
+@@ -40,6 +39,16 @@
+ 	));
+ 	like($explain, qr/Index Scan using idx/);
+ 
++	# 3x the rows are needed for distance filters
++	# since the planner uses DEFAULT_INEQ_SEL for the selectivity (should be 1)
++	# Recreate index for performance
++	$node->safe_psql("postgres", "DROP INDEX idx;");
++	$node->safe_psql("postgres",
++		"INSERT INTO tst SELECT i, ARRAY[$array_sql] FROM generate_series(2001, 6000) i;"
++	);
++	$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops);");
++	$node->safe_psql("postgres", "ANALYZE tst;");
++
+ 	$explain = $node->safe_psql("postgres", qq(
+ 		EXPLAIN ANALYZE SELECT i FROM tst WHERE v <-> '$query' < 1 ORDER BY v <-> '$query' LIMIT $limit;
+ 	));

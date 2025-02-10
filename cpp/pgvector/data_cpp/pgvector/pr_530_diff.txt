@@ -1,0 +1,133 @@
+diff --git a/src/halfvec.c b/src/halfvec.c
+index 508ddc37..81468c34 100644
+--- a/src/halfvec.c
++++ b/src/halfvec.c
+@@ -934,17 +934,32 @@ halfvec_subvector(PG_FUNCTION_ARGS)
+ 	HalfVector *a = PG_GETARG_HALFVEC_P(0);
+ 	int32		start = PG_GETARG_INT32(1);
+ 	int32		count = PG_GETARG_INT32(2);
+-	int32		end = start + count;
++	int32		end;
+ 	half	   *ax = a->x;
+ 	HalfVector *result;
+-	int			dim;
++	int32		dim;
++
++	if (count < 1)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_EXCEPTION),
++				 errmsg("halfvec must have at least 1 dimension")));
++
++	/*
++	 * Check if (start + count > a->dim), avoiding integer overflow. a->dim
++	 * and count are both positive, so a->dim - count won't overflow.
++	 */
++	if (start > a->dim - count)
++		end = a->dim + 1;
++	else
++		end = start + count;
+ 
+ 	/* Indexing starts at 1, like substring */
+ 	if (start < 1)
+ 		start = 1;
+-
+-	if (end > a->dim)
+-		end = a->dim + 1;
++	else if (start > a->dim)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_EXCEPTION),
++				 errmsg("halfvec must have at least 1 dimension")));
+ 
+ 	dim = end - start;
+ 	CheckDim(dim);
+diff --git a/src/vector.c b/src/vector.c
+index 63fb5299..098df23b 100644
+--- a/src/vector.c
++++ b/src/vector.c
+@@ -980,17 +980,32 @@ subvector(PG_FUNCTION_ARGS)
+ 	Vector	   *a = PG_GETARG_VECTOR_P(0);
+ 	int32		start = PG_GETARG_INT32(1);
+ 	int32		count = PG_GETARG_INT32(2);
+-	int32		end = start + count;
++	int32		end;
+ 	float	   *ax = a->x;
+ 	Vector	   *result;
+ 	int			dim;
+ 
++	if (count < 1)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_EXCEPTION),
++				 errmsg("vector must have at least 1 dimension")));
++
++	/*
++	 * Check if (start + count > a->dim), avoiding integer overflow. a->dim
++	 * and count are both positive, so a->dim - count won't overflow.
++	 */
++	if (start > a->dim - count)
++		end = a->dim + 1;
++	else
++		end = start + count;
++
+ 	/* Indexing starts at 1, like substring */
+ 	if (start < 1)
+ 		start = 1;
+-
+-	if (end > a->dim)
+-		end = a->dim + 1;
++	else if (start > a->dim)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_EXCEPTION),
++				 errmsg("vector must have at least 1 dimension")));
+ 
+ 	dim = end - start;
+ 	CheckDim(dim);
+diff --git a/test/expected/halfvec_functions.out b/test/expected/halfvec_functions.out
+index 02d7c4cc..7c1d7dcc 100644
+--- a/test/expected/halfvec_functions.out
++++ b/test/expected/halfvec_functions.out
+@@ -394,6 +394,8 @@ SELECT subvector('[1,2,3,4,5]'::halfvec, 3, -1);
+ ERROR:  halfvec must have at least 1 dimension
+ SELECT subvector('[1,2,3,4,5]'::halfvec, -1, 2);
+ ERROR:  halfvec must have at least 1 dimension
++SELECT subvector('[1,2,3,4,5]'::halfvec, 2147483647, 10);
++ERROR:  halfvec must have at least 1 dimension
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::halfvec, '[3,5,7]']) v;
+     avg    
+ -----------
+diff --git a/test/expected/vector_functions.out b/test/expected/vector_functions.out
+index f6a31071..4b656495 100644
+--- a/test/expected/vector_functions.out
++++ b/test/expected/vector_functions.out
+@@ -418,6 +418,8 @@ SELECT subvector('[1,2,3,4,5]'::vector, 3, -1);
+ ERROR:  vector must have at least 1 dimension
+ SELECT subvector('[1,2,3,4,5]'::vector, -1, 2);
+ ERROR:  vector must have at least 1 dimension
++SELECT subvector('[1,2,3,4,5]'::vector, 2147483647, 10);
++ERROR:  vector must have at least 1 dimension
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::vector, '[3,5,7]']) v;
+     avg    
+ -----------
+diff --git a/test/sql/halfvec_functions.sql b/test/sql/halfvec_functions.sql
+index 788e2833..a1b5fb33 100644
+--- a/test/sql/halfvec_functions.sql
++++ b/test/sql/halfvec_functions.sql
+@@ -88,6 +88,7 @@ SELECT subvector('[1,2,3,4,5]'::halfvec, 3, 9);
+ SELECT subvector('[1,2,3,4,5]'::halfvec, 1, 0);
+ SELECT subvector('[1,2,3,4,5]'::halfvec, 3, -1);
+ SELECT subvector('[1,2,3,4,5]'::halfvec, -1, 2);
++SELECT subvector('[1,2,3,4,5]'::halfvec, 2147483647, 10);
+ 
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::halfvec, '[3,5,7]']) v;
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::halfvec, '[3,5,7]', NULL]) v;
+diff --git a/test/sql/vector_functions.sql b/test/sql/vector_functions.sql
+index 2d195d7f..e4b8eb41 100644
+--- a/test/sql/vector_functions.sql
++++ b/test/sql/vector_functions.sql
+@@ -92,6 +92,7 @@ SELECT subvector('[1,2,3,4,5]'::vector, 3, 9);
+ SELECT subvector('[1,2,3,4,5]'::vector, 1, 0);
+ SELECT subvector('[1,2,3,4,5]'::vector, 3, -1);
+ SELECT subvector('[1,2,3,4,5]'::vector, -1, 2);
++SELECT subvector('[1,2,3,4,5]'::vector, 2147483647, 10);
+ 
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::vector, '[3,5,7]']) v;
+ SELECT avg(v) FROM unnest(ARRAY['[1,2,3]'::vector, '[3,5,7]', NULL]) v;

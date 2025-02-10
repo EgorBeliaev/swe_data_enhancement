@@ -1,0 +1,140 @@
+[
+    {
+        "title": "fix and improve: VAE tiling"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "- properly handle the upper left corner interpolating both x and y\r\n- use smootherstep to preserve more detail and spend less area blending\r\n\r\nCompletely fixes tiling seams!\r\nThanks to @stduhpf \r\n\r\nfixes #353.\r\n\r\n<details><summary>Old Details</summary>\r\n\r\n\r\nHere is a test image, which replaces each tile with a single uniform shade of gray. The lines are the midway points of the overlap.\r\n### Before:\r\n![image](https://github.com/user-attachments/assets/64ae9ec0-80b0-4eeb-a615-add28b9a1db1)\r\n### After:\r\n![image](https://github.com/user-attachments/assets/d9cd81c1-fc92-461e-bc67-da20c2e360d8)\r\n\r\nAnd now with a proper test image.\r\n### Before:\r\n![image](https://github.com/user-attachments/assets/de49dd33-c02e-4c50-b765-a36194125279)\r\n### After:\r\n![image](https://github.com/user-attachments/assets/ea0d5e26-b57e-4660-a9c0-4031692f2f9a)\r\n### Without tiling:\r\n![image](https://github.com/user-attachments/assets/4cf9fbf2-cab9-42f3-b7a6-4a15aeb94d93)\r\n\r\n\r\nIMO a significant improvement. There are however still vertical seams. I am a bit out of ideas now, so I wanted to contribute what I already have.\r\n\r\n\r\nSome more details can be found in #353 .\r\n\r\n</details> \r\n\r\nThis is ready to merge.\r\n\r\n### Before:\r\n![image](https://github.com/user-attachments/assets/de49dd33-c02e-4c50-b765-a36194125279)\r\n### After:\r\n![artius_output](https://github.com/user-attachments/assets/40d82ea6-88ed-41ac-9ae3-7ada65d84ab1)\r\n"
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "Green-Sky"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "I played around a bit with the interpolation code, and ended up with this. It seems to be almost flawless, except for the right and bottom borders that get washed out:\r\n\r\n```c++\r\n// Would be great to have acess to the max values for x and y\r\n  const float x_f_0 = x>0 ? ix / float(overlap) : 1;\r\n  const float x_f_1 = (width - ix) / float(overlap);\r\n  const float y_f_0 = y>0 ? iy / float(overlap) : 1;\r\n  const float y_f_1 = (height - iy) / float(overlap);\r\n\r\n  const float x_f = std::min(x_f_0,x_f_1);\r\n  const float y_f = std::min(y_f_0,y_f_1);\r\n\r\n  ggml_tensor_set_f32(\r\n      output,\r\n      old_value +  new_value * ggml_smootherstep_f32(y_f<1 ? y_f : 1) * ggml_smootherstep_f32(x_f<1 ? x_f : 1),\r\n      x + ix, y + iy, k\r\n  );\r\n```\r\n![output](https://github.com/user-attachments/assets/6ea1a090-862b-490b-9f98-6f591af48e78)\r\n![output](https://github.com/user-attachments/assets/52500517-f644-4714-87d8-ce348001c54a)\r\n\r\n"
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "Ok I got it! I could get the image width and height from the output tensor\r\n\r\n```c++\r\n// unclamped -> expects x in the range [0-1]\r\n__STATIC_INLINE__ float ggml_smootherstep_f32(const float x) {\r\n    GGML_ASSERT(x >= 0.f && x <= 1.f);\r\n    return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);\r\n}\r\n\r\n__STATIC_INLINE__ void ggml_merge_tensor_2d(struct ggml_tensor* input,\r\n                                            struct ggml_tensor* output,\r\n                                            int x,\r\n                                            int y,\r\n                                            int overlap) {\r\n    int64_t width    = input->ne[0];\r\n    int64_t height   = input->ne[1];\r\n\r\n    int64_t img_width    = output->ne[0];\r\n    int64_t img_height   = output->ne[1];\r\n\r\n    int64_t channels = input->ne[2];\r\n    GGML_ASSERT(input->type == GGML_TYPE_F32 && output->type == GGML_TYPE_F32);\r\n    for (int iy = 0; iy < height; iy++) {\r\n        for (int ix = 0; ix < width; ix++) {\r\n            for (int k = 0; k < channels; k++) {\r\n                float new_value = ggml_tensor_get_f32(input, ix, iy, k);\r\n                if (overlap > 0) {  // blend colors in overlapped area\r\n                    float old_value = ggml_tensor_get_f32(output, x + ix, y + iy, k);\r\n\r\n                    const float x_f_0 = x>0 ? ix / float(overlap) : 1;\r\n                    const float x_f_1 = x<(img_width - width)? (width - ix) / float(overlap) : 1 ;\r\n                    const float y_f_0 = y>0 ? iy / float(overlap) : 1;\r\n                    const float y_f_1 = y<(img_height - height)? (height - iy) / float(overlap) : 1;\r\n\r\n                    const float x_f = std::min(x_f_0,x_f_1);\r\n                    const float y_f = std::min(y_f_0,y_f_1);\r\n                    ggml_tensor_set_f32(\r\n                        output,\r\n                        old_value +  new_value * ggml_smootherstep_f32(y_f<1?y_f:1)*ggml_smootherstep_f32(x_f<1?x_f:1),\r\n                        x + ix, y + iy, k\r\n                    );\r\n                }else{\r\n                    ggml_tensor_set_f32(output, new_value, x + ix, y + iy, k);\r\n                }\r\n            }\r\n        }\r\n    }\r\n}\r\n```\r\n![output](https://github.com/user-attachments/assets/c316b15e-e2d6-4eac-8595-6def154fa96f)\r\n"
+    },
+    {
+        "author": {
+            "login": "Green-Sky"
+        },
+        "body": "Why does this work?\r\n```c\r\nold_value + new_value * ggml_smootherstep_f32(y_f) * ggml_smootherstep_f32(x_f),\r\n```\r\n\r\nThis is not a lerp, it is adding the new value x`[0,1]`, right?\r\n\r\n(btw totally forgot you can multiply values in the `[0,1]` just like that, :smile: )"
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "> Why does this work?\r\n> \r\n> ```c\r\n> old_value + new_value * ggml_smootherstep_f32(y_f) * ggml_smootherstep_f32(x_f),\r\n> ```\r\n> \r\n> This is not a lerp, it is adding the new value x`[0,1]`, right?\r\n> \r\n> (btw totally forgot you can multiply values in the `[0,1]` just like that, \ud83d\ude04 )\r\n\r\nAssuming the following tiles:\r\nA B\r\nC D\r\n\r\nIf you ignore the `smootherstep`s, the values of the output tensor in the middle overlap take these succesive values:\r\n((x,y) are the coordinates within the quadruple overlap)\r\n\r\n- `(0) + A * (1-x)*(1-y)`\r\n- `(A * (1-x)*(1-y)) + B * x * (1.-y)` = `lerp(A, B, x)*(1.-y)`\r\n- `(lerp(A, B, x)*(1.-y)) + C * (1.-x)*y`\r\n- `(lerp(A, B, x)*(1.-y) + C * (1.-x)*y) + D * x * y` =  `lerp(A, B, x)*(1.-y) +  lerp(C, D, x)*y` =  `lerp(lerp(A, B, x), lerp(C, D, x), y)`\r\n\r\n![image](https://github.com/user-attachments/assets/e72f03e0-5ec4-4023-8997-6f76bff985ce)\r\n\r\nIf you're on an edge instead of a corner, either x or y is clamped to 0 or 1."
+    },
+    {
+        "author": {
+            "login": "Green-Sky"
+        },
+        "body": "Yea I get that (thanks for the effort), but what I meant was, we are summing the color here.\r\ncolor0 + color1 * f;\r\nSo we are not interpolating between them, something most be funny somewhere still.\r\nI am about to push your code, adding you as a coauthor."
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "It's equivalent to a bilinear interpolation. Just done in multiple steps because we don't have access to all the values at the same time"
+    },
+    {
+        "author": {
+            "login": "Green-Sky"
+        },
+        "body": "Pushed, should be ready to merge. :tada: "
+    },
+    {
+        "author": {
+            "login": "leejet"
+        },
+        "body": "Thank you for your contribution."
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "Thanks for the merge.\r\n I realize now that my code isn't quite optimal (variables are assigned inside the inner loop when they could very well be assigned outside), but the impact doesn't seem noticable (maybe the compiler optimizes it?)\r\n \r\n I'll do some benchmarking to see if it's worth making a pr for optimizing this loop."
+    },
+    {
+        "author": {
+            "login": "stduhpf"
+        },
+        "body": "I can gain a bit over 40ms (out of 18s, so 0.22% difference) for 56 tiles by optimizing this out. It's measurable, but not really significant."
+    },
+    {
+        "author": {
+            "login": "Green-Sky"
+        },
+        "body": "Yea, I thought about optimizing it too, but then i remember that simplicity is key, and this code is not using enough compute to bother. :)"
+    },
+    {
+        "data": {
+            "repository": {
+                "issue": {
+                    "title": "Bug? `--vae-tiling` produces very obvious seams/artifacts near the edge of each \"tiles\"",
+                    "body": "Case and point:\r\n\r\n`.\\build\\bin\\Release\\sd.exe -m ..\\models\\checkpoints\\sd3_medium_incl_clips_t5xxlfp16.safetensors --cfg-scale 5 --steps 20 --sampling-method euler  -H 1024 -W 1024 --seed 42 -p \"professional   photo of a girl laying down on grass, fine details, 4k resolution\" --vae-tiling`\r\n![output](https://github.com/user-attachments/assets/04346558-b660-488c-bcac-3746117d46ac)\r\n\r\nI can almost count all the 64 tiles by eye. I don't think that's the expected behavior.\r\n\r\nFor comparison, here is with normal vae on cpu:\r\n![output](https://github.com/user-attachments/assets/7b0025dd-d42c-4965-8361-662ff98030de)\r\n",
+                    "state": "CLOSED",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {
+                                    "login": "MGTRIDER"
+                                },
+                                "body": "> Case and point:\r\n> \r\n> `.\\build\\bin\\Release\\sd.exe -m ..\\models\\checkpoints\\sd3_medium_incl_clips_t5xxlfp16.safetensors --cfg-scale 5 --steps 20 --sampling-method euler -H 1024 -W 1024 --seed 42 -p \"professional photo of a girl laying down on grass, fine details, 4k resolution\" --vae-tiling` ![output](https://private-user-images.githubusercontent.com/28208228/359531676-04346558-b660-488c-bcac-3746117d46ac.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MjQ1NjAxMTYsIm5iZiI6MTcyNDU1OTgxNiwicGF0aCI6Ii8yODIwODIyOC8zNTk1MzE2NzYtMDQzNDY1NTgtYjY2MC00ODhjLWJjYWMtMzc0NjExN2Q0NmFjLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNDA4MjUlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjQwODI1VDA0MjMzNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPThhZThhZjBkODc1OWU3NDY2YTNhMDQxZjA1NDE2MTUyODNmOTIzMTIwNjhkZTEwODM1MDljNjc4MTExYTI0ZjImWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JmFjdG9yX2lkPTAma2V5X2lkPTAmcmVwb19pZD0wIn0.vHcRoG7FUFBA1mhPuFAoXP_vxtzMGrhOH7dGC6Rtcg4)\r\n> \r\n> I can almost count all the 64 tiles by eye. I don't think that's the expected behavior.\r\n> \r\n> For comparison, here is with normal vae on cpu: ![output](https://private-user-images.githubusercontent.com/28208228/359537014-7b0025dd-d42c-4965-8361-662ff98030de.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MjQ1NjAxMTYsIm5iZiI6MTcyNDU1OTgxNiwicGF0aCI6Ii8yODIwODIyOC8zNTk1MzcwMTQtN2IwMDI1ZGQtZDQyYy00OTY1LTgzNjEtNjYyZmY5ODAzMGRlLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNDA4MjUlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjQwODI1VDA0MjMzNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTlhYWQ2NjRjOWEwM2M5MDg3NDZkY2I4YzljNjI3NmE4ZTVhYzQ4MzY5ZWFjODA2OTAwYjhlYjg1ZjJlYjg2MDMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JmFjdG9yX2lkPTAma2V5X2lkPTAmcmVwb19pZD0wIn0.aEDtuNiCW7obFekxN0PrQ-oOFRVcNPXkHHH2VV3qh4Y)\r\n\r\nYes, i can confirm that these seams also happen for me when using tiled vae."
+                            },
+                            {
+                                "author": {
+                                    "login": "Green-Sky"
+                                },
+                                "body": "This has been an issue for a long time now, so I am currently investigating.\r\nHere is a test image, which replaces each tile with a single uniform shade of gray. The lines are the midway points of the overlap.\r\n![artius_output](https://github.com/user-attachments/assets/b196d873-93b5-460b-af00-a912812b0377)\r\nYou can clearly see seams, basically everywhere beside the outermost tiles. So only the outermost with the next seem to be merged (lerped) correctly.\r\n\r\nedit: also I'm looking into using smootherstep for the lerp, might help after the seams are fixed."
+                            },
+                            {
+                                "author": {
+                                    "login": "Green-Sky"
+                                },
+                                "body": "I am relatively confident that the current interpolation function blends like this:\r\n![image](https://github.com/user-attachments/assets/0d780a18-881d-4266-8e1a-a737fce94492)\r\n\r\nso I am trying to make it looks like this:\r\n\r\n![image](https://github.com/user-attachments/assets/6f3deef3-f5ee-4e9c-8a8e-16ab3d7bf398)\r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "Green-Sky"
+                                },
+                                "body": "![artius_output](https://github.com/user-attachments/assets/411208ed-be13-4a79-addb-03cfa9fa9487)\r\n\r\nHmmm, this still has issues...\r\n\r\n\r\nedit: using smootherstep it looks even nicer, but here are still seams and I am not sure why.\r\n\r\n![artius_output](https://github.com/user-attachments/assets/956073d1-06c4-4f56-847d-57605021a9fb)\r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "Green-Sky"
+                                },
+                                "body": "| old merge | new merge |\r\n|------------|-----------------------------------------------------------------------------|\r\n| ![vae_lerp_new](https://github.com/user-attachments/assets/a39febf3-bd8e-4787-8cf7-3248b3554ac0) | ![artius_output](https://github.com/user-attachments/assets/c0b3c48e-999d-42ea-9715-e78963480467) |\r\n| no tiling | lines at mid-overlap |\r\n| ![vae_no_tiling](https://github.com/user-attachments/assets/d2666b33-f6eb-4fc9-9745-4b976c6938b9) | ![vae_debug_corner_smoother](https://github.com/user-attachments/assets/6f0e241f-af85-4728-b51f-74db3133cd3e) |\r\n\r\nnew merge is using `lerp(a, b, smootherstep(min(x ,y)))`\r\n\r\n\r\nI think this is good enough for a pr, I will open one soon if I don't have anymore insights into whats wrong or could be better."
+                            },
+                            {
+                                "author": {
+                                    "login": "stduhpf"
+                                },
+                                "body": "> I think this is good enough for a pr, I will open one soon if I don't have anymore insights into whats wrong or could be better.\r\n\r\nPlease do, maybe i could help figuring it out"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+]

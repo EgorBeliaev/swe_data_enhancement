@@ -1,0 +1,1186 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff154eb2e1..6a9b7bcdad 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -64,16 +64,8 @@ cmake_dependent_option(APPLE_UNIX "Build OpenSCAD in Unix mode in MacOS X instea
+ cmake_dependent_option(ENABLE_QTDBUS "Enable DBus input driver for Qt." ON "NOT HEADLESS" OFF)
+ cmake_dependent_option(ENABLE_GAMEPAD "Enable Qt5Gamepad input driver." ON "NOT HEADLESS;NOT USE_QT6" OFF)
+ 
+-if(USE_QT6)
+-  set(DEPLOYMENT_TARGET "10.15")
+-elseif(EXPERIMENTAL AND ENABLE_TBB)
+-  # TBB 2021.8.0 uses aligned memory deallocation.
+-  # While this is technically supported in macOS 10.13, an LLVM bug used to limit this to macOS 10.14+.
+-  # The bug was fixed in LLVM 15.0.0 (https://reviews.llvm.org/D129198), but was still present in Xcode 14.3.1a.
+-  set(DEPLOYMENT_TARGET "10.14")
+-else()
+-  set(DEPLOYMENT_TARGET "10.13")
+-endif()
++# Minimum version required for std::filesystem
++set(DEPLOYMENT_TARGET "10.15")
+ 
+ # Note: CMAKE_OSX_DEPLOYMENT_TARGET must be set before the project() invocation
+ set(CMAKE_OSX_DEPLOYMENT_TARGET ${DEPLOYMENT_TARGET} CACHE STRING "Minimum OS X deployment version")
+@@ -861,7 +853,6 @@ set(CORE_SOURCES
+   src/libsvg/util.cc
+   src/platform/PlatformUtils.cc
+   src/utils/StackCheck.h
+-  src/utils/boost-utils.cc
+   src/utils/calc.cc
+   src/utils/degree_trig.cc
+   src/utils/hash.cc
+diff --git a/scripts/macosx-build-dependencies.sh b/scripts/macosx-build-dependencies.sh
+index b19cd649ed..b13eaf07cd 100755
+--- a/scripts/macosx-build-dependencies.sh
++++ b/scripts/macosx-build-dependencies.sh
+@@ -30,7 +30,7 @@ BASEDIR=$PWD/../libraries
+ OPENSCADDIR=$PWD
+ SRCDIR=$BASEDIR/src
+ DEPLOYDIR=$BASEDIR/install
+-MAC_OSX_VERSION_MIN=10.13
++MAC_OSX_VERSION_MIN=10.15
+ OPTION_DEPLOY=false
+ OPTION_FORCE=0
+ OPTION_ARM64=false
+diff --git a/scripts/macosx-sanity-check.py b/scripts/macosx-sanity-check.py
+index ad65df33c6..adb09ac756 100755
+--- a/scripts/macosx-sanity-check.py
++++ b/scripts/macosx-sanity-check.py
+@@ -29,7 +29,7 @@
+ 
+ cxxlib = None
+ 
+-macos_version_min = '10.14'
++macos_version_min = '10.15'
+ 
+ def usage():
+     print("Usage: " + sys.argv[0] + " <executable>", sys.stderr)
+diff --git a/src/FontCache.cc b/src/FontCache.cc
+index 132fe65fc0..7153449ab3 100644
+--- a/src/FontCache.cc
++++ b/src/FontCache.cc
+@@ -30,7 +30,7 @@
+ #include <iostream>
+ #include <vector>
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/algorithm/string.hpp>
+ #include <string>
+ #include <utility>
+@@ -43,7 +43,7 @@ extern std::vector<std::string> librarypath;
+ 
+ std::vector<std::string> fontpath;
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ const std::string get_fontconfig_version()
+ {
+diff --git a/src/core/AST.cc b/src/core/AST.cc
+index 32d6fbd907..c8eff0b0fe 100644
+--- a/src/core/AST.cc
++++ b/src/core/AST.cc
+@@ -3,7 +3,7 @@
+ #include <memory>
+ #include <sstream>
+ #include <string>
+-#include "utils/boost-utils.h"
++#include "io/fileutils.h"
+ 
+ const Location Location::NONE(0, 0, 0, 0, std::make_shared<fs::path>(fs::path{}));
+ 
+@@ -27,7 +27,7 @@ bool Location::isNone() const {
+ 
+ std::string Location::toRelativeString(const std::string& docPath) const {
+   if (this->isNone()) return "location unknown";
+-  return "in file " + boostfs_uncomplete((*path), docPath).generic_string() + ", " + "line " + std::to_string(this->firstLine());
++  return "in file " + fs_uncomplete((*path), docPath).generic_string() + ", " + "line " + std::to_string(this->firstLine());
+ }
+ 
+ std::ostream& operator<<(std::ostream& stream, const ASTNode& ast)
+diff --git a/src/core/AST.h b/src/core/AST.h
+index 4d2a030056..da3d8c7a2c 100644
+--- a/src/core/AST.h
++++ b/src/core/AST.h
+@@ -3,9 +3,9 @@
+ #include <ostream>
+ #include <string>
+ #include <memory>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <utility>
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ #include <string>
+ 
+diff --git a/src/core/ImportNode.cc b/src/core/ImportNode.cc
+index f6d582ace0..9dab5c37c2 100644
+--- a/src/core/ImportNode.cc
++++ b/src/core/ImportNode.cc
+@@ -43,7 +43,6 @@
+ #include "io/fileutils.h"
+ #include "Feature.h"
+ #include "handle_dep.h"
+-#include "utils/boost-utils.h"
+ #include <cmath>
+ #include <ios>
+ #include <utility>
+@@ -51,8 +50,8 @@
+ #include <sys/types.h>
+ #include <sstream>
+ #include <boost/algorithm/string.hpp>
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ #include <boost/assign/std/vector.hpp>
+ using namespace boost::assign; // bring 'operator+=()' into scope
+ 
+@@ -139,7 +138,7 @@ static std::shared_ptr<AbstractNode> do_import(const ModuleInstantiation *inst,
+   if (dpi.type() == Value::Type::NUMBER) {
+     double val = dpi.toDouble();
+     if (val < 0.001) {
+-      std::string filePath = boostfs_uncomplete(inst->location().filePath(), parameters.documentRoot()).generic_string();
++      std::string filePath = fs_uncomplete(inst->location().filePath(), parameters.documentRoot()).generic_string();
+       LOG(message_group::Warning,
+           "Invalid dpi value giving, using default of %1$f dpi. Value must be positive and >= 0.001, file %2$s, import() at line %3$d",
+           origin.toEchoStringNoThrow(), filePath, filePath, inst->location().firstLine()
+@@ -243,7 +242,7 @@ std::string ImportNode::toString() const
+   stream << ", scale = " << this->scale
+          << ", convexity = " << this->convexity
+          << ", $fn = " << this->fn << ", $fa = " << this->fa << ", $fs = " << this->fs
+-         << ", timestamp = " << (fs::exists(path) ? fs::last_write_time(path) : 0)
++         << ", timestamp = " << fs_timestamp(path)
+          << ")";
+ 
+   return stream.str();
+diff --git a/src/core/LinearExtrudeNode.cc b/src/core/LinearExtrudeNode.cc
+index 3ba720d35d..1084fdc70e 100644
+--- a/src/core/LinearExtrudeNode.cc
++++ b/src/core/LinearExtrudeNode.cc
+@@ -42,8 +42,8 @@
+ #include <boost/assign/std/vector.hpp>
+ using namespace boost::assign; // bring 'operator+=()' into scope
+ 
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ /*
+  * Historic linear_extrude argument parsing is quirky. To remain bug-compatible,
+@@ -168,7 +168,7 @@ std::string LinearExtrudeNode::toString() const
+       "file = " << this->filename << ", "
+       "layer = " << QuotedString(this->layername) << ", "
+       "origin = [" << this->origin_x << ", " << this->origin_y << "], "
+-           << "timestamp = " << (fs::exists(path) ? fs::last_write_time(path) : 0) << ", "
++           << "timestamp = " << fs_timestamp(path) << ", "
+     ;
+   }
+   double height=this->height.norm();
+diff --git a/src/core/RotateExtrudeNode.cc b/src/core/RotateExtrudeNode.cc
+index 87e23e9024..bc9fba84ad 100644
+--- a/src/core/RotateExtrudeNode.cc
++++ b/src/core/RotateExtrudeNode.cc
+@@ -41,8 +41,8 @@
+ #include <boost/assign/std/vector.hpp>
+ using namespace boost::assign; // bring 'operator+=()' into scope
+ 
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ static std::shared_ptr<AbstractNode> builtin_rotate_extrude(const ModuleInstantiation *inst, Arguments arguments, const Children& children)
+ {
+@@ -104,7 +104,7 @@ std::string RotateExtrudeNode::toString() const
+       "layer = " << QuotedString(this->layername) << ", "
+       "origin = [" << std::dec << this->origin_x << ", " << this->origin_y << "], "
+       "scale = " << this->scale << ", "
+-           << "timestamp = " << (fs::exists(path) ? fs::last_write_time(path) : 0) << ", "
++           << "timestamp = " << fs_timestamp(path) << ", "
+     ;
+   }
+   stream <<
+diff --git a/src/core/SourceFile.cc b/src/core/SourceFile.cc
+index af8d1f0572..3b87eb69ac 100644
+--- a/src/core/SourceFile.cc
++++ b/src/core/SourceFile.cc
+@@ -33,15 +33,16 @@
+ #include "core/parsersettings.h"
+ #include "core/StatCache.h"
+ #include <algorithm>
++#include <ctime>
+ #include <ostream>
+ #include <memory>
+ #include <boost/algorithm/string.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <string>
+ #include <utility>
+ #include <vector>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ #include "FontCache.h"
+ #include <sys/stat.h>
+ 
+diff --git a/src/core/SurfaceNode.cc b/src/core/SurfaceNode.cc
+index 04fac280da..3c4535805e 100644
+--- a/src/core/SurfaceNode.cc
++++ b/src/core/SurfaceNode.cc
+@@ -59,8 +59,8 @@
+ #include <boost/assign/std/vector.hpp>
+ using namespace boost::assign; // bring 'operator+=()' into scope
+ 
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ 
+ static std::shared_ptr<AbstractNode> builtin_surface(const ModuleInstantiation *inst, Arguments arguments, const Children& children)
+@@ -339,7 +339,7 @@ std::string SurfaceNode::toString() const
+   stream << this->name() << "(file = " << this->filename
+          << ", center = " << (this->center ? "true" : "false")
+          << ", invert = " << (this->invert ? "true" : "false")
+-         << ", " "timestamp = " << (fs::exists(path) ? fs::last_write_time(path) : 0)
++         << ", " "timestamp = " << fs_timestamp(path)
+          << ")";
+ 
+   return stream.str();
+diff --git a/src/core/Value.cc b/src/core/Value.cc
+index ee4883834b..616f52fc34 100644
+--- a/src/core/Value.cc
++++ b/src/core/Value.cc
+@@ -41,6 +41,7 @@
+ #include <boost/lexical_cast.hpp>
+ 
+ #include "core/EvaluationSession.h"
++#include "io/fileutils.h"
+ #include "utils/printutils.h"
+ #include "utils/StackCheck.h"
+ #include "utils/boost-utils.h"
+@@ -48,7 +49,7 @@
+ #include <double-conversion/utils.h>
+ #include <double-conversion/ieee.h>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ const Value Value::undefined;
+ const VectorType VectorType::EMPTY(nullptr);
+@@ -180,7 +181,7 @@ static uint32_t convert_to_uint32(const double d)
+ std::ostream& operator<<(std::ostream& stream, const Filename& filename)
+ {
+   fs::path fnpath{static_cast<std::string>(filename)}; // gcc-4.6
+-  auto fpath = boostfs_uncomplete(fnpath, fs::current_path());
++  auto fpath = fs_uncomplete(fnpath, fs::current_path());
+   stream << QuotedString(fpath.generic_string());
+   return stream;
+ }
+diff --git a/src/core/lexer.l b/src/core/lexer.l
+index 51ace2d254..c2b4588cfe 100644
+--- a/src/core/lexer.l
++++ b/src/core/lexer.l
+@@ -39,9 +39,8 @@
+ #include "core/SourceFile.h"
+ #include <assert.h>
+ #include <boost/lexical_cast.hpp>
+-#include <boost/filesystem.hpp>
+-//#include "utils/boost-utils.h"
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ //isatty for visual c++ and mingw-cross-env
+ #if defined __WIN32__ && ! defined _MSC_VER
+diff --git a/src/core/parser.y b/src/core/parser.y
+index 2e680b761e..2b09b6a644 100644
+--- a/src/core/parser.y
++++ b/src/core/parser.y
+@@ -42,14 +42,14 @@
+ #include "core/Assignment.h"
+ #include "core/Expression.h"
+ #include "core/function.h"
++#include "io/fileutils.h"
+ #include "utils/printutils.h"
+ #include <memory>
+ #include <sstream>
+ #include <stack>
+-#include <boost/filesystem.hpp>
+-#include "utils/boost-utils.h"
++#include <filesystem>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ #define YYMAXDEPTH 20000
+ #define LOC(loc) Location(loc.first_line, loc.first_column, loc.last_line, loc.last_column, sourcefile())
+@@ -728,8 +728,8 @@ void handle_assignment(const std::string token, Expression *expr, const Location
+ 			auto prevFile = assignment->location().fileName();
+ 			auto currFile = loc.fileName();
+ 
+-			const auto uncPathCurr = boostfs_uncomplete(currFile, mainFilePath.parent_path());
+-			const auto uncPathPrev = boostfs_uncomplete(prevFile, mainFilePath.parent_path());
++			const auto uncPathCurr = fs_uncomplete(currFile, mainFilePath.parent_path());
++			const auto uncPathPrev = fs_uncomplete(prevFile, mainFilePath.parent_path());
+ 			if (fileEnded) {
+ 				//assignments via commandline
+ 			} else if (prevFile == mainFile && currFile == mainFile) {
+diff --git a/src/core/parsersettings.cc b/src/core/parsersettings.cc
+index a33605c68d..4a242c4c78 100644
+--- a/src/core/parsersettings.cc
++++ b/src/core/parsersettings.cc
+@@ -6,11 +6,11 @@
+ #include <string>
+ #include <vector>
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/algorithm/string.hpp>
+ #include "platform/PlatformUtils.h"
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ std::vector<std::string> librarypath;
+ 
+diff --git a/src/core/parsersettings.h b/src/core/parsersettings.h
+index e6e468b927..7ae3a9a5ea 100644
+--- a/src/core/parsersettings.h
++++ b/src/core/parsersettings.h
+@@ -2,9 +2,9 @@
+ 
+ #include <string>
+ #include <vector>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ extern int parser_error_pos;
+ 
+diff --git a/src/glview/ColorMap.cc b/src/glview/ColorMap.cc
+index a113aa6f5f..d7e661da23 100644
+--- a/src/glview/ColorMap.cc
++++ b/src/glview/ColorMap.cc
+@@ -10,10 +10,10 @@
+ #include <exception>
+ #include <memory>
+ #include <boost/property_tree/json_parser.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <cmath>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ static const char *DEFAULT_COLOR_SCHEME_NAME = "Cornfield";
+ 
+diff --git a/src/glview/ColorMap.h b/src/glview/ColorMap.h
+index 10d925f949..90ed649f0b 100644
+--- a/src/glview/ColorMap.h
++++ b/src/glview/ColorMap.h
+@@ -9,10 +9,10 @@
+ 
+ #include "geometry/linalg.h"
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/property_tree/ptree.hpp>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ enum class RenderColor {
+   BACKGROUND_COLOR,
+diff --git a/src/gui/Animate.cc b/src/gui/Animate.cc
+index e44c29e064..febc29a430 100644
+--- a/src/gui/Animate.cc
++++ b/src/gui/Animate.cc
+@@ -10,7 +10,7 @@
+ #include <QTimer>
+ #include <QWidget>
+ #include <iostream>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <QFormLayout>
+ 
+ Animate::Animate(QWidget *parent) : QWidget(parent)
+diff --git a/src/gui/ErrorLog.cc b/src/gui/ErrorLog.cc
+index e553fea59b..7bb8689111 100644
+--- a/src/gui/ErrorLog.cc
++++ b/src/gui/ErrorLog.cc
+@@ -8,7 +8,7 @@
+ #include <QStandardItemModel>
+ #include <QString>
+ #include <QWidget>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ 
+ ErrorLog::ErrorLog(QWidget *parent) : QWidget(parent)
+ {
+diff --git a/src/gui/MainWindow.cc b/src/gui/MainWindow.cc
+index df9055b7bd..7b7c048209 100644
+--- a/src/gui/MainWindow.cc
++++ b/src/gui/MainWindow.cc
+@@ -55,7 +55,6 @@
+ #ifdef ENABLE_MANIFOLD
+ #include "geometry/manifold/manifoldutils.h"
+ #endif
+-#include "utils/boost-utils.h"
+ #include "core/Builtins.h"
+ #include "core/BuiltinContext.h"
+ #include "core/customizer/CommentParser.h"
+@@ -74,6 +73,7 @@
+ #include "core/ScopeContext.h"
+ #include "core/progress.h"
+ #include "io/dxfdim.h"
++#include "io/fileutils.h"
+ #include "gui/Settings.h"
+ #include "gui/AboutDialog.h"
+ #include "gui/FontListDialog.h"
+@@ -1292,7 +1292,7 @@ void MainWindow::instantiateRoot()
+   this->root_node.reset();
+   this->tree.setRoot(nullptr);
+ 
+-  boost::filesystem::path doc(activeEditor->filepath.toStdString());
++  std::filesystem::path doc(activeEditor->filepath.toStdString());
+   this->tree.setDocumentPath(doc.parent_path().string());
+ 
+   if (this->root_file) {
+@@ -2489,7 +2489,7 @@ void MainWindow::rightClick(QPoint mouse)
+         ss << name << " (" << location.filePath().filename().string() << ":"
+            << location.firstLine() << ")";
+       } else {
+-        auto relative_filename = boostfs_uncomplete(location.filePath(), fs::path(activeEditor->filepath.toStdString()).parent_path())
++        auto relative_filename = fs_uncomplete(location.filePath(), fs::path(activeEditor->filepath.toStdString()).parent_path())
+           .generic_string();
+         // Set the displayed name relative to the active editor window
+         ss << name << " (" << relative_filename << ":" << location.firstLine() << ")";
+diff --git a/src/gui/MainWindow.h b/src/gui/MainWindow.h
+index 269ef26a63..f963dc4ccb 100644
+--- a/src/gui/MainWindow.h
++++ b/src/gui/MainWindow.h
+@@ -29,6 +29,7 @@
+ #include <QTimer>
+ #include <QUrl>
+ #include <QWidget>
++#include <ctime>
+ #include <unordered_map>
+ #include <memory>
+ #include <string>
+diff --git a/src/gui/ScintillaEditor.cc b/src/gui/ScintillaEditor.cc
+index cc75b0c3e0..832f8785bb 100644
+--- a/src/gui/ScintillaEditor.cc
++++ b/src/gui/ScintillaEditor.cc
+@@ -16,7 +16,7 @@
+ #include <string>
+ #include <vector>
+ #include <algorithm>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/property_tree/ptree.hpp>
+ #include <boost/property_tree/json_parser.hpp>
+ #include <QString>
+@@ -34,7 +34,7 @@
+ #include <QPoint>
+ #include <QToolTip>
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ const QString ScintillaEditor::cursorPlaceHolder = "^~^";
+ 
+diff --git a/src/gui/UIUtils.h b/src/gui/UIUtils.h
+index 498732e180..536b05a775 100644
+--- a/src/gui/UIUtils.h
++++ b/src/gui/UIUtils.h
+@@ -29,8 +29,8 @@
+ #include <QWidget>
+ #include <QStringList>
+ #include <QFileInfoList>
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ namespace UIUtils {
+ static const int maxRecentFiles = 10;
+diff --git a/src/gui/ViewportControl.cc b/src/gui/ViewportControl.cc
+index d7259e71a6..ce5948a147 100644
+--- a/src/gui/ViewportControl.cc
++++ b/src/gui/ViewportControl.cc
+@@ -10,7 +10,7 @@
+ #include <QString>
+ #include <QWidget>
+ #include <iostream>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <cfloat>
+ #include <QDoubleSpinBox>
+ 
+diff --git a/src/gui/parameter/ParameterWidget.cc b/src/gui/parameter/ParameterWidget.cc
+index 824dee24b7..ebb8f5dd37 100644
+--- a/src/gui/parameter/ParameterWidget.cc
++++ b/src/gui/parameter/ParameterWidget.cc
+@@ -44,7 +44,7 @@
+ #include "gui/parameter/ParameterVector.h"
+ #include "gui/Preferences.h"
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ 
+ #include <QInputDialog>
+ #include <QMessageBox>
+@@ -87,7 +87,7 @@ void ParameterWidget::readFile(const QString& scadFile)
+   assert(widgets.empty());
+ 
+   QString jsonFile = getJsonFile(scadFile);
+-  if (!boost::filesystem::exists(jsonFile.toStdString()) || this->sets.readFile(jsonFile.toStdString())) {
++  if (!std::filesystem::exists(jsonFile.toStdString()) || this->sets.readFile(jsonFile.toStdString())) {
+     this->invalidJsonFile = QString();
+   } else {
+     this->invalidJsonFile = jsonFile;
+@@ -413,7 +413,7 @@ ParameterVirtualWidget *ParameterWidget::createParameterWidget(ParameterObject *
+ 
+ QString ParameterWidget::getJsonFile(const QString& scadFile)
+ {
+-  boost::filesystem::path p = scadFile.toStdString();
++  std::filesystem::path p = scadFile.toStdString();
+   return QString::fromStdString(p.replace_extension(".json").string());
+ }
+ 
+diff --git a/src/handle_dep.cc b/src/handle_dep.cc
+index 367deb191e..e4bf89d663 100644
+--- a/src/handle_dep.cc
++++ b/src/handle_dep.cc
+@@ -6,8 +6,8 @@
+ #include <unordered_set>
+ #include <vector>
+ #include <boost/regex.hpp>
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ #ifndef _WIN32 // NOT _WIN32
+ #include <sys/wait.h>
+diff --git a/src/io/DxfData.cc b/src/io/DxfData.cc
+index 1fc33317e5..f8c97cbed9 100644
+--- a/src/io/DxfData.cc
++++ b/src/io/DxfData.cc
+@@ -41,20 +41,20 @@
+ #include <vector>
+ #include <boost/lexical_cast.hpp>
+ #include <boost/algorithm/string.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <algorithm>
+ #include <sstream>
+ #include <string>
+ #include <map>
+ 
+ #include "core/Value.h"
+-#include "utils/boost-utils.h"
+ #include "geometry/Polygon2d.h"
++#include "io/fileutils.h"
+ #include "utils/printutils.h"
+ #include "utils/degree_trig.h"
+ 
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ /*! \class DxfData
+ 
+@@ -384,10 +384,10 @@ DxfData::DxfData(double fn, double fs, double fa,
+   for (const auto& i : unsupported_entities_list) {
+     if (layername.empty()) {
+       LOG(message_group::Warning,
+-          "Unsupported DXF Entity '%1$s' (%2$x) in %3$s.", i.first, i.second, QuotedString(boostfs_uncomplete(filename, fs::current_path()).generic_string()));
++          "Unsupported DXF Entity '%1$s' (%2$x) in %3$s.", i.first, i.second, QuotedString(fs_uncomplete(filename, fs::current_path()).generic_string()));
+     } else {
+       LOG(message_group::Warning,
+-          "Unsupported DXF Entity '%1$s' (%2$x) in layer '%3$s' of %4$s", i.first, i.second, layername, boostfs_uncomplete(filename, fs::current_path()).generic_string());
++          "Unsupported DXF Entity '%1$s' (%2$x) in layer '%3$s' of %4$s", i.first, i.second, layername, fs_uncomplete(filename, fs::current_path()).generic_string());
+     }
+   }
+ 
+@@ -410,7 +410,7 @@ DxfData::DxfData(double fn, double fs, double fa,
+         for (int k : lv) {
+           if (k < 0 || static_cast<unsigned int>(k) >= lines.size()) {
+             LOG(message_group::Warning,
+-                "Bad DXF line index in %1$s.", QuotedString(boostfs_uncomplete(filename, fs::current_path()).generic_string()));
++                "Bad DXF line index in %1$s.", QuotedString(fs_uncomplete(filename, fs::current_path()).generic_string()));
+             continue;
+           }
+           if (k == idx || lines[k].disabled) continue;
+@@ -439,7 +439,7 @@ next_open_path_j:;
+       for (int k : lv) {
+         if (k < 0 || static_cast<unsigned int>(k) >= lines.size()) {
+           LOG(message_group::Warning,
+-              "Bad DXF line index in %1$s.", QuotedString(boostfs_uncomplete(filename, fs::current_path()).generic_string()));
++              "Bad DXF line index in %1$s.", QuotedString(fs_uncomplete(filename, fs::current_path()).generic_string()));
+           continue;
+         }
+         if (lines[k].disabled) continue;
+@@ -480,7 +480,7 @@ found_next_line_in_open_path:;
+       for (int k : lv) {
+         if (k < 0 || static_cast<unsigned int>(k) >= lines.size()) {
+           LOG(message_group::Warning,
+-              "Bad DXF line index in %1$s.", QuotedString(boostfs_uncomplete(filename, fs::current_path()).generic_string()));
++              "Bad DXF line index in %1$s.", QuotedString(fs_uncomplete(filename, fs::current_path()).generic_string()));
+           continue;
+         }
+         if (lines[k].disabled) continue;
+diff --git a/src/io/dxfdim.cc b/src/io/dxfdim.cc
+index 000311c9b3..673a08f293 100644
+--- a/src/io/dxfdim.cc
++++ b/src/io/dxfdim.cc
+@@ -43,10 +43,10 @@
+ #include <string>
+ #include <vector>
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ std::unordered_map<std::string, double> dxf_dim_cache;
+ std::unordered_map<std::string, std::vector<double>> dxf_cross_cache;
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ Value builtin_dxf_dim(Arguments arguments, const Location& loc)
+ {
+@@ -73,11 +73,11 @@ Value builtin_dxf_dim(Arguments arguments, const Location& loc)
+ 
+   fs::path filepath(filename);
+   uintmax_t filesize = -1;
+-  time_t lastwritetime = -1;
++  int64_t lastwritetime = -1;
+   if (fs::exists(filepath)) {
+     if (fs::is_regular_file(filepath)) {
+       filesize = fs::file_size(filepath);
+-      lastwritetime = fs::last_write_time(filepath);
++      lastwritetime = fs_timestamp(filepath);
+     }
+   } else {
+     LOG(message_group::Warning, loc, parameters.documentRoot(), "Can't open DXF file '%1$s'!", rawFilename);
+@@ -169,11 +169,11 @@ Value builtin_dxf_cross(Arguments arguments, const Location& loc)
+ 
+   fs::path filepath(filename);
+   uintmax_t filesize = -1;
+-  time_t lastwritetime = -1;
++  int64_t lastwritetime = -1;
+   if (fs::exists(filepath)) {
+     if (fs::is_regular_file(filepath)) {
+       filesize = fs::file_size(filepath);
+-      lastwritetime = fs::last_write_time(filepath);
++      lastwritetime = fs_timestamp(filepath);
+     }
+   } else {
+     LOG(message_group::Warning, loc, parameters.documentRoot(), "Can't open DXF file '%1$s'!", rawFilename);
+diff --git a/src/io/export.cc b/src/io/export.cc
+index 007877d914..69b1647ddb 100644
+--- a/src/io/export.cc
++++ b/src/io/export.cc
+@@ -38,8 +38,7 @@
+ #include <cstddef>
+ #include <fstream>
+ #include <vector>
+-#include <boost/filesystem/path.hpp>
+-#include <boost/filesystem/fstream.hpp>
++#include <filesystem>
+ #include <iostream>
+ 
+ #ifdef _WIN32
+@@ -216,8 +215,8 @@ bool exportFileByName(const std::shared_ptr<const Geometry>& root_geom, const st
+   if (exportInfo.format == FileFormat::_3MF || exportInfo.format == FileFormat::BINARY_STL || exportInfo.format == FileFormat::PDF) {
+     mode |= std::ios::binary;
+   }
+-  const boost::filesystem::path path(filename);
+-  boost::filesystem::ofstream fstream(path, mode);
++  const std::filesystem::path path(filename);
++  std::ofstream fstream(path, mode);
+   if (!fstream.is_open()) {
+     LOG(_("Can't open file \"%1$s\" for export"), filename);
+     return false;
+diff --git a/src/io/export_pdf.cc b/src/io/export_pdf.cc
+index f951d21952..f18edd0e69 100644
+--- a/src/io/export_pdf.cc
++++ b/src/io/export_pdf.cc
+@@ -260,7 +260,7 @@ if (exportInfo.options==nullptr) {
+ 
+ 
+ #if CAIRO_VERSION >= CAIRO_VERSION_ENCODE(1, 16, 0)
+-  cairo_pdf_surface_set_metadata(surface, CAIRO_PDF_METADATA_TITLE, boost::filesystem::path(exportInfo.sourceFilePath).filename().string().c_str());
++  cairo_pdf_surface_set_metadata(surface, CAIRO_PDF_METADATA_TITLE, std::filesystem::path(exportInfo.sourceFilePath).filename().string().c_str());
+   cairo_pdf_surface_set_metadata(surface, CAIRO_PDF_METADATA_CREATOR, "OpenSCAD (https://www.openscad.org/)");
+   cairo_pdf_surface_set_metadata(surface, CAIRO_PDF_METADATA_CREATE_DATE, "");
+   cairo_pdf_surface_set_metadata(surface, CAIRO_PDF_METADATA_MOD_DATE, "");
+diff --git a/src/io/export_pov.cc b/src/io/export_pov.cc
+index b31631cfdc..38444b6233 100644
+--- a/src/io/export_pov.cc
++++ b/src/io/export_pov.cc
+@@ -44,7 +44,7 @@ void export_pov(const std::shared_ptr<const Geometry>& geom, std::ostream& outpu
+   }
+ 
+   output << "// Generated by OpenSCAD!\n";
+-  output << "// Source file: " << boost::filesystem::path(exportInfo.sourceFilePath).filename().string() << "\n\n";
++  output << "// Source file: " << std::filesystem::path(exportInfo.sourceFilePath).filename().string() << "\n\n";
+ 
+   output << "#version 3.7;\n";
+   output << "global_settings { assumed_gamma 1.0 }\n";
+diff --git a/src/io/fileutils.cc b/src/io/fileutils.cc
+index 67d2b9f06b..9ce30703f8 100644
+--- a/src/io/fileutils.cc
++++ b/src/io/fileutils.cc
+@@ -1,11 +1,11 @@
+ #include "io/fileutils.h"
++#include "utils/printutils.h"
+ 
++#include <cstdint>
++#include <filesystem>
+ #include <string>
+ 
+-#include "utils/printutils.h"
+-
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ /*!
+    Returns the absolute path to the given filename, unless it's empty.
+@@ -33,3 +33,19 @@ std::string lookup_file(const std::string& filename,
+   }
+   return resultfile;
+ }
++
++fs::path fs_uncomplete(fs::path const& p, fs::path const& base)
++{
++  if (p == fs::path{}) return p;
++  return fs::relative(p, base == fs::path{} ? fs::path{"."} : base);
++}
++
++int64_t fs_timestamp(fs::path const& path) {
++  int64_t seconds = 0;
++  if (fs::exists(path)) {
++    const auto t = fs::last_write_time(path);
++    const auto duration = t.time_since_epoch();
++    seconds = std::chrono::duration_cast<std::chrono::seconds>(duration).count();
++  }
++  return seconds;
++}
+\ No newline at end of file
+diff --git a/src/io/fileutils.h b/src/io/fileutils.h
+index 9b2eb1a533..1419fd69c5 100644
+--- a/src/io/fileutils.h
++++ b/src/io/fileutils.h
+@@ -1,6 +1,14 @@
+ #pragma once
+ 
++#include <cstdint>
++#include <filesystem>
+ #include <string>
+ 
++namespace fs = std::filesystem;
++
+ std::string lookup_file(const std::string& filename,
+                         const std::string& path, const std::string& fallbackpath);
++
++
++fs::path fs_uncomplete(fs::path const& p, fs::path const& base);
++int64_t fs_timestamp(fs::path const& path);
+\ No newline at end of file
+diff --git a/src/io/import_amf.cc b/src/io/import_amf.cc
+index f1d42f09f0..6183065679 100644
+--- a/src/io/import_amf.cc
++++ b/src/io/import_amf.cc
+@@ -43,7 +43,7 @@
+ #include <string>
+ #include <vector>
+ #include <libxml/xmlreader.h>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/lexical_cast.hpp>
+ 
+ static const std::string text_node("#text");
+diff --git a/src/openscad.cc b/src/openscad.cc
+index 30ee3f7994..52470fb284 100644
+--- a/src/openscad.cc
++++ b/src/openscad.cc
+@@ -40,7 +40,7 @@
+ #include <boost/bind/bind.hpp>
+ #include <boost/range/adaptor/transformed.hpp>
+ #include <boost/program_options.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include <boost/optional.hpp>
+ #include <boost/dll.hpp>
+ 
+@@ -77,7 +77,7 @@ bool python_active = false;
+ bool python_trusted = false;
+ #endif
+ namespace po = boost::program_options;
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ std::string commandline_commands;
+ static bool arg_info = false;
+diff --git a/src/openscad.h b/src/openscad.h
+index 04cf5263dd..a9f2d6a393 100644
+--- a/src/openscad.h
++++ b/src/openscad.h
+@@ -29,7 +29,7 @@
+ #include <string>
+ #include <utility>
+ 
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ 
+ extern bool parse(class SourceFile *& file, const std::string& text, const std::string& filename, const std::string& mainFile, int debug);
+ 
+diff --git a/src/openscad_gui.cc b/src/openscad_gui.cc
+index 8dd123dca9..e73a8483fe 100644
+--- a/src/openscad_gui.cc
++++ b/src/openscad_gui.cc
+@@ -72,7 +72,7 @@ extern std::string arg_colorscheme;
+ namespace {
+ 
+ // Only if "fileName" is not absolute, prepend the "absoluteBase".
+-QString assemblePath(const boost::filesystem::path& absoluteBaseDir,
++QString assemblePath(const std::filesystem::path& absoluteBaseDir,
+                      const std::string& fileName) {
+   if (fileName.empty()) return "";
+   auto qsDir = QString::fromLocal8Bit(absoluteBaseDir.generic_string().c_str());
+@@ -129,7 +129,7 @@ void registerDefaultIcon(const QString&) { }
+ #define DESKTOP_FILENAME "openscad"
+ #endif
+ 
+-int gui(std::vector<std::string>& inputFiles, const boost::filesystem::path& original_path, int argc, char **argv)
++int gui(std::vector<std::string>& inputFiles, const std::filesystem::path& original_path, int argc, char **argv)
+ {
+   OpenSCADApp app(argc, argv);
+   // remove ugly frames in the QStatusBar when using additional widgets
+diff --git a/src/openscad_gui.h b/src/openscad_gui.h
+index 52e9b50860..f28f8366d9 100644
+--- a/src/openscad_gui.h
++++ b/src/openscad_gui.h
+@@ -29,7 +29,7 @@
+ #include <string>
+ #include <vector>
+ 
+-#include <boost/filesystem/path.hpp>
++#include <filesystem>
+ 
+ 
+-int gui(std::vector<std::string>& inputFiles, const boost::filesystem::path& original_path, int argc, char **argv);
++int gui(std::vector<std::string>& inputFiles, const std::filesystem::path& original_path, int argc, char **argv);
+diff --git a/src/platform/PlatformUtils-posix.cc b/src/platform/PlatformUtils-posix.cc
+index 0a855faabc..518b8707c9 100644
+--- a/src/platform/PlatformUtils-posix.cc
++++ b/src/platform/PlatformUtils-posix.cc
+@@ -9,12 +9,12 @@
+ 
+ #include <boost/regex.hpp>
+ #include <boost/algorithm/string.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ 
+ #include "version.h"
+ #include "platform/PlatformUtils.h"
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ static std::mutex user_agent_mutex;
+ 
+diff --git a/src/platform/PlatformUtils-win.cc b/src/platform/PlatformUtils-win.cc
+index 1b87578bd0..7cc2c913c5 100644
+--- a/src/platform/PlatformUtils-win.cc
++++ b/src/platform/PlatformUtils-win.cc
+@@ -75,7 +75,7 @@ static const std::string getFolderPath(int nFolder)
+ 
+   if (result == S_OK) {
+     path = std::wstring(path.c_str() ); // strip extra nullptrs
+-    // Use boost::filesystem to decide how to convert from wstring
++    // Use std::filesystem to decide how to convert from wstring
+     // to string. Normally the path encoding is system local and
+     // we don't want to force conversion to UTF-8.
+     fs::path p(path);
+diff --git a/src/platform/PlatformUtils.h b/src/platform/PlatformUtils.h
+index c74e809204..49ad8387e3 100644
+--- a/src/platform/PlatformUtils.h
++++ b/src/platform/PlatformUtils.h
+@@ -4,8 +4,8 @@
+ #include <cstddef>
+ #include <string>
+ 
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ static constexpr size_t STACK_BUFFER_SIZE = 128ul * 1024ul;
+ static constexpr size_t STACK_LIMIT_DEFAULT = size_t{STACKSIZE} - STACK_BUFFER_SIZE;
+diff --git a/src/utils/boost-utils.cc b/src/utils/boost-utils.cc
+deleted file mode 100644
+index a59ef6b411..0000000000
+--- a/src/utils/boost-utils.cc
++++ /dev/null
+@@ -1,124 +0,0 @@
+-#include "utils/boost-utils.h"
+-#include <stdexcept>
+-#include <cstdio>
+-#include <string>
+-
+-namespace fs = boost::filesystem;
+-
+-// Will normalize the given path, i.e. remove any redundant ".." path elements.
+-fs::path boostfs_normalize(const fs::path& path)
+-{
+-  auto absPath = fs::absolute(path);
+-  auto it = absPath.begin();
+-  auto result = *it;
+-  if (it != absPath.end()) it++;
+-
+-  // Get canonical version of the existing part
+-  for (; exists(result) && it != absPath.end(); ++it) {
+-    result /= *it;
+-  }
+-  result = fs::canonical(result.parent_path());
+-  if (it != absPath.begin()) it--;
+-
+-  // For the rest remove ".." and "." in a path with no symlinks
+-  for (; it != absPath.end(); ++it) {
+-    // Just move back on ../
+-    if (*it == "..") {
+-      result = result.parent_path();
+-    }
+-    // Ignore "."
+-    else if (*it != ".") {
+-      // Just cat other path entries
+-      result /= *it;
+-    }
+-  }
+-
+-  return result;
+-}
+-
+-/**
+- * https://svn.boost.org/trac/boost/ticket/1976#comment:2
+- *
+- * "The idea: uncomplete(/foo/new, /foo/bar) => ../new
+- *  The use case for this is any time you get a full path (from an open dialog, perhaps)
+- *  and want to store a relative path so that the group of files can be moved to a different
+- *  directory without breaking the paths. An IDE would be a simple example, so that the
+- *  project file could be safely checked out of subversion."
+- *
+- * ALGORITHM:
+- *  iterate path and base
+- * compare all elements so far of path and base
+- * whilst they are the same, no write to output
+- * when they change, or one runs out:
+- *   write to output, ../ times the number of remaining elements in base
+- *   write to output, the remaining elements in path
+- */
+-fs::path
+-boostfs_uncomplete(fs::path const& p, fs::path const& base)
+-{
+-  if (p == base) return "./";
+-  /*!! this breaks stuff if path is a filename rather than a directory,
+-     which it most likely is... but then base shouldn't be a filename so... */
+-
+-  // create absolute paths
+-  fs::path abs_p = fs::absolute(boostfs_normalize(p));
+-  fs::path abs_base = fs::absolute(boostfs_normalize(base));
+-
+-  fs::path from_path, from_base, output;
+-
+-  fs::path::iterator path_it = abs_p.begin(),    path_end = abs_p.end();
+-  fs::path::iterator base_it = abs_base.begin(), base_end = abs_base.end();
+-
+-  // check for emptiness
+-  if ((path_it == path_end) || (base_it == base_end)) {
+-    throw std::runtime_error("path or base was empty; couldn't generate relative path");
+-  }
+-
+-#ifdef _WIN32
+-  // drive letters are different; don't generate a relative path
+-  if (*path_it != *base_it) return p;
+-
+-  // now advance past drive letters; relative paths should only go up
+-  // to the root of the drive and not past it
+-  ++path_it, ++base_it;
+-#endif
+-
+-  // Cache system-dependent dot, double-dot and slash strings
+-  const std::string _dot = ".";
+-  const std::string _dots = "..";
+-  const std::string _sep = "/";
+-
+-  // iterate over path and base
+-  while (true) {
+-
+-    // compare all elements so far of path and base to find greatest common root;
+-    // when elements of path and base differ, or run out:
+-    if ((path_it == path_end) || (base_it == base_end) || (*path_it != *base_it)) {
+-
+-      // write to output, ../ times the number of remaining elements in base;
+-      // this is how far we've had to come down the tree from base to get to the common root
+-      for (; base_it != base_end; ++base_it) {
+-        if (*base_it == _dot || *base_it == _sep) continue;
+-        output /= "../";
+-      }
+-
+-      // write to output, the remaining elements in path;
+-      // this is the path relative from the common root
+-      fs::path::iterator path_it_start = path_it;
+-      for (; path_it != path_end; ++path_it) {
+-        if (path_it != path_it_start) output /= "/";
+-        if (*path_it == _dot || *path_it == _sep) continue;
+-        output /= *path_it;
+-      }
+-      break;
+-    }
+-
+-    // add directory level to both paths and continue iteration
+-    from_path /= fs::path(*path_it);
+-    from_base /= fs::path(*base_it);
+-
+-    ++path_it, ++base_it;
+-  }
+-
+-  return output;
+-}
+diff --git a/src/utils/boost-utils.h b/src/utils/boost-utils.h
+index 212f6b0397..120552e857 100644
+--- a/src/utils/boost-utils.h
++++ b/src/utils/boost-utils.h
+@@ -1,12 +1,7 @@
+ #pragma once
+ 
+ #include <limits>
+-#include <boost/filesystem.hpp>
+ #include "utils/printutils.h"
+-namespace fs = boost::filesystem;
+-
+-fs::path boostfs_normalize(const fs::path& path);
+-fs::path boostfs_uncomplete(fs::path const& p, fs::path const& base);
+ 
+ #include <boost/cast.hpp>
+ #include <sstream>
+diff --git a/src/utils/printutils.cc b/src/utils/printutils.cc
+index 5ec876c7fa..1128481356 100644
+--- a/src/utils/printutils.cc
++++ b/src/utils/printutils.cc
+@@ -9,11 +9,11 @@
+ #include <boost/algorithm/string.hpp>
+ #include <boost/algorithm/string/predicate.hpp>
+ #include <boost/circular_buffer.hpp>
+-#include <boost/filesystem.hpp>
++#include <filesystem>
+ #include "utils/exceptions.h"
+ 
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ std::set<std::string> printedDeprecations;
+ std::list<std::string> print_messages_stack;
+diff --git a/tests/lexer.cxx b/tests/lexer.cxx
+index 357f01b92f..22a6f83f46 100644
+--- a/tests/lexer.cxx
++++ b/tests/lexer.cxx
+@@ -684,8 +684,8 @@ char *lexertext;
+ #include "FileModule.h"
+ #include <assert.h>
+ #include <boost/lexical_cast.hpp>
+-#include <boost/filesystem.hpp>
+-namespace fs = boost::filesystem;
++#include <filesystem>
++namespace fs = std::filesystem;
+ 
+ //isatty for visual c++ and mingw-cross-env
+ #if defined __WIN32__ && ! defined _MSC_VER
+diff --git a/tests/parser.cxx b/tests/parser.cxx
+index c5a4a3d2a5..3b86ae378f 100644
+--- a/tests/parser.cxx
++++ b/tests/parser.cxx
+@@ -159,10 +159,10 @@
+ #include "printutils.h"
+ #include "memory.h"
+ #include <sstream>
+-#include <boost/filesystem.hpp>
+-#include "boost-utils.h"
++#include <filesystem>
++#include "io/fileutils.h"
+ 
+-namespace fs = boost::filesystem;
++namespace fs = std::filesystem;
+ 
+ #define YYMAXDEPTH 20000
+ #define LOC(loc) Location(loc.first_line, loc.first_column, loc.last_line, loc.last_column, sourcefile())
+@@ -1811,8 +1811,8 @@ yyparse ()
+                         auto prevFile = assignment.location().fileName();
+                         auto currFile = LOC((yyloc)).fileName();
+                         
+-                        const auto uncPathCurr = boostfs_uncomplete(currFile, mainFilePath.parent_path());
+-                        const auto uncPathPrev = boostfs_uncomplete(prevFile, mainFilePath.parent_path());
++                        const auto uncPathCurr = fs_uncomplete(currFile, mainFilePath.parent_path());
++                        const auto uncPathPrev = fs_uncomplete(prevFile, mainFilePath.parent_path());
+ 
+                         if(fileEnded){
+                             //assigments via commandline
+diff --git a/tests/test_cmdline_tool.py b/tests/test_cmdline_tool.py
+index 1efe25467a..162431e07f 100755
+--- a/tests/test_cmdline_tool.py
++++ b/tests/test_cmdline_tool.py
+@@ -125,7 +125,8 @@ def normalize_string(s):
+ 
+     This also normalizes away import paths from 'file = ' arguments."""
+ 
+-    s = re.sub(', timestamp = [0-9]+', '', s)
++    # timestamp can potentially be negative since stdlibc++ internally uses an epoch based in year 2174
++    s = re.sub(', timestamp = -?[0-9]+', '', s)
+ 
+     """ Don't replace floats after implementing double-conversion library
+     def floatrep(match):
+@@ -137,9 +138,12 @@ def floatrep(match):
+         return "%.6g"%value
+     s = re.sub('(-?[0-9]+(\\.[0-9]+)?(e[+-][0-9]+)?)', floatrep, s)
+     """
++
++    """ Relative file paths are hopefully consistent across platforms now?
+     def pathrep(match):
+         return match.groups()[0] + match.groups()[2]
+     s = re.sub('(file = ")([^"/]*/)*([^"]*")', pathrep, s)
++    """
+ 
+     return s
+ 
+diff --git a/xcode/OpenSCAD.xcodeproj/project.pbxproj b/xcode/OpenSCAD.xcodeproj/project.pbxproj
+index 3fdc40d904..87621d6d33 100644
+--- a/xcode/OpenSCAD.xcodeproj/project.pbxproj
++++ b/xcode/OpenSCAD.xcodeproj/project.pbxproj
+@@ -217,7 +217,7 @@
+ 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+ 				GCC_WARN_UNUSED_FUNCTION = YES;
+ 				GCC_WARN_UNUSED_VARIABLE = YES;
+-				MACOSX_DEPLOYMENT_TARGET = 10.14;
++				MACOSX_DEPLOYMENT_TARGET = 10.15;
+ 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+ 				MTL_FAST_MATH = YES;
+ 				ONLY_ACTIVE_ARCH = YES;
+@@ -270,7 +270,7 @@
+ 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+ 				GCC_WARN_UNUSED_FUNCTION = YES;
+ 				GCC_WARN_UNUSED_VARIABLE = YES;
+-				MACOSX_DEPLOYMENT_TARGET = 10.14;
++				MACOSX_DEPLOYMENT_TARGET = 10.15;
+ 				MTL_ENABLE_DEBUG_INFO = NO;
+ 				MTL_FAST_MATH = YES;
+ 				SDKROOT = macosx;

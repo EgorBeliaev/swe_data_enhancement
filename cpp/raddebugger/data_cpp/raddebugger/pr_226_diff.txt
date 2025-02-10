@@ -1,0 +1,417 @@
+diff --git a/src/df/gfx/df_gfx.c b/src/df/gfx/df_gfx.c
+index 6f1ba7099..b270e646c 100644
+--- a/src/df/gfx/df_gfx.c
++++ b/src/df/gfx/df_gfx.c
+@@ -12930,7 +12930,7 @@ df_gfx_init(OS_WindowRepaintFunctionType *window_repaint_entry_point, DF_StateDe
+     }
+     
+     // rjf: upload to gpu texture
+-    df_gfx_state->icon_texture = r_tex2d_alloc(R_Tex2DKind_Static, image_dim, R_Tex2DFormat_RGBA8, image_data);
++    df_gfx_state->icon_texture = r_tex2d_alloc(R_ResourceKind_Static, image_dim, R_Tex2DFormat_RGBA8, image_data);
+     
+     // rjf: release
+     stbi_image_free(image_data);
+diff --git a/src/font_cache/font_cache.c b/src/font_cache/font_cache.c
+index b3b8eaa2a..cd6597228 100644
+--- a/src/font_cache/font_cache.c
++++ b/src/font_cache/font_cache.c
+@@ -704,7 +704,7 @@ f_push_run_from_string(Arena *arena, F_Tag tag, F32 size, F_RunFlags flags, Stri
+               atlas->root->max_free_size[Corner_01] =
+               atlas->root->max_free_size[Corner_10] =
+               atlas->root->max_free_size[Corner_11] = v2s16(atlas->root_dim.x/2, atlas->root_dim.y/2);
+-            atlas->texture = r_tex2d_alloc(R_Tex2DKind_Dynamic, v2s32((S32)atlas->root_dim.x, (S32)atlas->root_dim.y), R_Tex2DFormat_RGBA8, 0);
++            atlas->texture = r_tex2d_alloc(R_ResourceKind_Dynamic, v2s32((S32)atlas->root_dim.x, (S32)atlas->root_dim.y), R_Tex2DFormat_RGBA8, 0);
+           }
+           
+           // rjf: allocate from atlas
+diff --git a/src/geo_cache/geo_cache.c b/src/geo_cache/geo_cache.c
+index cec24960d..587a76fda 100644
+--- a/src/geo_cache/geo_cache.c
++++ b/src/geo_cache/geo_cache.c
+@@ -301,7 +301,7 @@ geo_xfer_thread__entry_point(void *p)
+     R_Handle buffer = {0};
+     if(got_task && data.size != 0)
+     {
+-      buffer = r_buffer_alloc(R_BufferKind_Static, data.size, data.str);
++      buffer = r_buffer_alloc(R_ResourceKind_Static, data.size, data.str);
+     }
+     
+     //- rjf: commit results to cache
+diff --git a/src/render/d3d11/render_d3d11.cpp b/src/render/d3d11/render_d3d11.cpp
+index eef97d946..206866508 100644
+--- a/src/render/d3d11/render_d3d11.cpp
++++ b/src/render/d3d11/render_d3d11.cpp
+@@ -125,6 +125,34 @@ r_d3d11_instance_buffer_from_size(U64 size)
+   return buffer;
+ }
+ 
++internal
++void r_res_kind_to_usage(R_ResourceKind kind, D3D11_USAGE* d3d11_usage, UINT* cpu_access_flags)
++{
++  //- rjf: kind -> usage * cpu access flags
++  switch(kind)
++  {
++    case R_ResourceKind_Static:
++    {
++      *d3d11_usage = D3D11_USAGE_IMMUTABLE;
++      *cpu_access_flags = 0;
++    }break;
++    case R_ResourceKind_Dynamic:
++    {
++      *d3d11_usage = D3D11_USAGE_DEFAULT;
++      *cpu_access_flags = 0;
++    }break;
++    case R_ResourceKind_Stream:
++    {
++      *d3d11_usage = D3D11_USAGE_DYNAMIC;
++      *cpu_access_flags = D3D11_CPU_ACCESS_WRITE;
++    }break;
++    default:
++    {
++      InvalidPath;
++    }
++  }
++}
++
+ ////////////////////////////////
+ //~ rjf: Backend Hook Implementations
+ 
+@@ -428,7 +456,7 @@ r_init(CmdLine *cmdln)
+       0xff00ffff, 0x330033ff,
+       0x330033ff, 0xff00ffff,
+     };
+-    r_d3d11_state->backup_texture = r_tex2d_alloc(R_Tex2DKind_Static, v2s32(2, 2), R_Tex2DFormat_RGBA8, backup_texture_data);
++    r_d3d11_state->backup_texture = r_tex2d_alloc(R_ResourceKind_Static, v2s32(2, 2), R_Tex2DFormat_RGBA8, backup_texture_data);
+   }
+   
+   //- rjf: initialize buffer flush state
+@@ -534,7 +562,7 @@ r_window_unequip(OS_Handle handle, R_Handle equip_handle)
+ //- rjf: textures
+ 
+ r_hook R_Handle
+-r_tex2d_alloc(R_Tex2DKind kind, Vec2S32 size, R_Tex2DFormat format, void *data)
++r_tex2d_alloc(R_ResourceKind kind, Vec2S32 size, R_Tex2DFormat format, void *data)
+ {
+   ProfBeginFunction();
+   
+@@ -557,27 +585,12 @@ r_tex2d_alloc(R_Tex2DKind kind, Vec2S32 size, R_Tex2DFormat format, void *data)
+     texture->generation += 1;
+   }
+   
+-  //- rjf: kind * initial_data -> usage * cpu access flags
+-  D3D11_USAGE d3d11_usage = D3D11_USAGE_IMMUTABLE;
++  D3D11_USAGE d3d11_usage = D3D11_USAGE_DEFAULT;
+   UINT cpu_access_flags = 0;
++  r_res_kind_to_usage(kind, &d3d11_usage, &cpu_access_flags);
++  if (kind == R_ResourceKind_Static)
+   {
+-    switch(kind)
+-    {
+-      default:
+-      case R_Tex2DKind_Static:
+-      {
+-        if(data == 0)
+-        {
+-          d3d11_usage = D3D11_USAGE_DYNAMIC;
+-          cpu_access_flags = D3D11_CPU_ACCESS_WRITE;
+-        }
+-      }break;
+-      case R_Tex2DKind_Dynamic:
+-      {
+-        d3d11_usage = D3D11_USAGE_DEFAULT;
+-        cpu_access_flags = D3D11_CPU_ACCESS_WRITE;
+-      }break;
+-    }
++    Assert(data != 0 && "static texture must have initial data provided");
+   }
+   
+   //- rjf: format -> dxgi format
+@@ -650,7 +663,7 @@ r_tex2d_release(R_Handle handle)
+   ProfEnd();
+ }
+ 
+-r_hook R_Tex2DKind
++r_hook R_ResourceKind
+ r_kind_from_tex2d(R_Handle handle)
+ {
+   R_D3D11_Tex2D *texture = r_d3d11_tex2d_from_handle(handle);
+@@ -678,6 +691,7 @@ r_fill_tex2d_region(R_Handle handle, Rng2S32 subrect, void *data)
+   OS_MutexScopeW(r_d3d11_state->device_rw_mutex)
+   {
+     R_D3D11_Tex2D *texture = r_d3d11_tex2d_from_handle(handle);
++    Assert(texture->kind == R_ResourceKind_Dynamic && "only dynamic texture can update region");
+     U64 bytes_per_pixel = r_tex2d_format_bytes_per_pixel_table[texture->format];
+     Vec2S32 dim = v2s32(subrect.x1 - subrect.x0, subrect.y1 - subrect.y0);
+     D3D11_BOX dst_box =
+@@ -693,7 +707,7 @@ r_fill_tex2d_region(R_Handle handle, Rng2S32 subrect, void *data)
+ //- rjf: buffers
+ 
+ r_hook R_Handle
+-r_buffer_alloc(R_BufferKind kind, U64 size, void *data)
++r_buffer_alloc(R_ResourceKind kind, U64 size, void *data)
+ {
+   ProfBeginFunction();
+   
+@@ -716,27 +730,12 @@ r_buffer_alloc(R_BufferKind kind, U64 size, void *data)
+     buffer->generation += 1;
+   }
+   
+-  //- rjf: kind * initial_data -> usage * cpu access flags
+-  D3D11_USAGE d3d11_usage = D3D11_USAGE_IMMUTABLE;
++  D3D11_USAGE d3d11_usage = D3D11_USAGE_DEFAULT;
+   UINT cpu_access_flags = 0;
++  r_res_kind_to_usage(kind, &d3d11_usage, &cpu_access_flags);
++  if (kind == R_ResourceKind_Static)
+   {
+-    switch(kind)
+-    {
+-      default:
+-      case R_BufferKind_Static:
+-      {
+-        if(data == 0)
+-        {
+-          d3d11_usage = D3D11_USAGE_DYNAMIC;
+-          cpu_access_flags = D3D11_CPU_ACCESS_WRITE;
+-        }
+-      }break;
+-      case R_BufferKind_Dynamic:
+-      {
+-        d3d11_usage = D3D11_USAGE_DEFAULT;
+-        cpu_access_flags = D3D11_CPU_ACCESS_WRITE;
+-      }break;
+-    }
++    Assert(data != 0 && "static buffer must have initial data provided");
+   }
+   
+   //- rjf: prep initial data, if passed
+diff --git a/src/render/d3d11/render_d3d11.h b/src/render/d3d11/render_d3d11.h
+index 0be2f1451..b25b4e4bd 100644
+--- a/src/render/d3d11/render_d3d11.h
++++ b/src/render/d3d11/render_d3d11.h
+@@ -63,7 +63,7 @@ struct R_D3D11_Tex2D
+   U64 generation;
+   ID3D11Texture2D *texture;
+   ID3D11ShaderResourceView *view;
+-  R_Tex2DKind kind;
++  R_ResourceKind kind;
+   Vec2S32 size;
+   R_Tex2DFormat format;
+ };
+@@ -73,7 +73,7 @@ struct R_D3D11_Buffer
+   R_D3D11_Buffer *next;
+   U64 generation;
+   ID3D11Buffer *buffer;
+-  R_BufferKind kind;
++  R_ResourceKind kind;
+   U64 size;
+ };
+ 
+@@ -173,5 +173,6 @@ internal R_Handle r_d3d11_handle_from_tex2d(R_D3D11_Tex2D *texture);
+ internal R_D3D11_Buffer *r_d3d11_buffer_from_handle(R_Handle handle);
+ internal R_Handle r_d3d11_handle_from_buffer(R_D3D11_Buffer *buffer);
+ internal ID3D11Buffer *r_d3d11_instance_buffer_from_size(U64 size);
++internal void r_res_kind_to_usage(R_ResourceKind kind, D3D11_USAGE* d3d11_usage, UINT* cpu_access_flags);
+ 
+ #endif // RENDER_D3D11_H
+diff --git a/src/render/generated/render.meta.c b/src/render/generated/render.meta.c
+index ca405579d..55fcceefd 100644
+--- a/src/render/generated/render.meta.c
++++ b/src/render/generated/render.meta.c
+@@ -30,10 +30,9 @@ U8 r_tex2d_format_bytes_per_pixel_table[9] =
+ 16,
+ };
+ 
+-String8 r_tex2d_kind_display_string_table[2] =
++String8 r_tex2d_kind_display_string_table[1] =
+ {
+-str8_lit_comp("Static"),
+-str8_lit_comp("Dynamic"),
++str8_lit_comp("$(a.display_string)"),
+ };
+ 
+ String8 r_tex2d_sample_kind_display_string_table[2] =
+diff --git a/src/render/generated/render.meta.h b/src/render/generated/render.meta.h
+index 5ab27d473..5c4081e6b 100644
+--- a/src/render/generated/render.meta.h
++++ b/src/render/generated/render.meta.h
+@@ -20,12 +20,13 @@ R_Tex2DFormat_RGBA32,
+ R_Tex2DFormat_COUNT,
+ } R_Tex2DFormat;
+ 
+-typedef enum R_Tex2DKind
++typedef enum R_ResourceKind
+ {
+-R_Tex2DKind_Static,
+-R_Tex2DKind_Dynamic,
+-R_Tex2DKind_COUNT,
+-} R_Tex2DKind;
++R_ResourceKind_Static,
++R_ResourceKind_Dynamic,
++R_ResourceKind_Stream,
++R_ResourceKind_COUNT,
++} R_ResourceKind;
+ 
+ typedef enum R_Tex2DSampleKind
+ {
+@@ -43,13 +44,6 @@ R_GeoTopologyKind_TriangleStrip,
+ R_GeoTopologyKind_COUNT,
+ } R_GeoTopologyKind;
+ 
+-typedef enum R_BufferKind
+-{
+-R_BufferKind_Static,
+-R_BufferKind_Dynamic,
+-R_BufferKind_COUNT,
+-} R_BufferKind;
+-
+ typedef enum R_PassKind
+ {
+ R_PassKind_UI,
+@@ -61,7 +55,7 @@ R_PassKind_COUNT,
+ C_LINKAGE_BEGIN
+ extern String8 r_tex2d_format_display_string_table[9];
+ extern U8 r_tex2d_format_bytes_per_pixel_table[9];
+-extern String8 r_tex2d_kind_display_string_table[2];
++extern String8 r_tex2d_kind_display_string_table[1];
+ extern String8 r_tex2d_sample_kind_display_string_table[2];
+ extern String8 r_pass_kind_display_string_table[3];
+ extern U8 r_pass_kind_batch_table[3];
+diff --git a/src/render/render_core.h b/src/render/render_core.h
+index e4db1699c..d2c130a6d 100644
+--- a/src/render/render_core.h
++++ b/src/render/render_core.h
+@@ -221,15 +221,15 @@ r_hook R_Handle          r_window_equip(OS_Handle window);
+ r_hook void              r_window_unequip(OS_Handle window, R_Handle window_equip);
+ 
+ //- rjf: textures
+-r_hook R_Handle          r_tex2d_alloc(R_Tex2DKind kind, Vec2S32 size, R_Tex2DFormat format, void *data);
++r_hook R_Handle          r_tex2d_alloc(R_ResourceKind kind, Vec2S32 size, R_Tex2DFormat format, void *data);
+ r_hook void              r_tex2d_release(R_Handle texture);
+-r_hook R_Tex2DKind       r_kind_from_tex2d(R_Handle texture);
++r_hook R_ResourceKind    r_kind_from_tex2d(R_Handle texture);
+ r_hook Vec2S32           r_size_from_tex2d(R_Handle texture);
+ r_hook R_Tex2DFormat     r_format_from_tex2d(R_Handle texture);
+ r_hook void              r_fill_tex2d_region(R_Handle texture, Rng2S32 subrect, void *data);
+ 
+ //- rjf: buffers
+-r_hook R_Handle          r_buffer_alloc(R_BufferKind kind, U64 size, void *data);
++r_hook R_Handle          r_buffer_alloc(R_ResourceKind kind, U64 size, void *data);
+ r_hook void              r_buffer_release(R_Handle buffer);
+ 
+ //- rjf: frame markers
+diff --git a/src/render/render_core.mdesk b/src/render/render_core.mdesk
+index ba3eff737..2aea39637 100644
+--- a/src/render/render_core.mdesk
++++ b/src/render/render_core.mdesk
+@@ -19,10 +19,23 @@ R_Tex2DFormatTable:
+ }
+ 
+ @table(name, display_string)
+-R_Tex2DKindTable:
++R_ResourceKindTable:
+ {
++  // static resource is immutable
++  // initial data must be provided at creation time
++  // GPU can read the resource
++  // CPU is not allowed to read or write
+   {Static   "Static" }
++
++  // dynamic resource allows resource to be modified
++  // GPU can read & write to it
++  // CPU can write to it using UpdateSubresource
+   {Dynamic  "Dynamic"}
++
++  // stream resource will be often updated fully overwriting previous data
++  // GPU can only read it
++  // CPU can update via Map (with WRITE_DISCARD flag) + Unmap
++  {Stream   "Stream "} 
+ }
+ 
+ @table(name, display_string)
+@@ -41,13 +54,6 @@ R_GeoTopologyKindTable:
+   {TriangleStrip  "Triangle Strip" }
+ }
+ 
+-@table(name, display_string)
+-R_BufferKindTable:
+-{
+-  {Static   "Static" }
+-  {Dynamic  "Dynamic"}
+-}
+-
+ @table(name, batch, display_string)
+ R_PassKindTable:
+ {
+@@ -65,9 +71,9 @@ R_PassKindTable:
+   COUNT,
+ }
+ 
+-@enum R_Tex2DKind:
++@enum R_ResourceKind:
+ {
+-  @expand(R_Tex2DKindTable a) `$(a.name)`,
++  @expand(R_ResourceKindTable a) `$(a.name)`,
+   COUNT,
+ }
+ 
+@@ -83,12 +89,6 @@ R_PassKindTable:
+   COUNT,
+ }
+ 
+-@enum R_BufferKind:
+-{
+-  @expand(R_BufferKindTable a) `$(a.name)`,
+-  COUNT,
+-}
+-
+ @enum R_PassKind:
+ {
+   @expand(R_PassKindTable a) `$(a.name)`,
+diff --git a/src/render/stub/render_stub.c b/src/render/stub/render_stub.c
+index 721af66cf..b64dfa83d 100644
+--- a/src/render/stub/render_stub.c
++++ b/src/render/stub/render_stub.c
+@@ -26,7 +26,7 @@ r_window_unequip(OS_Handle window, R_Handle window_equip)
+ //- rjf: textures
+ 
+ r_hook R_Handle
+-r_tex2d_alloc(R_Tex2DKind kind, Vec2S32 size, R_Tex2DFormat format, void *data)
++r_tex2d_alloc(R_ResourceKind kind, Vec2S32 size, R_Tex2DFormat format, void *data)
+ {
+   R_Handle handle = {0};
+   handle.u64[0] = 1;
+@@ -38,10 +38,10 @@ r_tex2d_release(R_Handle texture)
+ {
+ }
+ 
+-r_hook R_Tex2DKind
++r_hook R_ResourceKind
+ r_kind_from_tex2d(R_Handle texture)
+ {
+-  return R_Tex2DKind_Static;
++  return R_ResourceStatic;
+ }
+ 
+ r_hook Vec2S32
+@@ -64,7 +64,7 @@ r_fill_tex2d_region(R_Handle texture, Rng2S32 subrect, void *data)
+ //- rjf: buffers
+ 
+ r_hook R_Handle
+-r_buffer_alloc(R_BufferKind kind, U64 size, void *data)
++r_buffer_alloc(R_ResourceKind kind, U64 size, void *data)
+ {
+   R_Handle handle = {0};
+   handle.u64[0] = 1;
+diff --git a/src/texture_cache/texture_cache.c b/src/texture_cache/texture_cache.c
+index 300eda127..bae578953 100644
+--- a/src/texture_cache/texture_cache.c
++++ b/src/texture_cache/texture_cache.c
+@@ -319,7 +319,7 @@ tex_xfer_thread__entry_point(void *p)
+     R_Handle texture = {0};
+     if(got_task && top.dim.x > 0 && top.dim.y > 0 && data.size >= (U64)top.dim.x*(U64)top.dim.y*(U64)r_tex2d_format_bytes_per_pixel_table[top.fmt])
+     {
+-      texture = r_tex2d_alloc(R_Tex2DKind_Static, v2s32(top.dim.x, top.dim.y), top.fmt, data.str);
++      texture = r_tex2d_alloc(R_ResourceKind_Static, v2s32(top.dim.x, top.dim.y), top.fmt, data.str);
+     }
+     
+     //- rjf: commit results to cache

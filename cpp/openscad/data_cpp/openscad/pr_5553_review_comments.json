@@ -1,0 +1,236 @@
+[
+    {
+        "title": "Start rotate_extrude on -X only for no angle specified."
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "Start on +X when an angle is specified, including 360.\r\n\r\nRef #1886, #3972.\r\n\r\nExisting behavior is that when the angle parameter is not specified or is bad (undef, NaN, et cetera) it defaults to 360, and that when the angle parameter is 360 (whether by default or explicitly) the extrusion starts along the -X axis.  All *other* values for angle, and circles and cylinders, have the extrusion start along +X.  (The difference is in whether an odd-number-of-sides shape has a point on the left and flat on the right, or vice versa.)\r\n\r\nThe behavior of rotate_extrude with no angle specified is, unfortunately, pretty much nailed down by backward compatibility concerns.  I say \"unfortunately\", because it requires workaround to have a rotate_extrude align with, say, a cylinder.  However, rotate_extrude *with* an angle supplied is more recent, and the explicit angle=360 case is very much a special case; a caller who wants 360 degrees is more likely to omit the parameter entirely.\r\n\r\nThis change keeps the unspecified-angle case starting on -X, but changes the angle=360 case so that it starts on +X, consistent with other angles and with circles and cylinders.\r\n\r\nOne subtle effect:  when exporting to CSG, current behavior emits an explicit \"angle=360\" for both the unspecified-angle case and the angle=360 case.  That would mean that CSG couldn't distinguish the two cases.  This change drops the angle parameter from the CSG output when it wasn't specified in the OpenSCAD input, so that CSG executed as OpenSCAD input behaves as expected."
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "My local test runs show no differences in the images created.  I changed the CSG-dump tests to remove the explicit \"angle=\" in those cases where the OpenSCAD input did not specify an angle.\r\n\r\nI wrote a specialty test program to examine the models resulting for several interesting cases.\r\n\r\nHere's the old output for various angles and whether the 2D shape is in +X or -X:\r\n![Rlh5rmC7F03nEKVU](https://github.com/user-attachments/assets/cbb8627b-8f75-42c5-8116-085faa92f57d)\r\n\r\nHere's the new output:\r\n![PMtcfSrh8A9gkNrT](https://github.com/user-attachments/assets/1cbe9bba-5086-4aa2-91f9-79f646bd0ae9)\r\n\r\nNote that they differ only for explicit 360 and -360.\r\n"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Still narrower case:  explicit angles greater than 360 or less than -360 are clamped to \u00b1360.  In the current release, their extrusion is then started on -X.  With this change they are still clamped to \u00b1360, but are considered to be \"explicit angle\" cases and so start on +X.\r\n\r\nThe only cases that start on -X are\r\n* No angle specified.\r\n* Angle specified cannot be converted to a finite number.\r\n"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Here's the test program mentioned above (but with an additional case for angle>360):\r\n```\r\ncases = [\r\n    [ undef, 1 ],\r\n    [ undef, -1 ],\r\n    [ 360, 1 ],\r\n    [ 360, -1],\r\n    [ -360, 1 ],\r\n    [ -360, -1],\r\n    [ 300, 1 ],\r\n    [ 300, -1 ],\r\n    [ -300, 1 ],\r\n    [ -300, -1 ],\r\n    [ 1360, 1 ],\r\n    [ 1360, -1],\r\n];\r\n\r\nfor (i = [ 0: len(cases)-1 ])\r\n    translate([i*4,0,0]) {\r\n        angle = cases[i][0];\r\n        center = cases[i][1];\r\n        rotate_extrude(angle=angle)\r\n            translate([center,0])\r\n                square(center=true);\r\n        color(\"black\") linear_extrude(height=0.001) {\r\n            translate([0,3]) text(str(angle), size=0.5, halign=\"center\");\r\n            translate([0,2]) text(center < 0 ? \"-X\" : \"+X\", size=0.5, halign=\"center\");\r\n        }\r\n    }\r\n```"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Another possibility for CSG would be to emit `angle=undef`, but that seems more likely to cause problems for hypothetical non-OpenSCAD consumers."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "It would be nice to deprecate the behavior for no-angle-specified, so that we could eventually flip it around and have everything consistent.  However, I'm not really sure how to do that without having the warnings be unreasonably intrusive - for every person who is depending on the start-on-negative-X behavior, there are probably ten who aren't.  Maybe the answer would be to warn only on no angle supplied *and* $fn supplied, which is the people most likely to be depending on the behavior."
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "I generally agree that this is a good thing, but the one thing I don't like is that dumping the file and reading it back yields different results. It would be really nice to be able to continue to rely on that behavior, even if it's just for internal consistency.\r\n\r\nI'll think about it for a bit."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "> the one thing I don't like is that dumping the file and reading it back yields different results.\r\n\r\nHmm?  I have the generated CSG mirroring the input OpenSCAD.  If you don't specify an angle in the input OpenSCAD, it doesn't appear in the generated CSG, and so the results when you execute that generated CSG as OpenSCAD should be the same as for the original.\r\n"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "A more general approach would be to add, to both OpenSCAD and the generated CSG, a \"start\" parameter that gives the angle of the start of the extrusion.  The default \"start\" would be zero, except if the arc-angle is not specified then the default \"start\" would be 180.  Such a mechanism would allow the CSG to not depend on the \"magic\" behavior of a missing \"angle\" parameter.\r\n\r\nIt would add a small amount of convenience, in that you could start your extrusion at whatever angle you needed, instead of having it always start at zero and needing to rotate it into place.  But that rotation is a very small cost.\r\n"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "That is, `rotate_extrude()` would turn into `rotate_extrude(angle=360, start=180)`, while `rotate_extrude(angle=360)` would turn into `rotate_extrude(angle=360, start=0)`.\r\n"
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "Actually, specifying a start angle is not a bad idea. I still need to weight the pros/cons.\r\nIt's the special-case stuff that's bothering me the most; but I think it would be find if we could deprecate some legacy variants, and offer special case handling of that, and eventually kill it.\r\n..basically aim for the future to be clean and accept temporary mess :)"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Yes, special cases are bad.  For the time being at least, we're stuck with the special case where not specifying \"angle\" causes the extrusion to start on -X.  The question here is whether that special case should extend to angle=360.\r\n\r\nAnd yes, we should always be moving towards cleaner answers, even at a modest cost in compatibility."
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "Some thoughts, structured as alternatives. Will let it simmer for a bit, but feel free to comment / edit the pros/cons:\r\n\r\n**A: Simply change the default start angle to 0, as a potentially breaking change**\r\n   **+** Cleanest solution\r\n   **-** Breaks existing behavior \r\n   **-** Bad for people relying on existing behavior, and no trivial way to detect (would need to add a rotation() to reinstate existing behavior).\r\n\r\n**B: Change the default start angle only when manually specifying angle=. Same idea as **A**, but only breaks for a subset of usages.**\r\n   **-** Breaks existing behavior\r\n   **+** ..but # of people effected is likely extremely small.\r\n   **-** We need a special-case CSG export to be able to re-import, which is suboptimal.\r\n   **-** Uses conditional defaults, which is suboptimal\r\n\r\n**C: Introduce start=, defaulting to 0**\r\n   **+** Equally clean solution as **A**\r\n   **+** start= could be a nice feature to have in general\r\n   **-** Same negatives as *A*\r\n   **+** .. but offers a trivial fix (start=180) for people affected.\r\n\r\n**D: Introduce start= but default it to 180 if no parameters or angle=360**\r\n   **+** Same positives as *C*\r\n   **-** Uses conditional defaults, which is suboptimal\r\n\r\n**E: Introduce start= but default it to 180 if no parameters.**\r\n   **+** Same positives as *D*\r\n   **-** ..but breaks existing behavior, but # of people effected is likely extremely small.\r\n   **-** Same negatives as *D*\r\n   **+** ..but slightly more structured than **D** as we'll only have a single special case (no parameters)\r\n\r\n**F: Introduce \"start=\" and default to 180 if no parameters, but warn if no parameters and $fn odd**\r\n   **+** Same positives as **E**\r\n   **+** Same negatives as **E**\r\n   **+** Prepares for a clean future, where we always default to start=0\r\n   **-** Could cause lots of unnecessary warnings.\r\n\r\n**G: Introduce start= and deprecate and warn on parameterless instantiation, but offer existing behavior until next release.**\r\n   **+** Carves out a path for a clean future situation \r\n   **-** Bad for people who don't care about starting angle, as it would cause lots of unnecessary warnings. We could potentially issue warnings only when $fn evaluates to an odd number.\r\n\r\n**H: Deprecate rotate_extrude() and start fresh**\r\n   **+** Good for new sweep-related innovations\r\n   **-** Hard to pull off before next release\r\n   **-** Requires a new sweep() feature to offer good shortcuts for simple cases.\r\n\r\n"
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "> A: Simply change the default start angle to 0, as a potentially breaking change\r\n\r\nAgree.\r\n\r\n> B: Change the default start angle only when manually specifying angle=. Same idea as A, but only breaks for a subset of usages.\r\n\r\nThis is the proposed behavior.  Note that it only changes the behavior when the angle is explicitly set to 360 or is explicitly set but clamped to 360.\r\n\r\nNote that changing how CSG export works is only a couple of lines, and the proposed change does it.  However, it's ugly in that CSG normally fully populates all parameters.\r\n\r\n> C: Introduce start=, defaulting to 0\r\n\r\nAgree.  Also adds the \"start\" feature.  (Which is a very minor one, since it's equivalent to `rotate(start) ...`.)\r\n\r\n> D: Introduce start= but default it to 180 if no parameters or angle=360\r\n\r\nSo start=0 is the way to get a full extrusion started on +X, which is the point of this work.\r\nYou say \"same negatives as C\", which recursively means \"same negatives as A\", which is \"breaks existing behavior\", but this option does *not* break existing behavior.  The only negative is that it leaves the unclean behavior that angle=359 and angle=360 start in different places.\r\n\r\n> E: Introduce start= but default it to 180 if no parameters.\r\n\r\nThis is the same as B, but adds \"start\" for additional flexibility and to make the CSG picture clearer.\r\n\r\n> F: Introduce start= and deprecate and warn on parameterless instantiation, but offer existing behavior until next release.\r\n\r\nLots and lots of unnecessary warnings.  Maybe warn on parameterless invocation with $fn set.  But even then, there's a lot of people who set $fn globally.  Maybe only warn when $fn is set to an odd number.\r\n\r\n> G: Deprecate rotate_extrude() and start fresh\r\n\r\nEven with general sweep, I think you'll want a simple rotational extrusion and a simple linear extrusion.  Those are common enough that they need the simplest possible invocation.  **Maybe** if you could say `extrude(circle(10)) ...` and `extrude(zline(10))` or something like that."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "H:  Introduce \"start\" and default to 180 if no parameters, as in E, but warn if no parameters and $fn odd, in preparation for a future transition to always defaulting to 0, as in F."
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "Thanks for comments, I edited my overview to address the issues you pointed out and inserted your suggested **H** as **F** and renumbered the remaining items. (and hid your comments to avoid confusion)"
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "My current evaluation:\r\n* Try to avoid issuing warnings, hoping to clean up later. While ideal in the future, I've been thinking a bit about this: I don't have a good sense of what $fn typically ends up being, but my fear is that even odd $fn could cause a lot of false positive warnings.\r\n* **H: Deprecate rotate_extrude()** might be a good long-term solution, but not for a few years\r\n* My current vote would be **E: Introduce start= but default it to 180 if no parameters.**. My main concern is that conditional defaults could make things less structured, but I haven't really thought it through."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Note that any $fn proposal is only for an explicitly-specified $fn, not for the \"effective\" $fn that's calculated from $fa and $fs.  Many people will explicitly set $fn to 50 or 64 or 100 or 500, trying to get a high-precision circle.  How many will explicitly set it to an odd number while trying to generate a circle (vs a regular polygon)?\r\n\r\nOf course, even somebody who is trying to generate a triangle may not care about the alignment.\r\n"
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "You might be right :) If you otherwise agree, implementing **F: Introduce \"start=\" and default to 180 if no parameters, but warn if no parameters and $fn odd**, and evaluate the warning as we go, could be a good solution."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "Will do."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "That push adds `start` and the deprecation warning discussed.\r\n\r\nNote:  I'm seeing two test failures:\r\n```\r\nThe following tests FAILED:\r\n        645 - previewtest_issue1105d (Failed)\r\n        1609 - previewmanifoldtest_issue1105d (Failed)\r\n```\r\n\r\nbut in looking at the images, it looks like the \"expected\" images have small flaws that this new version fixes.  (I don't immediately know *why* it fixes them, but I did clean up the math some.)\r\n\r\nAssuming that the CI tests show the same failures, it would be good if somebody else would take a look at the images and opine.\r\n"
+    },
+    {
+        "author": {
+            "login": "kintel"
+        },
+        "body": "I see the same failure locally. The old goldens look like they have a convexity-related artifact. I say regenerate."
+    },
+    {
+        "author": {
+            "login": "jordanbrown0"
+        },
+        "body": "The flaws are just convexity artifacts.  I don't know why they moved or disappeared, but it may be relevant that the old implementation did \"full\" extrusions clockwise, while I do all extrusions counter-clockwise.  The right fix is to bump the convexity up to 4 and fix the images."
+    },
+    {
+        "data": {
+            "repository": {
+                "issue": {
+                    "title": "rotate_extrude and cylinders with $fn have sides which don't align",
+                    "body": "I couldn't find a reference to a bug similar to this. I'm running a nightly debian build 20161201T231538.git5192388-1734.1, after suggestion to do so to resolve a dxf/svg import issue via irc.\r\n\r\nHaving both a cylinder and doing a rotate_extrude on a 2D shape, each with $fn set to finite values, leads to edges (sides) which don't align properly due to different rotational offsets, as illustrated by the following:\r\n```\r\ncoin_diameter=40;\r\ncoin_thickness=2;\r\nring_height=1;\r\nslope_inset=1.5; // non-zero values add slope inside ring (eating into text_padding)\r\nsides=7; // or 0 for default (~round)\r\nside_rotation=90;\r\nwidth_to_fit_text=35;\r\n\r\nrotate_extrude_extra_angle=180/sides; // Necessary to ensure sides>0 has edges which align\r\n// =========================================================================\r\nrotate([0,0,side_rotation])\r\ndifference()\r\n{\r\n  cylinder(r=coin_diameter/2,h=ring_height+coin_thickness,$fn=sides);\r\n  translate([0,0,coin_thickness]) \r\n    cylinder(r=width_to_fit_text/2,h=ring_height+1,$fn=sides);\r\n}\r\n\r\nif (slope_inset>0)\r\n{\r\n  overlap=1;\r\n  rotate([0,0,side_rotation+rotate_extrude_extra_angle])\r\n  rotate_extrude($fn=sides)\r\n  polygon(points=[[width_to_fit_text/2-slope_inset,coin_thickness],\r\n                  [width_to_fit_text/2,ring_height+coin_thickness],\r\n                  [overlap+width_to_fit_text/2,ring_height+coin_thickness], // into ring\r\n                  [width_to_fit_text/2,coin_thickness]]);\r\n}\r\n```\r\n\r\n<bountysource-plugin>\r\n\r\n---\r\nWant to back this issue? **[Post a bounty on it!](https://app.bountysource.com/issues/39819431-rotate_extrude-and-cylinders-with-fn-have-sides-which-don-t-align?utm_campaign=plugin&utm_content=tracker%2F52063&utm_medium=issues&utm_source=github)** We accept bounties via [Bountysource](https://app.bountysource.com/?utm_campaign=plugin&utm_content=tracker%2F52063&utm_medium=issues&utm_source=github).\r\n</bountysource-plugin>",
+                    "state": "CLOSED",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {
+                                    "login": "thehans"
+                                },
+                                "body": "Yes this is a particular inconsistency in the way that rotate_extrude works.  \r\n\r\nIn early code, before rotate_extrude had an angle parameter, it was implemented such that it started drawing the points from the negative x-axis, instead of positive x.  IMO, this behavior was a mistake from the start, but has been purposely kept for legacy support (so people's older scripts don't break).  So its actually rotated a complete 180 degrees, regardless of the number of sides;  and rotate_extrude_extra_angle=180 would also have worked in your example.\r\n\r\nHowever, if an angle parameter other than 360 is given, the newer angle functionality starts the first point at the more logical positive x-axis, (where angle=0 by convention for cartesian system).\r\nSo you can potentially do a kludge like:  rotate_extrude($fa=359.999/sides, angle=359.999)  \r\nand it would appear how you want without any rotate_extrude_extra_angle\r\n(but that would also leave a sliver of a gap that might mess up your model).  Just saying, as an example.\r\n\r\nThe related code is here in case you are curious:\r\nhttps://github.com/openscad/openscad/blob/4a0ac7b2fa6e8ca390e3b95e1c2d2541cf9d77af/src/GeometryEvaluator.cc#L868\r\n\r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "kintel"
+                                },
+                                "body": "We might clean up some of these things if we do a major language overhaul in the future, but changing this now is likely to break existing designs."
+                            },
+                            {
+                                "author": {
+                                    "login": "neiljp"
+                                },
+                                "body": "Has there been a release with the angle=* feature? If not, could angle=360 work consistently and leave the no-parameter version as backward-compatible?\r\n\r\nIf an angle not 360 uses a different rotation... well I appreciate the desire to break designs, but that's worse IMO.\r\n\r\nCould openscad determine the version used to (last) save the file and work accordingly, or something like that?\r\n\r\nRe the label, while I appreciate it was a design decision and so arguably not a bug as such, perhaps also adding a reason such as 'backwards compatibility' or 'language inconsistency' would be good. Do you intend to leave this open?\r\n\r\nThanks for the feedback. Is this behaviour documented?"
+                            },
+                            {
+                                "author": {
+                                    "login": "kintel"
+                                },
+                                "body": "There's only been development snapshots with the `angle=` feature, so it's still possible to change it.\r\nI have to think about this.\r\n\r\nWe currently don't have a versioning scheme for .scad files, but we're looking into ways of solving this. One way is to do a major overhaul and thus force people to upgrade their syntax (where we could automatically flip rotate_extrudes with an odd number of segments). Another way is to introduce a version header.\r\n\r\nI didn't close yet - before closing we should take note of this somewhere.\r\n\r\nDocumentation isn't clear on this. Do you want to take a stab at clarifying it? https://en.wikibooks.org/wiki/OpenSCAD_User_Manual/2D_to_3D_Extrusion#Rotate_Extrude\r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "neiljp"
+                                },
+                                "body": "Options I see (as a new user):\r\n1) leave it as currently coded, with explicit documentation of the 180 degree offset in the docs\r\n2) have that specifying angle=* switches the default rotation axis to that used elsewhere\r\n3) have that specifying angle=* switches to the proper axis (as above), with angle=-360 (note minus) being the default, implying the reverse angle - this also would allow use of different orientations by users? (better/explicit/extensible version of (2))\r\n4) introduce a new command which allows partial angles (ie accepts angle=*), with new default value behaviour that fits that elsewhere; potentially deprecate old command later, converting eg. rotate_extrude() to angular_extrude(-360), and allowing use of angular_extrude() and angular_extrude(360) to match angular behaviour of cylinders etc.\r\n\r\nFor me, (3) would be bearable, though still surprising (default of -360, vs 360); (4) would be best IMO.\r\n\r\nNo issue for tracking .scad versioning? (to cross-reference to this :))\r\n\r\nCould look at docs at some point, but would be good to find out if there's a plan too :)\r\nThe wikibook is the accepted documentation?"
+                            },
+                            {
+                                "author": {
+                                    "login": "Ma-XX-oN"
+                                },
+                                "body": "If I'm understanding this thread correctly, this is the result of backward compatibility issue?\r\n\r\nTo maintain legacy support, why not have another parameter that is a start angle (referenced against +ve X-axis).  This would default to 180 to make it backward compatible, but could be set to 0 to make it more intuitive.\r\n\r\nBTW, what is meant by `angle=*`.  Is this a new syntax?\r\n\r\nOne other question, can the angle wedge be taken from anywhere?  I.e. can I specify an angle between 30-90 as opposed to 0-60?  This would make a difference depending on what $fn is."
+                            },
+                            {
+                                "author": {
+                                    "login": "kintel"
+                                },
+                                "body": "I don't think there is an issue for tracking scad file versioning.\r\nThe wikibooks docs is the reference manual.\r\n\r\nI'm uncertain about adding sugar to specify start angle. having rotation and sweep angle orthogonal may make sense as you could e.g. do `rotate(30) rotate_extrude(angle=60)`.\r\n\r\nI agree that a new module may be the cleanest. For completeness, we might then want to look at naming scheme of `linear_extrude()` as well."
+                            },
+                            {
+                                "author": {
+                                    "login": "neiljp"
+                                },
+                                "body": "I only came up with it as a simple idea, but linear_ and angular_extrude seem like good parallels to me :)"
+                            },
+                            {
+                                "author": {
+                                    "login": "indazoo"
+                                },
+                                "body": "Hi\r\nI just stumbled over this also. Come on guys, the last official release is 2015! Rotate_extrude not even knew the angle parameter , I think. So you only \"break\" scripts with full turns. So \"only\" small overlapping errors for uneven(!) $fn values will appear in a future major release.\r\nOn the other side, if you leave it this way, and release it, then everybody using rotate_extrude will fall into this \"feature\" and have to adjust his design so it looks good. This feature is especially annoying if you do parametric models with an adjustable opening from 0 to 360 degree. Then, your thingy looks different with 0  degree in contrast when the user inputs 1 degree.\r\n\r\nrotate_extrude suffers from these problems:\r\n1. as mentioned above the different start point in contrast to cylinder()\r\n2. the \"fix\" with using angles other than 0 and 360 to use another starting point\r\n3. the more problematic one: If you do a cylinder with $fn=13 and then use rotate_extrude() with an angle value of say 355 degree to create an overlapping/attachment to the cylinder, the facets of the polygons do not match. rotate_extrude() calculates its step angle by itself. Yes I know this is difficult to solve, because the resulting mesh of rotate_extrude() should use the angle step size of $fn as cylinder() does but then may have to draw an \"uncomplete\" facet to draw the last degrees.\r\n\r\nI vote for fixing it. \r\nThank you\r\n"
+                            },
+                            {
+                                "author": {
+                                    "login": "kintel"
+                                },
+                                "body": "Closing as angle= has been released for years now, and we deem this to be a minor enough issue that we can live with it"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+]

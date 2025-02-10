@@ -1,0 +1,790 @@
+diff --git a/nav2_graceful_controller/include/nav2_graceful_controller/graceful_controller.hpp b/nav2_graceful_controller/include/nav2_graceful_controller/graceful_controller.hpp
+index 1a77a3adfc6..209ff616f30 100644
+--- a/nav2_graceful_controller/include/nav2_graceful_controller/graceful_controller.hpp
++++ b/nav2_graceful_controller/include/nav2_graceful_controller/graceful_controller.hpp
+@@ -107,33 +107,23 @@ class GracefulController : public nav2_core::Controller
+   void setSpeedLimit(const double & speed_limit, const bool & percentage) override;
+ 
+ protected:
+-  /**
+-   * @brief Get motion target point.
+-   * @param motion_target_dist Optimal motion target distance
+-   * @param path Current global path
+-   * @return Motion target point
+-   */
+-  geometry_msgs::msg::PoseStamped getMotionTarget(
+-    const double & motion_target_dist,
+-    const nav_msgs::msg::Path & path);
+-
+   /**
+    * @brief Simulate trajectory calculating in every step the new velocity command based on
+    * a new curvature value and checking for collisions.
+    *
+-   * @param robot_pose Robot pose
+-   * @param motion_target Motion target point
++   * @param motion_target Motion target point (in costmap local frame?)
+    * @param costmap_transform Transform between global and local costmap
+    * @param trajectory Simulated trajectory
++   * @param cmd_vel Initial command velocity during simulation
+    * @param backward Flag to indicate if the robot is moving backward
+    * @return true if the trajectory is collision free, false otherwise
+    */
+   bool simulateTrajectory(
+-    const geometry_msgs::msg::PoseStamped & robot_pose,
+     const geometry_msgs::msg::PoseStamped & motion_target,
+     const geometry_msgs::msg::TransformStamped & costmap_transform,
+     nav_msgs::msg::Path & trajectory,
+-    const bool & backward);
++    geometry_msgs::msg::TwistStamped & cmd_vel,
++    bool backward);
+ 
+   /**
+    * @brief Rotate the robot to face the motion target with maximum angular velocity.
+@@ -141,8 +131,7 @@ class GracefulController : public nav2_core::Controller
+    * @param angle_to_target Angle to the motion target
+    * @return geometry_msgs::msg::Twist Velocity command
+    */
+-  geometry_msgs::msg::Twist rotateToTarget(
+-    const double & angle_to_target);
++  geometry_msgs::msg::Twist rotateToTarget(double angle_to_target);
+ 
+   /**
+    * @brief Checks if the robot is in collision
+@@ -153,6 +142,21 @@ class GracefulController : public nav2_core::Controller
+    */
+   bool inCollision(const double & x, const double & y, const double & theta);
+ 
++  /**
++   * @brief Compute the distance to each pose in a path
++   * @param poses Poses to compute distances with
++   * @param distances Computed distances
++   */
++  void computeDistanceAlongPath(
++    const std::vector<geometry_msgs::msg::PoseStamped> & poses,
++    std::vector<double> & distances);
++
++  /**
++   * @brief Control law requires proper orientations, not all planners provide them
++   * @param path Path to add orientations into, if required
++   */
++  void validateOrientations(std::vector<geometry_msgs::msg::PoseStamped> & path);
++
+   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+   std::string plugin_name_;
+   std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros_;
+@@ -164,6 +168,9 @@ class GracefulController : public nav2_core::Controller
+   double goal_dist_tolerance_;
+   bool goal_reached_;
+ 
++  // True from the time a new path arrives until we have completed an initial rotation
++  bool do_initial_rotation_;
++
+   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>> transformed_plan_pub_;
+   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>> local_plan_pub_;
+   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PointStamped>>
+diff --git a/nav2_graceful_controller/include/nav2_graceful_controller/parameter_handler.hpp b/nav2_graceful_controller/include/nav2_graceful_controller/parameter_handler.hpp
+index 7594524cf0f..dd4d4df09ce 100644
+--- a/nav2_graceful_controller/include/nav2_graceful_controller/parameter_handler.hpp
++++ b/nav2_graceful_controller/include/nav2_graceful_controller/parameter_handler.hpp
+@@ -33,7 +33,8 @@ namespace nav2_graceful_controller
+ struct Parameters
+ {
+   double transform_tolerance;
+-  double motion_target_dist;
++  double min_lookahead;
++  double max_lookahead;
+   double max_robot_pose_search_dist;
+   double k_phi;
+   double k_delta;
+@@ -44,12 +45,14 @@ struct Parameters
+   double v_linear_max_initial;
+   double v_angular_max;
+   double v_angular_max_initial;
++  double v_angular_min_in_place;
+   double slowdown_radius;
+   bool initial_rotation;
+-  double initial_rotation_min_angle;
+-  bool final_rotation;
++  double initial_rotation_tolerance;
++  bool prefer_final_rotation;
+   double rotation_scaling_factor;
+   bool allow_backward;
++  double in_place_collision_resolution;
+ };
+ 
+ /**
+diff --git a/nav2_graceful_controller/src/graceful_controller.cpp b/nav2_graceful_controller/src/graceful_controller.cpp
+index b442ede1fef..fea723c0095 100644
+--- a/nav2_graceful_controller/src/graceful_controller.cpp
++++ b/nav2_graceful_controller/src/graceful_controller.cpp
+@@ -114,6 +114,9 @@ geometry_msgs::msg::TwistStamped GracefulController::computeVelocityCommands(
+ {
+   std::lock_guard<std::mutex> param_lock(param_handler_->getMutex());
+ 
++  geometry_msgs::msg::TwistStamped cmd_vel;
++  cmd_vel.header = pose.header;
++
+   // Update for the current goal checker's state
+   geometry_msgs::msg::Pose pose_tolerance;
+   geometry_msgs::msg::Twist velocity_tolerance;
+@@ -129,64 +132,15 @@ geometry_msgs::msg::TwistStamped GracefulController::computeVelocityCommands(
+   control_law_->setSlowdownRadius(params_->slowdown_radius);
+   control_law_->setSpeedLimit(params_->v_linear_min, params_->v_linear_max, params_->v_angular_max);
+ 
+-  // Transform path to robot base frame and publish it
++  // Transform path to robot base frame
+   auto transformed_plan = path_handler_->transformGlobalPlan(
+     pose, params_->max_robot_pose_search_dist);
+-  transformed_plan_pub_->publish(transformed_plan);
+ 
+-  // Get the particular point on the path at the motion target distance and publish it
+-  auto motion_target = getMotionTarget(params_->motion_target_dist, transformed_plan);
+-  auto motion_target_point = nav2_graceful_controller::createMotionTargetMsg(motion_target);
+-  motion_target_pub_->publish(motion_target_point);
+-
+-  // Publish marker for slowdown radius around motion target for debugging / visualization
+-  auto slowdown_marker = nav2_graceful_controller::createSlowdownMarker(
+-    motion_target,
+-    params_->slowdown_radius);
+-  slowdown_pub_->publish(slowdown_marker);
+-
+-  // Compute distance to goal as the path's integrated distance to account for path curvatures
+-  double dist_to_goal = nav2_util::geometry_utils::calculate_path_length(transformed_plan);
++  // Add proper orientations to plan, if needed
++  validateOrientations(transformed_plan.poses);
+ 
+-  // If the distance to the goal is less than the motion target distance, i.e.
+-  // the 'motion target' is the goal, then we skip the motion target orientation by pointing
+-  // it in the same orientation that the last segment of the path
+-  double angle_to_target = atan2(motion_target.pose.position.y, motion_target.pose.position.x);
+-  if (params_->final_rotation && dist_to_goal < params_->motion_target_dist) {
+-    geometry_msgs::msg::PoseStamped stl_pose =
+-      transformed_plan.poses[transformed_plan.poses.size() - 2];
+-    geometry_msgs::msg::PoseStamped goal_pose = transformed_plan.poses.back();
+-    double dx = goal_pose.pose.position.x - stl_pose.pose.position.x;
+-    double dy = goal_pose.pose.position.y - stl_pose.pose.position.y;
+-    double yaw = std::atan2(dy, dx);
+-    motion_target.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
+-  }
+-
+-  // Flip the orientation of the motion target if the robot is moving backwards
+-  bool reversing = false;
+-  if (params_->allow_backward && motion_target.pose.position.x < 0.0) {
+-    reversing = true;
+-    motion_target.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(
+-      tf2::getYaw(motion_target.pose.orientation) + M_PI);
+-  }
+-
+-  // Compute velocity command:
+-  // 1. Check if we are close enough to the goal to do a final rotation in place
+-  // 2. Check if we must do a rotation in place before moving
+-  // 3. Calculate the new velocity command using the smooth control law
+-  geometry_msgs::msg::TwistStamped cmd_vel;
+-  cmd_vel.header = pose.header;
+-  if (params_->final_rotation && (dist_to_goal < goal_dist_tolerance_ || goal_reached_)) {
+-    goal_reached_ = true;
+-    double angle_to_goal = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
+-    cmd_vel.twist = rotateToTarget(angle_to_goal);
+-  } else if (params_->initial_rotation && // NOLINT
+-    fabs(angle_to_target) > params_->initial_rotation_min_angle)
+-  {
+-    cmd_vel.twist = rotateToTarget(angle_to_target);
+-  } else {
+-    cmd_vel.twist = control_law_->calculateRegularVelocity(motion_target.pose, reversing);
+-  }
++  // Publish plan for visualization
++  transformed_plan_pub_->publish(transformed_plan);
+ 
+   // Transform local frame to global frame to use in collision checking
+   geometry_msgs::msg::TransformStamped costmap_transform;
+@@ -199,24 +153,108 @@ geometry_msgs::msg::TwistStamped GracefulController::computeVelocityCommands(
+       logger_, "Could not transform %s to %s: %s",
+       costmap_ros_->getBaseFrameID().c_str(), costmap_ros_->getGlobalFrameID().c_str(),
+       ex.what());
+-    return cmd_vel;
++    throw ex;
+   }
+ 
+-  // Generate and publish local plan for debugging / visualization
+-  nav_msgs::msg::Path local_plan;
+-  if (!simulateTrajectory(pose, motion_target, costmap_transform, local_plan, reversing)) {
+-    throw nav2_core::NoValidControl("Collision detected in the trajectory");
++  // Compute distance to goal as the path's integrated distance to account for path curvatures
++  double dist_to_goal = nav2_util::geometry_utils::calculate_path_length(transformed_plan);
++
++  // If we've reached the XY goal tolerance, just rotate
++  if (dist_to_goal < goal_dist_tolerance_ || goal_reached_) {
++    goal_reached_ = true;
++    double angle_to_goal = tf2::getYaw(transformed_plan.poses.back().pose.orientation);
++    // Check for collisions between our current pose and goal pose
++    size_t num_steps = fabs(angle_to_goal) / params_->in_place_collision_resolution;
++    // Need to check at least the end pose
++    num_steps = std::max(static_cast<size_t>(1), num_steps);
++    bool collision_free = true;
++    for (size_t i = 1; i <= num_steps; ++i) {
++      double step = static_cast<double>(i) / static_cast<double>(num_steps);
++      double yaw = step * angle_to_goal;
++      geometry_msgs::msg::PoseStamped next_pose;
++      next_pose.header.frame_id = costmap_ros_->getBaseFrameID();
++      next_pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
++      geometry_msgs::msg::PoseStamped costmap_pose;
++      tf2::doTransform(next_pose, costmap_pose, costmap_transform);
++      if (inCollision(
++          costmap_pose.pose.position.x, costmap_pose.pose.position.y,
++          tf2::getYaw(costmap_pose.pose.orientation)))
++      {
++        collision_free = false;
++        break;
++      }
++    }
++    // Compute velocity if rotation is possible
++    if (collision_free) {
++      cmd_vel.twist = rotateToTarget(angle_to_goal);
++      return cmd_vel;
++    }
++    // Else, fall through and see if we should follow control law longer
+   }
+-  local_plan.header = transformed_plan.header;
+-  local_plan_pub_->publish(local_plan);
+ 
+-  return cmd_vel;
++  // Precompute distance to candidate poses
++  std::vector<double> target_distances;
++  computeDistanceAlongPath(transformed_plan.poses, target_distances);
++
++  // Work back from the end of plan to find valid target pose
++  for (int i = transformed_plan.poses.size() - 1; i >= 0; --i) {
++    // Underlying control law needs a single target pose, which should:
++    //  * Be as far away as possible from the robot (for smoothness)
++    //  * But no further than the max_lookahed_ distance
++    //  * Be feasible to reach in a collision free manner
++    geometry_msgs::msg::PoseStamped target_pose = transformed_plan.poses[i];
++    double dist_to_target = target_distances[i];
++
++    // Continue if target_pose is too far away from robot
++    if (dist_to_target > params_->max_lookahead) {continue;}
++
++    if (dist_to_goal < params_->max_lookahead) {
++      if (params_->prefer_final_rotation) {
++        // Avoid unstability and big sweeping turns at the end of paths by
++        // ignoring final heading
++        double yaw = std::atan2(target_pose.pose.position.y, target_pose.pose.position.x);
++        target_pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
++      }
++    } else if (dist_to_target < params_->min_lookahead) {
++      // Make sure target is far enough away to avoid instability
++      break;
++    }
++
++    // Flip the orientation of the motion target if the robot is moving backwards
++    bool reversing = false;
++    if (params_->allow_backward && target_pose.pose.position.x < 0.0) {
++      reversing = true;
++      target_pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(
++        tf2::getYaw(target_pose.pose.orientation) + M_PI);
++    }
++
++    // Actually simulate our path
++    nav_msgs::msg::Path local_plan;
++    if (simulateTrajectory(target_pose, costmap_transform, local_plan, cmd_vel, reversing)) {
++      // Successfully simulated to target_pose - compute velocity at this moment
++      // Publish the selected target_pose
++      auto motion_target_point = nav2_graceful_controller::createMotionTargetMsg(target_pose);
++      motion_target_pub_->publish(motion_target_point);
++      // Publish marker for slowdown radius around motion target for debugging / visualization
++      auto slowdown_marker = nav2_graceful_controller::createSlowdownMarker(
++        target_pose, params_->slowdown_radius);
++      slowdown_pub_->publish(slowdown_marker);
++      // Publish the local plan
++      local_plan.header = transformed_plan.header;
++      local_plan_pub_->publish(local_plan);
++      // Successfully found velocity command
++      return cmd_vel;
++    }
++  }
++
++  throw nav2_core::NoValidControl("Collision detected in trajectory");
+ }
+ 
+ void GracefulController::setPlan(const nav_msgs::msg::Path & path)
+ {
+   path_handler_->setPlan(path);
+   goal_reached_ = false;
++  do_initial_rotation_ = true;
+ }
+ 
+ void GracefulController::setSpeedLimit(
+@@ -243,58 +281,66 @@ void GracefulController::setSpeedLimit(
+   }
+ }
+ 
+-geometry_msgs::msg::PoseStamped GracefulController::getMotionTarget(
+-  const double & motion_target_dist,
+-  const nav_msgs::msg::Path & transformed_plan)
+-{
+-  // Find the first pose which is at a distance greater than the motion target distance
+-  auto goal_pose_it = std::find_if(
+-    transformed_plan.poses.begin(), transformed_plan.poses.end(), [&](const auto & ps) {
+-      return std::hypot(ps.pose.position.x, ps.pose.position.y) >= motion_target_dist;
+-    });
+-
+-  // If the pose is not far enough, take the last pose
+-  if (goal_pose_it == transformed_plan.poses.end()) {
+-    goal_pose_it = std::prev(transformed_plan.poses.end());
+-  }
+-
+-  return *goal_pose_it;
+-}
+-
+ bool GracefulController::simulateTrajectory(
+-  const geometry_msgs::msg::PoseStamped & robot_pose,
+   const geometry_msgs::msg::PoseStamped & motion_target,
+   const geometry_msgs::msg::TransformStamped & costmap_transform,
+-  nav_msgs::msg::Path & trajectory, const bool & backward)
++  nav_msgs::msg::Path & trajectory,
++  geometry_msgs::msg::TwistStamped & cmd_vel,
++  bool backward)
+ {
+-  // Check for collision before moving
+-  if (inCollision(
+-      robot_pose.pose.position.x, robot_pose.pose.position.y,
+-      tf2::getYaw(robot_pose.pose.orientation)))
+-  {
+-    return false;
+-  }
++  trajectory.poses.clear();
+ 
+-  // First pose
++  // First pose is robot current pose
+   geometry_msgs::msg::PoseStamped next_pose;
+   next_pose.header.frame_id = costmap_ros_->getBaseFrameID();
+   next_pose.pose.orientation.w = 1.0;
+-  trajectory.poses.push_back(next_pose);
++
++  // Should we simulate rotation initially?
++  bool sim_initial_rotation = do_initial_rotation_ && params_->initial_rotation;
++  double angle_to_target =
++    std::atan2(motion_target.pose.position.y, motion_target.pose.position.x);
++  if (fabs(angle_to_target) < params_->initial_rotation_tolerance) {
++    sim_initial_rotation = false;
++    do_initial_rotation_ = false;
++  }
+ 
+   double distance = std::numeric_limits<double>::max();
+   double resolution_ = costmap_ros_->getCostmap()->getResolution();
+   double dt = (params_->v_linear_max > 0.0) ? resolution_ / params_->v_linear_max : 0.0;
+ 
+   // Set max iter to avoid infinite loop
+-  unsigned int max_iter = 2 * sqrt(
+-    motion_target.pose.position.x * motion_target.pose.position.x +
+-    motion_target.pose.position.y * motion_target.pose.position.y) / resolution_;
++  unsigned int max_iter = 3 *
++    std::hypot(motion_target.pose.position.x, motion_target.pose.position.y) / resolution_;
+ 
+   // Generate path
+   do{
+-    // Apply velocities to calculate next pose
+-    next_pose.pose = control_law_->calculateNextPose(
+-      dt, motion_target.pose, next_pose.pose, backward);
++    if (sim_initial_rotation) {
++      // Compute rotation velocity
++      double next_pose_yaw = tf2::getYaw(next_pose.pose.orientation);
++      auto cmd = rotateToTarget(angle_to_target - next_pose_yaw);
++
++      // If this is first iteration, this is our current target velocity
++      if (trajectory.poses.empty()) {cmd_vel.twist = cmd;}
++
++      // Are we done simulating initial rotation?
++      if (fabs(angle_to_target - next_pose_yaw) < params_->initial_rotation_tolerance) {
++        sim_initial_rotation = false;
++      }
++
++      // Forward simulate rotation command
++      next_pose_yaw += cmd_vel.twist.angular.z * dt;
++      next_pose.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(next_pose_yaw);
++    } else {
++      // If this is first iteration, this is our current target velocity
++      if (trajectory.poses.empty()) {
++        cmd_vel.twist = control_law_->calculateRegularVelocity(
++          motion_target.pose, next_pose.pose, backward);
++      }
++
++      // Apply velocities to calculate next pose
++      next_pose.pose = control_law_->calculateNextPose(
++        dt, motion_target.pose, next_pose.pose, backward);
++    }
+ 
+     // Add the pose to the trajectory for visualization
+     trajectory.poses.push_back(next_pose);
+@@ -316,11 +362,13 @@ bool GracefulController::simulateTrajectory(
+   return true;
+ }
+ 
+-geometry_msgs::msg::Twist GracefulController::rotateToTarget(const double & angle_to_target)
++geometry_msgs::msg::Twist GracefulController::rotateToTarget(double angle_to_target)
+ {
+   geometry_msgs::msg::Twist vel;
+   vel.linear.x = 0.0;
+   vel.angular.z = params_->rotation_scaling_factor * angle_to_target * params_->v_angular_max;
++  vel.angular.z = std::copysign(1.0, vel.angular.z) * std::min(abs(vel.angular.z),
++      params_->v_angular_min_in_place);
+   return vel;
+ }
+ 
+@@ -360,6 +408,43 @@ bool GracefulController::inCollision(const double & x, const double & y, const d
+   return false;
+ }
+ 
++void GracefulController::computeDistanceAlongPath(
++  const std::vector<geometry_msgs::msg::PoseStamped> & poses,
++  std::vector<double> & distances)
++{
++  distances.resize(poses.size());
++  // Do the first pose from robot
++  double d = std::hypot(poses[0].pose.position.x, poses[0].pose.position.y);
++  distances[0] = d;
++  // Compute remaining poses
++  for (size_t i = 1; i < poses.size(); ++i) {
++    d += nav2_util::geometry_utils::euclidean_distance(poses[i - 1].pose, poses[i].pose);
++    distances[i] = d;
++  }
++}
++
++void GracefulController::validateOrientations(
++  std::vector<geometry_msgs::msg::PoseStamped> & path)
++{
++  // This really shouldn't happen
++  if (path.empty()) {return;}
++
++  // Check if we actually need to add orientations
++  for (size_t i = 1; i < path.size() - 1; ++i) {
++    if (tf2::getYaw(path[i].pose.orientation) != 0.0) {return;}
++  }
++
++  // For each pose, point at the next one
++  // NOTE: control loop will handle reversing logic
++  for (size_t i = 0; i < path.size() - 1; ++i) {
++    // Get relative yaw angle
++    double dx = path[i + 1].pose.position.x - path[i].pose.position.x;
++    double dy = path[i + 1].pose.position.y - path[i].pose.position.y;
++    double yaw = std::atan2(dy, dx);
++    path[i].pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(yaw);
++  }
++}
++
+ }  // namespace nav2_graceful_controller
+ 
+ // Register this controller as a nav2_core plugin
+diff --git a/nav2_graceful_controller/src/parameter_handler.cpp b/nav2_graceful_controller/src/parameter_handler.cpp
+index 3d3389ec1d9..f8ba2aa075c 100644
+--- a/nav2_graceful_controller/src/parameter_handler.cpp
++++ b/nav2_graceful_controller/src/parameter_handler.cpp
+@@ -38,13 +38,15 @@ ParameterHandler::ParameterHandler(
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".transform_tolerance", rclcpp::ParameterValue(0.1));
+   declare_parameter_if_not_declared(
+-    node, plugin_name_ + ".motion_target_dist", rclcpp::ParameterValue(0.6));
++    node, plugin_name_ + ".min_lookahead", rclcpp::ParameterValue(0.25));
++  declare_parameter_if_not_declared(
++    node, plugin_name_ + ".max_lookahead", rclcpp::ParameterValue(1.0));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".max_robot_pose_search_dist",
+     rclcpp::ParameterValue(costmap_size_x / 2.0));
+-  declare_parameter_if_not_declared(node, plugin_name_ + ".k_phi", rclcpp::ParameterValue(3.0));
+-  declare_parameter_if_not_declared(node, plugin_name_ + ".k_delta", rclcpp::ParameterValue(2.0));
+-  declare_parameter_if_not_declared(node, plugin_name_ + ".beta", rclcpp::ParameterValue(0.2));
++  declare_parameter_if_not_declared(node, plugin_name_ + ".k_phi", rclcpp::ParameterValue(2.0));
++  declare_parameter_if_not_declared(node, plugin_name_ + ".k_delta", rclcpp::ParameterValue(1.0));
++  declare_parameter_if_not_declared(node, plugin_name_ + ".beta", rclcpp::ParameterValue(0.4));
+   declare_parameter_if_not_declared(node, plugin_name_ + ".lambda", rclcpp::ParameterValue(2.0));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".v_linear_min", rclcpp::ParameterValue(0.1));
+@@ -52,21 +54,26 @@ ParameterHandler::ParameterHandler(
+     node, plugin_name_ + ".v_linear_max", rclcpp::ParameterValue(0.5));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".v_angular_max", rclcpp::ParameterValue(1.0));
++  declare_parameter_if_not_declared(
++    node, plugin_name_ + ".v_angular_min_in_place", rclcpp::ParameterValue(0.25));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".slowdown_radius", rclcpp::ParameterValue(1.5));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".initial_rotation", rclcpp::ParameterValue(true));
+   declare_parameter_if_not_declared(
+-    node, plugin_name_ + ".initial_rotation_min_angle", rclcpp::ParameterValue(0.75));
++    node, plugin_name_ + ".initial_rotation_tolerance", rclcpp::ParameterValue(0.75));
+   declare_parameter_if_not_declared(
+-    node, plugin_name_ + ".final_rotation", rclcpp::ParameterValue(true));
++    node, plugin_name_ + ".prefer_final_rotation", rclcpp::ParameterValue(true));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".rotation_scaling_factor", rclcpp::ParameterValue(0.5));
+   declare_parameter_if_not_declared(
+     node, plugin_name_ + ".allow_backward", rclcpp::ParameterValue(false));
++  declare_parameter_if_not_declared(
++    node, plugin_name_ + ".in_place_collision_resolution", rclcpp::ParameterValue(0.1));
+ 
+   node->get_parameter(plugin_name_ + ".transform_tolerance", params_.transform_tolerance);
+-  node->get_parameter(plugin_name_ + ".motion_target_dist", params_.motion_target_dist);
++  node->get_parameter(plugin_name_ + ".min_lookahead", params_.min_lookahead);
++  node->get_parameter(plugin_name_ + ".max_lookahead", params_.max_lookahead);
+   node->get_parameter(
+     plugin_name_ + ".max_robot_pose_search_dist", params_.max_robot_pose_search_dist);
+   if (params_.max_robot_pose_search_dist < 0.0) {
+@@ -85,13 +92,17 @@ ParameterHandler::ParameterHandler(
+   params_.v_linear_max_initial = params_.v_linear_max;
+   node->get_parameter(plugin_name_ + ".v_angular_max", params_.v_angular_max);
+   params_.v_angular_max_initial = params_.v_angular_max;
++  node->get_parameter(
++    plugin_name_ + ".v_angular_min_in_place", params_.v_angular_min_in_place);
+   node->get_parameter(plugin_name_ + ".slowdown_radius", params_.slowdown_radius);
+   node->get_parameter(plugin_name_ + ".initial_rotation", params_.initial_rotation);
+   node->get_parameter(
+-    plugin_name_ + ".initial_rotation_min_angle", params_.initial_rotation_min_angle);
+-  node->get_parameter(plugin_name_ + ".final_rotation", params_.final_rotation);
++    plugin_name_ + ".initial_rotation_tolerance", params_.initial_rotation_tolerance);
++  node->get_parameter(plugin_name_ + ".prefer_final_rotation", params_.prefer_final_rotation);
+   node->get_parameter(plugin_name_ + ".rotation_scaling_factor", params_.rotation_scaling_factor);
+   node->get_parameter(plugin_name_ + ".allow_backward", params_.allow_backward);
++  node->get_parameter(
++    plugin_name_ + ".in_place_collision_resolution", params_.in_place_collision_resolution);
+ 
+   if (params_.initial_rotation && params_.allow_backward) {
+     RCLCPP_WARN(
+@@ -126,8 +137,10 @@ ParameterHandler::dynamicParametersCallback(std::vector<rclcpp::Parameter> param
+     if (type == ParameterType::PARAMETER_DOUBLE) {
+       if (name == plugin_name_ + ".transform_tolerance") {
+         params_.transform_tolerance = parameter.as_double();
+-      } else if (name == plugin_name_ + ".motion_target_dist") {
+-        params_.motion_target_dist = parameter.as_double();
++      } else if (name == plugin_name_ + ".min_lookahead") {
++        params_.min_lookahead = parameter.as_double();
++      } else if (name == plugin_name_ + ".max_lookahead") {
++        params_.max_lookahead = parameter.as_double();
+       } else if (name == plugin_name_ + ".k_phi") {
+         params_.k_phi = parameter.as_double();
+       } else if (name == plugin_name_ + ".k_delta") {
+@@ -144,12 +157,16 @@ ParameterHandler::dynamicParametersCallback(std::vector<rclcpp::Parameter> param
+       } else if (name == plugin_name_ + ".v_angular_max") {
+         params_.v_angular_max = parameter.as_double();
+         params_.v_angular_max_initial = params_.v_angular_max;
++      } else if (name == plugin_name_ + ".v_angular_min_in_place") {
++        params_.v_angular_min_in_place = parameter.as_double();
+       } else if (name == plugin_name_ + ".slowdown_radius") {
+         params_.slowdown_radius = parameter.as_double();
+-      } else if (name == plugin_name_ + ".initial_rotation_min_angle") {
+-        params_.initial_rotation_min_angle = parameter.as_double();
++      } else if (name == plugin_name_ + ".initial_rotation_tolerance") {
++        params_.initial_rotation_tolerance = parameter.as_double();
+       } else if (name == plugin_name_ + ".rotation_scaling_factor") {
+         params_.rotation_scaling_factor = parameter.as_double();
++      } else if (name == plugin_name_ + ".in_place_collision_resolution") {
++        params_.in_place_collision_resolution = parameter.as_double();
+       }
+     } else if (type == ParameterType::PARAMETER_BOOL) {
+       if (name == plugin_name_ + ".initial_rotation") {
+@@ -160,8 +177,8 @@ ParameterHandler::dynamicParametersCallback(std::vector<rclcpp::Parameter> param
+           continue;
+         }
+         params_.initial_rotation = parameter.as_bool();
+-      } else if (name == plugin_name_ + ".final_rotation") {
+-        params_.final_rotation = parameter.as_bool();
++      } else if (name == plugin_name_ + ".prefer_final_rotation") {
++        params_.prefer_final_rotation = parameter.as_bool();
+       } else if (name == plugin_name_ + ".allow_backward") {
+         if (params_.initial_rotation && parameter.as_bool()) {
+           RCLCPP_WARN(
+diff --git a/nav2_graceful_controller/test/test_graceful_controller.cpp b/nav2_graceful_controller/test/test_graceful_controller.cpp
+index fd5f986c76a..2fd98675b81 100644
+--- a/nav2_graceful_controller/test/test_graceful_controller.cpp
++++ b/nav2_graceful_controller/test/test_graceful_controller.cpp
+@@ -59,13 +59,6 @@ class GMControllerFixture : public nav2_graceful_controller::GracefulController
+ 
+   nav_msgs::msg::Path getPlan() {return path_handler_->getPlan();}
+ 
+-  geometry_msgs::msg::PoseStamped getMotionTarget(
+-    const double & motion_target_distance, const nav_msgs::msg::Path & plan)
+-  {
+-    return nav2_graceful_controller::GracefulController::getMotionTarget(
+-      motion_target_distance, plan);
+-  }
+-
+   geometry_msgs::msg::PointStamped createMotionTargetMsg(
+     const geometry_msgs::msg::PoseStamped & motion_target)
+   {
+@@ -86,16 +79,6 @@ class GMControllerFixture : public nav2_graceful_controller::GracefulController
+       angle_to_target);
+   }
+ 
+-  bool simulateTrajectory(
+-    const geometry_msgs::msg::PoseStamped & robot_pose,
+-    const geometry_msgs::msg::PoseStamped & motion_target,
+-    const geometry_msgs::msg::TransformStamped & costmap_transform,
+-    nav_msgs::msg::Path & trajectory, const bool & backward)
+-  {
+-    return nav2_graceful_controller::GracefulController::simulateTrajectory(
+-      robot_pose, motion_target, costmap_transform, trajectory, backward);
+-  }
+-
+   double getSpeedLinearMax() {return params_->v_linear_max;}
+ 
+   nav_msgs::msg::Path transformGlobalPlan(
+@@ -289,7 +272,8 @@ TEST(GracefulControllerTest, dynamicParameters) {
+   // Set parameters
+   auto results = params->set_parameters_atomically(
+     {rclcpp::Parameter("test.transform_tolerance", 1.0),
+-      rclcpp::Parameter("test.motion_target_dist", 2.0),
++      rclcpp::Parameter("test.min_lookahead", 1.0),
++      rclcpp::Parameter("test.max_lookahead", 2.0),
+       rclcpp::Parameter("test.k_phi", 4.0),
+       rclcpp::Parameter("test.k_delta", 5.0),
+       rclcpp::Parameter("test.beta", 6.0),
+@@ -297,19 +281,22 @@ TEST(GracefulControllerTest, dynamicParameters) {
+       rclcpp::Parameter("test.v_linear_min", 8.0),
+       rclcpp::Parameter("test.v_linear_max", 9.0),
+       rclcpp::Parameter("test.v_angular_max", 10.0),
++      rclcpp::Parameter("test.v_angular_min_in_place", 14.0),
+       rclcpp::Parameter("test.slowdown_radius", 11.0),
+       rclcpp::Parameter("test.initial_rotation", false),
+-      rclcpp::Parameter("test.initial_rotation_min_angle", 12.0),
+-      rclcpp::Parameter("test.final_rotation", false),
++      rclcpp::Parameter("test.initial_rotation_tolerance", 12.0),
++      rclcpp::Parameter("test.prefer_final_rotation", false),
+       rclcpp::Parameter("test.rotation_scaling_factor", 13.0),
+-      rclcpp::Parameter("test.allow_backward", true)});
++      rclcpp::Parameter("test.allow_backward", true),
++      rclcpp::Parameter("test.in_place_collision_resolution", 15.0)});
+ 
+   // Spin
+   rclcpp::spin_until_future_complete(node->get_node_base_interface(), results);
+ 
+   // Check parameters
+   EXPECT_EQ(node->get_parameter("test.transform_tolerance").as_double(), 1.0);
+-  EXPECT_EQ(node->get_parameter("test.motion_target_dist").as_double(), 2.0);
++  EXPECT_EQ(node->get_parameter("test.min_lookahead").as_double(), 1.0);
++  EXPECT_EQ(node->get_parameter("test.max_lookahead").as_double(), 2.0);
+   EXPECT_EQ(node->get_parameter("test.k_phi").as_double(), 4.0);
+   EXPECT_EQ(node->get_parameter("test.k_delta").as_double(), 5.0);
+   EXPECT_EQ(node->get_parameter("test.beta").as_double(), 6.0);
+@@ -317,12 +304,14 @@ TEST(GracefulControllerTest, dynamicParameters) {
+   EXPECT_EQ(node->get_parameter("test.v_linear_min").as_double(), 8.0);
+   EXPECT_EQ(node->get_parameter("test.v_linear_max").as_double(), 9.0);
+   EXPECT_EQ(node->get_parameter("test.v_angular_max").as_double(), 10.0);
++  EXPECT_EQ(node->get_parameter("test.v_angular_min_in_place").as_double(), 14.0);
+   EXPECT_EQ(node->get_parameter("test.slowdown_radius").as_double(), 11.0);
+   EXPECT_EQ(node->get_parameter("test.initial_rotation").as_bool(), false);
+-  EXPECT_EQ(node->get_parameter("test.initial_rotation_min_angle").as_double(), 12.0);
+-  EXPECT_EQ(node->get_parameter("test.final_rotation").as_bool(), false);
++  EXPECT_EQ(node->get_parameter("test.initial_rotation_tolerance").as_double(), 12.0);
++  EXPECT_EQ(node->get_parameter("test.prefer_final_rotation").as_bool(), false);
+   EXPECT_EQ(node->get_parameter("test.rotation_scaling_factor").as_double(), 13.0);
+   EXPECT_EQ(node->get_parameter("test.allow_backward").as_bool(), true);
++  EXPECT_EQ(node->get_parameter("test.in_place_collision_resolution").as_double(), 15.0);
+ 
+   // Set initial rotation to true
+   results = params->set_parameters_atomically(
+@@ -356,56 +345,6 @@ TEST(GracefulControllerTest, dynamicParameters) {
+   EXPECT_EQ(controller->getAllowBackward(), false);
+ }
+ 
+-TEST(GracefulControllerTest, getDifferentMotionTargets) {
+-  auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("testGraceful");
+-  auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+-  auto costmap_ros = std::make_shared<nav2_costmap_2d::Costmap2DROS>("global_costmap");
+-
+-  // Create controller
+-  auto controller = std::make_shared<GMControllerFixture>();
+-  costmap_ros->on_configure(rclcpp_lifecycle::State());
+-  controller->configure(node, "test", tf, costmap_ros);
+-  controller->activate();
+-
+-  // Set the plan
+-  nav_msgs::msg::Path plan;
+-  plan.header.frame_id = "map";
+-  plan.poses.resize(3);
+-  plan.poses[0].header.frame_id = "map";
+-  plan.poses[0].pose.position.x = 1.0;
+-  plan.poses[0].pose.position.y = 2.0;
+-  plan.poses[0].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+-  plan.poses[1].header.frame_id = "map";
+-  plan.poses[1].pose.position.x = 3.0;
+-  plan.poses[1].pose.position.y = 4.0;
+-  plan.poses[1].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+-  plan.poses[2].header.frame_id = "map";
+-  plan.poses[2].pose.position.x = 5.0;
+-  plan.poses[2].pose.position.y = 6.0;
+-  plan.poses[2].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+-  controller->setPlan(plan);
+-
+-  // Set distance and get motion target
+-  double motion_target_distance = 3.5;
+-  auto motion_target = controller->getMotionTarget(motion_target_distance, plan);
+-
+-  // Check results, should be the second one
+-  EXPECT_EQ(motion_target.header.frame_id, "map");
+-  EXPECT_EQ(motion_target.pose.position.x, 3.0);
+-  EXPECT_EQ(motion_target.pose.position.y, 4.0);
+-  EXPECT_EQ(motion_target.pose.orientation, tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0)));
+-
+-  // Set a new distance greater than the path length and get motion target
+-  motion_target_distance = 10.0;
+-  motion_target = controller->getMotionTarget(motion_target_distance, plan);
+-
+-  // Check results: should be the last one
+-  EXPECT_EQ(motion_target.header.frame_id, "map");
+-  EXPECT_EQ(motion_target.pose.position.x, 5.0);
+-  EXPECT_EQ(motion_target.pose.position.y, 6.0);
+-  EXPECT_EQ(motion_target.pose.orientation, tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0)));
+-}
+-
+ TEST(GracefulControllerTest, createMotionTargetMsg) {
+   auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("testGraceful");
+   auto tf = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+@@ -937,12 +876,12 @@ TEST(GracefulControllerTest, computeVelocityCommandRotate) {
+   plan.poses[0].pose.position.y = 0.0;
+   plan.poses[0].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+   plan.poses[1].header.frame_id = "test_global_frame";
+-  plan.poses[1].pose.position.x = 1.0;
+-  plan.poses[1].pose.position.y = 1.0;
++  plan.poses[1].pose.position.x = 0.5;
++  plan.poses[1].pose.position.y = 0.5;
+   plan.poses[1].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+   plan.poses[2].header.frame_id = "test_global_frame";
+-  plan.poses[2].pose.position.x = 2.0;
+-  plan.poses[2].pose.position.y = 2.0;
++  plan.poses[2].pose.position.x = 1.0;
++  plan.poses[2].pose.position.y = 1.0;
+   plan.poses[2].pose.orientation = tf2::toMsg(tf2::Quaternion({0, 0, 1}, 0.0));
+   controller->setPlan(plan);
+ 
+@@ -960,8 +899,8 @@ TEST(GracefulControllerTest, computeVelocityCommandRotate) {
+   // Check results: the robot should rotate in place.
+   // So, linear velocity should be zero and angular velocity should be a positive value below 0.5.
+   EXPECT_EQ(cmd_vel.twist.linear.x, 0.0);
+-  EXPECT_GE(cmd_vel.twist.angular.x, 0.0);
+-  EXPECT_LE(cmd_vel.twist.angular.x, 0.5);
++  EXPECT_GT(cmd_vel.twist.angular.z, 0.0);
++  EXPECT_LE(cmd_vel.twist.angular.z, 0.5);
+ }
+ 
+ TEST(GracefulControllerTest, computeVelocityCommandRegular) {
+@@ -1117,7 +1056,9 @@ TEST(GracefulControllerTest, computeVelocityCommandRegularBackwards) {
+   // Check results: the robot should go straight to the target.
+   // So, both linear velocity should be some negative values.
+   EXPECT_LT(cmd_vel.twist.linear.x, 0.0);
+-  EXPECT_LT(cmd_vel.twist.angular.z, 0.0);
++  // There might be a small bit of noise on angular velocity
++  EXPECT_LT(cmd_vel.twist.angular.z, 0.01);
++  EXPECT_GT(cmd_vel.twist.angular.z, -0.01);
+ }
+ 
+ TEST(GracefulControllerTest, computeVelocityCommandFinal) {
+@@ -1200,8 +1141,8 @@ TEST(GracefulControllerTest, computeVelocityCommandFinal) {
+   // Check results: the robot should do a final rotation near the target.
+   // So, linear velocity should be zero and angular velocity should be a positive value below 0.5.
+   EXPECT_EQ(cmd_vel.twist.linear.x, 0.0);
+-  EXPECT_GE(cmd_vel.twist.angular.x, 0.0);
+-  EXPECT_LE(cmd_vel.twist.angular.x, 0.5);
++  EXPECT_GE(cmd_vel.twist.angular.z, 0.0);
++  EXPECT_LE(cmd_vel.twist.angular.z, 0.5);
+ }
+ 
+ int main(int argc, char ** argv)

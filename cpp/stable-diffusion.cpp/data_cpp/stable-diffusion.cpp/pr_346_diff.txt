@@ -1,0 +1,93 @@
+diff --git a/README.md b/README.md
+index b077ad13..c1ab11c7 100644
+--- a/README.md
++++ b/README.md
+@@ -223,7 +223,7 @@ arguments:
+   --rng {std_default, cuda}          RNG (default: cuda)
+   -s SEED, --seed SEED               RNG seed (default: 42, use random seed for < 0)
+   -b, --batch-count COUNT            number of images to generate.
+-  --schedule {discrete, karras, ays, gits} Denoiser sigma schedule (default: discrete)
++  --schedule {discrete, karras, exponential, ays, gits} Denoiser sigma schedule (default: discrete)
+   --clip-skip N                      ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)
+                                      <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x
+   --vae-tiling                       process vae in tiles to reduce memory usage
+diff --git a/denoiser.hpp b/denoiser.hpp
+index 207fa4c9..287b1093 100644
+--- a/denoiser.hpp
++++ b/denoiser.hpp
+@@ -42,6 +42,27 @@ struct DiscreteSchedule : SigmaSchedule {
+     }
+ };
+ 
++struct ExponentialSchedule : SigmaSchedule {
++    std::vector<float> get_sigmas(uint32_t n, float sigma_min, float sigma_max, t_to_sigma_t t_to_sigma) {
++        std::vector<float> sigmas;
++
++        // Calculate step size
++        float log_sigma_min = std::log(sigma_min);
++        float log_sigma_max = std::log(sigma_max);
++        float step = (log_sigma_max - log_sigma_min) / (n - 1);
++
++        // Fill sigmas with exponential values
++        for (uint32_t i = 0; i < n; ++i) {
++            float sigma = std::exp(log_sigma_max - step * i);
++            sigmas.push_back(sigma);
++        }
++
++        sigmas.push_back(0.0f);
++
++        return sigmas;
++    }
++};
++
+ /* interp and linear_interp adapted from dpilger26's NumCpp library:
+  * https://github.com/dpilger26/NumCpp/tree/5e40aab74d14e257d65d3dc385c9ff9e2120c60e */
+ constexpr double interp(double left, double right, double perc) noexcept {
+diff --git a/examples/cli/main.cpp b/examples/cli/main.cpp
+index 7f3ad436..fbb73afc 100644
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -46,6 +46,7 @@ const char* schedule_str[] = {
+     "default",
+     "discrete",
+     "karras",
++    "exponential",
+     "ays",
+     "gits",
+ };
+@@ -203,7 +204,7 @@ void print_usage(int argc, const char* argv[]) {
+     printf("  --rng {std_default, cuda}          RNG (default: cuda)\n");
+     printf("  -s SEED, --seed SEED               RNG seed (default: 42, use random seed for < 0)\n");
+     printf("  -b, --batch-count COUNT            number of images to generate.\n");
+-    printf("  --schedule {discrete, karras, ays, gits} Denoiser sigma schedule (default: discrete)\n");
++    printf("  --schedule {discrete, karras, exponential, ays, gits} Denoiser sigma schedule (default: discrete)\n");
+     printf("  --clip-skip N                      ignore last layers of CLIP network; 1 ignores none, 2 ignores one layer (default: -1)\n");
+     printf("                                     <= 0 represents unspecified, will be 1 for SD1.x, 2 for SD2.x\n");
+     printf("  --vae-tiling                       process vae in tiles to reduce memory usage\n");
+diff --git a/stable-diffusion.cpp b/stable-diffusion.cpp
+index 4791db9d..7ab8889c 100644
+--- a/stable-diffusion.cpp
++++ b/stable-diffusion.cpp
+@@ -538,6 +538,10 @@ class StableDiffusionGGML {
+                     LOG_INFO("running with Karras schedule");
+                     denoiser->schedule = std::make_shared<KarrasSchedule>();
+                     break;
++                case EXPONENTIAL:
++                    LOG_INFO("running exponential schedule");
++                    denoiser->schedule = std::make_shared<ExponentialSchedule>();
++                    break;
+                 case AYS:
+                     LOG_INFO("Running with Align-Your-Steps schedule");
+                     denoiser->schedule          = std::make_shared<AYSSchedule>();
+diff --git a/stable-diffusion.h b/stable-diffusion.h
+index 1c980306..0d4cc1fd 100644
+--- a/stable-diffusion.h
++++ b/stable-diffusion.h
+@@ -51,6 +51,7 @@ enum schedule_t {
+     DEFAULT,
+     DISCRETE,
+     KARRAS,
++    EXPONENTIAL,
+     AYS,
+     GITS,
+     N_SCHEDULES

@@ -1,0 +1,106 @@
+diff --git a/examples/cli/main.cpp b/examples/cli/main.cpp
+index 3c35b103..cfadf434 100644
+--- a/examples/cli/main.cpp
++++ b/examples/cli/main.cpp
+@@ -1057,16 +1057,41 @@ int main(int argc, const char* argv[]) {
+         }
+     }
+ 
+-    size_t last            = params.output_path.find_last_of(".");
+-    std::string dummy_name = last != std::string::npos ? params.output_path.substr(0, last) : params.output_path;
++    std::string dummy_name, ext, lc_ext;
++    bool is_jpg;
++    size_t last = params.output_path.find_last_of(".");
++    size_t last_path = std::min(params.output_path.find_last_of("/"),
++                                params.output_path.find_last_of("\\"));
++    if (last != std::string::npos // filename has extension
++    && (last_path == std::string::npos || last > last_path)) {
++        dummy_name = params.output_path.substr(0, last);
++        ext = lc_ext = params.output_path.substr(last);
++        std::transform(ext.begin(), ext.end(), lc_ext.begin(), ::tolower);
++        is_jpg = lc_ext == ".jpg" || lc_ext == ".jpeg" || lc_ext == ".jpe";
++    } else {
++        dummy_name = params.output_path;
++        ext = lc_ext = "";
++        is_jpg = false;
++    }
++    // appending ".png" to absent or unknown extension
++    if (!is_jpg && lc_ext != ".png") {
++        dummy_name += ext;
++        ext = ".png";
++    }
+     for (int i = 0; i < params.batch_count; i++) {
+         if (results[i].data == NULL) {
+             continue;
+         }
+-        std::string final_image_path = i > 0 ? dummy_name + "_" + std::to_string(i + 1) + ".png" : dummy_name + ".png";
+-        stbi_write_png(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
+-                       results[i].data, 0, get_image_params(params, params.seed + i).c_str());
+-        printf("save result image to '%s'\n", final_image_path.c_str());
++        std::string final_image_path = i > 0 ? dummy_name + "_" + std::to_string(i + 1) + ext : dummy_name + ext;
++        if(is_jpg) {
++            stbi_write_jpg(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
++                           results[i].data, 90, get_image_params(params, params.seed + i).c_str());
++            printf("save result JPEG image to '%s'\n", final_image_path.c_str());
++        } else {
++            stbi_write_png(final_image_path.c_str(), results[i].width, results[i].height, results[i].channel,
++                           results[i].data, 0, get_image_params(params, params.seed + i).c_str());
++            printf("save result PNG image to '%s'\n", final_image_path.c_str());
++        }
+         free(results[i].data);
+         results[i].data = NULL;
+     }
+diff --git a/thirdparty/stb_image_write.h b/thirdparty/stb_image_write.h
+index 5589a7ec..a9139bec 100644
+--- a/thirdparty/stb_image_write.h
++++ b/thirdparty/stb_image_write.h
+@@ -1412,7 +1412,7 @@ static int stbiw__jpg_processDU(stbi__write_context *s, int *bitBuf, int *bitCnt
+    return DU[0];
+ }
+ 
+-static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, int comp, const void* data, int quality) {
++static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, int comp, const void* data, int quality, const char* parameters) {
+    // Constants that don't pollute global namespace
+    static const unsigned char std_dc_luminance_nrcodes[] = {0,0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0};
+    static const unsigned char std_dc_luminance_values[] = {0,1,2,3,4,5,6,7,8,9,10,11};
+@@ -1521,6 +1521,20 @@ static int stbi_write_jpg_core(stbi__write_context *s, int width, int height, in
+       s->func(s->context, (void*)YTable, sizeof(YTable));
+       stbiw__putc(s, 1);
+       s->func(s->context, UVTable, sizeof(UVTable));
++
++      // comment block with parameters of generation
++      if(parameters != NULL) {
++         stbiw__putc(s, 0xFF /* comnent */ );
++         stbiw__putc(s, 0xFE /* marker  */ );
++         size_t param_length = std::min(2 + strlen("parameters") + 1 + strlen(parameters) + 1, (size_t) 0xFFFF);
++         stbiw__putc(s, param_length >> 8); // no need to mask, length < 65536
++         stbiw__putc(s, param_length & 0xFF);
++         s->func(s->context, (void*)"parameters", strlen("parameters") + 1); // std::string is zero-terminated
++         s->func(s->context, (void*)parameters, std::min(param_length, (size_t) 65534) - 2 - strlen("parameters") - 1);
++         if(param_length > 65534) stbiw__putc(s, 0); // always zero-terminate for safety
++         if(param_length & 1) stbiw__putc(s, 0xFF); // pad to even length
++      }
++
+       s->func(s->context, (void*)head1, sizeof(head1));
+       s->func(s->context, (void*)(std_dc_luminance_nrcodes+1), sizeof(std_dc_luminance_nrcodes)-1);
+       s->func(s->context, (void*)std_dc_luminance_values, sizeof(std_dc_luminance_values));
+@@ -1625,16 +1639,16 @@ STBIWDEF int stbi_write_jpg_to_func(stbi_write_func *func, void *context, int x,
+ {
+    stbi__write_context s = { 0 };
+    stbi__start_write_callbacks(&s, func, context);
+-   return stbi_write_jpg_core(&s, x, y, comp, (void *) data, quality);
++   return stbi_write_jpg_core(&s, x, y, comp, (void *) data, quality, NULL);
+ }
+ 
+ 
+ #ifndef STBI_WRITE_NO_STDIO
+-STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const void *data, int quality)
++STBIWDEF int stbi_write_jpg(char const *filename, int x, int y, int comp, const void *data, int quality, const char* parameters)
+ {
+    stbi__write_context s = { 0 };
+    if (stbi__start_write_file(&s,filename)) {
+-      int r = stbi_write_jpg_core(&s, x, y, comp, data, quality);
++      int r = stbi_write_jpg_core(&s, x, y, comp, data, quality, parameters);
+       stbi__end_write_file(&s);
+       return r;
+    } else

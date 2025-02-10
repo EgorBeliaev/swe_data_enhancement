@@ -1,0 +1,117 @@
+diff --git a/src/apps/deskflow-gui/MainWindow.cpp b/src/apps/deskflow-gui/MainWindow.cpp
+index b2db9cbf011..32ed0199f86 100644
+--- a/src/apps/deskflow-gui/MainWindow.cpp
++++ b/src/apps/deskflow-gui/MainWindow.cpp
+@@ -43,6 +43,8 @@
+ #include <QApplication>
+ #include <QDesktopServices>
+ #include <QFileDialog>
++#include <QLocalServer>
++#include <QLocalSocket>
+ #include <QMenu>
+ #include <QMenuBar>
+ #include <QMessageBox>
+@@ -81,6 +83,7 @@ MainWindow::MainWindow(ConfigScopes &configScopes, AppConfig &appConfig)
+       m_ClientConnection(this, appConfig),
+       m_TlsUtility(appConfig),
+       m_WindowSaveTimer(this),
++      m_guiDupeChecker{new QLocalServer(this)},
+       m_actionAbout{new QAction(this)},
+       m_actionClearSettings{new QAction(tr("Clear settings"), this)},
+       m_actionHelp{new QAction(tr("Report a Bug"), this)},
+@@ -119,6 +122,11 @@ MainWindow::MainWindow(ConfigScopes &configScopes, AppConfig &appConfig)
+ 
+   toggleLogVisible(m_AppConfig.logExpanded());
+ 
++  // Setup the Instance Checking
++  // In case of a previous crash remove first
++  m_guiDupeChecker->removeServer(m_guiSocketName);
++  m_guiDupeChecker->listen(m_guiSocketName);
++
+   createMenuBar();
+   setupControls();
+   connectSlots();
+@@ -138,6 +146,7 @@ MainWindow::MainWindow(ConfigScopes &configScopes, AppConfig &appConfig)
+ 
+ MainWindow::~MainWindow()
+ {
++  m_guiDupeChecker->close();
+   m_CoreProcess.cleanup();
+ }
+ 
+@@ -309,6 +318,8 @@ void MainWindow::connectSlots()
+   connect(ui->rbModeClient, &QRadioButton::clicked, this, &MainWindow::setModeClient);
+ 
+   connect(ui->btnToggleLog, &QAbstractButton::toggled, this, &MainWindow::toggleLogVisible);
++
++  connect(m_guiDupeChecker, &QLocalServer::newConnection, this, &MainWindow::showAndActivate);
+ }
+ 
+ void MainWindow::toggleLogVisible(bool visible)
+diff --git a/src/apps/deskflow-gui/MainWindow.h b/src/apps/deskflow-gui/MainWindow.h
+index c20d77513bf..2452eb3ffd7 100644
+--- a/src/apps/deskflow-gui/MainWindow.h
++++ b/src/apps/deskflow-gui/MainWindow.h
+@@ -55,6 +55,7 @@ class QCheckBox;
+ class QRadioButton;
+ class QMessageBox;
+ class QAbstractButton;
++class QLocalServer;
+ 
+ class DeskflowApplication;
+ class SetupWizard;
+@@ -210,6 +211,9 @@ private slots:
+   QTimer m_WindowSaveTimer;
+   QSize m_expandedSize = QSize();
+ 
++  QLocalServer *m_guiDupeChecker = nullptr;
++  inline static const auto m_guiSocketName = QStringLiteral("deskflow-gui");
++
+   // Window Actions
+   QAction *m_actionAbout = nullptr;
+   QAction *m_actionClearSettings = nullptr;
+diff --git a/src/apps/deskflow-gui/main.cpp b/src/apps/deskflow-gui/main.cpp
+index 59ced379ead..5baf02ff72d 100644
+--- a/src/apps/deskflow-gui/main.cpp
++++ b/src/apps/deskflow-gui/main.cpp
+@@ -35,8 +35,10 @@
+ #include <QApplication>
+ #include <QDebug>
+ #include <QGuiApplication>
++#include <QLocalSocket>
+ #include <QMessageBox>
+ #include <QObject>
++#include <QSharedMemory>
+ #include <QtGlobal>
+ 
+ #if defined(Q_OS_MAC)
+@@ -90,6 +92,29 @@ int main(int argc, char *argv[])
+ 
+   QApplication app(argc, argv);
+ 
++  // Create a shared memory segment with a unique key
++  // This is to prevent a new instance from running if one is already running
++  QSharedMemory sharedMemory("deskflow-gui");
++
++  // Attempt to attach first and detach in order to clean up stale shm chunks
++  // This can happen if the previous instance was killed or crashed
++  if (sharedMemory.attach())
++    sharedMemory.detach();
++
++  // If we can create 1 byte of SHM we are the only instance
++  if (!sharedMemory.create(1)) {
++    // Ping the running instance to have it show itself
++    QLocalSocket socket;
++    socket.connectToServer("deskflow-gui", QLocalSocket::ReadOnly);
++    if (!socket.waitForConnected()) {
++      // If we can't connect to the other instance tell the user its running.
++      // This should never happen but just incase we should show something
++      QMessageBox::information(nullptr, QObject::tr("Deskflow"), QObject::tr("Deskflow is already running"));
++    }
++    socket.disconnectFromServer();
++    return 0;
++  }
++
+ #if !defined(Q_OS_MAC)
+   // causes dark mode to be used on some DE's
+   if (qEnvironmentVariable("XDG_CURRENT_DESKTOP") != QLatin1String("KDE")) {

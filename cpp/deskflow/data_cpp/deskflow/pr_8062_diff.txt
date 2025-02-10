@@ -1,0 +1,200 @@
+diff --git a/src/apps/deskflow-gui/MainWindow.cpp b/src/apps/deskflow-gui/MainWindow.cpp
+index d95e5c701e4..a9adfe6e47a 100644
+--- a/src/apps/deskflow-gui/MainWindow.cpp
++++ b/src/apps/deskflow-gui/MainWindow.cpp
+@@ -80,7 +80,6 @@ MainWindow::MainWindow(ConfigScopes &configScopes, AppConfig &appConfig)
+       m_ServerConnection(this, appConfig, m_ServerConfig, m_ServerConfigDialogState),
+       m_ClientConnection(this, appConfig),
+       m_TlsUtility(appConfig),
+-      m_WindowSaveTimer(this),
+       m_trayIcon{new QSystemTrayIcon(this)},
+       m_guiDupeChecker{new QLocalServer(this)},
+       m_actionAbout{new QAction(this)},
+@@ -158,7 +157,7 @@ void MainWindow::restoreWindow()
+   const auto &windowSize = m_AppConfig.mainWindowSize();
+   if (windowSize.has_value()) {
+     qDebug() << "restoring main window size";
+-    resize(windowSize.value());
++    m_expandedSize = windowSize.value();
+   }
+ 
+   const auto &windowPosition = m_AppConfig.mainWindowPosition();
+@@ -186,24 +185,6 @@ void MainWindow::restoreWindow()
+     QRect screenGeometry = screen->geometry();
+     move(screenGeometry.center() - rect().center());
+   }
+-
+-  // give the window chance to restore its size and position before the window
+-  // size and position are saved. this prevents the window from being saved
+-  // with the wrong size and position.
+-  m_SaveWindow = true;
+-}
+-
+-void MainWindow::saveWindow()
+-{
+-  if (!m_SaveWindow) {
+-    qDebug() << "not yet ready to save window size and position, skipping";
+-    return;
+-  }
+-
+-  qDebug() << "saving window size and position";
+-  m_AppConfig.setMainWindowSize(size());
+-  m_AppConfig.setMainWindowPosition(pos());
+-  m_ConfigScopes.save();
+ }
+ 
+ void MainWindow::setupControls()
+@@ -288,8 +269,6 @@ void MainWindow::connectSlots()
+ 
+   connect(&m_VersionChecker, &VersionChecker::updateFound, this, &MainWindow::onVersionCheckerUpdateFound);
+ 
+-  connect(&m_WindowSaveTimer, &QTimer::timeout, this, &MainWindow::onWindowSaveTimerTimeout);
+-
+ // Mac os tray will only show a menu
+ #ifndef Q_OS_MAC
+   connect(m_trayIcon, &QSystemTrayIcon::activated, this, &MainWindow::onTrayIconActivated);
+@@ -337,8 +316,8 @@ void MainWindow::toggleLogVisible(bool visible)
+     ui->textLog->setVisible(false);
+     m_AppConfig.setLogExpanded(false);
+   }
+-  // 10 ms is long enough to process events and quick enough to not see the visual change.
+-  QTimer::singleShot(10, this, &MainWindow::updateSize);
++  // 1 ms delay is to make sure we have left the function before calling updateSize
++  QTimer::singleShot(1, this, &MainWindow::updateSize);
+ }
+ 
+ void MainWindow::onShown()
+@@ -490,16 +469,10 @@ void MainWindow::resetCore()
+ 
+ void MainWindow::updateSize()
+ {
+-#ifdef Q_OS_MAC
+-  // On mac os the titlebar is part of the height so we need to adjust our Y coord to avoid moving the window up
+-  const auto kTitleBarOffset = 28;
+-#else
+-  const auto kTitleBarOffset = 0;
+-#endif
+   if (ui->textLog->isVisible()) {
+     setMaximumHeight(16777215);
+     setMaximumWidth(16777215);
+-    setGeometry(x(), y() + kTitleBarOffset, m_expandedSize.width(), m_expandedSize.height());
++    resize(m_expandedSize);
+   } else {
+     adjustSize();
+     // Prevent Resize with log collapsed
+@@ -527,11 +500,6 @@ void MainWindow::setModeClient()
+   m_ConfigScopes.save();
+ }
+ 
+-void MainWindow::onWindowSaveTimerTimeout()
+-{
+-  saveWindow();
+-}
+-
+ void MainWindow::onServerConnectionConfigureClient(const QString &clientName)
+ {
+   m_ServerConfigDialogState.setVisible(true);
+@@ -546,24 +514,6 @@ void MainWindow::onServerConnectionConfigureClient(const QString &clientName)
+ // End slots
+ //////////////////////////////////////////////////////////////////////////////
+ 
+-void MainWindow::resizeEvent(QResizeEvent *event)
+-{
+-  QMainWindow::resizeEvent(event);
+-
+-  // postpone save so that settings are not written every delta change.
+-  m_WindowSaveTimer.setSingleShot(true);
+-  m_WindowSaveTimer.start(1000);
+-}
+-
+-void MainWindow::moveEvent(QMoveEvent *event)
+-{
+-  QMainWindow::moveEvent(event);
+-
+-  // postpone save so that settings are not written every delta change.
+-  m_WindowSaveTimer.setSingleShot(true);
+-  m_WindowSaveTimer.start(1000);
+-}
+-
+ void MainWindow::open()
+ {
+   if (!m_AppConfig.enableUpdateCheck().has_value()) {
+@@ -805,9 +755,11 @@ void MainWindow::closeEvent(QCloseEvent *event)
+     return;
+   }
+ 
+-  if (m_SaveOnExit)
++  if (m_SaveOnExit) {
++    m_AppConfig.setMainWindowPosition(pos());
++    m_AppConfig.setMainWindowSize(size());
+     m_ConfigScopes.save();
+-
++  }
+   qDebug() << "quitting application";
+   event->accept();
+   QApplication::quit();
+diff --git a/src/apps/deskflow-gui/MainWindow.h b/src/apps/deskflow-gui/MainWindow.h
+index 3696dd6b682..bc5ae32d0f8 100644
+--- a/src/apps/deskflow-gui/MainWindow.h
++++ b/src/apps/deskflow-gui/MainWindow.h
+@@ -125,7 +125,6 @@ private slots:
+   void onCoreProcessSecureSocket(bool enabled);
+   void onVersionCheckerUpdateFound(const QString &version);
+   void onTrayIconActivated(QSystemTrayIcon::ActivationReason reason);
+-  void onWindowSaveTimerTimeout();
+   void onServerConnectionConfigureClient(const QString &clientName);
+ 
+   void clearSettings();
+@@ -182,10 +181,7 @@ private slots:
+   QString configFilename();
+   void showConfigureServer(const QString &message);
+   void restoreWindow();
+-  void saveWindow();
+   void setupControls();
+-  void resizeEvent(QResizeEvent *event) override;
+-  void moveEvent(QMoveEvent *event) override;
+   void showFirstConnectedMessage();
+   void updateStatus();
+   void showAndActivate();
+@@ -194,7 +190,6 @@ private slots:
+   QSystemTrayIcon *m_trayIcon = nullptr;
+   QAbstractButton *m_pCancelButton = nullptr;
+   bool m_SecureSocket = false;
+-  bool m_SaveWindow = false;
+   deskflow::gui::config::ServerConfigDialogState m_ServerConfigDialogState;
+   bool m_SaveOnExit = true;
+   deskflow::gui::core::WaylandWarnings m_WaylandWarnings;
+@@ -206,7 +201,6 @@ private slots:
+   deskflow::gui::ServerConnection m_ServerConnection;
+   deskflow::gui::ClientConnection m_ClientConnection;
+   deskflow::gui::TlsUtility m_TlsUtility;
+-  QTimer m_WindowSaveTimer;
+   QSize m_expandedSize = QSize();
+ 
+   QLocalServer *m_guiDupeChecker = nullptr;
+diff --git a/src/apps/deskflow-gui/MainWindow.ui b/src/apps/deskflow-gui/MainWindow.ui
+index 7aa261f8f69..8744a583d7f 100644
+--- a/src/apps/deskflow-gui/MainWindow.ui
++++ b/src/apps/deskflow-gui/MainWindow.ui
+@@ -11,7 +11,7 @@
+    </rect>
+   </property>
+   <property name="sizePolicy">
+-   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++   <sizepolicy hsizetype="Preferred" vsizetype="Maximum">
+     <horstretch>0</horstretch>
+     <verstretch>0</verstretch>
+    </sizepolicy>
+@@ -91,6 +91,12 @@
+     </item>
+     <item>
+      <widget class="QLabel" name="lblMyFingerprint">
++      <property name="sizePolicy">
++       <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
++        <horstretch>0</horstretch>
++        <verstretch>0</verstretch>
++       </sizepolicy>
++      </property>
+       <property name="text">
+        <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;TLS enabled (&lt;a href=&quot;#&quot;&gt;&lt;span style=&quot; text-decoration: underline; color:#4285f4;&quot;&gt;fingerprint&lt;/span&gt;&lt;/a&gt;)&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+       </property>

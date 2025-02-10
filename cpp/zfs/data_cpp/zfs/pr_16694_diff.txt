@@ -1,0 +1,230 @@
+diff --git a/include/sys/dbuf.h b/include/sys/dbuf.h
+index c9bfb9a8026c..e69464809a42 100644
+--- a/include/sys/dbuf.h
++++ b/include/sys/dbuf.h
+@@ -171,7 +171,6 @@ typedef struct dbuf_dirty_record {
+ 			 * gets COW'd in a subsequent transaction group.
+ 			 */
+ 			arc_buf_t *dr_data;
+-			blkptr_t dr_overridden_by;
+ 			override_states_t dr_override_state;
+ 			uint8_t dr_copies;
+ 			boolean_t dr_nopwrite;
+@@ -179,14 +178,21 @@ typedef struct dbuf_dirty_record {
+ 			boolean_t dr_diowrite;
+ 			boolean_t dr_has_raw_params;
+ 
+-			/*
+-			 * If dr_has_raw_params is set, the following crypt
+-			 * params will be set on the BP that's written.
+-			 */
+-			boolean_t dr_byteorder;
+-			uint8_t	dr_salt[ZIO_DATA_SALT_LEN];
+-			uint8_t	dr_iv[ZIO_DATA_IV_LEN];
+-			uint8_t	dr_mac[ZIO_DATA_MAC_LEN];
++			/* Override and raw params are mutually exclusive. */
++			union {
++				blkptr_t dr_overridden_by;
++				struct {
++					/*
++					 * If dr_has_raw_params is set, the
++					 * following crypt params will be set
++					 * on the BP that's written.
++					 */
++					boolean_t dr_byteorder;
++					uint8_t	dr_salt[ZIO_DATA_SALT_LEN];
++					uint8_t	dr_iv[ZIO_DATA_IV_LEN];
++					uint8_t	dr_mac[ZIO_DATA_MAC_LEN];
++				};
++			};
+ 		} dl;
+ 		struct dirty_lightweight_leaf {
+ 			/*
+@@ -346,6 +352,8 @@ typedef struct dbuf_hash_table {
+ 
+ typedef void (*dbuf_prefetch_fn)(void *, uint64_t, uint64_t, boolean_t);
+ 
++extern kmem_cache_t *dbuf_dirty_kmem_cache;
++
+ uint64_t dbuf_whichblock(const struct dnode *di, const int64_t level,
+     const uint64_t offset);
+ 
+diff --git a/module/zfs/dbuf.c b/module/zfs/dbuf.c
+index df9368fc8bdb..b1419d96f4ef 100644
+--- a/module/zfs/dbuf.c
++++ b/module/zfs/dbuf.c
+@@ -182,6 +182,7 @@ static void dbuf_sync_leaf_verify_bonus_dnode(dbuf_dirty_record_t *dr);
+  * Global data structures and functions for the dbuf cache.
+  */
+ static kmem_cache_t *dbuf_kmem_cache;
++kmem_cache_t *dbuf_dirty_kmem_cache;
+ static taskq_t *dbu_evict_taskq;
+ 
+ static kthread_t *dbuf_cache_evict_thread;
+@@ -966,6 +967,8 @@ dbuf_init(void)
+ 	dbuf_kmem_cache = kmem_cache_create("dmu_buf_impl_t",
+ 	    sizeof (dmu_buf_impl_t),
+ 	    0, dbuf_cons, dbuf_dest, NULL, NULL, NULL, 0);
++	dbuf_dirty_kmem_cache = kmem_cache_create("dbuf_dirty_record_t",
++	    sizeof (dbuf_dirty_record_t), 0, NULL, NULL, NULL, NULL, NULL, 0);
+ 
+ 	for (int i = 0; i < hmsize; i++)
+ 		mutex_init(&h->hash_mutexes[i], NULL, MUTEX_NOLOCKDEP, NULL);
+@@ -1041,6 +1044,7 @@ dbuf_fini(void)
+ 	    sizeof (kmutex_t));
+ 
+ 	kmem_cache_destroy(dbuf_kmem_cache);
++	kmem_cache_destroy(dbuf_dirty_kmem_cache);
+ 	taskq_destroy(dbu_evict_taskq);
+ 
+ 	mutex_enter(&dbuf_evict_lock);
+@@ -2343,7 +2347,8 @@ dbuf_dirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
+ 	 * to make a copy of it so that the changes we make in this
+ 	 * transaction group won't leak out when we sync the older txg.
+ 	 */
+-	dr = kmem_zalloc(sizeof (dbuf_dirty_record_t), KM_SLEEP);
++	dr = kmem_cache_alloc(dbuf_dirty_kmem_cache, KM_SLEEP);
++	memset(dr, 0, sizeof (*dr));
+ 	list_link_init(&dr->dr_dirty_node);
+ 	list_link_init(&dr->dr_dbuf_node);
+ 	dr->dr_dnode = dn;
+@@ -2526,7 +2531,7 @@ dbuf_undirty_bonus(dbuf_dirty_record_t *dr)
+ 		mutex_destroy(&dr->dt.di.dr_mtx);
+ 		list_destroy(&dr->dt.di.dr_children);
+ 	}
+-	kmem_free(dr, sizeof (dbuf_dirty_record_t));
++	kmem_cache_free(dbuf_dirty_kmem_cache, dr);
+ 	ASSERT3U(db->db_dirtycnt, >, 0);
+ 	db->db_dirtycnt -= 1;
+ }
+@@ -2616,7 +2621,7 @@ dbuf_undirty(dmu_buf_impl_t *db, dmu_tx_t *tx)
+ 		}
+ 	}
+ 
+-	kmem_free(dr, sizeof (dbuf_dirty_record_t));
++	kmem_cache_free(dbuf_dirty_kmem_cache, dr);
+ 
+ 	ASSERT(db->db_dirtycnt > 0);
+ 	db->db_dirtycnt -= 1;
+@@ -2941,7 +2946,7 @@ dmu_buf_set_crypt_params(dmu_buf_t *db_fake, boolean_t byteorder,
+ 	 * (see dbuf_sync_dnode_leaf_crypt()).
+ 	 */
+ 	ASSERT3U(db->db.db_object, ==, DMU_META_DNODE_OBJECT);
+-	ASSERT3U(db->db_level, ==, 0);
++	ASSERT0(db->db_level);
+ 	ASSERT(db->db_objset->os_raw_receive);
+ 
+ 	dmu_buf_will_dirty_impl(db_fake,
+@@ -2950,6 +2955,7 @@ dmu_buf_set_crypt_params(dmu_buf_t *db_fake, boolean_t byteorder,
+ 	dr = dbuf_find_dirty_eq(db, tx->tx_txg);
+ 
+ 	ASSERT3P(dr, !=, NULL);
++	ASSERT3U(dr->dt.dl.dr_override_state, ==, DR_NOT_OVERRIDDEN);
+ 
+ 	dr->dt.dl.dr_has_raw_params = B_TRUE;
+ 	dr->dt.dl.dr_byteorder = byteorder;
+@@ -2964,10 +2970,14 @@ dbuf_override_impl(dmu_buf_impl_t *db, const blkptr_t *bp, dmu_tx_t *tx)
+ 	struct dirty_leaf *dl;
+ 	dbuf_dirty_record_t *dr;
+ 
++	ASSERT3U(db->db.db_object, !=, DMU_META_DNODE_OBJECT);
++	ASSERT0(db->db_level);
++
+ 	dr = list_head(&db->db_dirty_records);
+ 	ASSERT3P(dr, !=, NULL);
+ 	ASSERT3U(dr->dr_txg, ==, tx->tx_txg);
+ 	dl = &dr->dt.dl;
++	ASSERT0(dl->dr_has_raw_params);
+ 	dl->dr_overridden_by = *bp;
+ 	dl->dr_override_state = DR_OVERRIDDEN;
+ 	BP_SET_LOGICAL_BIRTH(&dl->dr_overridden_by, dr->dr_txg);
+@@ -3040,6 +3050,7 @@ dmu_buf_write_embedded(dmu_buf_t *dbuf, void *data,
+ 	ASSERT3P(dr, !=, NULL);
+ 	ASSERT3U(dr->dr_txg, ==, tx->tx_txg);
+ 	dl = &dr->dt.dl;
++	ASSERT0(dl->dr_has_raw_params);
+ 	encode_embedded_bp_compressed(&dl->dr_overridden_by,
+ 	    data, comp, uncompressed_size, compressed_size);
+ 	BPE_SET_ETYPE(&dl->dr_overridden_by, etype);
+@@ -5083,7 +5094,7 @@ dbuf_write_done(zio_t *zio, arc_buf_t *buf, void *vdb)
+ 	dsl_pool_undirty_space(dmu_objset_pool(os), dr->dr_accounted,
+ 	    zio->io_txg);
+ 
+-	kmem_free(dr, sizeof (dbuf_dirty_record_t));
++	kmem_cache_free(dbuf_dirty_kmem_cache, dr);
+ }
+ 
+ static void
+diff --git a/module/zfs/dmu.c b/module/zfs/dmu.c
+index 3f87cfe6bee9..362415a25895 100644
+--- a/module/zfs/dmu.c
++++ b/module/zfs/dmu.c
+@@ -1895,6 +1895,7 @@ dmu_sync_done(zio_t *zio, arc_buf_t *buf, void *varg)
+ 	mutex_enter(&db->db_mtx);
+ 	ASSERT(dr->dt.dl.dr_override_state == DR_IN_DMU_SYNC);
+ 	if (zio->io_error == 0) {
++		ASSERT0(dr->dt.dl.dr_has_raw_params);
+ 		dr->dt.dl.dr_nopwrite = !!(zio->io_flags & ZIO_FLAG_NOPWRITE);
+ 		if (dr->dt.dl.dr_nopwrite) {
+ 			blkptr_t *bp = zio->io_bp;
+@@ -2190,6 +2191,7 @@ dmu_sync(zio_t *pio, uint64_t txg, dmu_sync_cb_t *done, zgd_t *zgd)
+ 		return (SET_ERROR(EALREADY));
+ 	}
+ 
++	ASSERT0(dr->dt.dl.dr_has_raw_params);
+ 	ASSERT(dr->dt.dl.dr_override_state == DR_NOT_OVERRIDDEN);
+ 	dr->dt.dl.dr_override_state = DR_IN_DMU_SYNC;
+ 	mutex_exit(&db->db_mtx);
+@@ -2657,6 +2659,7 @@ dmu_brt_clone(objset_t *os, uint64_t object, uint64_t offset, uint64_t length,
+ 		db = (dmu_buf_impl_t *)dbuf;
+ 		bp = &bps[i];
+ 
++		ASSERT3U(db->db.db_object, !=, DMU_META_DNODE_OBJECT);
+ 		ASSERT0(db->db_level);
+ 		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
+ 		ASSERT(db->db_blkid != DMU_SPILL_BLKID);
+@@ -2672,11 +2675,6 @@ dmu_brt_clone(objset_t *os, uint64_t object, uint64_t offset, uint64_t length,
+ 		db = (dmu_buf_impl_t *)dbuf;
+ 		bp = &bps[i];
+ 
+-		ASSERT0(db->db_level);
+-		ASSERT(db->db_blkid != DMU_BONUS_BLKID);
+-		ASSERT(db->db_blkid != DMU_SPILL_BLKID);
+-		ASSERT(BP_IS_HOLE(bp) || dbuf->db_size == BP_GET_LSIZE(bp));
+-
+ 		dmu_buf_will_clone_or_dio(dbuf, tx);
+ 
+ 		mutex_enter(&db->db_mtx);
+@@ -2685,6 +2683,7 @@ dmu_brt_clone(objset_t *os, uint64_t object, uint64_t offset, uint64_t length,
+ 		VERIFY(dr != NULL);
+ 		ASSERT3U(dr->dr_txg, ==, tx->tx_txg);
+ 		dl = &dr->dt.dl;
++		ASSERT0(dl->dr_has_raw_params);
+ 		dl->dr_overridden_by = *bp;
+ 		if (!BP_IS_HOLE(bp) || BP_GET_LOGICAL_BIRTH(bp) != 0) {
+ 			if (!BP_IS_EMBEDDED(bp)) {
+diff --git a/module/zfs/dmu_direct.c b/module/zfs/dmu_direct.c
+index ed96e7515bc7..40b78b519f49 100644
+--- a/module/zfs/dmu_direct.c
++++ b/module/zfs/dmu_direct.c
+@@ -180,6 +180,7 @@ dmu_write_direct(zio_t *pio, dmu_buf_impl_t *db, abd_t *data, dmu_tx_t *tx)
+ 	if (list_next(&db->db_dirty_records, dr_head) != NULL)
+ 		zp.zp_nopwrite = B_FALSE;
+ 
++	ASSERT0(dr_head->dt.dl.dr_has_raw_params);
+ 	ASSERT3S(dr_head->dt.dl.dr_override_state, ==, DR_NOT_OVERRIDDEN);
+ 	dr_head->dt.dl.dr_override_state = DR_IN_DMU_SYNC;
+ 
+diff --git a/module/zfs/dnode_sync.c b/module/zfs/dnode_sync.c
+index f67dad002319..122d7d0d17d8 100644
+--- a/module/zfs/dnode_sync.c
++++ b/module/zfs/dnode_sync.c
+@@ -566,7 +566,7 @@ dnode_undirty_dbufs(list_t *list)
+ 			mutex_destroy(&dr->dt.di.dr_mtx);
+ 			list_destroy(&dr->dt.di.dr_children);
+ 		}
+-		kmem_free(dr, sizeof (dbuf_dirty_record_t));
++		kmem_cache_free(dbuf_dirty_kmem_cache, dr);
+ 		dbuf_rele_and_unlock(db, (void *)(uintptr_t)txg, B_FALSE);
+ 	}
+ }

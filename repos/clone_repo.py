@@ -64,7 +64,7 @@ def clone_and_checkout(repo_url, merge_commit_sha, required_files, repo_dir='clo
 
 def remove_non_code_files(directory):
     # Define file extensions to keep (common code file extensions)
-    code_extensions = {'.dart','.gradle', 'Makefile', '.json', '.pl', '.ui', '.md', '.ksh', '.vcxproj', '.yaml', '.gui', '.m', '.py', 'LICENSE', '.ejs', '.hbs', '.ejs', '.tmpl', '.erb', '.haml', '.jade', '.mustache', '.njk', '.pug', '.slim', '.twig','.svelte', '.sh', '.css', '.html', '.java', '.cpp', '.h', '.hpp','.c', '.cc', '.hh', '.cxx', '.hxx', '.hpp', '.ipp', '.c++', '.h++', '.C', '.H', '.cp', '.CPP','.cs', '.rb', '.go', '.php', '.swift', '.kt', '.rs', '.md', '.ts', '.js', '.jsx', '.tsx', '.json', '.vue', '.xml', '.yml', '.toml', 'Dockerfile', 'Gemfile', 'Rakefile', 'Makefile', 'Pipfile', '.txt', '.lua', '.sql', '.config', '.log'}
+    code_extensions = {'.dart','.gradle', 'Makefile', '.json', '.run', '.am', '.pl', '.ui', '.md', '.ksh', '.vcxproj', '.yaml', '.gui', '.m', '.py', 'LICENSE', '.ejs', '.hbs', '.ejs', '.tmpl', '.erb', '.haml', '.jade', '.mustache', '.njk', '.pug', '.slim', '.twig','.svelte', '.sh', '.css', '.html', '.java', '.cpp', '.h', '.hpp','.c', '.cc', '.hh', '.cxx', '.hxx', '.hpp', '.ipp', '.c++', '.h++', '.C', '.H', '.cp', '.CPP','.cs', '.rb', '.go', '.php', '.swift', '.kt', '.rs', '.md', '.ts', '.js', '.jsx', '.tsx', '.json', '.vue', '.xml', '.yml', '.toml', 'Dockerfile', 'Gemfile', 'Rakefile', 'Makefile', 'Pipfile', '.txt', '.lua', '.sql', '.config', '.log'}
 
     for root, dirs, files in os.walk(directory):
         for file in files:

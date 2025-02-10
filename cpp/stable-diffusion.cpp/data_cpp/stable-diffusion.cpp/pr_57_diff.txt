@@ -1,0 +1,145 @@
+diff --git a/README.md b/README.md
+index b9f03142..817c08e1 100644
+--- a/README.md
++++ b/README.md
+@@ -27,6 +27,7 @@ Inference of [Stable Diffusion](https://github.com/CompVis/stable-diffusion) in
+     - [`DPM++ 2M v2`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457)
+     - `DPM++ 2S a`
+ - Cross-platform reproducibility (`--rng cuda`, consistent with the `stable-diffusion-webui GPU RNG`)
++- Embedds generation parameters into png output as webui-compatible text string
+ - Supported platforms
+     - Linux
+     - Mac OS
+diff --git a/examples/main.cpp b/examples/main.cpp
+index 248bc9f2..b2e79ae4 100644
+--- a/examples/main.cpp
++++ b/examples/main.cpp
+@@ -365,6 +365,18 @@ void parse_args(int argc, const char* argv[], Option* opt) {
+     }
+ }
+ 
++std::string basename(const std::string& path) {
++    size_t pos = path.find_last_of('/');
++    if (pos != std::string::npos) {
++        return path.substr(pos + 1);
++    }
++    pos = path.find_last_of('\\');
++    if (pos != std::string::npos) {
++        return path.substr(pos + 1);
++    }
++    return path;
++}
++
+ int main(int argc, const char* argv[]) {
+     Option opt;
+     parse_args(argc, argv, &opt);
+@@ -437,7 +449,24 @@ int main(int argc, const char* argv[]) {
+         return 1;
+     }
+ 
+-    stbi_write_png(opt.output_path.c_str(), opt.w, opt.h, 3, img.data(), 0);
++    std::string parameter_string = opt.prompt + "\n";
++    if (opt.negative_prompt.size() != 0) {
++        parameter_string += "Negative prompt: " + opt.negative_prompt + "\n";
++    }
++    parameter_string += "Steps: " + std::to_string(opt.sample_steps) + ", ";
++    parameter_string += "CFG scale: " + std::to_string(opt.cfg_scale) + ", ";
++    parameter_string += "Seed: " + std::to_string(opt.seed) + ", ";
++    parameter_string += "Size: " + std::to_string(opt.w) + "x" + std::to_string(opt.h) + ", ";
++    parameter_string += "Model: " + basename(opt.model_path) + ", ";
++    parameter_string += "RNG: " + std::string(rng_type_to_str[opt.rng_type]) + ", ";
++    parameter_string += "Sampler: " + std::string(sample_method_str[opt.sample_method]);
++    if (opt.schedule == KARRAS) {
++        parameter_string += " karras";
++    }
++    parameter_string += ", ";
++    parameter_string += "Version: stable-diffusion.cpp";
++
++    stbi_write_png(opt.output_path.c_str(), opt.w, opt.h, 3, img.data(), 0, parameter_string.c_str());
+     printf("save result image to '%s'\n", opt.output_path.c_str());
+ 
+     return 0;
+diff --git a/examples/stb_image_write.h b/examples/stb_image_write.h
+index e4b32ed1..5589a7ec 100644
+--- a/examples/stb_image_write.h
++++ b/examples/stb_image_write.h
+@@ -173,7 +173,7 @@ STBIWDEF int stbi_write_force_png_filter;
+ #endif
+ 
+ #ifndef STBI_WRITE_NO_STDIO
+-STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, int stride_in_bytes);
++STBIWDEF int stbi_write_png(char const *filename, int w, int h, int comp, const void  *data, int stride_in_bytes, const char* parameters = NULL);
+ STBIWDEF int stbi_write_bmp(char const *filename, int w, int h, int comp, const void  *data);
+ STBIWDEF int stbi_write_tga(char const *filename, int w, int h, int comp, const void  *data);
+ STBIWDEF int stbi_write_hdr(char const *filename, int w, int h, int comp, const float *data);
+@@ -1125,9 +1125,10 @@ static void stbiw__encode_png_line(unsigned char *pixels, int stride_bytes, int
+    }
+ }
+ 
+-STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int stride_bytes, int x, int y, int n, int *out_len)
++STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int stride_bytes, int x, int y, int n, int *out_len, const char* parameters)
+ {
+    int force_filter = stbi_write_force_png_filter;
++   int param_length = 0;
+    int ctype[5] = { -1, 0, 4, 2, 6 };
+    unsigned char sig[8] = { 137,80,78,71,13,10,26,10 };
+    unsigned char *out,*o, *filt, *zlib;
+@@ -1177,10 +1178,15 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int s
+    STBIW_FREE(filt);
+    if (!zlib) return 0;
+ 
++   if(parameters != NULL) {
++      param_length = strlen(parameters);
++      param_length += strlen("parameters") + 1; // For the name and the null-byte
++   }
++
+    // each tag requires 12 bytes of overhead
+-   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12);
++   out = (unsigned char *) STBIW_MALLOC(8 + 12+13 + 12+zlen + 12 + ((parameters)?(param_length+12):0));
+    if (!out) return 0;
+-   *out_len = 8 + 12+13 + 12+zlen + 12;
++   *out_len = 8 + 12+13 + 12+zlen + 12 + ((parameters)?(param_length+12):0);
+ 
+    o=out;
+    STBIW_MEMMOVE(o,sig,8); o+= 8;
+@@ -1195,6 +1201,17 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int s
+    *o++ = 0;
+    stbiw__wpcrc(&o,13);
+ 
++   if(parameters != NULL) {
++      stbiw__wp32(o, param_length);
++      stbiw__wptag(o, "tEXt");
++      STBIW_MEMMOVE(o, "parameters", strlen("parameters"));
++      o+=strlen("parameters");
++      *o++ = 0; // Null pyte separator
++      STBIW_MEMMOVE(o, parameters, strlen(parameters));
++      o+=strlen(parameters);
++      stbiw__wpcrc(&o, param_length);
++   }
++
+    stbiw__wp32(o, zlen);
+    stbiw__wptag(o, "IDAT");
+    STBIW_MEMMOVE(o, zlib, zlen);
+@@ -1212,11 +1229,11 @@ STBIWDEF unsigned char *stbi_write_png_to_mem(const unsigned char *pixels, int s
+ }
+ 
+ #ifndef STBI_WRITE_NO_STDIO
+-STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const void *data, int stride_bytes)
++STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const void *data, int stride_bytes, const char* parameters)
+ {
+    FILE *f;
+    int len;
+-   unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
++   unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len, parameters);
+    if (png == NULL) return 0;
+ 
+    f = stbiw__fopen(filename, "wb");
+@@ -1231,7 +1248,7 @@ STBIWDEF int stbi_write_png(char const *filename, int x, int y, int comp, const
+ STBIWDEF int stbi_write_png_to_func(stbi_write_func *func, void *context, int x, int y, int comp, const void *data, int stride_bytes)
+ {
+    int len;
+-   unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len);
++   unsigned char *png = stbi_write_png_to_mem((const unsigned char *) data, stride_bytes, x, y, comp, &len, NULL);
+    if (png == NULL) return 0;
+    func(context, png, len);
+    STBIW_FREE(png);

@@ -1,0 +1,47 @@
+[
+    {
+        "title": "Use LWLocks instead of SpinLocks"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "Spinlocks should be held only for a few instructions, for multiple reasons:\r\n\r\n- You have to be very careful not to elog() out while holding a spinlock, because there is no mechanism to release the spinlock on error.\r\n\r\n- Waiters can waste a lot of cycles spinning if the lock is contended. I you wait on a spinlock for too long, the PostgreSQL implementation will actually PANIC, see s_lock_stuck().\r\n\r\nThe flushLock is particularly problematic. It is held in exclusive mode, which means it holds a spinlock, over the call to FlushPages(). FlushPages() performs lots of I/O so it can take a very long time (>= minutes), and can also easily error out for various reasons.\r\n\r\nallocatorLock would perhaps be OK as a spinlocks, but even that feels a bit heavy, so I converted that to an LWLock, too.\r\n\r\nentryLock is usually held for a very short time, in shared mode, so that would be fine as a spinlock. However, in the rare case that the entry point is updated, it's held for a very long time. An LWLock used in shared mode is about as fast a spinlock, that path is pretty heavily optimized.\r\n\r\nI think we have some problems with the per-element spinlocks too. In HnswUpdateNeighborPagesInMemory(), it's held over a call to HnswUpdateConnection(), but HnswUpdateConnection() can error out at least in case of an out-of-memory error (it uses lappend(), which calls palloc()). It also calls the distance function, and I don't think they are guaranteed to be ereport-free either. However, I didn't address that in this PR, it needs a bit more thinking."
+    },
+    {
+        "author": {
+            "login": "hlinnaka"
+        },
+        "body": "> I think we have some problems with the per-element spinlocks too. In HnswUpdateNeighborPagesInMemory(), it's held over a call to HnswUpdateConnection(), but HnswUpdateConnection() can error out at least in case of an out-of-memory error (it uses lappend(), which calls palloc()). It also calls the distance function, and I don't think they are guaranteed to be ereport-free either. However, I didn't address that in this PR, it needs a bit more thinking.\r\n\r\nThe straightforward fix is to replace the per-element spin lock with an LWLock, too. An LWLock is almost as fast as a spinlock in the uncontended case, but not quite. So it's probably fine from a performance point of view, but needs to be tested.\r\n"
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Thanks @hlinnaka! Just tried converting the per-element locks and didn't find any issues.\r\n\r\nI'm not entirely sure I understand the purpose of the tranche for LWLocks (in Postgres). Is it mainly for debugging / stats?"
+    },
+    {
+        "author": {
+            "login": "hlinnaka"
+        },
+        "body": "> Thanks @hlinnaka! Just tried converting the per-element locks and didn't find any issues.\r\n\r\nOk, great!\r\n\r\n> I'm not entirely sure I understand the purpose of the tranche for LWLocks (in Postgres). Is it mainly for debugging / stats?\r\n\r\nYes, it's purely for debugging and stats.\r\n\r\nOne nice effect is that you see the lock name in `pg_stat_activity`:\r\n```\r\npostgres=# select wait_event_type, wait_event, query from pg_stat_activity ;\r\n wait_event_type |       wait_event       |                               query                               \r\n-----------------+------------------------+-------------------------------------------------------------------\r\n Activity        | AutovacuumMain         | \r\n Activity        | LogicalLauncherMain    | \r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n LWLock          | pgvector allocatorLock | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | reindex index items_small_embedding_idx ;\r\n                 |                        | select wait_event_type, wait_event, query from pg_stat_activity ;\r\n Activity        | BgwriterHibernate      | \r\n Activity        | CheckpointerMain       | \r\n Activity        | WalWriterMain          | \r\n(14 rows)\r\n\r\n```\r\nIf the tranche name is not registered in the backend, the wait_event field says just `extension`. Notably, for the lock name to be displayed in `pg_stat_activity`, the tranche name needs to be registered _in the backend where you query `pg_stat_activity`_. So with this PR, if you run the above query on `pg_stat_activity` in a new connection that hasn't loaded the pgvector extension yet, you don't see the lock name. Unfortunately there isn't a good solution to that. You can add pgvector to shared_preload_libraries or load it explicitly in the backend, but that requires user action. But this is just a debugging/monitoring thing, it doesn't affect the actual locking.\r\n"
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Great, thanks for the explanation! It seems like we could probably use a single tranche for all locks."
+    },
+    {
+        "author": {
+            "login": "hlinnaka"
+        },
+        "body": "> Great, thanks for the explanation! It seems like we could probably use a single tranche for all locks.\r\n\r\nYeah, that works. It's nicer during debugging if you can easily see which lock is being contended. But I don't see much contention on these locks."
+    },
+    {
+        "author": {
+            "login": "ankane"
+        },
+        "body": "Great, will update in a follow-up commit. Thank you!"
+    }
+]

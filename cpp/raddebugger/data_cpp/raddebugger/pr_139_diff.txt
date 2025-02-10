@@ -1,0 +1,118 @@
+diff --git a/build.bat b/build.bat
+index 4c52c384f..8f00468b2 100644
+--- a/build.bat
++++ b/build.bat
+@@ -84,6 +84,9 @@ pushd build
+ %rc% /nologo /fo logo.res ..\data\logo.rc || exit /b 1
+ popd
+ 
++:: --- Get Current Git Commit Id ----------------------------------------------
++for /f %%i in ('call git describe --always --dirty') do set compile=%compile% -DRADDBG_GIT=\"%%i\"
++
+ :: --- Build & Run Metaprogram ------------------------------------------------
+ if "%no_meta%"=="1" echo [skipping metagen]
+ if not "%no_meta%"=="1" (
+diff --git a/src/raddbg/raddbg.h b/src/raddbg/raddbg.h
+index ee9be09ac..b58a910ed 100644
+--- a/src/raddbg/raddbg.h
++++ b/src/raddbg/raddbg.h
+@@ -405,10 +405,16 @@
+ #define RADDBG_VERSION_PATCH 8
+ #define RADDBG_VERSION_STRING_LITERAL Stringify(RADDBG_VERSION_MAJOR) "." Stringify(RADDBG_VERSION_MINOR) "." Stringify(RADDBG_VERSION_PATCH)
+ #if defined(NDEBUG)
+-# define RADDBG_TITLE_STRING_LITERAL "The RAD Debugger (" RADDBG_VERSION_STRING_LITERAL " ALPHA) - " __DATE__ ""
++# define RADDBG_BUILD_STR ""
+ #else
+-# define RADDBG_TITLE_STRING_LITERAL "The RAD Debugger (" RADDBG_VERSION_STRING_LITERAL " ALPHA) - " __DATE__ " [Debug]"
++# define RADDBG_BUILD_STR " [Debug]"
+ #endif
++#if defined(RADDBG_GIT)
++# define RADDBG_GIT_STR " [" RADDBG_GIT "]"
++#else
++# define RADDBG_GIT_STR ""
++#endif
++#define RADDBG_TITLE_STRING_LITERAL "The RAD Debugger (" RADDBG_VERSION_STRING_LITERAL " ALPHA) - " __DATE__ "" RADDBG_GIT_STR RADDBG_BUILD_STR
+ #define RADDBG_GITHUB_ISSUES "https://github.com/EpicGames/raddebugger/issues"
+ 
+ ////////////////////////////////
+diff --git a/src/raddbg/raddbg_main.cpp b/src/raddbg/raddbg_main.cpp
+index e441f4189..471e4e9d0 100644
+--- a/src/raddbg/raddbg_main.cpp
++++ b/src/raddbg/raddbg_main.cpp
+@@ -132,7 +132,7 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+   int buflen = 0;
+   
+   DWORD exception_code = exception_ptrs->ExceptionRecord->ExceptionCode;
+-  buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L"A fatal exception (code 0x%x) occurred. The process is terminating.\n", exception_code);
++  buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"A fatal exception (code 0x%x) occurred. The process is terminating.\n", exception_code);
+   
+   // load dbghelp dynamically just in case if it is missing
+   HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+@@ -213,7 +213,7 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+             const U32 max_frames = 32;
+             if(idx == max_frames)
+             {
+-              buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L"...");
++              buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"...");
+               break;
+             }
+             
+@@ -230,13 +230,13 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+             
+             if(idx==0)
+             {
+-              buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen,
++              buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen,
+                                    L"\nPress Ctrl+C to copy this text to clipboard, then create a new issue in\n"
+                                    L"<a href=\"%S\">%S</a>\n\n", RADDBG_GITHUB_ISSUES, RADDBG_GITHUB_ISSUES);
+-              buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L"Call stack:\n");
++              buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"Call stack:\n");
+             }
+             
+-            buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L"%u. [0x%I64x]", idx, address);
++            buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"%u. [0x%I64x]", idx + 1, address);
+             
+             struct {
+               SYMBOL_INFOW info;
+@@ -249,7 +249,7 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+             DWORD64 displacement = 0;
+             if(dbg_SymFromAddrW(process, address, &displacement, &symbol.info))
+             {
+-              buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L" %s +%u", symbol.info.Name, (DWORD)displacement);
++              buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L" %s +%u", symbol.info.Name, (DWORD)displacement);
+               
+               IMAGEHLP_LINEW64 line = {0};
+               line.SizeOfStruct = sizeof(line);
+@@ -257,7 +257,7 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+               DWORD line_displacement = 0;
+               if(dbg_SymGetLineFromAddrW64(process, address, &line_displacement, &line))
+               {
+-                buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L", %s line %u", PathFindFileNameW(line.FileName), line.LineNumber);
++                buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L", %s line %u", PathFindFileNameW(line.FileName), line.LineNumber);
+               }
+             }
+             else
+@@ -266,19 +266,18 @@ win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs)
+               module.SizeOfStruct = sizeof(module);
+               if(dbg_SymGetModuleInfoW64(process, address, &module))
+               {
+-                buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L" %s", module.ModuleName);
++                buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L" %s", module.ModuleName);
+               }
+             }
+             
+-            buflen += wnsprintfW(buffer + buflen, sizeof(buffer) - buflen, L"\n");
++            buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"\n");
+           }
+         }
+       }
+     }
+   }
+-  
+-  // remove last newline
+-  buffer[buflen] = 0;
++
++  buflen += wnsprintfW(buffer + buflen, ArrayCount(buffer) - buflen, L"\nVersion: %S%S", RADDBG_VERSION_STRING_LITERAL, RADDBG_GIT_STR);
+   
+   TASKDIALOGCONFIG dialog = {0};
+   dialog.cbSize = sizeof(dialog);

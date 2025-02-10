@@ -1,0 +1,257 @@
+diff --git a/cmd/zdb/zdb.c b/cmd/zdb/zdb.c
+index 3eb8a8a58839..aba99fabbbb9 100644
+--- a/cmd/zdb/zdb.c
++++ b/cmd/zdb/zdb.c
+@@ -6953,7 +6953,7 @@ iterate_deleted_livelists(spa_t *spa, ll_iter_t func, void *arg)
+ 	for (zap_cursor_init(&zc, mos, zap_obj);
+ 	    zap_cursor_retrieve(&zc, attrp) == 0;
+ 	    (void) zap_cursor_advance(&zc)) {
+-		dsl_deadlist_open(&ll, mos, attrp->za_first_integer);
++		VERIFY0(dsl_deadlist_open(&ll, mos, attrp->za_first_integer));
+ 		func(&ll, arg);
+ 		dsl_deadlist_close(&ll);
+ 	}
+diff --git a/include/sys/dsl_deadlist.h b/include/sys/dsl_deadlist.h
+index 3feb3bbf062f..798f9e3f6245 100644
+--- a/include/sys/dsl_deadlist.h
++++ b/include/sys/dsl_deadlist.h
+@@ -89,7 +89,7 @@ extern int zfs_livelist_min_percent_shared;
+ 
+ typedef int deadlist_iter_t(void *args, dsl_deadlist_entry_t *dle);
+ 
+-void dsl_deadlist_open(dsl_deadlist_t *dl, objset_t *os, uint64_t object);
++int dsl_deadlist_open(dsl_deadlist_t *dl, objset_t *os, uint64_t object);
+ void dsl_deadlist_close(dsl_deadlist_t *dl);
+ void dsl_deadlist_iterate(dsl_deadlist_t *dl, deadlist_iter_t func, void *arg);
+ uint64_t dsl_deadlist_alloc(objset_t *os, dmu_tx_t *tx);
+diff --git a/include/sys/dsl_dir.h b/include/sys/dsl_dir.h
+index f7c0d9acd10d..04ea7a8f293b 100644
+--- a/include/sys/dsl_dir.h
++++ b/include/sys/dsl_dir.h
+@@ -198,7 +198,7 @@ void dsl_dir_set_reservation_sync_impl(dsl_dir_t *dd, uint64_t value,
+     dmu_tx_t *tx);
+ void dsl_dir_zapify(dsl_dir_t *dd, dmu_tx_t *tx);
+ boolean_t dsl_dir_is_zapified(dsl_dir_t *dd);
+-void dsl_dir_livelist_open(dsl_dir_t *dd, uint64_t obj);
++int dsl_dir_livelist_open(dsl_dir_t *dd, uint64_t obj);
+ void dsl_dir_livelist_close(dsl_dir_t *dd);
+ void dsl_dir_remove_livelist(dsl_dir_t *dd, dmu_tx_t *tx, boolean_t total);
+ int dsl_dir_wait(dsl_dir_t *dd, dsl_dataset_t *ds, zfs_wait_activity_t activity,
+diff --git a/module/zfs/dsl_dataset.c b/module/zfs/dsl_dataset.c
+index 4712addf81be..629edd813fb9 100644
+--- a/module/zfs/dsl_dataset.c
++++ b/module/zfs/dsl_dataset.c
+@@ -701,13 +701,17 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, const void *tag,
+ 			    ZPOOL_ERRATA_ZOL_8308_ENCRYPTION;
+ 		}
+ 
+-		dsl_deadlist_open(&ds->ds_deadlist,
+-		    mos, dsl_dataset_phys(ds)->ds_deadlist_obj);
+-		uint64_t remap_deadlist_obj =
+-		    dsl_dataset_get_remap_deadlist_object(ds);
+-		if (remap_deadlist_obj != 0) {
+-			dsl_deadlist_open(&ds->ds_remap_deadlist, mos,
+-			    remap_deadlist_obj);
++		if (err == 0) {
++			err = dsl_deadlist_open(&ds->ds_deadlist,
++			    mos, dsl_dataset_phys(ds)->ds_deadlist_obj);
++		}
++		if (err == 0) {
++			uint64_t remap_deadlist_obj =
++			    dsl_dataset_get_remap_deadlist_object(ds);
++			if (remap_deadlist_obj != 0) {
++				err = dsl_deadlist_open(&ds->ds_remap_deadlist,
++				    mos, remap_deadlist_obj);
++			}
+ 		}
+ 
+ 		dmu_buf_init_user(&ds->ds_dbu, dsl_dataset_evict_sync,
+@@ -716,7 +720,8 @@ dsl_dataset_hold_obj(dsl_pool_t *dp, uint64_t dsobj, const void *tag,
+ 			winner = dmu_buf_set_user_ie(dbuf, &ds->ds_dbu);
+ 
+ 		if (err != 0 || winner != NULL) {
+-			dsl_deadlist_close(&ds->ds_deadlist);
++			if (dsl_deadlist_is_open(&ds->ds_deadlist))
++				dsl_deadlist_close(&ds->ds_deadlist);
+ 			if (dsl_deadlist_is_open(&ds->ds_remap_deadlist))
+ 				dsl_deadlist_close(&ds->ds_remap_deadlist);
+ 			dsl_bookmark_fini_ds(ds);
+@@ -1823,8 +1828,8 @@ dsl_dataset_snapshot_sync_impl(dsl_dataset_t *ds, const char *snapname,
+ 	    dsl_deadlist_clone(&ds->ds_deadlist, UINT64_MAX,
+ 	    dsl_dataset_phys(ds)->ds_prev_snap_obj, tx);
+ 	dsl_deadlist_close(&ds->ds_deadlist);
+-	dsl_deadlist_open(&ds->ds_deadlist, mos,
+-	    dsl_dataset_phys(ds)->ds_deadlist_obj);
++	VERIFY0(dsl_deadlist_open(&ds->ds_deadlist, mos,
++	    dsl_dataset_phys(ds)->ds_deadlist_obj));
+ 	dsl_deadlist_add_key(&ds->ds_deadlist,
+ 	    dsl_dataset_phys(ds)->ds_prev_snap_txg, tx);
+ 	dsl_bookmark_snapshotted(ds, tx);
+@@ -4044,14 +4049,14 @@ dsl_dataset_swap_remap_deadlists(dsl_dataset_t *clone,
+ 	if (clone_remap_dl_obj != 0) {
+ 		dsl_dataset_set_remap_deadlist_object(origin,
+ 		    clone_remap_dl_obj, tx);
+-		dsl_deadlist_open(&origin->ds_remap_deadlist,
+-		    dp->dp_meta_objset, clone_remap_dl_obj);
++		VERIFY0(dsl_deadlist_open(&origin->ds_remap_deadlist,
++		    dp->dp_meta_objset, clone_remap_dl_obj));
+ 	}
+ 	if (origin_remap_dl_obj != 0) {
+ 		dsl_dataset_set_remap_deadlist_object(clone,
+ 		    origin_remap_dl_obj, tx);
+-		dsl_deadlist_open(&clone->ds_remap_deadlist,
+-		    dp->dp_meta_objset, origin_remap_dl_obj);
++		VERIFY0(dsl_deadlist_open(&clone->ds_remap_deadlist,
++		    dp->dp_meta_objset, origin_remap_dl_obj));
+ 	}
+ }
+ 
+@@ -4222,10 +4227,10 @@ dsl_dataset_clone_swap_sync_impl(dsl_dataset_t *clone,
+ 	dsl_deadlist_close(&origin_head->ds_deadlist);
+ 	SWITCH64(dsl_dataset_phys(origin_head)->ds_deadlist_obj,
+ 	    dsl_dataset_phys(clone)->ds_deadlist_obj);
+-	dsl_deadlist_open(&clone->ds_deadlist, dp->dp_meta_objset,
+-	    dsl_dataset_phys(clone)->ds_deadlist_obj);
+-	dsl_deadlist_open(&origin_head->ds_deadlist, dp->dp_meta_objset,
+-	    dsl_dataset_phys(origin_head)->ds_deadlist_obj);
++	VERIFY0(dsl_deadlist_open(&clone->ds_deadlist, dp->dp_meta_objset,
++	    dsl_dataset_phys(clone)->ds_deadlist_obj));
++	VERIFY0(dsl_deadlist_open(&origin_head->ds_deadlist, dp->dp_meta_objset,
++	    dsl_dataset_phys(origin_head)->ds_deadlist_obj));
+ 	dsl_dataset_swap_remap_deadlists(clone, origin_head, tx);
+ 
+ 	/*
+@@ -4959,8 +4964,8 @@ dsl_dataset_create_remap_deadlist(dsl_dataset_t *ds, dmu_tx_t *tx)
+ 	    dsl_dataset_phys(ds)->ds_prev_snap_obj, tx);
+ 	dsl_dataset_set_remap_deadlist_object(ds,
+ 	    remap_deadlist_obj, tx);
+-	dsl_deadlist_open(&ds->ds_remap_deadlist, spa_meta_objset(spa),
+-	    remap_deadlist_obj);
++	VERIFY0(dsl_deadlist_open(&ds->ds_remap_deadlist, spa_meta_objset(spa),
++	    remap_deadlist_obj));
+ 	spa_feature_incr(spa, SPA_FEATURE_OBSOLETE_COUNTS, tx);
+ }
+ 
+diff --git a/module/zfs/dsl_deadlist.c b/module/zfs/dsl_deadlist.c
+index e457e2fd86ef..b1be8fae3b47 100644
+--- a/module/zfs/dsl_deadlist.c
++++ b/module/zfs/dsl_deadlist.c
+@@ -299,30 +299,33 @@ dsl_deadlist_iterate(dsl_deadlist_t *dl, deadlist_iter_t func, void *args)
+ 	}
+ }
+ 
+-void
++int
+ dsl_deadlist_open(dsl_deadlist_t *dl, objset_t *os, uint64_t object)
+ {
+ 	dmu_object_info_t doi;
++	int err;
+ 
+ 	ASSERT(!dsl_deadlist_is_open(dl));
+ 
+ 	mutex_init(&dl->dl_lock, NULL, MUTEX_DEFAULT, NULL);
+ 	dl->dl_os = os;
+ 	dl->dl_object = object;
+-	VERIFY0(dmu_bonus_hold(os, object, dl, &dl->dl_dbuf));
++	err = dmu_bonus_hold(os, object, dl, &dl->dl_dbuf);
++	if (err != 0)
++		return (err);
+ 	dmu_object_info_from_db(dl->dl_dbuf, &doi);
+ 	if (doi.doi_type == DMU_OT_BPOBJ) {
+ 		dmu_buf_rele(dl->dl_dbuf, dl);
+ 		dl->dl_dbuf = NULL;
+ 		dl->dl_oldfmt = B_TRUE;
+-		VERIFY0(bpobj_open(&dl->dl_bpobj, os, object));
+-		return;
++		return (bpobj_open(&dl->dl_bpobj, os, object));
+ 	}
+ 
+ 	dl->dl_oldfmt = B_FALSE;
+ 	dl->dl_phys = dl->dl_dbuf->db_data;
+ 	dl->dl_havetree = B_FALSE;
+ 	dl->dl_havecache = B_FALSE;
++	return (0);
+ }
+ 
+ boolean_t
+@@ -686,7 +689,7 @@ dsl_deadlist_regenerate(objset_t *os, uint64_t dlobj,
+ 	dsl_deadlist_t dl = { 0 };
+ 	dsl_pool_t *dp = dmu_objset_pool(os);
+ 
+-	dsl_deadlist_open(&dl, os, dlobj);
++	VERIFY0(dsl_deadlist_open(&dl, os, dlobj));
+ 	if (dl.dl_oldfmt) {
+ 		dsl_deadlist_close(&dl);
+ 		return;
+diff --git a/module/zfs/dsl_destroy.c b/module/zfs/dsl_destroy.c
+index b2b925b135f7..e6c7e79ed6c0 100644
+--- a/module/zfs/dsl_destroy.c
++++ b/module/zfs/dsl_destroy.c
+@@ -182,10 +182,10 @@ process_old_deadlist(dsl_dataset_t *ds, dsl_dataset_t *ds_prev,
+ 	dsl_dataset_phys(ds)->ds_deadlist_obj =
+ 	    dsl_dataset_phys(ds_next)->ds_deadlist_obj;
+ 	dsl_dataset_phys(ds_next)->ds_deadlist_obj = deadlist_obj;
+-	dsl_deadlist_open(&ds->ds_deadlist, mos,
+-	    dsl_dataset_phys(ds)->ds_deadlist_obj);
+-	dsl_deadlist_open(&ds_next->ds_deadlist, mos,
+-	    dsl_dataset_phys(ds_next)->ds_deadlist_obj);
++	VERIFY0(dsl_deadlist_open(&ds->ds_deadlist, mos,
++	    dsl_dataset_phys(ds)->ds_deadlist_obj));
++	VERIFY0(dsl_deadlist_open(&ds_next->ds_deadlist, mos,
++	    dsl_dataset_phys(ds_next)->ds_deadlist_obj));
+ }
+ 
+ typedef struct remaining_clones_key {
+diff --git a/module/zfs/dsl_dir.c b/module/zfs/dsl_dir.c
+index 1b60fa620b8d..8788ba11aea9 100644
+--- a/module/zfs/dsl_dir.c
++++ b/module/zfs/dsl_dir.c
+@@ -272,9 +272,11 @@ dsl_dir_hold_obj(dsl_pool_t *dp, uint64_t ddobj,
+ 				err = zap_lookup(dp->dp_meta_objset,
+ 				    dd->dd_object, DD_FIELD_LIVELIST,
+ 				    sizeof (uint64_t), 1, &obj);
+-				if (err == 0)
+-					dsl_dir_livelist_open(dd, obj);
+-				else if (err != ENOENT)
++				if (err == 0) {
++					err = dsl_dir_livelist_open(dd, obj);
++					if (err != 0)
++						goto errout;
++				} else if (err != ENOENT)
+ 					goto errout;
+ 			}
+ 		}
+@@ -2301,15 +2303,18 @@ dsl_dir_is_zapified(dsl_dir_t *dd)
+ 	return (doi.doi_type == DMU_OTN_ZAP_METADATA);
+ }
+ 
+-void
++int
+ dsl_dir_livelist_open(dsl_dir_t *dd, uint64_t obj)
+ {
+ 	objset_t *mos = dd->dd_pool->dp_meta_objset;
+ 	ASSERT(spa_feature_is_active(dd->dd_pool->dp_spa,
+ 	    SPA_FEATURE_LIVELIST));
+-	dsl_deadlist_open(&dd->dd_livelist, mos, obj);
++	int err = dsl_deadlist_open(&dd->dd_livelist, mos, obj);
++	if (err != 0)
++		return (err);
+ 	bplist_create(&dd->dd_pending_allocs);
+ 	bplist_create(&dd->dd_pending_frees);
++	return (0);
+ }
+ 
+ void
+diff --git a/module/zfs/spa.c b/module/zfs/spa.c
+index bf3b0d143db4..0c6e433e780c 100644
+--- a/module/zfs/spa.c
++++ b/module/zfs/spa.c
+@@ -3065,7 +3065,7 @@ spa_livelist_delete_cb(void *arg, zthr_t *z)
+ 		dsl_deadlist_entry_t *dle;
+ 		bplist_t to_free;
+ 		ll = kmem_zalloc(sizeof (dsl_deadlist_t), KM_SLEEP);
+-		dsl_deadlist_open(ll, mos, ll_obj);
++		VERIFY0(dsl_deadlist_open(ll, mos, ll_obj));
+ 		dle = dsl_deadlist_first(ll);
+ 		ASSERT3P(dle, !=, NULL);
+ 		bplist_create(&to_free);

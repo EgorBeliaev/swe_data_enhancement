@@ -1,0 +1,1265 @@
+diff --git a/cmd/zpool/zpool_main.c b/cmd/zpool/zpool_main.c
+index bc9f90cae08b..09a6c6043280 100644
+--- a/cmd/zpool/zpool_main.c
++++ b/cmd/zpool/zpool_main.c
+@@ -9224,6 +9224,12 @@ vdev_stats_nvlist(zpool_handle_t *zhp, status_cbdata_t *cb, nvlist_t *nv,
+ 		}
+ 	}
+ 
++	if (cb->cb_print_dio_verify) {
++		nice_num_str_nvlist(vds, "dio_verify_errors",
++		    vs->vs_dio_verify_errors, cb->cb_literal,
++		    cb->cb_json_as_int, ZFS_NICENUM_1024);
++	}
++
+ 	if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NOT_PRESENT,
+ 	    &notpresent) == 0) {
+ 		nice_num_str_nvlist(vds, ZPOOL_CONFIG_NOT_PRESENT,
+diff --git a/include/sys/fm/fs/zfs.h b/include/sys/fm/fs/zfs.h
+index 55b150c044ee..43d6e3f96ea3 100644
+--- a/include/sys/fm/fs/zfs.h
++++ b/include/sys/fm/fs/zfs.h
+@@ -42,7 +42,8 @@ extern "C" {
+ #define	FM_EREPORT_ZFS_DATA			"data"
+ #define	FM_EREPORT_ZFS_DELAY			"delay"
+ #define	FM_EREPORT_ZFS_DEADMAN			"deadman"
+-#define	FM_EREPORT_ZFS_DIO_VERIFY		"dio_verify"
++#define	FM_EREPORT_ZFS_DIO_VERIFY_WR		"dio_verify_wr"
++#define	FM_EREPORT_ZFS_DIO_VERIFY_RD		"dio_verify_rd"
+ #define	FM_EREPORT_ZFS_POOL			"zpool"
+ #define	FM_EREPORT_ZFS_DEVICE_UNKNOWN		"vdev.unknown"
+ #define	FM_EREPORT_ZFS_DEVICE_OPEN_FAILED	"vdev.open_failed"
+diff --git a/include/sys/vdev_raidz.h b/include/sys/vdev_raidz.h
+index a34bc00ca4df..64f484e9aa13 100644
+--- a/include/sys/vdev_raidz.h
++++ b/include/sys/vdev_raidz.h
+@@ -57,7 +57,7 @@ void vdev_raidz_reconstruct(struct raidz_map *, const int *, int);
+ void vdev_raidz_child_done(zio_t *);
+ void vdev_raidz_io_done(zio_t *);
+ void vdev_raidz_checksum_error(zio_t *, struct raidz_col *, abd_t *);
+-struct raidz_row *vdev_raidz_row_alloc(int);
++struct raidz_row *vdev_raidz_row_alloc(int, zio_t *);
+ void vdev_raidz_reflow_copy_scratch(spa_t *);
+ void raidz_dtl_reassessed(vdev_t *);
+ 
+diff --git a/include/sys/zio.h b/include/sys/zio.h
+index f9409433e031..46f5d68aed4a 100644
+--- a/include/sys/zio.h
++++ b/include/sys/zio.h
+@@ -208,25 +208,25 @@ typedef uint64_t zio_flag_t;
+ #define	ZIO_FLAG_PROBE		(1ULL << 16)
+ #define	ZIO_FLAG_TRYHARD	(1ULL << 17)
+ #define	ZIO_FLAG_OPTIONAL	(1ULL << 18)
+-
++#define	ZIO_FLAG_DIO_READ	(1ULL << 19)
+ #define	ZIO_FLAG_VDEV_INHERIT	(ZIO_FLAG_DONT_QUEUE - 1)
+ 
+ 	/*
+ 	 * Flags not inherited by any children.
+ 	 */
+-#define	ZIO_FLAG_DONT_QUEUE	(1ULL << 19)	/* must be first for INHERIT */
+-#define	ZIO_FLAG_DONT_PROPAGATE	(1ULL << 20)
+-#define	ZIO_FLAG_IO_BYPASS	(1ULL << 21)
+-#define	ZIO_FLAG_IO_REWRITE	(1ULL << 22)
+-#define	ZIO_FLAG_RAW_COMPRESS	(1ULL << 23)
+-#define	ZIO_FLAG_RAW_ENCRYPT	(1ULL << 24)
+-#define	ZIO_FLAG_GANG_CHILD	(1ULL << 25)
+-#define	ZIO_FLAG_DDT_CHILD	(1ULL << 26)
+-#define	ZIO_FLAG_GODFATHER	(1ULL << 27)
+-#define	ZIO_FLAG_NOPWRITE	(1ULL << 28)
+-#define	ZIO_FLAG_REEXECUTED	(1ULL << 29)
+-#define	ZIO_FLAG_DELEGATED	(1ULL << 30)
+-#define	ZIO_FLAG_DIO_CHKSUM_ERR	(1ULL << 31)
++#define	ZIO_FLAG_DONT_QUEUE	(1ULL << 20)	/* must be first for INHERIT */
++#define	ZIO_FLAG_DONT_PROPAGATE	(1ULL << 21)
++#define	ZIO_FLAG_IO_BYPASS	(1ULL << 22)
++#define	ZIO_FLAG_IO_REWRITE	(1ULL << 23)
++#define	ZIO_FLAG_RAW_COMPRESS	(1ULL << 24)
++#define	ZIO_FLAG_RAW_ENCRYPT	(1ULL << 25)
++#define	ZIO_FLAG_GANG_CHILD	(1ULL << 26)
++#define	ZIO_FLAG_DDT_CHILD	(1ULL << 27)
++#define	ZIO_FLAG_GODFATHER	(1ULL << 28)
++#define	ZIO_FLAG_NOPWRITE	(1ULL << 29)
++#define	ZIO_FLAG_REEXECUTED	(1ULL << 30)
++#define	ZIO_FLAG_DELEGATED	(1ULL << 31)
++#define	ZIO_FLAG_DIO_CHKSUM_ERR	(1ULL << 32)
+ 
+ #define	ZIO_ALLOCATOR_NONE	(-1)
+ #define	ZIO_HAS_ALLOCATOR(zio)	((zio)->io_allocator != ZIO_ALLOCATOR_NONE)
+@@ -647,6 +647,7 @@ extern void zio_vdev_io_redone(zio_t *zio);
+ extern void zio_change_priority(zio_t *pio, zio_priority_t priority);
+ 
+ extern void zio_checksum_verified(zio_t *zio);
++extern void zio_dio_chksum_verify_error_report(zio_t *zio);
+ extern int zio_worst_error(int e1, int e2);
+ 
+ extern enum zio_checksum zio_checksum_select(enum zio_checksum child,
+diff --git a/man/man4/zfs.4 b/man/man4/zfs.4
+index e19573d5ee14..c9f6ed0dece3 100644
+--- a/man/man4/zfs.4
++++ b/man/man4/zfs.4
+@@ -436,7 +436,7 @@ write.
+ It can also help to identify if reported checksum errors are tied to Direct I/O
+ writes.
+ Each verify error causes a
+-.Sy dio_verify
++.Sy dio_verify_wr
+ zevent.
+ Direct Write I/O checkum verify errors can be seen with
+ .Nm zpool Cm status Fl d .
+diff --git a/man/man8/zpool-events.8 b/man/man8/zpool-events.8
+index 234612baea8d..01f849845bd9 100644
+--- a/man/man8/zpool-events.8
++++ b/man/man8/zpool-events.8
+@@ -98,7 +98,10 @@ This can be an indicator of problems with the underlying storage device.
+ The number of delay events is ratelimited by the
+ .Sy zfs_slow_io_events_per_second
+ module parameter.
+-.It Sy dio_verify
++.It Sy dio_verify_rd
++Issued when there was a checksum verify error after a Direct I/O read has been
++issued.
++.It Sy dio_verify_wr
+ Issued when there was a checksum verify error after a Direct I/O write has been
+ issued.
+ This event can only take place if the module parameter
+diff --git a/man/man8/zpool-status.8 b/man/man8/zpool-status.8
+index 868fc4414dbb..f44f3f5f838f 100644
+--- a/man/man8/zpool-status.8
++++ b/man/man8/zpool-status.8
+@@ -82,14 +82,18 @@ Specify
+ .Sy --json-pool-key-guid
+ to set pool GUID as key for pool objects instead of pool names.
+ .It Fl d
+-Display the number of Direct I/O write checksum verify errors that have occured
+-on a top-level VDEV.
++Display the number of Direct I/O read/write checksum verify errors that have
++occured on a top-level VDEV.
+ See
+ .Sx zfs_vdev_direct_write_verify
+ in
+ .Xr zfs 4
+ for details about the conditions that can cause Direct I/O write checksum
+ verify failures to occur.
++Direct I/O reads checksum verify errors can also occur if the contents of the
++buffer are being manipulated after the I/O has been issued and is in flight.
++In the case of Direct I/O read checksum verify errors, the I/O will be reissued
++through the ARC.
+ .It Fl D
+ Display a histogram of deduplication statistics, showing the allocated
+ .Pq physically present on disk
+diff --git a/module/os/freebsd/zfs/abd_os.c b/module/os/freebsd/zfs/abd_os.c
+index f20dc5d8c325..ab4f49a4ec5a 100644
+--- a/module/os/freebsd/zfs/abd_os.c
++++ b/module/os/freebsd/zfs/abd_os.c
+@@ -620,9 +620,16 @@ abd_borrow_buf_copy(abd_t *abd, size_t n)
+ 
+ /*
+  * Return a borrowed raw buffer to an ABD. If the ABD is scattered, this will
+- * no change the contents of the ABD and will ASSERT that you didn't modify
+- * the buffer since it was borrowed. If you want any changes you made to buf to
+- * be copied back to abd, use abd_return_buf_copy() instead.
++ * not change the contents of the ABD. If you want any changes you made to
++ * buf to be copied back to abd, use abd_return_buf_copy() instead. If the
++ * ABD is not constructed from user pages from Direct I/O then an ASSERT
++ * checks to make sure the contents of the buffer have not changed since it was
++ * borrowed. We can not ASSERT the contents of the buffer have not changed if
++ * it is composed of user pages. While Direct I/O write pages are placed under
++ * write protection and can not be changed, this is not the case for Direct I/O
++ * reads. The pages of a Direct I/O read could be manipulated at any time.
++ * Checksum verifications in the ZIO pipeline check for this issue and handle
++ * it by returning an error on checksum verification failure.
+  */
+ void
+ abd_return_buf(abd_t *abd, void *buf, size_t n)
+@@ -632,8 +639,34 @@ abd_return_buf(abd_t *abd, void *buf, size_t n)
+ #ifdef ZFS_DEBUG
+ 	(void) zfs_refcount_remove_many(&abd->abd_children, n, buf);
+ #endif
+-	if (abd_is_linear(abd)) {
++	if (abd_is_from_pages(abd)) {
++		if (!abd_is_linear_page(abd))
++			zio_buf_free(buf, n);
++	} else if (abd_is_linear(abd)) {
+ 		ASSERT3P(buf, ==, abd_to_buf(abd));
++	} else if (abd_is_gang(abd)) {
++#ifdef ZFS_DEBUG
++		/*
++		 * We have to be careful with gang ABD's that we do not ASSERT
++		 * for any ABD's that contain user pages from Direct I/O. See
++		 * the comment above about Direct I/O read buffers possibly
++		 * being manipulated. In order to handle this, we jsut iterate
++		 * through the gang ABD and only verify ABD's that are not from
++		 * user pages.
++		 */
++		void *cmp_buf = buf;
++
++		for (abd_t *cabd = list_head(&ABD_GANG(abd).abd_gang_chain);
++		    cabd != NULL;
++		    cabd = list_next(&ABD_GANG(abd).abd_gang_chain, cabd)) {
++			if (!abd_is_from_pages(cabd)) {
++				ASSERT0(abd_cmp_buf(cabd, cmp_buf,
++				    cabd->abd_size));
++			}
++			cmp_buf = (char *)cmp_buf + cabd->abd_size;
++		}
++#endif
++		zio_buf_free(buf, n);
+ 	} else {
+ 		ASSERT0(abd_cmp_buf(abd, buf, n));
+ 		zio_buf_free(buf, n);
+diff --git a/module/os/linux/zfs/abd_os.c b/module/os/linux/zfs/abd_os.c
+index 03362b1ee860..303af48cf3af 100644
+--- a/module/os/linux/zfs/abd_os.c
++++ b/module/os/linux/zfs/abd_os.c
+@@ -1008,7 +1008,9 @@ abd_borrow_buf_copy(abd_t *abd, size_t n)
+  * borrowed. We can not ASSERT that the contents of the buffer have not changed
+  * if it is composed of user pages because the pages can not be placed under
+  * write protection and the user could have possibly changed the contents in
+- * the pages at any time.
++ * the pages at any time. This is also an issue for Direct I/O reads. Checksum
++ * verifications in the ZIO pipeline check for this issue and handle it by
++ * returning an error on checksum verification failure.
+  */
+ void
+ abd_return_buf(abd_t *abd, void *buf, size_t n)
+diff --git a/module/zcommon/zfs_valstr.c b/module/zcommon/zfs_valstr.c
+index 622323bbbd5f..43bccea14a85 100644
+--- a/module/zcommon/zfs_valstr.c
++++ b/module/zcommon/zfs_valstr.c
+@@ -206,6 +206,7 @@ _VALSTR_BITFIELD_IMPL(zio_flag,
+ 	{ '.', "PR", "PROBE" },
+ 	{ '.', "TH", "TRYHARD" },
+ 	{ '.', "OP", "OPTIONAL" },
++	{ '.', "RD", "DIO_READ" },
+ 	{ '.', "DQ", "DONT_QUEUE" },
+ 	{ '.', "DP", "DONT_PROPAGATE" },
+ 	{ '.', "BY", "IO_BYPASS" },
+diff --git a/module/zfs/dmu_direct.c b/module/zfs/dmu_direct.c
+index 91a7fd8df464..ed96e7515bc7 100644
+--- a/module/zfs/dmu_direct.c
++++ b/module/zfs/dmu_direct.c
+@@ -330,7 +330,7 @@ dmu_read_abd(dnode_t *dn, uint64_t offset, uint64_t size,
+ 		 */
+ 		zio_t *cio = zio_read(rio, spa, bp, mbuf, db->db.db_size,
+ 		    dmu_read_abd_done, NULL, ZIO_PRIORITY_SYNC_READ,
+-		    ZIO_FLAG_CANFAIL, &zb);
++		    ZIO_FLAG_CANFAIL | ZIO_FLAG_DIO_READ, &zb);
+ 		mutex_exit(&db->db_mtx);
+ 
+ 		zfs_racct_read(spa, db->db.db_size, 1, flags);
+diff --git a/module/zfs/vdev_draid.c b/module/zfs/vdev_draid.c
+index 13bb33cc6871..419c8ac5bb28 100644
+--- a/module/zfs/vdev_draid.c
++++ b/module/zfs/vdev_draid.c
+@@ -1026,7 +1026,7 @@ vdev_draid_map_alloc_row(zio_t *zio, raidz_row_t **rrp, uint64_t io_offset,
+ 
+ 	ASSERT3U(vdc->vdc_nparity, >, 0);
+ 
+-	raidz_row_t *rr = vdev_raidz_row_alloc(groupwidth);
++	raidz_row_t *rr = vdev_raidz_row_alloc(groupwidth, zio);
+ 	rr->rr_bigcols = bc;
+ 	rr->rr_firstdatacol = vdc->vdc_nparity;
+ #ifdef ZFS_DEBUG
+diff --git a/module/zfs/vdev_indirect.c b/module/zfs/vdev_indirect.c
+index acb725696674..e3dba0257b21 100644
+--- a/module/zfs/vdev_indirect.c
++++ b/module/zfs/vdev_indirect.c
+@@ -34,6 +34,7 @@
+ #include <sys/zap.h>
+ #include <sys/abd.h>
+ #include <sys/zthr.h>
++#include <sys/fm/fs/zfs.h>
+ 
+ /*
+  * An indirect vdev corresponds to a vdev that has been removed.  Since
+@@ -1832,6 +1833,19 @@ vdev_indirect_io_done(zio_t *zio)
+ 
+ 	zio_bad_cksum_t zbc;
+ 	int ret = zio_checksum_error(zio, &zbc);
++	/*
++	 * Any Direct I/O read that has a checksum error must be treated as
++	 * suspicious as the contents of the buffer could be getting
++	 * manipulated while the I/O is taking place. The checksum verify error
++	 * will be reported to the top-level VDEV.
++	 */
++	if (zio->io_flags & ZIO_FLAG_DIO_READ && ret == ECKSUM) {
++		zio->io_error = ret;
++		zio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
++		zio_dio_chksum_verify_error_report(zio);
++		ret = 0;
++	}
++
+ 	if (ret == 0) {
+ 		zio_checksum_verified(zio);
+ 		return;
+diff --git a/module/zfs/vdev_mirror.c b/module/zfs/vdev_mirror.c
+index 102eacb03349..65a840bf9728 100644
+--- a/module/zfs/vdev_mirror.c
++++ b/module/zfs/vdev_mirror.c
+@@ -764,6 +764,27 @@ vdev_mirror_io_done(zio_t *zio)
+ 
+ 	ASSERT(zio->io_type == ZIO_TYPE_READ);
+ 
++	/*
++	 * Any Direct I/O read that has a checksum error must be treated as
++	 * suspicious as the contents of the buffer could be getting
++	 * manipulated while the I/O is taking place. The checksum verify error
++	 * will be reported to the top-level Mirror VDEV.
++	 *
++	 * There will be no attampt at reading any additional data copies. If
++	 * the buffer is still being manipulated while attempting to read from
++	 * another child, there exists a possibly that the checksum could be
++	 * verified as valid. However, the buffer contents could again get
++	 * manipulated after verifying the checksum. This would lead to bad data
++	 * being written out during self healing.
++	 */
++	if ((zio->io_flags & ZIO_FLAG_DIO_READ) &&
++	    (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR)) {
++		zio_dio_chksum_verify_error_report(zio);
++		zio->io_error = vdev_mirror_worst_error(mm);
++		ASSERT3U(zio->io_error, ==, ECKSUM);
++		return;
++	}
++
+ 	/*
+ 	 * If we don't have a good copy yet, keep trying other children.
+ 	 */
+diff --git a/module/zfs/vdev_raidz.c b/module/zfs/vdev_raidz.c
+index 15c8b8ca6016..5e330626be2b 100644
+--- a/module/zfs/vdev_raidz.c
++++ b/module/zfs/vdev_raidz.c
+@@ -433,7 +433,7 @@ const zio_vsd_ops_t vdev_raidz_vsd_ops = {
+ };
+ 
+ raidz_row_t *
+-vdev_raidz_row_alloc(int cols)
++vdev_raidz_row_alloc(int cols, zio_t *zio)
+ {
+ 	raidz_row_t *rr =
+ 	    kmem_zalloc(offsetof(raidz_row_t, rr_col[cols]), KM_SLEEP);
+@@ -445,7 +445,17 @@ vdev_raidz_row_alloc(int cols)
+ 		raidz_col_t *rc = &rr->rr_col[c];
+ 		rc->rc_shadow_devidx = INT_MAX;
+ 		rc->rc_shadow_offset = UINT64_MAX;
+-		rc->rc_allow_repair = 1;
++		/*
++		 * We can not allow self healing to take place for Direct I/O
++		 * reads. There is nothing that stops the buffer contents from
++		 * being manipulated while the I/O is in flight. It is possible
++		 * that the checksum could be verified on the buffer and then
++		 * the contents of that buffer are manipulated afterwards. This
++		 * could lead to bad data being written out during self
++		 * healing.
++		 */
++		if (!(zio->io_flags & ZIO_FLAG_DIO_READ))
++			rc->rc_allow_repair = 1;
+ 	}
+ 	return (rr);
+ }
+@@ -619,7 +629,7 @@ vdev_raidz_map_alloc(zio_t *zio, uint64_t ashift, uint64_t dcols,
+ 	}
+ 
+ 	ASSERT3U(acols, <=, scols);
+-	rr = vdev_raidz_row_alloc(scols);
++	rr = vdev_raidz_row_alloc(scols, zio);
+ 	rm->rm_row[0] = rr;
+ 	rr->rr_cols = acols;
+ 	rr->rr_bigcols = bc;
+@@ -765,7 +775,7 @@ vdev_raidz_map_alloc_expanded(zio_t *zio,
+ 
+ 	for (uint64_t row = 0; row < rows; row++) {
+ 		boolean_t row_use_scratch = B_FALSE;
+-		raidz_row_t *rr = vdev_raidz_row_alloc(cols);
++		raidz_row_t *rr = vdev_raidz_row_alloc(cols, zio);
+ 		rm->rm_row[row] = rr;
+ 
+ 		/* The starting RAIDZ (parent) vdev sector of the row. */
+@@ -2633,6 +2643,20 @@ raidz_checksum_verify(zio_t *zio)
+ 	raidz_map_t *rm = zio->io_vsd;
+ 
+ 	int ret = zio_checksum_error(zio, &zbc);
++	/*
++	 * Any Direct I/O read that has a checksum error must be treated as
++	 * suspicious as the contents of the buffer could be getting
++	 * manipulated while the I/O is taking place. The checksum verify error
++	 * will be reported to the top-level RAIDZ VDEV.
++	 */
++	if (zio->io_flags & ZIO_FLAG_DIO_READ && ret == ECKSUM) {
++		zio->io_error = ret;
++		zio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
++		zio_dio_chksum_verify_error_report(zio);
++		zio_checksum_verified(zio);
++		return (0);
++	}
++
+ 	if (ret != 0 && zbc.zbc_injected != 0)
+ 		rm->rm_ecksuminjected = 1;
+ 
+@@ -2776,6 +2800,11 @@ vdev_raidz_io_done_verified(zio_t *zio, raidz_row_t *rr)
+ 			    (rc->rc_error == 0 || rc->rc_size == 0)) {
+ 				continue;
+ 			}
++			/*
++			 * We do not allow self healing for Direct I/O reads.
++			 * See comment in vdev_raid_row_alloc().
++			 */
++			ASSERT0(zio->io_flags & ZIO_FLAG_DIO_READ);
+ 
+ 			zfs_dbgmsg("zio=%px repairing c=%u devidx=%u "
+ 			    "offset=%llx",
+@@ -2979,6 +3008,8 @@ raidz_reconstruct(zio_t *zio, int *ltgts, int ntgts, int nparity)
+ 
+ 	/* Check for success */
+ 	if (raidz_checksum_verify(zio) == 0) {
++		if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR)
++			return (0);
+ 
+ 		/* Reconstruction succeeded - report errors */
+ 		for (int i = 0; i < rm->rm_nrows; i++) {
+@@ -3379,7 +3410,6 @@ vdev_raidz_io_done_unrecoverable(zio_t *zio)
+ 			zio_bad_cksum_t zbc;
+ 			zbc.zbc_has_cksum = 0;
+ 			zbc.zbc_injected = rm->rm_ecksuminjected;
+-
+ 			mutex_enter(&cvd->vdev_stat_lock);
+ 			cvd->vdev_stat.vs_checksum_errors++;
+ 			mutex_exit(&cvd->vdev_stat_lock);
+@@ -3444,6 +3474,9 @@ vdev_raidz_io_done(zio_t *zio)
+ 		}
+ 
+ 		if (raidz_checksum_verify(zio) == 0) {
++			if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR)
++				goto done;
++
+ 			for (int i = 0; i < rm->rm_nrows; i++) {
+ 				raidz_row_t *rr = rm->rm_row[i];
+ 				vdev_raidz_io_done_verified(zio, rr);
+@@ -3538,6 +3571,7 @@ vdev_raidz_io_done(zio_t *zio)
+ 			}
+ 		}
+ 	}
++done:
+ 	if (rm->rm_lr != NULL) {
+ 		zfs_rangelock_exit(rm->rm_lr);
+ 		rm->rm_lr = NULL;
+diff --git a/module/zfs/zfs_vnops.c b/module/zfs/zfs_vnops.c
+index a96f508ffac0..d5e0d2a2b35a 100644
+--- a/module/zfs/zfs_vnops.c
++++ b/module/zfs/zfs_vnops.c
+@@ -303,6 +303,7 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
+ 	(void) cr;
+ 	int error = 0;
+ 	boolean_t frsync = B_FALSE;
++	boolean_t dio_checksum_failure = B_FALSE;
+ 
+ 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+ 	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+@@ -424,8 +425,26 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
+ 
+ 		if (error) {
+ 			/* convert checksum errors into IO errors */
+-			if (error == ECKSUM)
+-				error = SET_ERROR(EIO);
++			if (error == ECKSUM) {
++				/*
++				 * If a Direct I/O read returned a checksum
++				 * verify error, then it must be treated as
++				 * suspicious. The contents of the buffer could
++				 * have beeen manipulated while the I/O was in
++				 * flight. In this case, the remainder of I/O
++				 * request will just be reissued through the
++				 * ARC.
++				 */
++				if (uio->uio_extflg & UIO_DIRECT) {
++					dio_checksum_failure = B_TRUE;
++					uio->uio_extflg &= ~UIO_DIRECT;
++					n += dio_remaining_resid;
++					dio_remaining_resid = 0;
++					continue;
++				} else {
++					error = SET_ERROR(EIO);
++				}
++			}
+ 
+ #if defined(__linux__)
+ 			/*
+@@ -472,6 +491,9 @@ zfs_read(struct znode *zp, zfs_uio_t *uio, int ioflag, cred_t *cr)
+ out:
+ 	zfs_rangelock_exit(lr);
+ 
++	if (dio_checksum_failure == B_TRUE)
++		uio->uio_extflg |= UIO_DIRECT;
++
+ 	/*
+ 	 * Cleanup for Direct I/O if requested.
+ 	 */
+diff --git a/module/zfs/zio.c b/module/zfs/zio.c
+index b26f5e80abfb..a5daf73d59ba 100644
+--- a/module/zfs/zio.c
++++ b/module/zfs/zio.c
+@@ -804,11 +804,11 @@ zio_notify_parent(zio_t *pio, zio_t *zio, enum zio_wait_type wait,
+ 	pio->io_reexecute |= zio->io_reexecute;
+ 	ASSERT3U(*countp, >, 0);
+ 
+-	if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR) {
+-		ASSERT3U(*errorp, ==, EIO);
+-		ASSERT3U(pio->io_child_type, ==, ZIO_CHILD_LOGICAL);
++	/*
++	 * Propogate the Direct I/O checksum verify failure to the parent.
++	 */
++	if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR)
+ 		pio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
+-	}
+ 
+ 	(*countp)--;
+ 
+@@ -1573,6 +1573,14 @@ zio_vdev_child_io(zio_t *pio, blkptr_t *bp, vdev_t *vd, uint64_t offset,
+ 		 */
+ 		pipeline |= ZIO_STAGE_CHECKSUM_VERIFY;
+ 		pio->io_pipeline &= ~ZIO_STAGE_CHECKSUM_VERIFY;
++		/*
++		 * We never allow the mirror VDEV to attempt reading from any
++		 * additional data copies after the first Direct I/O checksum
++		 * verify failure. This is to avoid bad data being written out
++		 * through the mirror during self healing. See comment in
++		 * vdev_mirror_io_done() for more details.
++		 */
++		ASSERT0(pio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR);
+ 	} else if (type == ZIO_TYPE_WRITE &&
+ 	    pio->io_prop.zp_direct_write == B_TRUE) {
+ 		/*
+@@ -4555,18 +4563,18 @@ zio_vdev_io_assess(zio_t *zio)
+ 	}
+ 
+ 	/*
+-	 * If a Direct I/O write checksum verify error has occurred then this
+-	 * I/O should not attempt to be issued again. Instead the EIO will
+-	 * be returned.
++	 * If a Direct I/O operation has a checksum verify error then this I/O
++	 * should not attempt to be issued again.
+ 	 */
+ 	if (zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR) {
+-		ASSERT3U(zio->io_child_type, ==, ZIO_CHILD_LOGICAL);
+-		ASSERT3U(zio->io_error, ==, EIO);
++		if (zio->io_type == ZIO_TYPE_WRITE) {
++			ASSERT3U(zio->io_child_type, ==, ZIO_CHILD_LOGICAL);
++			ASSERT3U(zio->io_error, ==, EIO);
++		}
+ 		zio->io_pipeline = ZIO_INTERLOCK_PIPELINE;
+ 		return (zio);
+ 	}
+ 
+-
+ 	if (zio_injection_enabled && zio->io_error == 0)
+ 		zio->io_error = zio_handle_fault_injection(zio, EIO);
+ 
+@@ -4864,16 +4872,40 @@ zio_checksum_verify(zio_t *zio)
+ 		ASSERT3U(zio->io_prop.zp_checksum, ==, ZIO_CHECKSUM_LABEL);
+ 	}
+ 
++	ASSERT0(zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR);
++	IMPLY(zio->io_flags & ZIO_FLAG_DIO_READ,
++	    !(zio->io_flags & ZIO_FLAG_SPECULATIVE));
++
+ 	if ((error = zio_checksum_error(zio, &info)) != 0) {
+ 		zio->io_error = error;
+ 		if (error == ECKSUM &&
+ 		    !(zio->io_flags & ZIO_FLAG_SPECULATIVE)) {
+-			mutex_enter(&zio->io_vd->vdev_stat_lock);
+-			zio->io_vd->vdev_stat.vs_checksum_errors++;
+-			mutex_exit(&zio->io_vd->vdev_stat_lock);
+-			(void) zfs_ereport_start_checksum(zio->io_spa,
+-			    zio->io_vd, &zio->io_bookmark, zio,
+-			    zio->io_offset, zio->io_size, &info);
++			if (zio->io_flags & ZIO_FLAG_DIO_READ) {
++				zio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
++				zio_t *pio = zio_unique_parent(zio);
++				/*
++				 * Any Direct I/O read that has a checksum
++				 * error must be treated as suspicous as the
++				 * contents of the buffer could be getting
++				 * manipulated while the I/O is taking place.
++				 *
++				 * The checksum verify error will only be
++				 * reported here for disk and file VDEV's and
++				 * will be reported on those that the failure
++				 * occurred on. Other types of VDEV's report the
++				 * verify failure in their own code paths.
++				 */
++				if (pio->io_child_type == ZIO_CHILD_LOGICAL) {
++					zio_dio_chksum_verify_error_report(zio);
++				}
++			} else {
++				mutex_enter(&zio->io_vd->vdev_stat_lock);
++				zio->io_vd->vdev_stat.vs_checksum_errors++;
++				mutex_exit(&zio->io_vd->vdev_stat_lock);
++				(void) zfs_ereport_start_checksum(zio->io_spa,
++				    zio->io_vd, &zio->io_bookmark, zio,
++				    zio->io_offset, zio->io_size, &info);
++			}
+ 		}
+ 	}
+ 
+@@ -4899,22 +4931,8 @@ zio_dio_checksum_verify(zio_t *zio)
+ 	if ((error = zio_checksum_error(zio, NULL)) != 0) {
+ 		zio->io_error = error;
+ 		if (error == ECKSUM) {
+-			mutex_enter(&zio->io_vd->vdev_stat_lock);
+-			zio->io_vd->vdev_stat.vs_dio_verify_errors++;
+-			mutex_exit(&zio->io_vd->vdev_stat_lock);
+-			zio->io_error = SET_ERROR(EIO);
+ 			zio->io_flags |= ZIO_FLAG_DIO_CHKSUM_ERR;
+-
+-			/*
+-			 * The EIO error must be propagated up to the logical
+-			 * parent ZIO in zio_notify_parent() so it can be
+-			 * returned to dmu_write_abd().
+-			 */
+-			zio->io_flags &= ~ZIO_FLAG_DONT_PROPAGATE;
+-
+-			(void) zfs_ereport_post(FM_EREPORT_ZFS_DIO_VERIFY,
+-			    zio->io_spa, zio->io_vd, &zio->io_bookmark,
+-			    zio, 0);
++			zio_dio_chksum_verify_error_report(zio);
+ 		}
+ 	}
+ 
+@@ -4932,6 +4950,39 @@ zio_checksum_verified(zio_t *zio)
+ 	zio->io_pipeline &= ~ZIO_STAGE_CHECKSUM_VERIFY;
+ }
+ 
++/*
++ * Report Direct I/O checksum verify error and create ZED event.
++ */
++void
++zio_dio_chksum_verify_error_report(zio_t *zio)
++{
++	ASSERT(zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR);
++
++	if (zio->io_child_type == ZIO_CHILD_LOGICAL)
++		return;
++
++	mutex_enter(&zio->io_vd->vdev_stat_lock);
++	zio->io_vd->vdev_stat.vs_dio_verify_errors++;
++	mutex_exit(&zio->io_vd->vdev_stat_lock);
++	if (zio->io_type == ZIO_TYPE_WRITE) {
++		/*
++		 * Convert checksum error for writes into EIO.
++		 */
++		zio->io_error = SET_ERROR(EIO);
++		/*
++		 * Report dio_verify_wr ZED event.
++		 */
++		(void) zfs_ereport_post(FM_EREPORT_ZFS_DIO_VERIFY_WR,
++		    zio->io_spa,  zio->io_vd, &zio->io_bookmark, zio, 0);
++	} else {
++		/*
++		 * Report dio_verify_rd ZED event.
++		 */
++		(void) zfs_ereport_post(FM_EREPORT_ZFS_DIO_VERIFY_RD,
++		    zio->io_spa, zio->io_vd, &zio->io_bookmark, zio, 0);
++	}
++}
++
+ /*
+  * ==========================================================================
+  * Error rank.  Error are ranked in the order 0, ENXIO, ECKSUM, EIO, other.
+@@ -5343,10 +5394,9 @@ zio_done(zio_t *zio)
+ 
+ 	if (zio->io_reexecute) {
+ 		/*
+-		 * A Direct I/O write that has a checksum verify error should
+-		 * not attempt to reexecute. Instead, EAGAIN should just be
+-		 * propagated back up so the write can be attempt to be issued
+-		 * through the ARC.
++		 * A Direct I/O operation that has a checksum verify error
++		 * should not attempt to reexecute. Instead, the error should
++		 * just be propagated back.
+ 		 */
+ 		ASSERT(!(zio->io_flags & ZIO_FLAG_DIO_CHKSUM_ERR));
+ 
+diff --git a/tests/runfiles/common.run b/tests/runfiles/common.run
+index f89a4b3e0aae..fc4adc42d00a 100644
+--- a/tests/runfiles/common.run
++++ b/tests/runfiles/common.run
+@@ -697,8 +697,8 @@ tags = ['functional', 'delegate']
+ tests = ['dio_aligned_block', 'dio_async_always', 'dio_async_fio_ioengines',
+     'dio_compression', 'dio_dedup', 'dio_encryption', 'dio_grow_block',
+     'dio_max_recordsize', 'dio_mixed', 'dio_mmap', 'dio_overwrites',
+-    'dio_property', 'dio_random', 'dio_recordsize', 'dio_unaligned_block',
+-    'dio_unaligned_filesize']
++    'dio_property', 'dio_random', 'dio_read_verify', 'dio_recordsize',
++    'dio_unaligned_block', 'dio_unaligned_filesize']
+ tags = ['functional', 'direct']
+ 
+ [tests/functional/exec]
+diff --git a/tests/zfs-tests/cmd/manipulate_user_buffer.c b/tests/zfs-tests/cmd/manipulate_user_buffer.c
+index 714f42200557..173581094443 100644
+--- a/tests/zfs-tests/cmd/manipulate_user_buffer.c
++++ b/tests/zfs-tests/cmd/manipulate_user_buffer.c
+@@ -20,7 +20,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2022 by Triad National Security, LLC.
++ * Copyright (c) 2024 by Triad National Security, LLC.
+  */
+ 
+ #include <sys/types.h>
+@@ -39,51 +39,59 @@
+ #define	MIN(a, b)	((a) < (b)) ? (a) : (b)
+ #endif
+ 
+-static char *outputfile = NULL;
++static char *filename = NULL;
+ static int blocksize = 131072; /* 128K */
+-static int wr_err_expected = 0;
++static int err_expected = 0;
++static int read_op = 0;
++static int write_op = 0;
+ static int numblocks = 100;
+ static char *execname = NULL;
+ static int print_usage = 0;
+ static int randompattern = 0;
+-static int ofd;
++static int fd;
+ char *buf = NULL;
+ 
+ typedef struct {
+-	int entire_file_written;
++	int entire_file_completed;
+ } pthread_args_t;
+ 
+ static void
+ usage(void)
+ {
+ 	(void) fprintf(stderr,
+-	    "usage %s -o outputfile [-b blocksize] [-e wr_error_expected]\n"
+-	    "         [-n numblocks] [-p randpattern] [-h help]\n"
++	    "usage %s -f filename [-b blocksize] [-e wr_error_expected]\n"
++	    "         [-n numblocks] [-p randompattern] -r read_op \n"
++	    "         -w write_op [-h help]\n"
+ 	    "\n"
+ 	    "Testing whether checksum verify works correctly for O_DIRECT.\n"
+ 	    "when manipulating the contents of a userspace buffer.\n"
+ 	    "\n"
+-	    "    outputfile:      File to write to.\n"
+-	    "    blocksize:       Size of each block to write (must be at \n"
+-	    "                     least >= 512).\n"
+-	    "    wr_err_expected: Whether pwrite() is expected to return EIO\n"
+-	    "                     while manipulating the contents of the\n"
+-	    "                     buffer.\n"
+-	    "    numblocks:       Total number of blocksized blocks to\n"
+-	    "                     write.\n"
+-	    "    randpattern:     Fill data buffer with random data. Default\n"
+-	    "                     behavior is to fill the buffer with the \n"
+-	    "                     known data pattern (0xdeadbeef).\n"
++	    "    filename:       File to read or write to.\n"
++	    "    blocksize:      Size of each block to write (must be at \n"
++	    "                    least >= 512).\n"
++	    "    err_expected:   Whether write() is expected to return EIO\n"
++	    "                    while manipulating the contents of the\n"
++	    "                    buffer.\n"
++	    "    numblocks:      Total number of blocksized blocks to\n"
++	    "                    write.\n"
++	    "    read_op:        Perform reads to the filename file while\n"
++	    "                    while manipulating the buffer contents\n"
++	    "    write_op:       Perform writes to the filename file while\n"
++	    "                    manipulating the buffer contents\n"
++	    "    randompattern:  Fill data buffer with random data for \n"
++	    "                    writes. Default behavior is to fill the \n"
++	    "                    buffer with known data pattern (0xdeadbeef)\n"
+ 	    "    help:           Print usage information and exit.\n"
+ 	    "\n"
+ 	    "    Required parameters:\n"
+-	    "    outputfile\n"
++	    "    filename\n"
++	    "    read_op or write_op\n"
+ 	    "\n"
+ 	    "    Default Values:\n"
+ 	    "    blocksize       -> 131072\n"
+ 	    "    wr_err_expexted -> false\n"
+ 	    "    numblocks       -> 100\n"
+-	    "    randpattern     -> false\n",
++	    "    randompattern   -> false\n",
+ 	    execname);
+ 	(void) exit(1);
+ }
+@@ -97,16 +105,21 @@ parse_options(int argc, char *argv[])
+ 	extern int optind, optopt;
+ 	execname = argv[0];
+ 
+-	while ((c = getopt(argc, argv, "b:ehn:o:p")) != -1) {
++	while ((c = getopt(argc, argv, "b:ef:hn:rw")) != -1) {
+ 		switch (c) {
+ 			case 'b':
+ 				blocksize = atoi(optarg);
+ 				break;
+ 
+ 			case 'e':
+-				wr_err_expected = 1;
++				err_expected = 1;
+ 				break;
+ 
++			case 'f':
++				filename = optarg;
++				break;
++
++
+ 			case 'h':
+ 				print_usage = 1;
+ 				break;
+@@ -115,12 +128,12 @@ parse_options(int argc, char *argv[])
+ 				numblocks = atoi(optarg);
+ 				break;
+ 
+-			case 'o':
+-				outputfile = optarg;
++			case 'r':
++				read_op = 1;
+ 				break;
+ 
+-			case 'p':
+-				randompattern = 1;
++			case 'w':
++				write_op = 1;
+ 				break;
+ 
+ 			case ':':
+@@ -141,7 +154,8 @@ parse_options(int argc, char *argv[])
+ 	if (errflag || print_usage == 1)
+ 		(void) usage();
+ 
+-	if (blocksize < 512 || outputfile == NULL || numblocks <= 0) {
++	if (blocksize < 512 || filename == NULL || numblocks <= 0 ||
++	    (read_op == 0 && write_op == 0)) {
+ 		(void) fprintf(stderr,
+ 		    "Required paramater(s) missing or invalid.\n");
+ 		(void) usage();
+@@ -160,10 +174,10 @@ write_thread(void *arg)
+ 	ssize_t wrote = 0;
+ 	pthread_args_t *args = (pthread_args_t *)arg;
+ 
+-	while (!args->entire_file_written) {
+-		wrote = pwrite(ofd, buf, blocksize, offset);
++	while (!args->entire_file_completed) {
++		wrote = pwrite(fd, buf, blocksize, offset);
+ 		if (wrote != blocksize) {
+-			if (wr_err_expected)
++			if (err_expected)
+ 				assert(errno == EIO);
+ 			else
+ 				exit(2);
+@@ -173,7 +187,35 @@ write_thread(void *arg)
+ 		left -= blocksize;
+ 
+ 		if (left == 0)
+-			args->entire_file_written = 1;
++			args->entire_file_completed = 1;
++	}
++
++	pthread_exit(NULL);
++}
++
++/*
++ * Read blocksize * numblocks to the file using O_DIRECT.
++ */
++static void *
++read_thread(void *arg)
++{
++	size_t offset = 0;
++	int total_data = blocksize * numblocks;
++	int left = total_data;
++	ssize_t read = 0;
++	pthread_args_t *args = (pthread_args_t *)arg;
++
++	while (!args->entire_file_completed) {
++		read = pread(fd, buf, blocksize, offset);
++		if (read != blocksize) {
++			exit(2);
++		}
++
++		offset = ((offset + blocksize) % total_data);
++		left -= blocksize;
++
++		if (left == 0)
++			args->entire_file_completed = 1;
+ 	}
+ 
+ 	pthread_exit(NULL);
+@@ -189,7 +231,7 @@ manipulate_buf_thread(void *arg)
+ 	char rand_char;
+ 	pthread_args_t *args = (pthread_args_t *)arg;
+ 
+-	while (!args->entire_file_written) {
++	while (!args->entire_file_completed) {
+ 		rand_offset = (rand() % blocksize);
+ 		rand_char = (rand() % (126 - 33) + 33);
+ 		buf[rand_offset] = rand_char;
+@@ -202,9 +244,9 @@ int
+ main(int argc, char *argv[])
+ {
+ 	const char *datapattern = "0xdeadbeef";
+-	int ofd_flags = O_WRONLY | O_CREAT | O_DIRECT;
++	int fd_flags = O_DIRECT;
+ 	mode_t mode = S_IRUSR | S_IWUSR;
+-	pthread_t write_thr;
++	pthread_t io_thr;
+ 	pthread_t manipul_thr;
+ 	int left = blocksize;
+ 	int offset = 0;
+@@ -213,9 +255,15 @@ main(int argc, char *argv[])
+ 
+ 	parse_options(argc, argv);
+ 
+-	ofd = open(outputfile, ofd_flags, mode);
+-	if (ofd == -1) {
+-		(void) fprintf(stderr, "%s, %s\n", execname, outputfile);
++	if (write_op) {
++		fd_flags |= (O_WRONLY | O_CREAT);
++	} else {
++		fd_flags |= O_RDONLY;
++	}
++
++	fd = open(filename, fd_flags, mode);
++	if (fd == -1) {
++		(void) fprintf(stderr, "%s, %s\n", execname, filename);
+ 		perror("open");
+ 		exit(2);
+ 	}
+@@ -228,24 +276,22 @@ main(int argc, char *argv[])
+ 		exit(2);
+ 	}
+ 
+-	if (!randompattern) {
+-		/* Putting known data pattern in buffer */
+-		while (left) {
+-			size_t amt = MIN(strlen(datapattern), left);
+-			memcpy(&buf[offset], datapattern, amt);
+-			offset += amt;
+-			left -= amt;
++	if (write_op) {
++		if (!randompattern) {
++			/* Putting known data pattern in buffer */
++			while (left) {
++				size_t amt = MIN(strlen(datapattern), left);
++				memcpy(&buf[offset], datapattern, amt);
++				offset += amt;
++				left -= amt;
++			}
++		} else {
++			/* Putting random data in buffer */
++			for (int i = 0; i < blocksize; i++)
++				buf[i] = rand();
+ 		}
+-	} else {
+-		/* Putting random data in buffer */
+-		for (int i = 0; i < blocksize; i++)
+-			buf[i] = rand();
+ 	}
+ 
+-	/*
+-	 * Writing using O_DIRECT while manipulating the buffer contents until
+-	 * the entire file is written.
+-	 */
+ 	if ((rc = pthread_create(&manipul_thr, NULL, manipulate_buf_thread,
+ 	    &args))) {
+ 		fprintf(stderr, "error: pthreads_create, manipul_thr, "
+@@ -253,18 +299,34 @@ main(int argc, char *argv[])
+ 		exit(2);
+ 	}
+ 
+-	if ((rc = pthread_create(&write_thr, NULL, write_thread, &args))) {
+-		fprintf(stderr, "error: pthreads_create, write_thr, "
+-		    "rc: %d\n", rc);
+-		exit(2);
++	if (write_op) {
++		/*
++		 * Writing using O_DIRECT while manipulating the buffer contents
++		 * until the entire file is written.
++		 */
++		if ((rc = pthread_create(&io_thr, NULL, write_thread, &args))) {
++			fprintf(stderr, "error: pthreads_create, io_thr, "
++			    "rc: %d\n", rc);
++			exit(2);
++		}
++	} else {
++		/*
++		 * Reading using O_DIRECT while manipulating the buffer contents
++		 * until the entire file is read.
++		 */
++		if ((rc = pthread_create(&io_thr, NULL, read_thread, &args))) {
++			fprintf(stderr, "error: pthreads_create, io_thr, "
++			    "rc: %d\n", rc);
++			exit(2);
++		}
+ 	}
+ 
+-	pthread_join(write_thr, NULL);
++	pthread_join(io_thr, NULL);
+ 	pthread_join(manipul_thr, NULL);
+ 
+-	assert(args.entire_file_written == 1);
++	assert(args.entire_file_completed == 1);
+ 
+-	(void) close(ofd);
++	(void) close(fd);
+ 
+ 	free(buf);
+ 
+diff --git a/tests/zfs-tests/tests/Makefile.am b/tests/zfs-tests/tests/Makefile.am
+index 206ee8ac1542..bc767b9f624f 100644
+--- a/tests/zfs-tests/tests/Makefile.am
++++ b/tests/zfs-tests/tests/Makefile.am
+@@ -1477,6 +1477,7 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
+ 	functional/direct/dio_overwrites.ksh \
+ 	functional/direct/dio_property.ksh \
+ 	functional/direct/dio_random.ksh \
++	functional/direct/dio_read_verify.ksh \
+ 	functional/direct/dio_recordsize.ksh \
+ 	functional/direct/dio_unaligned_block.ksh \
+ 	functional/direct/dio_unaligned_filesize.ksh \
+diff --git a/tests/zfs-tests/tests/functional/direct/dio.kshlib b/tests/zfs-tests/tests/functional/direct/dio.kshlib
+index 3a70cf293967..5b3f893e1ce1 100644
+--- a/tests/zfs-tests/tests/functional/direct/dio.kshlib
++++ b/tests/zfs-tests/tests/functional/direct/dio.kshlib
+@@ -84,8 +84,9 @@ function get_zpool_status_chksum_verify_failures # pool_name vdev_type
+ function get_zed_dio_verify_events # pool
+ {
+ 	typeset pool=$1
++	typeset op=$2
+ 
+-	val=$(zpool events $pool | grep -c dio_verify)
++	val=$(zpool events $pool | grep -c "dio_verify_${op}")
+ 
+ 	echo "$val"
+ }
+@@ -96,11 +97,12 @@ function get_zed_dio_verify_events # pool
+ # zpool events
+ # After getting that counts will clear the out the ZPool errors and events
+ #
+-function check_dio_write_chksum_verify_failures # pool vdev_type expect_errors
++function check_dio_chksum_verify_failures # pool vdev_type op expect_errors
+ {
+ 	typeset pool=$1
+ 	typeset vdev_type=$2
+ 	typeset expect_errors=$3
++	typeset op=$4
+ 	typeset note_str="expecting none"
+ 
+ 	if [[ $expect_errors -ne 0 ]]; then
+@@ -108,10 +110,10 @@ function check_dio_write_chksum_verify_failures # pool vdev_type expect_errors
+ 	fi
+ 
+ 	log_note "Checking for Direct I/O write checksum verify errors \
+-	    $note_str on ZPool: $pool"
++	    $note_str on ZPool: $pool with $vdev_type"
+ 
+ 	status_failures=$(get_zpool_status_chksum_verify_failures $pool $vdev_type)
+-	zed_dio_verify_events=$(get_zed_dio_verify_events $pool)
++	zed_dio_verify_events=$(get_zed_dio_verify_events $pool $op)
+ 
+ 	if [[ $expect_errors -ne 0 ]]; then
+ 		if [[ $status_failures -eq 0 ||
+diff --git a/tests/zfs-tests/tests/functional/direct/dio_read_verify.ksh b/tests/zfs-tests/tests/functional/direct/dio_read_verify.ksh
+new file mode 100755
+index 000000000000..456d429b1d99
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/direct/dio_read_verify.ksh
+@@ -0,0 +1,107 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright (c) 2024 by Triad National Security, LLC.
++#
++
++. $STF_SUITE/include/libtest.shlib
++. $STF_SUITE/tests/functional/direct/dio.cfg
++. $STF_SUITE/tests/functional/direct/dio.kshlib
++
++#
++# DESCRIPTION:
++# 	Verify checksum verify works for Direct I/O reads.
++#
++# STRATEGY:
++#	1. Create a zpool from each vdev type.
++#	2. Start a Direct I/O read workload while manipulating the user buffer
++#	   contents.
++#	3. Verify there are Direct I/O read verify failures using
++#	   zpool status -d and checking for zevents. We also make sure there
++#	   are reported no data errors.
++#
++
++verify_runnable "global"
++
++log_assert "Verify checksum verify works for Direct I/O reads."
++
++log_onexit dio_cleanup
++
++NUMBLOCKS=300
++BS=$((128 * 1024)) # 128k
++
++log_must  truncate -s $MINVDEVSIZE $DIO_VDEVS
++
++# We will verify that there are no checksum errors for every Direct I/O read
++# while manipulating the buffer contents while the I/O is still in flight and
++# also that Direct I/O checksum verify failures and dio_verify_rd zevents are
++# reported.
++
++
++for type in "" "mirror" "raidz" "draid"; do
++	typeset vdev_type=$type
++	if [[ "${vdev_type}" == "" ]]; then
++		vdev_type="stripe"
++	fi
++
++	log_note "Verifying every Direct I/O read verify with VDEV type \
++	    ${vdev_type}"
++
++	create_pool $TESTPOOL1 $type $DIO_VDEVS
++	log_must eval "zfs create -o recordsize=128k -o compression=off  \
++	    $TESTPOOL1/$TESTFS1"
++
++	mntpnt=$(get_prop mountpoint $TESTPOOL1/$TESTFS1)
++	prev_dio_rd=$(get_iostats_stat $TESTPOOL1 direct_read_count)
++	prev_arc_rd=$(get_iostats_stat $TESTPOOL1 arc_read_count)
++
++	# Create the file before trying to manipulate the contents
++	log_must stride_dd -o "$mntpnt/direct-write.iso" -i /dev/urandom \
++	    -b $BS -c $NUMBLOCKS -D
++	# Manipulate the buffer contents will reading the file with Direct I/O
++	log_must manipulate_user_buffer -f "$mntpnt/direct-write.iso" \
++	    -n $NUMBLOCKS -b $BS -r
++
++	# Getting new Direct I/O and ARC Write counts.
++	curr_dio_rd=$(get_iostats_stat $TESTPOOL1 direct_read_count)
++	curr_arc_rd=$(get_iostats_stat $TESTPOOL1 arc_read_count)
++	total_dio_rd=$((curr_dio_rd - prev_dio_rd))
++	total_arc_rd=$((curr_arc_rd - prev_arc_rd))
++
++	log_note "Making sure there are no checksum errors with the ZPool"
++	log_must check_pool_status $TESTPOOL "errors" "No known data errors"
++
++	log_note "Making sure we have Direct I/O and ARC reads logged"
++	if [[ $total_dio_rd -lt 1 ]]; then
++		log_fail "No Direct I/O reads $total_dio_rd"
++	fi
++	if [[ $total_arc_rd -lt 1 ]]; then
++		log_fail "No ARC reads $total_arc_rd"
++	fi
++
++	log_note "Making sure we have Direct I/O write checksum verifies with ZPool"
++	check_dio_chksum_verify_failures "$TESTPOOL1" "$vdev_type" 1 "rd"
++	destroy_pool $TESTPOOL1
++done
++
++log_pass "Verified checksum verify works for Direct I/O reads." 
+diff --git a/tests/zfs-tests/tests/functional/direct/dio_write_stable_pages.ksh b/tests/zfs-tests/tests/functional/direct/dio_write_stable_pages.ksh
+index efc9ee639184..ccdabc678a68 100755
+--- a/tests/zfs-tests/tests/functional/direct/dio_write_stable_pages.ksh
++++ b/tests/zfs-tests/tests/functional/direct/dio_write_stable_pages.ksh
+@@ -46,7 +46,7 @@ verify_runnable "global"
+ function cleanup
+ {
+ 	log_must rm -f "$mntpnt/direct-write.iso"
+-	check_dio_write_chksum_verify_failures $TESTPOOL "raidz" 0
++	check_dio_chksum_verify_failures $TESTPOOL "raidz" 0 "wr"
+ }
+ 
+ log_assert "Verify stable pages work for Direct I/O writes."
+@@ -76,8 +76,8 @@ do
+ 
+ 		# Manipulate the user's buffer while running O_DIRECT write
+ 		# workload with the buffer.
+-		log_must manipulate_user_buffer -o "$mntpnt/direct-write.iso" \
+-		    -n $NUMBLOCKS -b $BS 
++		log_must manipulate_user_buffer -f "$mntpnt/direct-write.iso" \
++		    -n $NUMBLOCKS -b $BS -w 
+ 
+ 		# Reading back the contents of the file
+ 		log_must stride_dd -i $mntpnt/direct-write.iso -o /dev/null \
+diff --git a/tests/zfs-tests/tests/functional/direct/dio_write_verify.ksh b/tests/zfs-tests/tests/functional/direct/dio_write_verify.ksh
+index 536459a35e6c..4eb9efe95ef1 100755
+--- a/tests/zfs-tests/tests/functional/direct/dio_write_verify.ksh
++++ b/tests/zfs-tests/tests/functional/direct/dio_write_verify.ksh
+@@ -91,8 +91,8 @@ log_must set_tunable32 VDEV_DIRECT_WR_VERIFY 0
+ log_note "Verifying no panics for Direct I/O writes with compression"
+ log_must zfs set compression=on $TESTPOOL/$TESTFS
+ prev_dio_wr=$(get_iostats_stat $TESTPOOL direct_write_count)
+-log_must manipulate_user_buffer -o "$mntpnt/direct-write.iso" -n $NUMBLOCKS \
+-    -b $BS
++log_must manipulate_user_buffer -f "$mntpnt/direct-write.iso" -n $NUMBLOCKS \
++    -b $BS -w
+ curr_dio_wr=$(get_iostats_stat $TESTPOOL direct_write_count)
+ total_dio_wr=$((curr_dio_wr - prev_dio_wr))
+ 
+@@ -116,8 +116,8 @@ for i in $(seq 1 $ITERATIONS); do
+ 	    $i of $ITERATIONS with zfs_vdev_direct_write_verify=0"
+ 
+ 	prev_dio_wr=$(get_iostats_stat $TESTPOOL direct_write_count)
+-	log_must manipulate_user_buffer -o "$mntpnt/direct-write.iso" \
+-	    -n $NUMBLOCKS -b $BS
++	log_must manipulate_user_buffer -f "$mntpnt/direct-write.iso" \
++	    -n $NUMBLOCKS -b $BS -w
+ 
+ 	# Reading file back to verify checksum errors
+ 	filesize=$(get_file_size "$mntpnt/direct-write.iso")
+@@ -144,7 +144,7 @@ for i in $(seq 1 $ITERATIONS); do
+ 	fi
+ 	log_note "Making sure we have no Direct I/O write checksum verifies \
+ 	    with ZPool"
+-	check_dio_write_chksum_verify_failures $TESTPOOL "raidz" 0
++	check_dio_chksum_verify_failures $TESTPOOL "raidz" 0 "wr"
+ 
+ 	log_must rm -f "$mntpnt/direct-write.iso"
+ done
+@@ -166,8 +166,8 @@ for i in $(seq 1 $ITERATIONS); do
+ 	    $ITERATIONS with zfs_vdev_direct_write_verify=1"
+ 
+ 	prev_dio_wr=$(get_iostats_stat $TESTPOOL direct_write_count)
+-	log_must manipulate_user_buffer -o "$mntpnt/direct-write.iso" \
+-	    -n $NUMBLOCKS -b $BS -e
++	log_must manipulate_user_buffer -f "$mntpnt/direct-write.iso" \
++	    -n $NUMBLOCKS -b $BS -e -w
+ 
+ 	# Reading file back to verify there no are checksum errors
+ 	filesize=$(get_file_size "$mntpnt/direct-write.iso")
+@@ -175,7 +175,7 @@ for i in $(seq 1 $ITERATIONS); do
+ 	log_must stride_dd -i "$mntpnt/direct-write.iso" -o /dev/null -b $BS \
+ 	    -c $num_blocks
+ 
+-	# Getting new Direct I/O and ARC Write counts.
++	# Getting new Direct I/O write counts.
+ 	curr_dio_wr=$(get_iostats_stat $TESTPOOL direct_write_count)
+ 	total_dio_wr=$((curr_dio_wr - prev_dio_wr))
+ 
+@@ -188,7 +188,7 @@ for i in $(seq 1 $ITERATIONS); do
+ 	fi
+ 
+ 	log_note "Making sure we have Direct I/O write checksum verifies with ZPool"
+-	check_dio_write_chksum_verify_failures "$TESTPOOL" "raidz" 1
++	check_dio_chksum_verify_failures "$TESTPOOL" "raidz" 1 "wr"
+ done
+ 
+ log_must rm -f "$mntpnt/direct-write.iso"

@@ -1,0 +1,214 @@
+diff --git a/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d.hpp b/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d.hpp
+index 927e5806122..b30179977d5 100644
+--- a/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d.hpp
++++ b/nav2_costmap_2d/include/nav2_costmap_2d/costmap_2d.hpp
+@@ -58,6 +58,7 @@ struct MapLocation
+ {
+   unsigned int x;
+   unsigned int y;
++  unsigned char cost;
+ };
+ 
+ /**
+@@ -311,6 +312,32 @@ class Costmap2D
+     const std::vector<geometry_msgs::msg::Point> & polygon,
+     unsigned char cost_value);
+ 
++  /**
++   * @brief  Gets the map region occupied by polygon
++   * @param polygon The polygon to perform the operation on
++   * @param polygon_map_region The map region occupied by the polygon
++   * @return True if the polygon_map_region was filled... false if it could not be filled
++   */
++  bool getMapRegionOccupiedByPolygon(
++    const std::vector<geometry_msgs::msg::Point> & polygon,
++    std::vector<MapLocation> & polygon_map_region);
++
++  /**
++   * @brief  Sets the given map region to desired value
++   * @param polygon_map_region The map region to perform the operation on
++   * @param new_cost_value The value to set costs to
++   */
++  void setMapRegionOccupiedByPolygon(
++    const std::vector<MapLocation> & polygon_map_region,
++    unsigned char new_cost_value);
++
++  /**
++   * @brief  Restores the corresponding map region using given map region
++   * @param polygon_map_region The map region to perform the operation on
++   */
++  void restoreMapRegionOccupiedByPolygon(
++    const std::vector<MapLocation> & polygon_map_region);
++
+   /**
+    * @brief  Get the map cells that make up the outline of a polygon
+    * @param polygon The polygon in map coordinates to rasterize
+@@ -568,6 +595,7 @@ class Costmap2D
+     {
+       MapLocation loc;
+       costmap_.indexToCells(offset, loc.x, loc.y);
++      loc.cost = costmap_.getCost(loc.x, loc.y);
+       cells_.push_back(loc);
+     }
+ 
+diff --git a/nav2_costmap_2d/include/nav2_costmap_2d/static_layer.hpp b/nav2_costmap_2d/include/nav2_costmap_2d/static_layer.hpp
+index f0735904a9d..c938f30f55e 100644
+--- a/nav2_costmap_2d/include/nav2_costmap_2d/static_layer.hpp
++++ b/nav2_costmap_2d/include/nav2_costmap_2d/static_layer.hpp
+@@ -163,6 +163,7 @@ class StaticLayer : public CostmapLayer
+ 
+   std::vector<geometry_msgs::msg::Point> transformed_footprint_;
+   bool footprint_clearing_enabled_;
++  bool restore_cleared_footprint_;
+   /**
+    * @brief Clear costmap layer info below the robot's footprint
+    */
+diff --git a/nav2_costmap_2d/plugins/static_layer.cpp b/nav2_costmap_2d/plugins/static_layer.cpp
+index ac43c018673..9f0a69f80ed 100644
+--- a/nav2_costmap_2d/plugins/static_layer.cpp
++++ b/nav2_costmap_2d/plugins/static_layer.cpp
+@@ -138,6 +138,7 @@ StaticLayer::getParameters()
+   declareParameter("transform_tolerance", rclcpp::ParameterValue(0.0));
+   declareParameter("map_topic", rclcpp::ParameterValue("map"));
+   declareParameter("footprint_clearing_enabled", rclcpp::ParameterValue(false));
++  declareParameter("restore_cleared_footprint", rclcpp::ParameterValue(true));
+ 
+   auto node = node_.lock();
+   if (!node) {
+@@ -147,6 +148,7 @@ StaticLayer::getParameters()
+   node->get_parameter(name_ + "." + "enabled", enabled_);
+   node->get_parameter(name_ + "." + "subscribe_to_updates", subscribe_to_updates_);
+   node->get_parameter(name_ + "." + "footprint_clearing_enabled", footprint_clearing_enabled_);
++  node->get_parameter(name_ + "." + "restore_cleared_footprint", restore_cleared_footprint_);
+   node->get_parameter(name_ + "." + "map_topic", map_topic_);
+   map_topic_ = joinWithParentNamespace(map_topic_);
+   node->get_parameter(
+@@ -411,8 +413,11 @@ StaticLayer::updateCosts(
+     return;
+   }
+ 
++  std::vector<MapLocation> map_region_to_restore;
+   if (footprint_clearing_enabled_) {
+-    setConvexPolygonCost(transformed_footprint_, nav2_costmap_2d::FREE_SPACE);
++    map_region_to_restore.reserve(100);
++    getMapRegionOccupiedByPolygon(transformed_footprint_, map_region_to_restore);
++    setMapRegionOccupiedByPolygon(map_region_to_restore, nav2_costmap_2d::FREE_SPACE);
+   }
+ 
+   if (!layered_costmap_->isRolling()) {
+@@ -458,6 +463,11 @@ StaticLayer::updateCosts(
+       }
+     }
+   }
++
++  if (footprint_clearing_enabled_ && restore_cleared_footprint_) {
++    // restore the map region occupied by the polygon using cached data
++    restoreMapRegionOccupiedByPolygon(map_region_to_restore);
++  }
+   current_ = true;
+ }
+ 
+@@ -498,6 +508,13 @@ StaticLayer::dynamicParametersCallback(
+         current_ = false;
+       } else if (param_name == name_ + "." + "footprint_clearing_enabled") {
+         footprint_clearing_enabled_ = parameter.as_bool();
++      } else if (param_name == name_ + "." + "restore_cleared_footprint") {
++        if (footprint_clearing_enabled_) {
++          restore_cleared_footprint_ = parameter.as_bool();
++        } else {
++          RCLCPP_WARN(logger_, "restore_cleared_footprint cannot be used "
++                      "when footprint_clearing_enabled is False. Rejecting parameter update.");
++        }
+       }
+     }
+   }
+diff --git a/nav2_costmap_2d/src/costmap_2d.cpp b/nav2_costmap_2d/src/costmap_2d.cpp
+index 0302801297b..1d9997de8da 100644
+--- a/nav2_costmap_2d/src/costmap_2d.cpp
++++ b/nav2_costmap_2d/src/costmap_2d.cpp
+@@ -399,29 +399,54 @@ void Costmap2D::updateOrigin(double new_origin_x, double new_origin_y)
+ bool Costmap2D::setConvexPolygonCost(
+   const std::vector<geometry_msgs::msg::Point> & polygon,
+   unsigned char cost_value)
++{
++  std::vector<MapLocation> polygon_map_region;
++  polygon_map_region.reserve(100);
++  if (!getMapRegionOccupiedByPolygon(polygon, polygon_map_region)) {
++    return false;
++  }
++
++  // set the cost of those cells
++  setMapRegionOccupiedByPolygon(polygon_map_region, cost_value);
++  return true;
++}
++
++void Costmap2D::setMapRegionOccupiedByPolygon(
++  const std::vector<MapLocation> & polygon_map_region,
++  unsigned char new_cost_value)
++{
++  for (const auto & cell : polygon_map_region) {
++    setCost(cell.x, cell.y, new_cost_value);
++  }
++}
++
++void Costmap2D::restoreMapRegionOccupiedByPolygon(
++  const std::vector<MapLocation> & polygon_map_region)
++{
++  for (const auto & cell : polygon_map_region) {
++    setCost(cell.x, cell.y, cell.cost);
++  }
++}
++
++bool Costmap2D::getMapRegionOccupiedByPolygon(
++  const std::vector<geometry_msgs::msg::Point> & polygon,
++  std::vector<MapLocation> & polygon_map_region)
+ {
+   // we assume the polygon is given in the global_frame...
+   // we need to transform it to map coordinates
+   std::vector<MapLocation> map_polygon;
+-  for (unsigned int i = 0; i < polygon.size(); ++i) {
++  for (const auto & cell : polygon) {
+     MapLocation loc;
+-    if (!worldToMap(polygon[i].x, polygon[i].y, loc.x, loc.y)) {
++    if (!worldToMap(cell.x, cell.y, loc.x, loc.y)) {
+       // ("Polygon lies outside map bounds, so we can't fill it");
+       return false;
+     }
+     map_polygon.push_back(loc);
+   }
+ 
+-  std::vector<MapLocation> polygon_cells;
+-
+   // get the cells that fill the polygon
+-  convexFillCells(map_polygon, polygon_cells);
++  convexFillCells(map_polygon, polygon_map_region);
+ 
+-  // set the cost of those cells
+-  for (unsigned int i = 0; i < polygon_cells.size(); ++i) {
+-    unsigned int index = getIndex(polygon_cells[i].x, polygon_cells[i].y);
+-    costmap_[index] = cost_value;
+-  }
+   return true;
+ }
+ 
+@@ -506,6 +531,7 @@ void Costmap2D::convexFillCells(
+     for (unsigned int y = min_pt.y; y <= max_pt.y; ++y) {
+       pt.x = x;
+       pt.y = y;
++      pt.cost = getCost(x, y);
+       polygon_cells.push_back(pt);
+     }
+   }
+diff --git a/nav2_system_tests/src/system/nav2_system_params.yaml b/nav2_system_tests/src/system/nav2_system_params.yaml
+index 5ee29e6536e..756f0958f9f 100644
+--- a/nav2_system_tests/src/system/nav2_system_params.yaml
++++ b/nav2_system_tests/src/system/nav2_system_params.yaml
+@@ -196,6 +196,8 @@ global_costmap:
+       static_layer:
+         plugin: "nav2_costmap_2d::StaticLayer"
+         map_subscribe_transient_local: True
++        footprint_clearing_enabled: True
++        restore_cleared_footprint: True
+       inflation_layer:
+         plugin: "nav2_costmap_2d::InflationLayer"
+         cost_scaling_factor: 3.0

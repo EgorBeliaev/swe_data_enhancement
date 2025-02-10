@@ -1,0 +1,140 @@
+diff --git a/nav2_util/include/nav2_util/lifecycle_node.hpp b/nav2_util/include/nav2_util/lifecycle_node.hpp
+index d652982aef3..38b2ef11a0a 100644
+--- a/nav2_util/include/nav2_util/lifecycle_node.hpp
++++ b/nav2_util/include/nav2_util/lifecycle_node.hpp
+@@ -168,6 +168,11 @@ class LifecycleNode : public rclcpp_lifecycle::LifecycleNode
+     return nav2_util::CallbackReturn::SUCCESS;
+   }
+ 
++  /**
++   * @brief Automatically configure and active the node
++   */
++  void autostart();
++
+   /**
+    * @brief Perform preshutdown activities before our Context is shutdown.
+    * Note that this is related to our Context's shutdown sequence, not the
+@@ -207,6 +212,7 @@ class LifecycleNode : public rclcpp_lifecycle::LifecycleNode
+   // Connection to tell that server is still up
+   std::unique_ptr<bond::Bond> bond_{nullptr};
+   double bond_heartbeat_period;
++  rclcpp::TimerBase::SharedPtr autostart_timer_;
+ };
+ 
+ }  // namespace nav2_util
+diff --git a/nav2_util/src/lifecycle_node.cpp b/nav2_util/src/lifecycle_node.cpp
+index 5976d098a86..3bc9dba1574 100644
+--- a/nav2_util/src/lifecycle_node.cpp
++++ b/nav2_util/src/lifecycle_node.cpp
+@@ -21,6 +21,8 @@
+ #include "lifecycle_msgs/msg/state.hpp"
+ #include "nav2_util/node_utils.hpp"
+ 
++using namespace std::chrono_literals;
++
+ namespace nav2_util
+ {
+ 
+@@ -40,6 +42,14 @@ LifecycleNode::LifecycleNode(
+     this, "bond_heartbeat_period", rclcpp::ParameterValue(0.1));
+   this->get_parameter("bond_heartbeat_period", bond_heartbeat_period);
+ 
++  bool autostart_node = false;
++  nav2_util::declare_parameter_if_not_declared(
++    this, "autostart_node", rclcpp::ParameterValue(false));
++  this->get_parameter("autostart_node", autostart_node);
++  if (autostart_node) {
++    autostart();
++  }
++
+   printLifecycleNodeNotification();
+ 
+   register_rcl_preshutdown_callback();
+@@ -74,6 +84,24 @@ void LifecycleNode::createBond()
+   }
+ }
+ 
++void LifecycleNode::autostart()
++{
++  using lifecycle_msgs::msg::State;
++  autostart_timer_ = this->create_wall_timer(
++    0s,
++    [this]() -> void {
++      autostart_timer_->cancel();
++      RCLCPP_INFO(get_logger(), "Auto-starting node: %s", this->get_name());
++      if (configure().id() != State::PRIMARY_STATE_INACTIVE) {
++        RCLCPP_ERROR(get_logger(), "Auto-starting node %s failed to configure!", this->get_name());
++        return;
++      }
++      if (activate().id() != State::PRIMARY_STATE_ACTIVE) {
++        RCLCPP_ERROR(get_logger(), "Auto-starting node %s failed to activate!", this->get_name());
++      }
++    });
++}
++
+ void LifecycleNode::runCleanups()
+ {
+   /*
+diff --git a/nav2_util/test/test_lifecycle_node.cpp b/nav2_util/test/test_lifecycle_node.cpp
+index 07ef0177d72..d29da5e6df4 100644
+--- a/nav2_util/test/test_lifecycle_node.cpp
++++ b/nav2_util/test/test_lifecycle_node.cpp
+@@ -26,6 +26,27 @@ class RclCppFixture
+ };
+ RclCppFixture g_rclcppfixture;
+ 
++class LifecycleTransitionTestNode : public nav2_util::LifecycleNode
++{
++public:
++  explicit LifecycleTransitionTestNode(rclcpp::NodeOptions options)
++  : nav2_util::LifecycleNode("test_node", "", options) {}
++
++  nav2_util::CallbackReturn on_configure(const rclcpp_lifecycle::State &) override
++  {
++    configured = true;
++    return nav2_util::CallbackReturn::SUCCESS;
++  }
++  nav2_util::CallbackReturn on_activate(const rclcpp_lifecycle::State &) override
++  {
++    activated = true;
++    return nav2_util::CallbackReturn::SUCCESS;
++  }
++
++  bool configured{false};
++  bool activated{false};
++};
++
+ // For the following two tests, if the LifecycleNode doesn't shut down properly,
+ // the overall test will hang since the rclcpp thread will still be running,
+ // preventing the executable from exiting (the test will hang)
+@@ -48,6 +69,30 @@ TEST(LifecycleNode, MultipleRclcppNodesExitCleanly)
+   SUCCEED();
+ }
+ 
++TEST(LifecycleNode, AutostartTransitions)
++{
++  auto executor = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
++  rclcpp::NodeOptions options;
++  auto node = std::make_shared<LifecycleTransitionTestNode>(options);
++  executor->add_node(node->get_node_base_interface());
++  executor->spin_some();
++  EXPECT_FALSE(node->configured);
++  EXPECT_FALSE(node->activated);
++  executor.reset();
++  node.reset();
++
++
++  executor = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
++  options.parameter_overrides({{"autostart_node", true}});
++  node = std::make_shared<LifecycleTransitionTestNode>(options);
++  executor->add_node(node->get_node_base_interface());
++  executor->spin_some();
++  EXPECT_TRUE(node->configured);
++  EXPECT_TRUE(node->activated);
++  executor.reset();
++  node.reset();
++}
++
+ TEST(LifecycleNode, OnPreshutdownCbFires)
+ {
+   // Ensure the on_rcl_preshutdown_cb fires
