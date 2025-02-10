@@ -1,0 +1,1748 @@
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java b/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
+index e8c8216ff..85cbc3ef8 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
+@@ -1,7 +1,14 @@
+ package ee.carlrobert.codegpt.settings.service;
+ 
++import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_O;
++import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_VISION_PREVIEW;
++
++import com.intellij.openapi.application.ApplicationManager;
+ import ee.carlrobert.codegpt.CodeGPTBundle;
++import ee.carlrobert.codegpt.settings.service.codegpt.CodeGPTServiceSettings;
++import ee.carlrobert.codegpt.settings.service.openai.OpenAISettings;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ 
+ public enum ServiceType {
+@@ -56,4 +63,26 @@ public static ServiceType fromClientCode(String clientCode) {
+     }
+     return serviceType;
+   }
++
++  public boolean isImageActionSupported() {
++    return switch (this) {
++      case ANTHROPIC:
++      case OLLAMA:
++        yield true;
++      case CODEGPT:
++        var codegptModel = ApplicationManager.getApplication()
++            .getService(CodeGPTServiceSettings.class)
++            .getState()
++            .getChatCompletionSettings()
++            .getModel();
++        yield List.of("gpt-4o", "claude-3-opus").contains(codegptModel);
++      case OPENAI:
++        var openaiModel = ApplicationManager.getApplication().getService(OpenAISettings.class)
++            .getState()
++            .getModel();
++        yield List.of(GPT_4_VISION_PREVIEW.getCode(), GPT_4_O.getCode()).contains(openaiModel);
++      default:
++        yield false;
++    };
++  }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowPanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowPanel.java
+index 99bf1525e..2ca19ffeb 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowPanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowPanel.java
+@@ -64,7 +64,7 @@ public ChatToolWindowPanel(
+ 
+     var messageBusConnection = project.getMessageBus().connect();
+     messageBusConnection.subscribe(IncludeFilesInContextNotifier.FILES_INCLUDED_IN_CONTEXT_TOPIC,
+-        (IncludeFilesInContextNotifier) this::displaySelectedFilesNotification);
++        (IncludeFilesInContextNotifier) this::updateSelectedFilesNotification);
+     messageBusConnection.subscribe(AttachImageNotifier.IMAGE_ATTACHMENT_FILE_PATH_TOPIC,
+         (AttachImageNotifier) filePath -> imageFileAttachmentNotification.show(
+             Path.of(filePath).getFileName().toString(),
+@@ -95,8 +95,9 @@ public ChatToolWindowTabbedPane getChatTabbedPane() {
+     return tabbedPane;
+   }
+ 
+-  public void displaySelectedFilesNotification(List<ReferencedFile> referencedFiles) {
++  public void updateSelectedFilesNotification(List<ReferencedFile> referencedFiles) {
+     if (referencedFiles.isEmpty()) {
++      selectedFilesNotification.hideNotification();
+       return;
+     }
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
+index a5088d948..7e7115621 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
+@@ -5,12 +5,10 @@
+ import static java.lang.String.format;
+ 
+ import com.intellij.openapi.Disposable;
+-import com.intellij.openapi.actionSystem.ActionPlaces;
+ import com.intellij.openapi.diagnostic.Logger;
+ import com.intellij.openapi.project.Project;
+ import com.intellij.ui.JBColor;
+ import com.intellij.util.ui.JBUI;
+-import com.intellij.util.ui.JBUI.Borders;
+ import ee.carlrobert.codegpt.CodeGPTKeys;
+ import ee.carlrobert.codegpt.EncodingManager;
+ import ee.carlrobert.codegpt.ReferencedFile;
+@@ -22,19 +20,16 @@
+ import ee.carlrobert.codegpt.conversations.Conversation;
+ import ee.carlrobert.codegpt.conversations.ConversationService;
+ import ee.carlrobert.codegpt.conversations.message.Message;
+-import ee.carlrobert.codegpt.settings.GeneralSettings;
+-import ee.carlrobert.codegpt.settings.service.ServiceType;
+ import ee.carlrobert.codegpt.telemetry.TelemetryAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.ChatMessageResponseBody;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.ChatToolWindowScrollablePanel;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.ResponsePanel;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.UserMessagePanel;
+-import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.ModelComboBoxAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.TotalTokensDetails;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.TotalTokensPanel;
+-import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.UserPromptTextArea;
+ import ee.carlrobert.codegpt.toolwindow.ui.ChatToolWindowLandingPanel;
+ import ee.carlrobert.codegpt.ui.OverlayUtil;
++import ee.carlrobert.codegpt.ui.textarea.UserInputPanel;
+ import ee.carlrobert.codegpt.util.EditorUtil;
+ import ee.carlrobert.codegpt.util.file.FileUtil;
+ import java.awt.BorderLayout;
+@@ -44,7 +39,6 @@
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.util.UUID;
+-import java.util.function.Consumer;
+ import javax.swing.JComponent;
+ import javax.swing.JPanel;
+ import javax.swing.SwingUtilities;
+@@ -59,11 +53,13 @@ public class ChatToolWindowTabPanel implements Disposable {
+   private final Project project;
+   private final JPanel rootPanel;
+   private final Conversation conversation;
+-  private final UserPromptTextArea userPromptTextArea;
++  private final UserInputPanel textArea;
+   private final ConversationService conversationService;
+   private final TotalTokensPanel totalTokensPanel;
+   private final ChatToolWindowScrollablePanel toolWindowScrollablePanel;
+ 
++  private @Nullable CompletionRequestHandler requestHandler;
++
+   public ChatToolWindowTabPanel(@NotNull Project project, @NotNull Conversation conversation) {
+     this.project = project;
+     this.conversation = conversation;
+@@ -74,10 +70,9 @@ public ChatToolWindowTabPanel(@NotNull Project project, @NotNull Conversation co
+         conversation,
+         EditorUtil.getSelectedEditorSelectedText(project),
+         this);
+-    userPromptTextArea = new UserPromptTextArea(this::handleSubmit, totalTokensPanel);
++    textArea = new UserInputPanel(project, this::handleSubmit, this::handleCancel);
++    textArea.requestFocus();
+     rootPanel = createRootPanel();
+-    userPromptTextArea.requestFocusInWindow();
+-    userPromptTextArea.requestFocus();
+ 
+     if (conversation.getMessages().isEmpty()) {
+       displayLandingView();
+@@ -103,7 +98,7 @@ public TotalTokensDetails getTokenDetails() {
+   }
+ 
+   public void requestFocusForTextArea() {
+-    userPromptTextArea.focus();
++    textArea.requestFocus();
+   }
+ 
+   public void displayLandingView() {
+@@ -233,24 +228,23 @@ private void call(CallParameters callParameters, ResponsePanel responsePanel) {
+       return;
+     }
+ 
+-    var requestHandler = new CompletionRequestHandler(
++    requestHandler = new CompletionRequestHandler(
+         new ToolWindowCompletionResponseEventListener(
+             conversationService,
+             responsePanel,
+             totalTokensPanel,
+-            userPromptTextArea) {
++            textArea) {
+           @Override
+           public void handleTokensExceededPolicyAccepted() {
+             call(callParameters, responsePanel);
+           }
+         });
+-    userPromptTextArea.setRequestHandler(requestHandler);
+-    userPromptTextArea.setSubmitEnabled(false);
++    textArea.setSubmitEnabled(false);
+ 
+     requestHandler.call(callParameters);
+   }
+ 
+-  private void handleSubmit(String text) {
++  private Unit handleSubmit(String text) {
+     var message = new Message(text);
+     var editor = EditorUtil.getSelectedEditor(project);
+     if (editor != null) {
+@@ -264,37 +258,27 @@ private void handleSubmit(String text) {
+     }
+     message.setUserMessage(text);
+     sendMessage(message, ConversationType.DEFAULT);
++    return Unit.INSTANCE;
++  }
++
++  private Unit handleCancel() {
++    if (requestHandler != null) {
++      requestHandler.cancel();
++    }
++    return Unit.INSTANCE;
+   }
+ 
+-  private JPanel createUserPromptPanel(ServiceType selectedService) {
++  private JPanel createUserPromptPanel() {
+     var panel = new JPanel(new BorderLayout());
+     panel.setBorder(JBUI.Borders.compound(
+         JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0),
+         JBUI.Borders.empty(8)));
+-    var contentManager = project.getService(ChatToolWindowContentManager.class);
+-    panel.add(JBUI.Panels.simplePanel(createUserPromptTextAreaHeader(
+-        project,
+-        selectedService,
+-        (provider) -> {
+-          ConversationService.getInstance().startConversation();
+-          contentManager.createNewTabPanel();
+-        })), BorderLayout.NORTH);
+-    panel.add(JBUI.Panels.simplePanel(userPromptTextArea), BorderLayout.CENTER);
++    panel.add(JBUI.Panels.simplePanel(totalTokensPanel)
++        .withBorder(JBUI.Borders.emptyBottom(8)), BorderLayout.NORTH);
++    panel.add(JBUI.Panels.simplePanel(textArea), BorderLayout.CENTER);
+     return panel;
+   }
+ 
+-  private JPanel createUserPromptTextAreaHeader(
+-      Project project,
+-      ServiceType selectedService,
+-      Consumer<ServiceType> onModelChange) {
+-    return JBUI.Panels.simplePanel()
+-        .withBorder(Borders.emptyBottom(8))
+-        .andTransparent()
+-        .addToLeft(totalTokensPanel)
+-        .addToRight(new ModelComboBoxAction(project, onModelChange, selectedService)
+-            .createCustomComponent(ActionPlaces.UNKNOWN));
+-  }
+-
+   private JComponent getLandingView() {
+     return new ChatToolWindowLandingPanel((action, locationOnScreen) -> {
+       var editor = EditorUtil.getSelectedEditor(project);
+@@ -354,8 +338,7 @@ private JPanel createRootPanel() {
+     gbc.weighty = 0;
+     gbc.fill = GridBagConstraints.HORIZONTAL;
+     gbc.gridy = 1;
+-    rootPanel.add(
+-        createUserPromptPanel(GeneralSettings.getSelectedService()), gbc);
++    rootPanel.add(createUserPromptPanel(), gbc);
+     return rootPanel;
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
+index 8f3747c72..664489657 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
+@@ -14,8 +14,8 @@
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.ChatMessageResponseBody;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.ResponsePanel;
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.TotalTokensPanel;
+-import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.UserPromptTextArea;
+ import ee.carlrobert.codegpt.ui.OverlayUtil;
++import ee.carlrobert.codegpt.ui.textarea.UserInputPanel;
+ import ee.carlrobert.llm.client.openai.completion.ErrorDetails;
+ import ee.carlrobert.llm.client.you.completion.YouSerpResult;
+ import java.util.HashMap;
+@@ -37,7 +37,7 @@ abstract class ToolWindowCompletionResponseEventListener implements
+   private final ResponsePanel responsePanel;
+   private final ChatMessageResponseBody responseContainer;
+   private final TotalTokensPanel totalTokensPanel;
+-  private final UserPromptTextArea userPromptTextArea;
++  private final UserInputPanel textArea;
+ 
+   private volatile boolean completed;
+ 
+@@ -45,13 +45,13 @@ public ToolWindowCompletionResponseEventListener(
+       ConversationService conversationService,
+       ResponsePanel responsePanel,
+       TotalTokensPanel totalTokensPanel,
+-      UserPromptTextArea userPromptTextArea) {
++      UserInputPanel textArea) {
+     this.encodingManager = EncodingManager.getInstance();
+     this.conversationService = conversationService;
+     this.responsePanel = responsePanel;
+     this.responseContainer = (ChatMessageResponseBody) responsePanel.getContent();
+     this.totalTokensPanel = totalTokensPanel;
+-    this.userPromptTextArea = userPromptTextArea;
++    this.textArea = textArea;
+   }
+ 
+   public abstract void handleTokensExceededPolicyAccepted();
+@@ -127,7 +127,7 @@ public void handleCompleted(String fullMessage, CallParameters callParameters) {
+         if (containsResults) {
+           responseContainer.displaySerpResults(serpResults);
+         }
+-        totalTokensPanel.updateUserPromptTokens(userPromptTextArea.getText());
++        totalTokensPanel.updateUserPromptTokens(textArea.getText());
+         totalTokensPanel.updateConversationTokens(callParameters.getConversation());
+       } finally {
+         stopStreaming(responseContainer);
+@@ -142,7 +142,7 @@ public void handleSerpResults(List<YouSerpResult> results, Message message) {
+ 
+   private void stopStreaming(ChatMessageResponseBody responseContainer) {
+     completed = true;
+-    userPromptTextArea.setSubmitEnabled(true);
++    textArea.setSubmitEnabled(true);
+     responseContainer.hideCaret();
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/SelectedFilesAccordion.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/SelectedFilesAccordion.java
+index 973c985e1..59e83d241 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/SelectedFilesAccordion.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/SelectedFilesAccordion.java
+@@ -37,7 +37,7 @@ public SelectedFilesAccordion(
+   private JPanel createContentPanel(Project project, List<String> referencedFilePaths) {
+     var panel = new JPanel();
+     panel.setOpaque(false);
+-    panel.setVisible(false);
++    panel.setVisible(true);
+     panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+     panel.setBorder(JBUI.Borders.empty(4, 0));
+     referencedFilePaths.stream()
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/textarea/UserPromptTextArea.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/textarea/UserPromptTextArea.java
+deleted file mode 100644
+index 7570f8872..000000000
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/textarea/UserPromptTextArea.java
++++ /dev/null
+@@ -1,231 +0,0 @@
+-package ee.carlrobert.codegpt.toolwindow.chat.ui.textarea;
+-
+-import static ee.carlrobert.codegpt.settings.service.ServiceType.ANTHROPIC;
+-import static ee.carlrobert.codegpt.settings.service.ServiceType.CODEGPT;
+-import static ee.carlrobert.codegpt.settings.service.ServiceType.OLLAMA;
+-import static ee.carlrobert.codegpt.settings.service.ServiceType.OPENAI;
+-import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_O;
+-import static ee.carlrobert.llm.client.openai.completion.OpenAIChatCompletionModel.GPT_4_VISION_PREVIEW;
+-
+-import com.intellij.icons.AllIcons;
+-import com.intellij.openapi.actionSystem.AnAction;
+-import com.intellij.openapi.actionSystem.AnActionEvent;
+-import com.intellij.openapi.application.ApplicationManager;
+-import com.intellij.openapi.diagnostic.Logger;
+-import com.intellij.openapi.editor.ex.util.EditorUtil;
+-import com.intellij.openapi.util.registry.Registry;
+-import com.intellij.ui.DocumentAdapter;
+-import com.intellij.ui.JBColor;
+-import com.intellij.ui.components.JBTextArea;
+-import com.intellij.util.ui.JBUI;
+-import ee.carlrobert.codegpt.CodeGPTBundle;
+-import ee.carlrobert.codegpt.Icons;
+-import ee.carlrobert.codegpt.actions.AttachImageAction;
+-import ee.carlrobert.codegpt.completions.CompletionRequestHandler;
+-import ee.carlrobert.codegpt.settings.GeneralSettings;
+-import ee.carlrobert.codegpt.settings.service.codegpt.CodeGPTServiceSettings;
+-import ee.carlrobert.codegpt.settings.service.openai.OpenAISettings;
+-import ee.carlrobert.codegpt.ui.IconActionButton;
+-import ee.carlrobert.codegpt.ui.UIUtil;
+-import java.awt.BasicStroke;
+-import java.awt.BorderLayout;
+-import java.awt.FlowLayout;
+-import java.awt.Graphics;
+-import java.awt.Graphics2D;
+-import java.awt.Insets;
+-import java.awt.RenderingHints;
+-import java.awt.event.ActionEvent;
+-import java.awt.event.FocusEvent;
+-import java.awt.event.FocusListener;
+-import java.util.List;
+-import java.util.concurrent.atomic.AtomicReference;
+-import java.util.function.Consumer;
+-import javax.swing.AbstractAction;
+-import javax.swing.JPanel;
+-import javax.swing.UIManager;
+-import javax.swing.event.DocumentEvent;
+-import javax.swing.text.BadLocationException;
+-import org.jetbrains.annotations.NotNull;
+-
+-public class UserPromptTextArea extends JPanel {
+-
+-  private static final Logger LOG = Logger.getInstance(UserPromptTextArea.class);
+-
+-  private static final JBColor BACKGROUND_COLOR = JBColor.namedColor(
+-      "Editor.SearchField.background", com.intellij.util.ui.UIUtil.getTextFieldBackground());
+-
+-  private final AtomicReference<CompletionRequestHandler> requestHandlerRef =
+-      new AtomicReference<>();
+-  private final JBTextArea textArea;
+-  private final int textAreaRadius = 16;
+-  private final Consumer<String> onSubmit;
+-  private IconActionButton stopButton;
+-  private boolean submitEnabled = true;
+-
+-  public UserPromptTextArea(Consumer<String> onSubmit, TotalTokensPanel totalTokensPanel) {
+-    super(new BorderLayout());
+-    this.onSubmit = onSubmit;
+-
+-    textArea = new JBTextArea();
+-    textArea.getDocument().addDocumentListener(getDocumentAdapter(totalTokensPanel));
+-    textArea.setOpaque(false);
+-    textArea.setBackground(BACKGROUND_COLOR);
+-    textArea.setLineWrap(true);
+-    textArea.setWrapStyleWord(true);
+-    textArea.getEmptyText().setText(CodeGPTBundle.get("toolwindow.chat.textArea.emptyText"));
+-    textArea.setBorder(JBUI.Borders.empty(8, 4));
+-    UIUtil.addShiftEnterInputMap(textArea, new AbstractAction() {
+-      @Override
+-      public void actionPerformed(ActionEvent e) {
+-        try {
+-          handleSubmit();
+-        } finally {
+-          totalTokensPanel.updateUserPromptTokens("");
+-        }
+-      }
+-    });
+-    textArea.addFocusListener(new FocusListener() {
+-      @Override
+-      public void focusGained(FocusEvent e) {
+-        UserPromptTextArea.super.paintBorder(UserPromptTextArea.super.getGraphics());
+-      }
+-
+-      @Override
+-      public void focusLost(FocusEvent e) {
+-        UserPromptTextArea.super.paintBorder(UserPromptTextArea.super.getGraphics());
+-      }
+-    });
+-    updateFont();
+-    init();
+-  }
+-
+-  private DocumentAdapter getDocumentAdapter(TotalTokensPanel totalTokensPanel) {
+-    return new DocumentAdapter() {
+-      @Override
+-      protected void textChanged(@NotNull DocumentEvent event) {
+-        if (submitEnabled) {
+-          try {
+-            var document = event.getDocument();
+-            var text = document.getText(
+-                document.getStartPosition().getOffset(),
+-                document.getEndPosition().getOffset() - 1);
+-            totalTokensPanel.updateUserPromptTokens(text);
+-          } catch (BadLocationException ex) {
+-            LOG.error("Something went wrong while processing user input tokens", ex);
+-          }
+-        }
+-      }
+-    };
+-  }
+-
+-  public String getText() {
+-    return textArea.getText().trim();
+-  }
+-
+-  public void focus() {
+-    textArea.requestFocus();
+-    textArea.requestFocusInWindow();
+-  }
+-
+-  @Override
+-  protected void paintComponent(Graphics g) {
+-    Graphics2D g2 = (Graphics2D) g.create();
+-    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+-    g2.setColor(getBackground());
+-    g2.fillRoundRect(0, 0, getWidth() - 1, getHeight() - 1, textAreaRadius, textAreaRadius);
+-    super.paintComponent(g);
+-  }
+-
+-  @Override
+-  protected void paintBorder(Graphics g) {
+-    Graphics2D g2 = (Graphics2D) g.create();
+-    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+-    g2.setColor(JBUI.CurrentTheme.ActionButton.focusedBorder());
+-    if (textArea.isFocusOwner()) {
+-      g2.setStroke(new BasicStroke(1.5F));
+-    }
+-    g2.drawRoundRect(0, 0, getWidth() - 1, getHeight() - 1, textAreaRadius, textAreaRadius);
+-  }
+-
+-  @Override
+-  public Insets getInsets() {
+-    return JBUI.insets(6, 12, 6, 6);
+-  }
+-
+-  public void setSubmitEnabled(boolean submitEnabled) {
+-    this.submitEnabled = submitEnabled;
+-    stopButton.setEnabled(!submitEnabled);
+-  }
+-
+-  public void setRequestHandler(@NotNull CompletionRequestHandler handler) {
+-    requestHandlerRef.set(handler);
+-  }
+-
+-  private void handleSubmit() {
+-    if (submitEnabled && !textArea.getText().isEmpty()) {
+-      // Replacing each newline with two newlines to ensure proper Markdown formatting
+-      var text = textArea.getText().replace("\n", "\n\n");
+-      onSubmit.accept(text.trim());
+-      textArea.setText("");
+-    }
+-  }
+-
+-  private void init() {
+-    setOpaque(false);
+-    add(textArea, BorderLayout.CENTER);
+-
+-    stopButton = new IconActionButton(
+-        new AnAction("Stop", "Stop current inference", AllIcons.Actions.Suspend) {
+-          @Override
+-          public void actionPerformed(@NotNull AnActionEvent e) {
+-            var handler = requestHandlerRef.get();
+-            if (handler != null) {
+-              handler.cancel();
+-            }
+-          }
+-        });
+-    stopButton.setEnabled(false);
+-
+-    var flowLayout = new FlowLayout(FlowLayout.RIGHT);
+-    flowLayout.setHgap(8);
+-    JPanel iconsPanel = new JPanel(flowLayout);
+-    iconsPanel.add(new IconActionButton(
+-        new AnAction("Send Message", "Send message", Icons.Send) {
+-          @Override
+-          public void actionPerformed(@NotNull AnActionEvent e) {
+-            handleSubmit();
+-          }
+-        }));
+-    if (isImageActionSupported()) {
+-      iconsPanel.add(new IconActionButton(new AttachImageAction()));
+-    }
+-    iconsPanel.add(stopButton);
+-    add(iconsPanel, BorderLayout.EAST);
+-  }
+-
+-  private boolean isImageActionSupported() {
+-    var selectedService = GeneralSettings.getSelectedService();
+-    if (selectedService == ANTHROPIC || selectedService == OLLAMA) {
+-      return true;
+-    }
+-    if (selectedService == CODEGPT) {
+-      var model = ApplicationManager.getApplication().getService(CodeGPTServiceSettings.class)
+-          .getState()
+-          .getChatCompletionSettings()
+-          .getModel();
+-      return List.of("gpt-4o", "claude-3-opus").contains(model);
+-    }
+-
+-    var model = OpenAISettings.getCurrentState().getModel();
+-    return selectedService == OPENAI && (
+-        GPT_4_VISION_PREVIEW.getCode().equals(model) || GPT_4_O.getCode().equals(model));
+-  }
+-
+-  private void updateFont() {
+-    if (Registry.is("ide.find.use.editor.font", false)) {
+-      textArea.setFont(EditorUtil.getEditorFont());
+-    } else {
+-      textArea.setFont(UIManager.getFont("TextField.font"));
+-    }
+-  }
+-}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/actions/AttachImageAction.kt b/src/main/kotlin/ee/carlrobert/codegpt/actions/AttachImageAction.kt
+index 509ed8c23..192e04252 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/actions/AttachImageAction.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/actions/AttachImageAction.kt
+@@ -1,18 +1,18 @@
+ package ee.carlrobert.codegpt.actions
+ 
++import com.intellij.icons.AllIcons
+ import com.intellij.openapi.actionSystem.AnAction
+ import com.intellij.openapi.actionSystem.AnActionEvent
+ import com.intellij.openapi.fileChooser.FileChooser
+ import com.intellij.openapi.fileChooser.FileChooserDescriptor
+ import ee.carlrobert.codegpt.CodeGPTBundle
+ import ee.carlrobert.codegpt.CodeGPTKeys
+-import ee.carlrobert.codegpt.Icons
+ import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.AttachImageNotifier
+ 
+ class AttachImageAction : AnAction(
+     CodeGPTBundle.get("action.attachImage"),
+     CodeGPTBundle.get("action.attachImageDescription"),
+-    Icons.Upload
++    AllIcons.FileTypes.Image
+ ) {
+ 
+     override fun actionPerformed(e: AnActionEvent) {
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt
+new file mode 100644
+index 000000000..cb81cabd4
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt
+@@ -0,0 +1,101 @@
++package ee.carlrobert.codegpt.ui.textarea
++
++import com.intellij.openapi.components.service
++import com.intellij.openapi.editor.colors.EditorColorsManager
++import com.intellij.openapi.editor.colors.EditorFontType
++import com.intellij.openapi.editor.ex.util.EditorUtil
++import com.intellij.openapi.util.registry.Registry
++import com.intellij.ui.JBColor
++import com.intellij.util.ui.JBFont
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.CodeGPTBundle
++import java.awt.Graphics
++import java.awt.Graphics2D
++import java.awt.RenderingHints
++import java.awt.event.ActionEvent
++import javax.swing.AbstractAction
++import javax.swing.JTextPane
++import javax.swing.KeyStroke
++import javax.swing.UIManager
++import javax.swing.text.DefaultStyledDocument
++import javax.swing.text.StyleConstants
++import javax.swing.text.StyleContext
++
++class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
++
++    init {
++        isOpaque = false
++        background = JBColor.namedColor("Editor.SearchField.background")
++        document = DefaultStyledDocument()
++        border = JBUI.Borders.empty(8)
++        isFocusable = true
++        font = if (Registry.`is`("ide.find.use.editor.font", false)) {
++            EditorUtil.getEditorFont()
++        } else {
++            UIManager.getFont("TextField.font")
++        }
++        inputMap.put(KeyStroke.getKeyStroke("shift ENTER"), "insert-break")
++        inputMap.put(KeyStroke.getKeyStroke("ENTER"), "text-submit")
++        actionMap.put("text-submit", object : AbstractAction() {
++            override fun actionPerformed(e: ActionEvent) {
++                onSubmit(text)
++            }
++        })
++    }
++
++    fun highlightText(text: String) {
++        val lastIndex = this.text.lastIndexOf('@')
++        if (lastIndex != -1) {
++            val styleContext = StyleContext.getDefaultStyleContext()
++            val fileNameStyle = styleContext.addStyle("smart-highlighter", null)
++            val fontFamily = service<EditorColorsManager>().globalScheme
++                .getFont(EditorFontType.PLAIN)
++                .deriveFont(JBFont.label().size.toFloat())
++                .family
++
++            StyleConstants.setFontFamily(fileNameStyle, fontFamily)
++            StyleConstants.setForeground(
++                fileNameStyle,
++                JBUI.CurrentTheme.GotItTooltip.codeForeground(true)
++            )
++            StyleConstants.setBackground(
++                fileNameStyle,
++                JBUI.CurrentTheme.GotItTooltip.codeBackground(true)
++            )
++
++            document.remove(lastIndex + 1, document.length - (lastIndex + 1))
++            document.insertString(lastIndex + 1, text, fileNameStyle)
++            styledDocument.setCharacterAttributes(
++                lastIndex,
++                text.length,
++                fileNameStyle,
++                true
++            )
++            document.insertString(
++                document.length,
++                " ",
++                styleContext.getStyle(StyleContext.DEFAULT_STYLE)
++            )
++        }
++    }
++
++    override fun paintComponent(g: Graphics) {
++        super.paintComponent(g)
++        val g2d = g as Graphics2D
++        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
++        if (document.length == 0) {
++            g2d.color = JBColor.GRAY
++            g2d.font = if (Registry.`is`("ide.find.use.editor.font", false)) {
++                EditorUtil.getEditorFont()
++            } else {
++                UIManager.getFont("TextField.font")
++            }
++            // Draw placeholder
++            g2d.drawString(
++                CodeGPTBundle.get("toolwindow.chat.textArea.emptyText"),
++                insets.left,
++                g2d.fontMetrics.maxAscent + insets.top
++            )
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt
+new file mode 100644
+index 000000000..d19e8067c
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt
+@@ -0,0 +1,38 @@
++package ee.carlrobert.codegpt.ui.textarea
++
++import com.intellij.openapi.components.Service
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.vfs.VirtualFile
++import ee.carlrobert.codegpt.CodeGPTKeys
++import ee.carlrobert.codegpt.ReferencedFile
++import ee.carlrobert.codegpt.actions.IncludeFilesInContextNotifier
++import ee.carlrobert.codegpt.util.file.FileUtil
++import kotlinx.coroutines.*
++import java.io.File
++
++@Service
++class FileSearchService private constructor(val project: Project) {
++    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
++
++    fun searchFiles(searchText: String): List<String> = runBlocking {
++        withContext(scope.coroutineContext) {
++            FileUtil.searchProjectFiles(project, searchText).map { it.path }
++        }
++    }
++
++    fun addFileToSession(file: VirtualFile) {
++        val filesIncluded =
++            project.getUserData(CodeGPTKeys.SELECTED_FILES).orEmpty().toMutableList()
++        filesIncluded.add(ReferencedFile(File(file.path)))
++        updateFilesInSession(filesIncluded)
++    }
++
++    fun removeFilesFromSession() = updateFilesInSession(mutableListOf())
++
++    private fun updateFilesInSession(files: MutableList<ReferencedFile>) {
++        project.putUserData(CodeGPTKeys.SELECTED_FILES, files)
++        project.messageBus
++            .syncPublisher(IncludeFilesInContextNotifier.FILES_INCLUDED_IN_CONTEXT_TOPIC)
++            .filesIncluded(files)
++    }
++}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt
+new file mode 100644
+index 000000000..4d5410805
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt
+@@ -0,0 +1,178 @@
++package ee.carlrobert.codegpt.ui.textarea
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.fileTypes.FileTypeManager
++import com.intellij.ui.JBColor
++import com.intellij.ui.components.JBList
++import com.intellij.ui.dsl.builder.AlignX
++import com.intellij.ui.dsl.builder.panel
++import com.intellij.util.ui.JBUI
++import java.awt.Component
++import java.awt.Dimension
++import java.awt.KeyboardFocusManager
++import java.awt.event.KeyAdapter
++import java.awt.event.KeyEvent
++import java.awt.event.MouseAdapter
++import java.awt.event.MouseEvent
++import javax.swing.*
++
++class SuggestionList(
++    listModel: DefaultListModel<SuggestionItem>,
++    private val onSelected: (SuggestionItem) -> Unit
++) : JBList<SuggestionItem>(listModel) {
++
++    init {
++        border = JBUI.Borders.empty()
++        preferredSize = Dimension(480, (30 * 6))
++        selectionMode = ListSelectionModel.SINGLE_SELECTION
++        cellRenderer = SuggestionsListCellRenderer()
++        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher { e ->
++            if (e.keyCode == KeyEvent.VK_TAB && e.id == KeyEvent.KEY_PRESSED && isFocusOwner) {
++                selectNext()
++                e.consume()
++                true
++            } else {
++                false
++            }
++        }
++        addKeyListener(object : KeyAdapter() {
++            override fun keyReleased(e: KeyEvent) {
++                when (e.keyCode) {
++                    KeyEvent.VK_ENTER -> {
++                        onSelected(listModel.get(selectedIndex))
++                        e.consume()
++                    }
++                }
++            }
++        })
++        addMouseListener(object : MouseAdapter() {
++            override fun mouseClicked(e: MouseEvent) {
++                val index = locationToIndex(e.point)
++                if (index >= 0) {
++                    onSelected(listModel.getElementAt(index))
++                }
++            }
++
++            override fun mouseExited(e: MouseEvent) {
++                putClientProperty("hoveredIndex", -1)
++                repaint()
++            }
++        })
++        addMouseMotionListener(object : MouseAdapter() {
++            override fun mouseMoved(e: MouseEvent) {
++                val index = locationToIndex(e.point)
++                if (index != getClientProperty("hoveredIndex")) {
++                    putClientProperty("hoveredIndex", index)
++                    repaint()
++                }
++            }
++        })
++    }
++
++    fun selectNext() {
++        val newIndex = if (selectedIndex < model.size - 1) selectedIndex + 1 else 0
++        selectedIndex = newIndex
++        ensureIndexIsVisible(newIndex)
++    }
++}
++
++private class SuggestionsListCellRenderer : DefaultListCellRenderer() {
++
++    override fun getListCellRendererComponent(
++        list: JList<*>?,
++        value: Any?,
++        index: Int,
++        isSelected: Boolean,
++        cellHasFocus: Boolean
++    ): Component = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus).apply {
++        setOpaque(false)
++    }.let { component ->
++        if (component is JLabel && value is SuggestionItem) {
++            renderSuggestionItem(component, value, list, index, isSelected, cellHasFocus)
++        } else {
++            component
++        }
++    }
++
++    private fun renderSuggestionItem(
++        component: JLabel,
++        value: SuggestionItem,
++        list: JList<*>?,
++        index: Int,
++        isSelected: Boolean,
++        cellHasFocus: Boolean
++    ): JPanel = when (value) {
++        is SuggestionItem.FileItem -> renderFileItem(component, value)
++        is SuggestionItem.ActionItem -> renderActionItem(component, value)
++    }.apply {
++        setupPanelProperties(list, index, isSelected, cellHasFocus)
++    }
++
++    private fun renderFileItem(component: JLabel, value: SuggestionItem.FileItem): JPanel {
++        val file = value.file
++        component.apply {
++            text = file.name
++            icon = when {
++                file.isDirectory -> AllIcons.Nodes.Folder
++                else -> FileTypeManager.getInstance().getFileTypeByFileName(file.name).icon
++            }
++            iconTextGap = 4
++        }
++
++        return panel {
++            row {
++                cell(component)
++                text(truncatePath(480 - component.width - 28, file.path))
++                    .align(AlignX.RIGHT)
++                    .applyToComponent {
++                        font = JBUI.Fonts.smallFont()
++                        foreground = JBColor.gray
++                    }
++            }
++        }
++    }
++
++    private fun renderActionItem(component: JLabel, value: SuggestionItem.ActionItem): JPanel {
++        component.apply {
++            text = value.action.displayName
++            icon = value.action.icon
++            iconTextGap = 4
++        }
++        return panel {
++            row {
++                cell(component)
++            }
++        }
++    }
++
++    private fun JPanel.setupPanelProperties(
++        list: JList<*>?,
++        index: Int,
++        isSelected: Boolean,
++        cellHasFocus: Boolean
++    ) {
++        preferredSize = Dimension(preferredSize.width, 30)
++        border = JBUI.Borders.empty(0, 4, 0, 4)
++
++        val isHovered = list?.getClientProperty("hoveredIndex") == index
++        if (isHovered || isSelected || cellHasFocus) {
++            background = UIManager.getColor("List.selectionBackground")
++            foreground = UIManager.getColor("List.selectionForeground")
++        }
++    }
++
++    private fun truncatePath(maxWidth: Int, fullPath: String): String {
++        val fontMetrics = getFontMetrics(JBUI.Fonts.smallFont())
++
++        if (fontMetrics.stringWidth(fullPath) <= maxWidth) {
++            return fullPath
++        }
++
++        val ellipsis = "..."
++        var truncatedPath = fullPath
++        while (truncatedPath.isNotEmpty() && fontMetrics.stringWidth(ellipsis + truncatedPath) > maxWidth) {
++            truncatedPath = truncatedPath.substring(1)
++        }
++        return ellipsis + truncatedPath
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt
+new file mode 100644
+index 000000000..fff15b0bc
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt
+@@ -0,0 +1,95 @@
++package ee.carlrobert.codegpt.ui.textarea
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.application.readAction
++import com.intellij.openapi.components.service
++import com.intellij.openapi.fileEditor.FileEditorManager
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.roots.ProjectFileIndex
++import com.intellij.openapi.ui.popup.JBPopup
++import com.intellij.openapi.ui.popup.JBPopupFactory
++import com.intellij.vcsUtil.showAbove
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import java.io.File
++import javax.swing.DefaultListModel
++import javax.swing.Icon
++import javax.swing.JComponent
++
++enum class DefaultAction(val displayName: String, val icon: Icon) {
++    ATTACH_IMAGE("Attach image", AllIcons.FileTypes.Image),
++    SEARCH_WEB("Search web", AllIcons.General.Web),
++}
++
++sealed class SuggestionItem {
++    data class FileItem(val file: File) : SuggestionItem()
++    data class ActionItem(val action: DefaultAction) : SuggestionItem()
++}
++
++class SuggestionsPopupManager(
++    private val project: Project,
++    private val onSelected: (filePath: String) -> Unit
++) {
++
++    private var popup: JBPopup? = null
++    private val listModel = DefaultListModel<SuggestionItem>()
++    private val list = SuggestionList(listModel) {
++        if (it is SuggestionItem.FileItem) {
++            onSelected(it.file.path)
++        } else if (it is SuggestionItem.ActionItem) {
++            when (it.action) {
++                DefaultAction.ATTACH_IMAGE -> {} // todo
++                DefaultAction.SEARCH_WEB -> {} // todo
++            }
++        }
++    }
++
++    fun showPopup(component: JComponent) {
++        popup = createPopup(component)
++        popup?.showAbove(component)
++
++        val projectFileIndex = project.service<ProjectFileIndex>()
++        CoroutineScope(Dispatchers.Default).launch {
++            val openFilePaths = project.service<FileEditorManager>().openFiles
++                .filter { readAction { projectFileIndex.isInContent(it) } }
++                .take(6)
++                .map { it.path }
++            updateSuggestions(openFilePaths)
++        }
++    }
++
++    fun hidePopup() {
++        popup?.cancel()
++    }
++
++    fun isPopupVisible(): Boolean {
++        return popup?.isVisible ?: false
++    }
++
++    fun updateSuggestions(filePaths: List<String>) {
++        listModel.clear()
++        listModel.addAll(filePaths.map { SuggestionItem.FileItem(File(it)) })
++    }
++
++    fun requestFocus() {
++        list.requestFocus()
++    }
++
++    fun selectNext() {
++        list.selectNext()
++    }
++
++    private fun createPopup(preferableFocusComponent: JComponent? = null): JBPopup =
++        service<JBPopupFactory>()
++            .createComponentPopupBuilder(list, preferableFocusComponent)
++            .setMovable(true)
++            .setCancelOnClickOutside(true)
++            .setCancelOnWindowDeactivation(false)
++            .setRequestFocus(true)
++            .setCancelCallback {
++                listModel.removeAllElements()
++                true
++            }
++            .createPopup()
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt
+new file mode 100644
+index 000000000..9939db547
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt
+@@ -0,0 +1,232 @@
++package ee.carlrobert.codegpt.ui.textarea
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.actionSystem.ActionPlaces
++import com.intellij.openapi.actionSystem.AnAction
++import com.intellij.openapi.actionSystem.AnActionEvent
++import com.intellij.openapi.components.service
++import com.intellij.openapi.observable.properties.AtomicBooleanProperty
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.vfs.VirtualFileManager
++import com.intellij.ui.components.AnActionLink
++import com.intellij.ui.dsl.builder.AlignX
++import com.intellij.ui.dsl.builder.RightGap
++import com.intellij.ui.dsl.builder.panel
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.CodeGPTBundle
++import ee.carlrobert.codegpt.Icons
++import ee.carlrobert.codegpt.actions.AttachImageAction
++import ee.carlrobert.codegpt.conversations.ConversationService
++import ee.carlrobert.codegpt.conversations.ConversationsState
++import ee.carlrobert.codegpt.settings.GeneralSettings
++import ee.carlrobert.codegpt.toolwindow.chat.ChatToolWindowContentManager
++import ee.carlrobert.codegpt.toolwindow.chat.ui.textarea.ModelComboBoxAction
++import ee.carlrobert.codegpt.ui.IconActionButton
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import java.awt.*
++import java.awt.event.KeyAdapter
++import java.awt.event.KeyEvent
++import java.nio.file.Paths
++import javax.swing.JPanel
++import javax.swing.text.StyleContext
++import javax.swing.text.StyledDocument
++
++class UserInputPanel(
++    private val project: Project,
++    private val onSubmit: (String) -> Unit,
++    private val onStop: () -> Unit
++) : JPanel(BorderLayout()) {
++
++    private val suggestionsPopupManager = SuggestionsPopupManager(project) {
++        handleFileSelection(it)
++    }
++    private val textPane = CustomTextPane { handleSubmit() }.apply {
++        addKeyListener(CustomTextPaneKeyAdapter())
++    }
++    private val submitButton = IconActionButton(
++        object : AnAction(
++            CodeGPTBundle.get("smartTextPane.submitButton.title"),
++            CodeGPTBundle.get("smartTextPane.submitButton.description"),
++            Icons.Send
++        ) {
++            override fun actionPerformed(e: AnActionEvent) {
++                handleSubmit()
++            }
++        }
++    )
++    private val stopButton = IconActionButton(
++        object : AnAction(
++            CodeGPTBundle.get("smartTextPane.stopButton.title"),
++            CodeGPTBundle.get("smartTextPane.stopButton.description"),
++            AllIcons.Actions.Suspend
++        ) {
++            override fun actionPerformed(e: AnActionEvent) {
++                onStop()
++            }
++        }
++    ).apply { isEnabled = false }
++    private val imageActionSupported = AtomicBooleanProperty(isImageActionSupported())
++
++    val text: String
++        get() = textPane.text
++
++    init {
++        isOpaque = false
++        add(textPane, BorderLayout.CENTER)
++        add(getFooter(), BorderLayout.SOUTH)
++    }
++
++    private fun getFooter(): JPanel {
++        val attachImageLink = AnActionLink(CodeGPTBundle.get("shared.image"), AttachImageAction())
++            .apply {
++                icon = AllIcons.FileTypes.Image
++                font = JBUI.Fonts.smallFont()
++            }
++        val modelComboBox = ModelComboBoxAction(
++            project,
++            {
++                imageActionSupported.set(isImageActionSupported())
++                // TODO: Implement a proper session management
++                if (service<ConversationsState>().state?.currentConversation?.messages?.isNotEmpty() == true) {
++                    service<ConversationService>().startConversation()
++                    project.service<ChatToolWindowContentManager>().createNewTabPanel()
++                }
++            },
++            service<GeneralSettings>().state.selectedService
++        ).createCustomComponent(ActionPlaces.UNKNOWN)
++
++        return panel {
++            twoColumnsRow({
++                cell(modelComboBox).gap(RightGap.SMALL)
++                cell(attachImageLink).visibleIf(imageActionSupported)
++            }, {
++                panel {
++                    row {
++                        cell(submitButton).gap(RightGap.SMALL)
++                        cell(stopButton)
++                    }
++                }.align(AlignX.RIGHT)
++            })
++        }
++    }
++
++    private fun isImageActionSupported(): Boolean {
++        return service<GeneralSettings>().state.selectedService.isImageActionSupported
++    }
++
++    fun setSubmitEnabled(enabled: Boolean) {
++        submitButton.isEnabled = enabled
++        stopButton.isEnabled = !enabled
++    }
++
++    override fun requestFocus() {
++        textPane.requestFocus()
++        textPane.requestFocusInWindow()
++    }
++
++    override fun paintComponent(g: Graphics) {
++        val g2 = g.create() as Graphics2D
++        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
++        g2.color = background
++        g2.fillRoundRect(0, 0, width - 1, height - 1, 16, 16)
++        super.paintComponent(g)
++        g2.dispose()
++    }
++
++    override fun paintBorder(g: Graphics) {
++        val g2 = g.create() as Graphics2D
++        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
++        g2.color = JBUI.CurrentTheme.ActionButton.focusedBorder()
++        if (textPane.isFocusOwner) {
++            g2.stroke = BasicStroke(1.5F)
++        }
++        g2.drawRoundRect(0, 0, width - 1, height - 1, 16, 16)
++        g2.dispose()
++    }
++
++    override fun getInsets(): Insets = JBUI.insets(4)
++
++    private fun updateSuggestions() {
++        CoroutineScope(Dispatchers.Default).launch {
++            val lastAtIndex = textPane.text.lastIndexOf('@')
++            if (lastAtIndex != -1) {
++                val searchText = textPane.text.substring(lastAtIndex + 1)
++                if (searchText.isNotEmpty()) {
++                    val filePaths = project.service<FileSearchService>().searchFiles(searchText)
++                    suggestionsPopupManager.updateSuggestions(filePaths)
++                }
++            } else {
++                suggestionsPopupManager.hidePopup()
++            }
++        }
++    }
++
++    private fun handleSubmit() {
++        val text = textPane.text.trim()
++        if (text.isNotEmpty()) {
++            onSubmit(text)
++            textPane.text = ""
++        }
++    }
++
++    private fun handleFileSelection(filePath: String) {
++        val selectedFile = service<VirtualFileManager>().findFileByNioPath(Paths.get(filePath))
++        selectedFile?.let { file ->
++            textPane.highlightText(file.name)
++            project.service<FileSearchService>().addFileToSession(file)
++        }
++        suggestionsPopupManager.hidePopup()
++    }
++
++    inner class CustomTextPaneKeyAdapter : KeyAdapter() {
++        private val defaultStyle =
++            StyleContext.getDefaultStyleContext().getStyle(StyleContext.DEFAULT_STYLE)
++
++        override fun keyReleased(e: KeyEvent) {
++            if (text.isEmpty()) {
++                project.service<FileSearchService>().removeFilesFromSession()
++            }
++
++            // todo
++            if (!text.contains('@')) {
++                suggestionsPopupManager.hidePopup()
++                return
++            }
++
++            when (e.keyCode) {
++                KeyEvent.VK_UP, KeyEvent.VK_DOWN -> {
++                    suggestionsPopupManager.requestFocus()
++                    suggestionsPopupManager.selectNext()
++                    e.consume()
++                }
++
++                else -> {
++                    if (suggestionsPopupManager.isPopupVisible()) {
++                        updateSuggestions()
++                    }
++                }
++            }
++        }
++
++        override fun keyTyped(e: KeyEvent) {
++            val popupVisible = suggestionsPopupManager.isPopupVisible()
++            if (e.keyChar == '@' && !popupVisible) {
++                suggestionsPopupManager.showPopup(textPane)
++                return
++            } else if (e.keyChar == '\t') {
++                suggestionsPopupManager.requestFocus()
++                suggestionsPopupManager.selectNext()
++                return
++            } else if (popupVisible) {
++                updateSuggestions()
++            }
++
++            val doc = textPane.document as StyledDocument
++            if (textPane.caretPosition >= 0) {
++                doc.setCharacterAttributes(textPane.caretPosition, 1, defaultStyle, true)
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/util/MarkdownUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/util/MarkdownUtil.kt
+index e0907289f..29887abd2 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/util/MarkdownUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/util/MarkdownUtil.kt
+@@ -31,9 +31,10 @@ object MarkdownUtil {
+   }
+ 
+   @JvmStatic
+-  fun convertMdToHtml(message: String?): String {
++  fun convertMdToHtml(message: String): String {
+     val options = MutableDataSet()
+-    val document = Parser.builder(options).build().parse(message!!)
++    options.set(HtmlRenderer.SOFT_BREAK, "<br/>")
++    val document = Parser.builder(options).build().parse(message)
+     return HtmlRenderer.builder(options)
+       .nodeRendererFactory(ResponseNodeRenderer.Factory())
+       .build()
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/util/file/FileUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/util/file/FileUtil.kt
+index 855b9599e..a149ac43f 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/util/file/FileUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/util/file/FileUtil.kt
+@@ -3,12 +3,17 @@ package ee.carlrobert.codegpt.util.file
+ import com.fasterxml.jackson.core.JsonProcessingException
+ import com.fasterxml.jackson.core.type.TypeReference
+ import com.fasterxml.jackson.databind.ObjectMapper
++import com.intellij.openapi.components.service
+ import com.intellij.openapi.diagnostic.Logger
+ import com.intellij.openapi.editor.Editor
+ import com.intellij.openapi.fileEditor.FileDocumentManager
+ import com.intellij.openapi.progress.ProgressIndicator
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.roots.ProjectFileIndex
+ import com.intellij.openapi.util.io.FileUtil.createDirectory
++import com.intellij.openapi.util.text.StringUtil
+ import com.intellij.openapi.vfs.VirtualFile
++import com.intellij.openapi.vfs.VirtualFileFilter
+ import ee.carlrobert.codegpt.settings.service.llama.LlamaSettings.getLlamaModelsPath
+ import java.io.File
+ import java.io.FileOutputStream
+@@ -23,191 +28,257 @@ import java.nio.file.Path
+ import java.nio.file.Paths
+ import java.nio.file.StandardOpenOption
+ import java.text.DecimalFormat
+-import java.util.Objects
+-import java.util.Optional
++import java.util.*
+ import java.util.regex.Pattern
+ 
+ object FileUtil {
+-  private val LOG = Logger.getInstance(FileUtil::class.java)
+-
+-  @JvmStatic
+-  fun createFile(directoryPath: Any, fileName: String?, fileContent: String?): File {
+-    requireNotNull(fileContent) { "fileContent null" }
+-    require(!fileName.isNullOrBlank()) { "fileName null or blank" }
+-    val path = when (directoryPath) {
+-      is Path -> directoryPath
+-      is File -> directoryPath.toPath()
+-      is String -> Path.of(directoryPath)
+-      else -> throw IllegalArgumentException("directoryPath must be Path, File or String: $directoryPath")
+-    }
+-    try {
+-      tryCreateDirectory(path)
+-      return Files.writeString(
+-        path.resolve(fileName),
+-        fileContent,
+-        StandardOpenOption.CREATE
+-      ).toFile()
+-    } catch (e: IOException) {
+-      throw RuntimeException("Failed to create file", e)
++    private val LOG = Logger.getInstance(FileUtil::class.java)
++
++    @JvmStatic
++    fun createFile(directoryPath: Any, fileName: String?, fileContent: String?): File {
++        requireNotNull(fileContent) { "fileContent null" }
++        require(!fileName.isNullOrBlank()) { "fileName null or blank" }
++        val path = when (directoryPath) {
++            is Path -> directoryPath
++            is File -> directoryPath.toPath()
++            is String -> Path.of(directoryPath)
++            else -> throw IllegalArgumentException("directoryPath must be Path, File or String: $directoryPath")
++        }
++        try {
++            tryCreateDirectory(path)
++            return Files.writeString(
++                path.resolve(fileName),
++                fileContent,
++                StandardOpenOption.CREATE
++            ).toFile()
++        } catch (e: IOException) {
++            throw RuntimeException("Failed to create file", e)
++        }
+     }
+-  }
+-
+-  @JvmStatic
+-  @Throws(IOException::class)
+-  fun copyFileWithProgress(
+-    fileName: String,
+-    url: URL,
+-    bytesRead: LongArray,
+-    fileSize: Long,
+-    indicator: ProgressIndicator
+-  ) {
+-    tryCreateDirectory(getLlamaModelsPath())
+-
+-    Channels.newChannel(url.openStream()).use { readableByteChannel ->
+-      FileOutputStream(getLlamaModelsPath().resolve(fileName).toFile()).use { fileOutputStream ->
+-        val buffer = ByteBuffer.allocateDirect(1024 * 10)
+-        while (readableByteChannel.read(buffer) != -1) {
+-          if (indicator.isCanceled) {
+-            readableByteChannel.close()
+-            break
+-          }
+-          buffer.flip()
+-          bytesRead[0] += fileOutputStream.channel.write(buffer).toLong()
+-          buffer.clear()
+-          indicator.fraction = bytesRead[0].toDouble() / fileSize
++
++    @JvmStatic
++    @Throws(IOException::class)
++    fun copyFileWithProgress(
++        fileName: String,
++        url: URL,
++        bytesRead: LongArray,
++        fileSize: Long,
++        indicator: ProgressIndicator
++    ) {
++        tryCreateDirectory(getLlamaModelsPath())
++
++        Channels.newChannel(url.openStream()).use { readableByteChannel ->
++            FileOutputStream(
++                getLlamaModelsPath().resolve(fileName).toFile()
++            ).use { fileOutputStream ->
++                val buffer = ByteBuffer.allocateDirect(1024 * 10)
++                while (readableByteChannel.read(buffer) != -1) {
++                    if (indicator.isCanceled) {
++                        readableByteChannel.close()
++                        break
++                    }
++                    buffer.flip()
++                    bytesRead[0] += fileOutputStream.channel.write(buffer).toLong()
++                    buffer.clear()
++                    indicator.fraction = bytesRead[0].toDouble() / fileSize
++                }
++            }
+         }
+-      }
+     }
+-  }
+-
+-  @JvmStatic
+-  fun getEditorFile(editor: Editor): VirtualFile? {
+-    return FileDocumentManager.getInstance().getFile(editor.document)
+-  }
+-
+-  private fun tryCreateDirectory(directoryPath: Path) {
+-    Files.exists(directoryPath).takeUnless { it } ?: return
+-    try {
+-      createDirectory(directoryPath.toFile())
+-    } catch (e: IOException) {
+-      throw RuntimeException("Failed to create directory", e)
+-    }.takeIf { it } ?: throw RuntimeException("Failed to create directory: $directoryPath")
+-  }
+-
+-  @JvmStatic
+-  fun getFileExtension(filename: String?): String {
+-    val pattern = Pattern.compile("[^.]+$")
+-    val matcher = filename?.let { pattern.matcher(it) }
+-
+-    if (matcher?.find() == true) {
+-      return matcher.group()
++
++    @JvmStatic
++    fun getEditorFile(editor: Editor): VirtualFile? {
++        return FileDocumentManager.getInstance().getFile(editor.document)
+     }
+-    return ""
+-  }
+-
+-  @JvmStatic
+-  fun findLanguageExtensionMapping(language: String): Map.Entry<String, String> {
+-    val defaultValue = mapOf("Text" to ".txt").entries.first()
+-    val mapper = ObjectMapper()
+-
+-    val extensionToLanguageMappings: List<FileExtensionLanguageDetails>
+-    val languageToExtensionMappings: List<LanguageFileExtensionDetails>
+-    try {
+-      extensionToLanguageMappings = mapper.readValue(
+-        getResourceContent("/fileExtensionLanguageMappings.json"),
+-        object : TypeReference<List<FileExtensionLanguageDetails>>() {
+-        })
+-      languageToExtensionMappings = mapper.readValue(
+-        getResourceContent("/languageFileExtensionMappings.json"),
+-        object : TypeReference<List<LanguageFileExtensionDetails>>() {
+-        })
+-    } catch (e: JsonProcessingException) {
+-      LOG.error("Unable to extract file extension", e)
+-      return defaultValue
++
++    private fun tryCreateDirectory(directoryPath: Path) {
++        Files.exists(directoryPath).takeUnless { it } ?: return
++        try {
++            createDirectory(directoryPath.toFile())
++        } catch (e: IOException) {
++            throw RuntimeException("Failed to create directory", e)
++        }.takeIf { it } ?: throw RuntimeException("Failed to create directory: $directoryPath")
+     }
+ 
+-    return findFirstExtension(languageToExtensionMappings, language)
+-      .or {
+-        extensionToLanguageMappings.stream()
+-          .filter { it.extension.equals(language, ignoreCase = true) }
+-          .findFirst()
+-          .flatMap { findFirstExtension(languageToExtensionMappings, it.value) }
+-      }.orElse(defaultValue)
+-  }
+-
+-  fun isUtf8File(filePath: String?): Boolean {
+-    val path = filePath?.let { Paths.get(it) }
+-    try {
+-      Files.newBufferedReader(path).use { reader ->
+-        val c = reader.read()
+-        if (c >= 0) {
+-          reader.transferTo(Writer.nullWriter())
++    @JvmStatic
++    fun getFileExtension(filename: String?): String {
++        val pattern = Pattern.compile("[^.]+$")
++        val matcher = filename?.let { pattern.matcher(it) }
++
++        if (matcher?.find() == true) {
++            return matcher.group()
+         }
+-        return true
+-      }
+-    } catch (e: Exception) {
+-      return false
++        return ""
+     }
+-  }
+-
+-  @JvmStatic
+-  fun getImageMediaType(fileName: String?): String {
+-    return when (val fileExtension = getFileExtension(fileName)) {
+-      "png" -> "image/png"
+-      "jpg", "jpeg" -> "image/jpeg"
+-      else -> throw IllegalArgumentException("Unsupported image type: $fileExtension")
++
++    @JvmStatic
++    fun findLanguageExtensionMapping(language: String): Map.Entry<String, String> {
++        val defaultValue = mapOf("Text" to ".txt").entries.first()
++        val mapper = ObjectMapper()
++
++        val extensionToLanguageMappings: List<FileExtensionLanguageDetails>
++        val languageToExtensionMappings: List<LanguageFileExtensionDetails>
++        try {
++            extensionToLanguageMappings = mapper.readValue(
++                getResourceContent("/fileExtensionLanguageMappings.json"),
++                object : TypeReference<List<FileExtensionLanguageDetails>>() {
++                })
++            languageToExtensionMappings = mapper.readValue(
++                getResourceContent("/languageFileExtensionMappings.json"),
++                object : TypeReference<List<LanguageFileExtensionDetails>>() {
++                })
++        } catch (e: JsonProcessingException) {
++            LOG.error("Unable to extract file extension", e)
++            return defaultValue
++        }
++
++        return findFirstExtension(languageToExtensionMappings, language)
++            .or {
++                extensionToLanguageMappings.stream()
++                    .filter { it.extension.equals(language, ignoreCase = true) }
++                    .findFirst()
++                    .flatMap { findFirstExtension(languageToExtensionMappings, it.value) }
++            }.orElse(defaultValue)
+     }
+-  }
+-
+-  @JvmStatic
+-  fun getResourceContent(name: String?): String {
+-    try {
+-      Objects.requireNonNull(name?.let { FileUtil::class.java.getResourceAsStream(it) }).use { stream ->
+-        return String(stream.readAllBytes(), StandardCharsets.UTF_8)
+-      }
+-    } catch (e: IOException) {
+-      throw RuntimeException("Unable to read resource", e)
++
++    fun isUtf8File(filePath: String?): Boolean {
++        val path = filePath?.let { Paths.get(it) }
++        try {
++            Files.newBufferedReader(path).use { reader ->
++                val c = reader.read()
++                if (c >= 0) {
++                    reader.transferTo(Writer.nullWriter())
++                }
++                return true
++            }
++        } catch (e: Exception) {
++            return false
++        }
+     }
+-  }
+ 
+-  @JvmStatic
+-  fun convertFileSize(fileSizeInBytes: Long): String {
+-    val units = arrayOf("B", "KB", "MB", "GB")
+-    var unitIndex = 0
+-    var fileSize = fileSizeInBytes.toDouble()
++    @JvmStatic
++    fun getImageMediaType(fileName: String?): String {
++        return when (val fileExtension = getFileExtension(fileName)) {
++            "png" -> "image/png"
++            "jpg", "jpeg" -> "image/jpeg"
++            else -> throw IllegalArgumentException("Unsupported image type: $fileExtension")
++        }
++    }
+ 
+-    while (fileSize >= 1024 && unitIndex < units.size - 1) {
+-      fileSize /= 1024.0
+-      unitIndex++
++    @JvmStatic
++    fun getResourceContent(name: String?): String {
++        try {
++            Objects.requireNonNull(name?.let { FileUtil::class.java.getResourceAsStream(it) })
++                .use { stream ->
++                    return String(stream.readAllBytes(), StandardCharsets.UTF_8)
++                }
++        } catch (e: IOException) {
++            throw RuntimeException("Unable to read resource", e)
++        }
+     }
+ 
+-    return DecimalFormat("#.##").format(fileSize) + " " + units[unitIndex]
+-  }
++    @JvmStatic
++    fun convertFileSize(fileSizeInBytes: Long): String {
++        val units = arrayOf("B", "KB", "MB", "GB")
++        var unitIndex = 0
++        var fileSize = fileSizeInBytes.toDouble()
++
++        while (fileSize >= 1024 && unitIndex < units.size - 1) {
++            fileSize /= 1024.0
++            unitIndex++
++        }
+ 
+-  @JvmStatic
+-  fun convertLongValue(value: Long): String {
+-    if (value >= 1000000) {
+-      return (value / 1000000).toString() + "M"
++        return DecimalFormat("#.##").format(fileSize) + " " + units[unitIndex]
+     }
+-    if (value >= 1000) {
+-      return (value / 1000).toString() + "K"
++
++    @JvmStatic
++    fun convertLongValue(value: Long): String {
++        if (value >= 1000000) {
++            return (value / 1000000).toString() + "M"
++        }
++        if (value >= 1000) {
++            return (value / 1000).toString() + "K"
++        }
++
++        return value.toString()
++    }
++
++    @JvmStatic
++    fun findFirstExtension(
++        languageFileExtensionMappings: List<LanguageFileExtensionDetails>,
++        language: String
++    ): Optional<Map.Entry<String, String>> {
++        return languageFileExtensionMappings.stream()
++            .filter {
++                language.equals(it.name, ignoreCase = true)
++                        && it.extensions != null
++                        && it.extensions.stream().anyMatch(String::isNotBlank)
++            }
++            .findFirst()
++            .map {
++                java.util.Map.entry(
++                    it.name,
++                    it.extensions?.stream()?.filter(String::isNotBlank)?.findFirst()?.orElse("")
++                        ?: ""
++                )
++            }
+     }
+ 
+-    return value.toString()
+-  }
+-
+-  @JvmStatic
+-  fun findFirstExtension(
+-    languageFileExtensionMappings: List<LanguageFileExtensionDetails>,
+-    language: String
+-  ): Optional<Map.Entry<String, String>> {
+-    return languageFileExtensionMappings.stream()
+-      .filter { language.equals(it.name, ignoreCase = true)
+-              && it.extensions != null
+-              && it.extensions.stream().anyMatch(String::isNotBlank) }
+-      .findFirst()
+-      .map { java.util.Map.entry(it.name,
+-        it.extensions?.stream()?.filter(String::isNotBlank)?.findFirst()?.orElse("") ?: ""
+-      ) }
+-  }
++    fun searchProjectFiles(
++        project: Project,
++        query: String,
++        maxResults: Int = 6,
++    ): List<VirtualFile> {
++        val results = mutableListOf<SearchResult>()
++        val fileIndex = project.service<ProjectFileIndex>()
++
++        fileIndex.iterateContent({ file ->
++            val score = calculateScore(file, query)
++            if (score > 0) {
++                results.add(SearchResult(file, score))
++            }
++            true
++        }, object : VirtualFileFilter {
++            override fun accept(file: VirtualFile): Boolean {
++                return !file.isDirectory && fileIndex.isInContent(file)
++            }
++
++            override fun toString(): String {
++                return "NONE"
++            }
++        })
++
++        return results.sortedByDescending { it.score }
++            .take(maxResults)
++            .map { it.file }
++    }
++
++    private fun calculateScore(file: VirtualFile, query: String): Int {
++        var score = 0
++
++        val fileName = file.name
++        if (fileName.contains(query, ignoreCase = true)) {
++            score += 10
++            if (fileName.startsWith(query, ignoreCase = true)) {
++                score += 5
++            }
++        }
++
++        if (StringUtil.containsIgnoreCase(fileName, query)) {
++            score += 3
++        }
++
++        try {
++            val content = String(file.contentsToByteArray(), Charsets.UTF_8)
++            if (content.contains(query, ignoreCase = true)) {
++                score += 2
++            }
++        } catch (e: Exception) {
++            // Ignore
++        }
++
++        return score
++    }
+ }
++
++data class SearchResult(val file: VirtualFile, val score: Int)
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index 02a92f314..ef2d2e0ca 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -189,7 +189,7 @@ toolwindow.chat.youProCheckBox.text=Use GPT-4 model
+ toolwindow.chat.youProCheckBox.enable=Turn on for complex queries
+ toolwindow.chat.youProCheckBox.disable=Turn off for faster responses
+ toolwindow.chat.youProCheckBox.notAllowed=Enable by subscribing to YouPro plan
+-toolwindow.chat.textArea.emptyText=Ask me anything...
++toolwindow.chat.textArea.emptyText=Ask anything... Use '@' to include files in the message
+ service.codegpt.title=CodeGPT
+ service.openai.title=OpenAI
+ service.custom.openai.title=Custom OpenAI
+@@ -227,6 +227,7 @@ action.attachImage=Attach Image
+ action.attachImageDescription=Attach an image
+ imageFileChooser.title=Select Image
+ imageAccordion.title=Attached image
++shared.image=Image
+ shared.chatCompletions=Chat Completions
+ shared.codeCompletions=Code Completions
+ codeCompletionsForm.enableFeatureText=Enable code completions
+@@ -239,4 +240,8 @@ editCodePopover.textField.comment=Provide instructions for the code modification
+ editCodePopover.submitButton.title=Submit Edit
+ editCodePopover.acceptButton.title=Accept Suggestion
+ editCodePopover.followUpButton.title=Submit Follow-up
+-editCodePopover.cancel.helpText=Esc to cancel
+\ No newline at end of file
++editCodePopover.cancel.helpText=Esc to cancel
++smartTextPane.submitButton.title=Send Message
++smartTextPane.submitButton.description=Send message
++smartTextPane.stopButton.title=Stop
++smartTextPane.stopButton.description=Stop completion
+\ No newline at end of file

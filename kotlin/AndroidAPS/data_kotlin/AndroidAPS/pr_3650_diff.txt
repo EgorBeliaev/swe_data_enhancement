@@ -1,0 +1,300 @@
+diff --git a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/AutomationPlugin.kt b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/AutomationPlugin.kt
+index cd1415729b2..7c67c314547 100644
+--- a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/AutomationPlugin.kt
++++ b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/AutomationPlugin.kt
+@@ -73,6 +73,7 @@ import app.aaps.plugins.automation.triggers.TriggerPumpLastConnection
+ import app.aaps.plugins.automation.triggers.TriggerRecurringTime
+ import app.aaps.plugins.automation.triggers.TriggerReservoirLevel
+ import app.aaps.plugins.automation.triggers.TriggerSensorAge
++import app.aaps.plugins.automation.triggers.TriggerStepsCount
+ import app.aaps.plugins.automation.triggers.TriggerTempTarget
+ import app.aaps.plugins.automation.triggers.TriggerTempTargetValue
+ import app.aaps.plugins.automation.triggers.TriggerTime
+@@ -420,7 +421,8 @@ class AutomationPlugin @Inject constructor(
+             TriggerHeartRate(injector),
+             TriggerSensorAge(injector),
+             TriggerCannulaAge(injector),
+-            TriggerReservoirLevel(injector)
++            TriggerReservoirLevel(injector),
++            TriggerStepsCount(injector)
+         )
+ 
+         val pump = activePlugin.activePump
+diff --git a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/di/AutomationModule.kt b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/di/AutomationModule.kt
+index a4bcd909f2f..94b30a68e60 100644
+--- a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/di/AutomationModule.kt
++++ b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/di/AutomationModule.kt
+@@ -50,6 +50,7 @@ import app.aaps.plugins.automation.triggers.TriggerPumpLastConnection
+ import app.aaps.plugins.automation.triggers.TriggerRecurringTime
+ import app.aaps.plugins.automation.triggers.TriggerReservoirLevel
+ import app.aaps.plugins.automation.triggers.TriggerSensorAge
++import app.aaps.plugins.automation.triggers.TriggerStepsCount
+ import app.aaps.plugins.automation.triggers.TriggerTempTarget
+ import app.aaps.plugins.automation.triggers.TriggerTempTargetValue
+ import app.aaps.plugins.automation.triggers.TriggerTime
+@@ -103,6 +104,7 @@ abstract class AutomationModule {
+     @ContributesAndroidInjector abstract fun triggerTime(): TriggerTime
+     @ContributesAndroidInjector abstract fun triggerTimeRangeInjector(): TriggerTimeRange
+     @ContributesAndroidInjector abstract fun triggerWifiSsidInjector(): TriggerWifiSsid
++    @ContributesAndroidInjector abstract fun triggerStepsCountInjector(): TriggerStepsCount
+ 
+     @ContributesAndroidInjector abstract fun actionInjector(): Action
+     @ContributesAndroidInjector abstract fun actionStopProcessingInjector(): ActionStopProcessing
+diff --git a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/Trigger.kt b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/Trigger.kt
+index 7a3744e5580..5a0fd63fb53 100644
+--- a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/Trigger.kt
++++ b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/Trigger.kt
+@@ -116,6 +116,7 @@ abstract class Trigger(val injector: HasAndroidInjector) {
+                 TriggerTime::class.java.simpleName               -> TriggerTime(injector).fromJSON(data.toString())
+                 TriggerTimeRange::class.java.simpleName          -> TriggerTimeRange(injector).fromJSON(data.toString())
+                 TriggerWifiSsid::class.java.simpleName           -> TriggerWifiSsid(injector).fromJSON(data.toString())
++                TriggerStepsCount::class.java.simpleName         -> TriggerStepsCount(injector).fromJSON(data.toString())
+ 
+                 else                                             -> TriggerConnector(injector)
+             }
+diff --git a/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCount.kt b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCount.kt
+new file mode 100644
+index 00000000000..d51ca90783c
+--- /dev/null
++++ b/plugins/automation/src/main/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCount.kt
+@@ -0,0 +1,101 @@
++package app.aaps.plugins.automation.triggers
++
++import android.widget.LinearLayout
++import androidx.annotation.VisibleForTesting
++import app.aaps.core.interfaces.logging.LTag
++import app.aaps.core.utils.JsonHelper
++import app.aaps.plugins.automation.R
++import app.aaps.plugins.automation.elements.Comparator
++import app.aaps.plugins.automation.elements.InputDouble
++import app.aaps.plugins.automation.elements.InputDropdownMenu
++import app.aaps.plugins.automation.elements.LabelWithElement
++import app.aaps.plugins.automation.elements.LayoutBuilder
++import app.aaps.plugins.automation.elements.StaticLabel
++import dagger.android.HasAndroidInjector
++import org.json.JSONObject
++import java.text.DecimalFormat
++import java.util.Optional
++
++class TriggerStepsCount(injector: HasAndroidInjector) : Trigger(injector) {
++    var measurementDuration: InputDropdownMenu = InputDropdownMenu(rh, "5")
++    var stepsCount: InputDouble = InputDouble(100.0, 0.0, 20000.0, 10.0, DecimalFormat("1"))
++    var comparator: Comparator = Comparator(rh).apply {
++        value = Comparator.Compare.IS_EQUAL_OR_GREATER
++    }
++
++    override fun shouldRun(): Boolean {
++        if (comparator.value == Comparator.Compare.IS_NOT_AVAILABLE) {
++            aapsLogger.info(LTag.AUTOMATION, "Steps count ready, no limit set ${friendlyDescription()}")
++            return true
++        }
++
++        
++        // Steps count entries update every 1-1.5 minutes on my watch,
++        // so we must get some entries from the last 5 minutes.
++        val start = dateUtil.now() - 5 * 60 * 1000L
++        val measurements = persistenceLayer.getStepsCountFromTime(start)
++        val lastSC = measurements.lastOrNull { it.duration == measurementDuration.value.toInt() * 60 * 1000L }
++        if (lastSC == null) {
++            aapsLogger.info(LTag.AUTOMATION, "No steps count measurements available - ${friendlyDescription()}")
++            return false
++        }
++
++        var lastStepsCount: Int? = when (measurementDuration.value) {
++            "5" -> lastSC.steps5min
++            "10" -> lastSC.steps10min
++            "15" -> lastSC.steps15min
++            "30" -> lastSC.steps30min
++            "60" -> lastSC.steps60min
++            "180" -> lastSC.steps180min
++            else -> null
++        }
++
++        if (lastStepsCount == null) {
++            aapsLogger.info(LTag.AUTOMATION, "No steps count measurements available in selected period - ${friendlyDescription()}")
++            return false
++        }
++
++        return comparator.value.check(lastStepsCount.toDouble(), stepsCount.value).also {
++            aapsLogger.info(LTag.AUTOMATION, "Steps count ${if (it) "" else "not "}ready for $lastStepsCount in ${measurementDuration.value} minutes for ${friendlyDescription()}")
++        }
++    }
++
++    override fun dataJSON(): JSONObject =
++        JSONObject()
++            .put("stepsCount", stepsCount.value)
++            .put("measurementDuration", measurementDuration.value)
++            .put("comparator", comparator.value.toString())
++
++    override fun fromJSON(data: String): Trigger {
++        val d = JSONObject(data)
++        stepsCount.setValue(JsonHelper.safeGetDouble(d, "stepsCount"))
++        measurementDuration.setValue(JsonHelper.safeGetString(d, "measurementDuration", "5"))
++        comparator.setValue(Comparator.Compare.valueOf(JsonHelper.safeGetString(d, "comparator")!!))
++        return this
++    }
++
++    override fun friendlyName(): Int = R.string.triggerStepsCountLabel
++
++    override fun friendlyDescription(): String =
++        rh.gs(R.string.triggerStepsCountDesc, measurementDuration.value, rh.gs(comparator.value.stringRes), stepsCount.value)
++
++    override fun icon(): Optional<Int> = Optional.of(app.aaps.core.objects.R.drawable.ic_cp_exercise)
++
++    override fun duplicate(): Trigger {
++        return TriggerStepsCount(injector).also { o ->
++            o.stepsCount.setValue(stepsCount.value)
++            o.measurementDuration.setValue(measurementDuration.value)
++            o.comparator.setValue(comparator.value)
++        }
++    }
++
++    override fun generateDialog(root: LinearLayout) {
++        measurementDuration.setList(arrayListOf("5", "10", "15", "30", "60", "180"))
++        LayoutBuilder()
++            .add(StaticLabel(rh, R.string.triggerStepsCountLabel, this))
++            .add(LabelWithElement(rh, rh.gs(R.string.triggerStepsCountDropdownLabel) + ": ", rh.gs(app.aaps.core.interfaces.R.string.unit_minutes), measurementDuration))
++            .add(comparator)
++            .add(LabelWithElement(rh, rh.gs(R.string.triggerStepsCountLabel) + ": ", "", stepsCount))
++            .build(root)
++    }
++}
+diff --git a/plugins/automation/src/main/res/values/strings.xml b/plugins/automation/src/main/res/values/strings.xml
+index df3f1681020..33786f8fe4f 100644
+--- a/plugins/automation/src/main/res/values/strings.xml
++++ b/plugins/automation/src/main/res/values/strings.xml
+@@ -140,4 +140,10 @@
+     <string name="autotune_run_with_error">Error during last Autotune run</string>
+     <string name="autotune_run_cancelled">Another run of Autotune is detected, run cancelled</string>
+ 
++
++    <!--    Steps count-->
++    <string name="triggerStepsCountLabel">Steps Count</string>
++    <string name="triggerStepsCountDesc">Steps count per %1$s minutes %2$s %3$.0f</string>
++    <string name="triggerStepsCountDropdownLabel">Measurement Duration</string>
++
+ </resources>
+\ No newline at end of file
+diff --git a/plugins/automation/src/test/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCountTest.kt b/plugins/automation/src/test/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCountTest.kt
+new file mode 100644
+index 00000000000..6d4600d1f5a
+--- /dev/null
++++ b/plugins/automation/src/test/kotlin/app/aaps/plugins/automation/triggers/TriggerStepsCountTest.kt
+@@ -0,0 +1,117 @@
++package app.aaps.plugins.automation.triggers
++
++import app.aaps.core.data.model.SC
++import app.aaps.plugins.automation.R
++import app.aaps.plugins.automation.elements.Comparator
++import com.google.common.truth.Truth.assertThat
++import org.json.JSONObject
++import org.junit.jupiter.api.Test
++import org.mockito.Mockito.verify
++import org.mockito.Mockito.verifyNoMoreInteractions
++import org.mockito.Mockito.`when`
++import org.skyscreamer.jsonassert.JSONAssert
++
++class TriggerStepsCountTest : TriggerTestBase() {
++
++    @Test
++    fun friendlyName() {
++        assertThat(TriggerStepsCount(injector).friendlyName()).isEqualTo(R.string.triggerStepsCountLabel)
++    }
++
++    @Test
++    fun friendlyDescription() {
++        val t = TriggerStepsCount(injector)
++        `when`(rh.gs(Comparator.Compare.IS_EQUAL_OR_GREATER.stringRes)).thenReturn(">")
++        `when`(rh.gs(R.string.triggerStepsCountDesc, "5", ">", 100.0)).thenReturn("test")
++
++        assertThat(t.friendlyDescription()).isEqualTo("test")
++    }
++
++    @Test
++    fun duplicate() {
++        val t = TriggerStepsCount(injector).apply {
++            stepsCount.value = 100.0
++            measurementDuration.value = "5"
++            comparator.value = Comparator.Compare.IS_GREATER
++        }
++        val dup = t.duplicate() as TriggerStepsCount
++        assertThat(dup).isNotSameInstanceAs(t)
++        assertThat(dup.stepsCount.value).isWithin(0.01).of(100.0)
++        assertThat(dup.measurementDuration.value).isEqualTo("5")
++        assertThat(dup.comparator.value).isEqualTo(Comparator.Compare.IS_GREATER)
++    }
++
++    @Test
++    fun shouldRunNotAvailable() {
++        val t = TriggerStepsCount(injector).apply { comparator.value = Comparator.Compare.IS_NOT_AVAILABLE }
++        assertThat(t.shouldRun()).isTrue()
++        verifyNoMoreInteractions(persistenceLayer)
++    }
++
++    @Test
++    fun shouldRunNoStepsAvailable() {
++        val t = TriggerStepsCount(injector).apply {
++            stepsCount.value = 100.0
++            measurementDuration.value = "5"
++            comparator.value = Comparator.Compare.IS_GREATER
++        }
++        `when`(persistenceLayer.getStepsCountFromTime(now - 300000L)).thenReturn(emptyList())
++        assertThat(t.shouldRun()).isFalse()
++        verify(persistenceLayer).getStepsCountFromTime(now - 300000L)
++        verifyNoMoreInteractions(persistenceLayer)
++    }
++
++    @Test
++    fun shouldRunBelowThreshold() {
++        val t = TriggerStepsCount(injector).apply {
++            stepsCount.value = 100.0
++            measurementDuration.value = "5"
++            comparator.value = Comparator.Compare.IS_GREATER
++        }
++        val scs = listOf(SC(duration = 300_000, timestamp = now, steps5min = 80, steps10min = 110, steps15min = 0, steps30min = 0, steps60min = 0, steps180min = 0, device = "test"))
++        
++        `when`(persistenceLayer.getStepsCountFromTime(now - 300000L)).thenReturn(scs)
++        assertThat(t.shouldRun()).isFalse()
++        verify(persistenceLayer).getStepsCountFromTime(now - 300000L)
++        verifyNoMoreInteractions(persistenceLayer)
++    }
++
++    @Test
++    fun shouldRunTrigger() {
++        val t = TriggerStepsCount(injector).apply {
++            stepsCount.value = 100.0
++            measurementDuration.value = "5"
++            comparator.value = Comparator.Compare.IS_GREATER
++        }
++        val scs = listOf(SC(duration = 300_000, timestamp = now, steps5min = 112, steps10min = 110, steps15min = 0, steps30min = 0, steps60min = 0, steps180min = 0, device = "test"))
++
++        `when`(persistenceLayer.getStepsCountFromTime(now - 300000L)).thenReturn(scs)
++        assertThat(t.shouldRun()).isTrue()
++        verify(persistenceLayer).getStepsCountFromTime(now - 300000L)
++        verifyNoMoreInteractions(persistenceLayer)
++    }
++
++    @Test
++    fun toJSON() {
++        val t = TriggerStepsCount(injector).apply {
++            stepsCount.value = 110.0
++            measurementDuration.value = "15"
++            comparator.value = Comparator.Compare.IS_GREATER
++        }
++        assertThat(t.comparator.value).isEqualTo(Comparator.Compare.IS_GREATER)
++
++        JSONAssert.assertEquals("""{"data":{"comparator":"IS_GREATER","stepsCount":110,"measurementDuration":"15"},"type":"TriggerStepsCount"}""", t.toJSON(), true)
++    }
++
++    @Test
++    fun fromJSON() {
++        val t = TriggerDummy(injector).instantiate(
++            JSONObject(
++                """{"data":{"comparator":"IS_GREATER","stepsCount":110,"measurementDuration":"10"},"type":"TriggerStepsCount"}"""
++            )
++        ) as TriggerStepsCount
++        assertThat(t.comparator.value).isEqualTo(Comparator.Compare.IS_GREATER)
++        assertThat(t.stepsCount.value).isWithin(0.01).of(110.0)
++        assertThat(t.measurementDuration.value).isEqualTo("10")
++    }
++}

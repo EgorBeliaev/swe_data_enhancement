@@ -1,0 +1,190 @@
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+index 715ff6fbc2..2e437c27a3 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+@@ -63,6 +63,7 @@ import eu.kanade.tachiyomi.ui.player.settings.sheets.ScreenshotOptionsSheet
+ import eu.kanade.tachiyomi.ui.player.settings.sheets.StreamsCatalogSheet
+ import eu.kanade.tachiyomi.ui.player.settings.sheets.VideoChaptersSheet
+ import eu.kanade.tachiyomi.ui.player.settings.sheets.subtitle.SubtitleSettingsSheet
++import eu.kanade.tachiyomi.ui.player.settings.sheets.subtitle.VideoFilters
+ import eu.kanade.tachiyomi.ui.player.settings.sheets.subtitle.toHexString
+ import eu.kanade.tachiyomi.ui.player.viewer.ACTION_MEDIA_CONTROL
+ import eu.kanade.tachiyomi.ui.player.viewer.AspectState
+@@ -635,12 +636,20 @@ class PlayerActivity : BaseActivity() {
+             )
+         }
+ 
++        setVideoFilters()
++
+         MPVLib.setOptionString("input-default-bindings", "yes")
+ 
+         MPVLib.addLogObserver(playerObserver)
+         player.addObserver(playerObserver)
+     }
+ 
++    private fun setVideoFilters() {
++        VideoFilters.entries.forEach {
++            MPVLib.setPropertyInt(it.mpvProperty, it.preference(playerPreferences).get())
++        }
++    }
++
+     private fun setupPlayerAudio() {
+         with(playerPreferences) {
+             audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+index ed87c18e9d..e8553f42fb 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+@@ -121,4 +121,10 @@ class PlayerPreferences(
+     fun backgroundColorSubtitles() = preferenceStore.getInt("pref_background_color_subtitles", 0)
+ 
+     fun mpvScripts() = preferenceStore.getBoolean("mpv_scripts", false)
++
++    fun brightnessFilter() = preferenceStore.getInt("pref_player_filter_brightness")
++    fun saturationFilter() = preferenceStore.getInt("pref_player_filter_saturation")
++    fun contrastFilter() = preferenceStore.getInt("pref_player_filter_contrast")
++    fun gammaFilter() = preferenceStore.getInt("pref_player_filter_gamma")
++    fun hueFilter() = preferenceStore.getInt("pref_player_filter_hue")
+ }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/SubtitleSettingsSheet.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/SubtitleSettingsSheet.kt
+index 74c410fec9..0d032b789d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/SubtitleSettingsSheet.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/SubtitleSettingsSheet.kt
+@@ -54,6 +54,7 @@ fun SubtitleSettingsSheet(
+     TabbedDialog(
+         onDismissRequest = onDismissRequest,
+         tabTitles = persistentListOf(
++            stringResource(MR.strings.player_subtitle_settings_filters),
+             stringResource(MR.strings.player_subtitle_settings_delay_tab),
+             stringResource(MR.strings.player_subtitle_settings_font_tab),
+             stringResource(MR.strings.player_subtitle_settings_color_tab),
+@@ -66,9 +67,10 @@ fun SubtitleSettingsSheet(
+                 .verticalScroll(rememberScrollState()),
+         ) {
+             when (page) {
+-                0 -> StreamsDelayPage(screenModel)
+-                1 -> SubtitleFontPage(screenModel)
+-                2 -> SubtitleColorPage(screenModel)
++                0 -> FiltersPage(screenModel)
++                1 -> StreamsDelayPage(screenModel)
++                2 -> SubtitleFontPage(screenModel)
++                3 -> SubtitleColorPage(screenModel)
+             }
+         }
+     }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/VideoFiltersPage.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/VideoFiltersPage.kt
+new file mode 100644
+index 0000000000..521422ee1f
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/subtitle/VideoFiltersPage.kt
+@@ -0,0 +1,89 @@
++package eu.kanade.tachiyomi.ui.player.settings.sheets.subtitle
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.outlined.Info
++import androidx.compose.material3.Icon
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import dev.icerock.moko.resources.StringResource
++import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
++import eu.kanade.tachiyomi.ui.player.settings.PlayerSettingsScreenModel
++import `is`.xyz.mpv.MPVLib
++import tachiyomi.core.common.preference.Preference
++import tachiyomi.i18n.MR
++import tachiyomi.presentation.core.components.SliderItem
++import tachiyomi.presentation.core.i18n.stringResource
++import tachiyomi.presentation.core.util.collectAsState
++
++@Composable
++fun FiltersPage(
++    screenModel: PlayerSettingsScreenModel,
++    modifier: Modifier = Modifier,
++) {
++    if (!screenModel.preferences.gpuNext().get()) {
++        Row(
++            modifier = Modifier.padding(16.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(16.dp),
++        ) {
++            Icon(Icons.Outlined.Info, null)
++            Text(stringResource(MR.strings.player_filters_warning))
++        }
++    }
++    Column(modifier) {
++        VideoFilters.entries.forEach { filter ->
++            val value by filter.preference(screenModel.preferences).collectAsState()
++            SliderItem(
++                label = stringResource(filter.title),
++                value = value,
++                valueText = value.toString(),
++                onChange = {
++                    filter.preference(screenModel.preferences).set(it)
++                    MPVLib.setPropertyInt(filter.mpvProperty, it)
++                },
++                max = 100,
++                min = -100,
++            )
++        }
++    }
++}
++
++enum class VideoFilters(
++    val title: StringResource,
++    val preference: (PlayerPreferences) -> Preference<Int>,
++    val mpvProperty: String,
++) {
++    BRIGHTNESS(
++        MR.strings.player_filters_brightness,
++        { it.brightnessFilter() },
++        "brightness",
++    ),
++    SATURATION(
++        MR.strings.player_filters_saturation,
++        { it.saturationFilter() },
++        "saturation",
++    ),
++    CONTRAST(
++        MR.strings.player_filters_contrast,
++        { it.contrastFilter() },
++        "contrast",
++    ),
++    GAMMA(
++        MR.strings.player_filters_gamma,
++        { it.gammaFilter() },
++        "gamma",
++    ),
++    HUE(
++        MR.strings.player_filters_hue,
++        { it.hueFilter() },
++        "hue",
++    ),
++}
+diff --git a/i18n/src/commonMain/moko-resources/base/strings.xml b/i18n/src/commonMain/moko-resources/base/strings.xml
+index 735644f35f..4bdb7414c8 100644
+--- a/i18n/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n/src/commonMain/moko-resources/base/strings.xml
+@@ -1101,9 +1101,16 @@
+     <string name="pref_category_hide_hidden">Hide hidden categories from categories and storage screen</string>
+     <string name="pref_update_anime_release_grace_period">Expected anime release grace period</string>
+     <string name="player_subtitle_settings_example">Lorem ipsum dolor sit amet.</string>
++    <string name="player_subtitle_settings_filters">Filters</string>
+     <string name="player_subtitle_settings_delay_tab">Delay</string>
+     <string name="player_subtitle_settings_font_tab">Font</string>
+     <string name="player_subtitle_settings_color_tab">Color</string>
++    <string name="player_filters_brightness">Brightness</string>
++    <string name="player_filters_saturation">Saturation</string>
++    <string name="player_filters_contrast">Contrast</string>
++    <string name="player_filters_gamma">Gamma</string>
++    <string name="player_filters_hue">Hue</string>
++    <string name="player_filters_warning">Some filters may not work your current video driver</string>
+     <string name="player_subtitle_settings">Subtitle settings</string>
+     <string name="player_add_external_audio">Add external audio</string>
+     <string name="player_add_external_audio_intent">Select an audio file.</string>

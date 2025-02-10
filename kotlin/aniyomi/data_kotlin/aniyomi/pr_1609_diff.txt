@@ -1,0 +1,455 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 47fa9b9ecd..ec873991f6 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -20,7 +20,7 @@ android {
+     defaultConfig {
+         applicationId = "xyz.jmir.tachiyomi.mi"
+ 
+-        versionCode = 123
++        versionCode = 124
+         versionName = "0.15.3.0"
+ 
+         buildConfigField("String", "COMMIT_COUNT", "\"${getCommitCount()}\"")
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
+index 28c3e66b8b..93ffff07d8 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
+@@ -12,7 +12,8 @@ import androidx.compose.ui.platform.LocalContext
+ import eu.kanade.core.preference.asState
+ import eu.kanade.presentation.more.settings.Preference
+ import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
+-import kotlinx.collections.immutable.persistentMapOf
++import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
++import kotlinx.collections.immutable.toImmutableMap
+ import tachiyomi.core.i18n.stringResource
+ import tachiyomi.domain.storage.service.StorageManager
+ import tachiyomi.i18n.MR
+@@ -85,13 +86,12 @@ object AdvancedPlayerSettingsScreen : SearchableSettings {
+             ),
+             Preference.PreferenceItem.ListPreference(
+                 title = context.stringResource(MR.strings.pref_debanding_title),
+-                pref = playerPreferences.deband(),
+-                entries = persistentMapOf(
+-                    0 to context.stringResource(MR.strings.pref_debanding_disabled),
+-                    1 to context.stringResource(MR.strings.pref_debanding_cpu),
+-                    2 to context.stringResource(MR.strings.pref_debanding_gpu),
+-                    3 to "YUV420P",
+-                ),
++                pref = playerPreferences.videoDebanding(),
++                entries = VideoDebanding.entries.associateWith {
++                    context.stringResource(
++                        it.stringRes,
++                    )
++                }.toImmutableMap(),
+             ),
+             Preference.PreferenceItem.SwitchPreference(
+                 title = context.stringResource(MR.strings.pref_mpv_scripts),
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/Migrations.kt b/app/src/main/java/eu/kanade/tachiyomi/Migrations.kt
+index 16df2ad614..130bbe78d4 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/Migrations.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/Migrations.kt
+@@ -16,7 +16,10 @@ import eu.kanade.tachiyomi.data.track.TrackerManager
+ import eu.kanade.tachiyomi.network.NetworkPreferences
+ import eu.kanade.tachiyomi.network.PREF_DOH_CLOUDFLARE
+ import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
++import eu.kanade.tachiyomi.ui.player.viewer.AspectState
+ import eu.kanade.tachiyomi.ui.player.viewer.HwDecState
++import eu.kanade.tachiyomi.ui.player.viewer.InvertedPlayback
++import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderOrientation
+ import eu.kanade.tachiyomi.ui.reader.setting.ReaderPreferences
+ import eu.kanade.tachiyomi.util.system.DeviceUtil
+@@ -510,10 +513,6 @@ object Migrations {
+                     newKey = { Preference.appStateKey(it) },
+                 )
+ 
+-                if (HwDecState.isWSA) {
+-                    playerPreferences.hwDec().set(HwDecState.SW.mpvValue)
+-                }
+-
+                 // Deleting old download cache index files, but might as well clear it all out
+                 context.cacheDir.deleteRecursively()
+             }
+@@ -561,8 +560,37 @@ object Migrations {
+                 }
+             }
+ 
+-            if (oldVersion < 122) {
+-                if (HwDecState.isWSA) playerPreferences.hwDec().set(HwDecState.SW.mpvValue)
++            if (oldVersion < 123) {
++                val invertedPosition = preferenceStore.getBoolean("pref_invert_playback_txt", false)
++                val invertedDuration = preferenceStore.getBoolean("pref_invert_duration_txt", false)
++                val hwDec = preferenceStore.getString("pref_hwdec", HwDecState.defaultHwDec.mpvValue)
++                val deband = preferenceStore.getInt("pref_deband", 0)
++                val playerViewMode = preferenceStore.getInt("pref_player_view_mode", 1)
++                val gpuNext = preferenceStore.getBoolean("gpu_next", false)
++
++                prefs.edit {
++                    remove("pref_invert_playback_txt")
++                    remove("pref_invert_duration_txt")
++                    remove("pref_hwdec")
++                    remove("pref_deband")
++                    remove("pref_player_view_mode")
++                    remove("gpu_next")
++
++                    val invertedPlayback = when {
++                        invertedPosition.get() -> InvertedPlayback.POSITION
++                        invertedDuration.get() -> InvertedPlayback.DURATION
++                        else -> InvertedPlayback.NONE
++                    }
++                    val hardwareDecoding = HwDecState.entries.first { it.mpvValue == hwDec.get() }
++                    val videoDebanding = VideoDebanding.entries.first { it.ordinal == deband.get() }
++                    val aspectState = AspectState.entries.first { it.ordinal == playerViewMode.get() }
++
++                    preferenceStore.getEnum("pref_inverted_playback", InvertedPlayback.NONE).set(invertedPlayback)
++                    preferenceStore.getEnum("pref_hardware_decoding", HwDecState.defaultHwDec).set(hardwareDecoding)
++                    preferenceStore.getEnum("pref_video_debanding", VideoDebanding.DISABLED).set(videoDebanding)
++                    preferenceStore.getEnum("pref_player_aspect_state", AspectState.FIT).set(aspectState)
++                    preferenceStore.getBoolean("pref_gpu_next", false).set(gpuNext.get())
++                }
+             }
+             return true
+         }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+index 4157e4fe8c..e2cfc48469 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+@@ -75,6 +75,7 @@ import eu.kanade.tachiyomi.ui.player.viewer.PictureInPictureHandler
+ import eu.kanade.tachiyomi.ui.player.viewer.PipState
+ import eu.kanade.tachiyomi.ui.player.viewer.SeekState
+ import eu.kanade.tachiyomi.ui.player.viewer.SetAsCover
++import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
+ import eu.kanade.tachiyomi.util.AniSkipApi
+ import eu.kanade.tachiyomi.util.SkipType
+ import eu.kanade.tachiyomi.util.Stamp
+@@ -610,11 +611,12 @@ class PlayerActivity : BaseActivity() {
+         MPVLib.setOptionString("keep-open", "always")
+         MPVLib.setOptionString("ytdl", "no")
+ 
+-        MPVLib.setOptionString("hwdec", playerPreferences.hwDec().get())
+-        when (playerPreferences.deband().get()) {
+-            1 -> MPVLib.setOptionString("vf", "gradfun=radius=12")
+-            2 -> MPVLib.setOptionString("deband", "yes")
+-            3 -> MPVLib.setOptionString("vf", "format=yuv420p")
++        MPVLib.setOptionString("hwdec", playerPreferences.hardwareDecoding().get().mpvValue)
++        when (playerPreferences.videoDebanding().get()) {
++            VideoDebanding.CPU -> MPVLib.setOptionString("vf", "gradfun=radius=12")
++            VideoDebanding.GPU -> MPVLib.setOptionString("deband", "yes")
++            VideoDebanding.YUV420P -> MPVLib.setOptionString("vf", "format=yuv420p")
++            VideoDebanding.DISABLED -> {}
+         }
+ 
+         val currentPlayerStatisticsPage = playerPreferences.playerStatisticsPage().get()
+@@ -882,7 +884,7 @@ class PlayerActivity : BaseActivity() {
+         AspectState.mode = if (aspectProperty != -1.0 && aspectProperty != (deviceWidth / deviceHeight).toDouble()) {
+             AspectState.CUSTOM
+         } else {
+-            AspectState.get(playerPreferences.playerViewMode().get())
++            playerPreferences.aspectState().get()
+         }
+ 
+         playerControls.setViewMode(showText = false)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+index 4d0e6be641..8a6b48342d 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+@@ -3,6 +3,8 @@ package eu.kanade.tachiyomi.ui.player.settings
+ import eu.kanade.tachiyomi.ui.player.viewer.AspectState
+ import eu.kanade.tachiyomi.ui.player.viewer.AudioChannels
+ import eu.kanade.tachiyomi.ui.player.viewer.HwDecState
++import eu.kanade.tachiyomi.ui.player.viewer.InvertedPlayback
++import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
+ import tachiyomi.core.preference.PreferenceStore
+ import tachiyomi.core.preference.getEnum
+ 
+@@ -29,8 +31,7 @@ class PlayerPreferences(
+ 
+     fun autoplayEnabled() = preferenceStore.getBoolean("pref_auto_play_enabled", false)
+ 
+-    fun invertedPlaybackTxt() = preferenceStore.getBoolean("pref_invert_playback_txt", false)
+-    fun invertedDurationTxt() = preferenceStore.getBoolean("pref_invert_duration_txt", false)
++    fun invertedPlayback() = preferenceStore.getEnum("pref_inverted_playback", InvertedPlayback.NONE)
+ 
+     fun mpvConf() = preferenceStore.getString("pref_mpv_conf", "")
+ 
+@@ -60,7 +61,7 @@ class PlayerPreferences(
+ 
+     fun mediaChapterSeek() = preferenceStore.getBoolean("pref_media_control_chapter_seeking", false)
+ 
+-    fun playerViewMode() = preferenceStore.getInt("pref_player_view_mode", AspectState.FIT.index)
++    fun aspectState() = preferenceStore.getEnum("pref_player_aspect_state", AspectState.FIT)
+ 
+     fun playerFullscreen() = preferenceStore.getBoolean("player_fullscreen", true)
+ 
+@@ -94,9 +95,9 @@ class PlayerPreferences(
+         false,
+     )
+ 
+-    fun hwDec() = preferenceStore.getString("pref_hwdec", HwDecState.defaultHwDec.mpvValue)
+-    fun deband() = preferenceStore.getInt("pref_deband", 0)
+-    fun gpuNext() = preferenceStore.getBoolean("gpu_next", false)
++    fun hardwareDecoding() = preferenceStore.getEnum("pref_hardware_decoding", HwDecState.defaultHwDec)
++    fun videoDebanding() = preferenceStore.getEnum("pref_video_debanding", VideoDebanding.DISABLED)
++    fun gpuNext() = preferenceStore.getBoolean("pref_gpu_next", false)
+ 
+     fun rememberAudioDelay() = preferenceStore.getBoolean("pref_remember_audio_delay", false)
+     fun audioDelay() = preferenceStore.getInt("pref_audio_delay", 0)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/PlayerSettingsSheet.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/PlayerSettingsSheet.kt
+index 13a6cfac45..95d2cab6ed 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/PlayerSettingsSheet.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/sheets/PlayerSettingsSheet.kt
+@@ -54,7 +54,7 @@ fun PlayerSettingsSheet(
+             screenModel.preferences.playerStatisticsPage().get(),
+         )
+     }
+-    var decoder by remember { mutableStateOf(screenModel.preferences.hwDec().get()) }
++    var decoder by remember { mutableStateOf(screenModel.preferences.hardwareDecoding().get()) }
+ 
+     val changeAudioChannel: (AudioChannels) -> Unit = { channel ->
+         audioChannel = channel
+@@ -82,10 +82,9 @@ fun PlayerSettingsSheet(
+     }
+ 
+     val togglePlayerDecoder: (HwDecState) -> Unit = { hwDecState ->
+-        val hwDec = hwDecState.mpvValue
+-        MPVLib.setOptionString("hwdec", hwDec)
+-        decoder = hwDec
+-        screenModel.preferences.hwDec().set(hwDec)
++        MPVLib.setOptionString("hwdec", hwDecState.mpvValue)
++        decoder = hwDecState
++        screenModel.preferences.hardwareDecoding().set(hwDecState)
+     }
+ 
+     AdaptiveSheet(
+@@ -135,7 +134,7 @@ fun PlayerSettingsSheet(
+                 ) {
+                     HwDecState.entries.forEach {
+                         FilterChip(
+-                            selected = decoder == it.mpvValue,
++                            selected = decoder == it,
+                             onClick = { togglePlayerDecoder(it) },
+                             label = { Text(it.title) },
+                         )
+@@ -183,9 +182,9 @@ fun PlayerSettingsSheet(
+                 ) {
+                     PlayerStatsPage.entries.forEach {
+                         FilterChip(
+-                            selected = statisticsPage == it.page,
+-                            onClick = { togglePlayerStatsPage(it.page) },
+-                            label = { Text(stringResource(it.textRes)) },
++                            selected = statisticsPage == it.ordinal,
++                            onClick = { togglePlayerStatsPage(it.ordinal) },
++                            label = { Text(stringResource(it.stringRes)) },
+                         )
+                     }
+                 }
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerControlsView.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerControlsView.kt
+index 0d7145df26..f819b3cd25 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerControlsView.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerControlsView.kt
+@@ -120,10 +120,15 @@ class PlayerControlsView @JvmOverloads constructor(context: Context, attrs: Attr
+ 
+         binding.playbackPositionBtn.setOnClickListener {
+             if (player.timePos != null && player.duration != null) {
+-                playerPreferences.invertedDurationTxt().set(false)
+-                playerPreferences.invertedPlaybackTxt().set(
+-                    !playerPreferences.invertedPlaybackTxt().get(),
+-                )
++                with(playerPreferences.invertedPlayback()) {
++                    this.set(
++                        if (this.get() == InvertedPlayback.POSITION) {
++                            InvertedPlayback.NONE
++                        } else {
++                            InvertedPlayback.POSITION
++                        },
++                    )
++                }
+                 updatePlaybackPos(player.timePos!!)
+                 updatePlaybackDuration(player.duration!!)
+             }
+@@ -131,10 +136,15 @@ class PlayerControlsView @JvmOverloads constructor(context: Context, attrs: Attr
+ 
+         binding.playbackDurationBtn.setOnClickListener {
+             if (player.timePos != null && player.duration != null) {
+-                playerPreferences.invertedPlaybackTxt().set(false)
+-                playerPreferences.invertedDurationTxt().set(
+-                    !playerPreferences.invertedDurationTxt().get(),
+-                )
++                with(playerPreferences.invertedPlayback()) {
++                    this.set(
++                        if (this.get() == InvertedPlayback.DURATION) {
++                            InvertedPlayback.NONE
++                        } else {
++                            InvertedPlayback.DURATION
++                        },
++                    )
++                }
+                 updatePlaybackPos(player.timePos!!)
+                 updatePlaybackDuration(player.duration!!)
+             }
+@@ -308,17 +318,18 @@ class PlayerControlsView @JvmOverloads constructor(context: Context, attrs: Attr
+     @SuppressLint("SetTextI18n")
+     internal fun updatePlaybackPos(position: Int) {
+         val duration = player.duration
+-        val invertedPlayback = playerPreferences.invertedPlaybackTxt().get()
+-        val invertedDuration = playerPreferences.invertedDurationTxt().get()
++        val invertedPlayback = playerPreferences.invertedPlayback().get()
+ 
+         if (duration != null) {
+-            if (invertedPlayback) {
+-                binding.playbackPositionBtn.text = "-${Utils.prettyTime(duration - position)}"
+-            } else if (invertedDuration) {
+-                binding.playbackPositionBtn.text = Utils.prettyTime(position)
+-                binding.playbackDurationBtn.text = "-${Utils.prettyTime(duration - position)}"
+-            } else {
+-                binding.playbackPositionBtn.text = Utils.prettyTime(position)
++            binding.playbackPositionBtn.text = when (invertedPlayback) {
++                InvertedPlayback.POSITION -> "-${Utils.prettyTime(duration - position)}"
++                InvertedPlayback.DURATION -> Utils.prettyTime(position)
++                InvertedPlayback.NONE -> Utils.prettyTime(position)
++            }
++            binding.playbackDurationBtn.text = when (invertedPlayback) {
++                InvertedPlayback.POSITION -> Utils.prettyTime(duration)
++                InvertedPlayback.DURATION -> "-${Utils.prettyTime(duration - position)}"
++                InvertedPlayback.NONE -> Utils.prettyTime(duration)
+             }
+             activity.viewModel.onSecondReached(position, duration)
+         }
+@@ -328,8 +339,14 @@ class PlayerControlsView @JvmOverloads constructor(context: Context, attrs: Attr
+ 
+     @SuppressLint("SetTextI18n")
+     internal fun updatePlaybackDuration(duration: Int) {
+-        if (!playerPreferences.invertedDurationTxt().get() && player.duration != null) {
+-            binding.playbackDurationBtn.text = Utils.prettyTime(duration)
++        val position = player.timePos
++        val invertedPlayback = playerPreferences.invertedPlayback().get()
++        if (position != null) {
++            binding.playbackDurationBtn.text = when (invertedPlayback) {
++                InvertedPlayback.POSITION -> Utils.prettyTime(duration)
++                InvertedPlayback.DURATION -> "-${Utils.prettyTime(duration - position)}"
++                InvertedPlayback.NONE -> Utils.prettyTime(duration)
++            }
+         }
+ 
+         seekbar.updateSeekbar(duration = duration.toFloat())
+@@ -461,7 +478,7 @@ class PlayerControlsView @JvmOverloads constructor(context: Context, attrs: Attr
+         }
+ 
+         mpvUpdateAspect(aspect = aspect, pan = pan)
+-        playerPreferences.playerViewMode().set(AspectState.mode.index)
++        playerPreferences.aspectState().set(AspectState.mode)
+ 
+         if (showText) {
+             animationHandler.removeCallbacks(playerInformationRunnable)
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerEnums.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerEnums.kt
+index f7e318ba42..d02cbe7ede 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerEnums.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/viewer/PlayerEnums.kt
+@@ -11,6 +11,13 @@ enum class SetAsCover {
+     Success, AddToLibraryFirst, Error
+ }
+ 
++/**
++ * Player's inverted playback text handler
++ */
++enum class InvertedPlayback {
++    NONE, POSITION, DURATION
++}
++
+ /**
+  * Player's Picture-In-Picture state handler
+  */
+@@ -36,17 +43,15 @@ enum class SeekState {
+ /**
+  * Player's Video Aspect state handler
+  */
+-enum class AspectState(val index: Int, val stringRes: StringResource) {
+-    CROP(index = 0, stringRes = MR.strings.video_crop_screen),
+-    FIT(index = 1, stringRes = MR.strings.video_fit_screen),
+-    STRETCH(index = 2, stringRes = MR.strings.video_stretch_screen),
+-    CUSTOM(index = 3, stringRes = MR.strings.video_custom_screen),
++enum class AspectState(val stringRes: StringResource) {
++    CROP(stringRes = MR.strings.video_crop_screen),
++    FIT(stringRes = MR.strings.video_fit_screen),
++    STRETCH(stringRes = MR.strings.video_stretch_screen),
++    CUSTOM(stringRes = MR.strings.video_custom_screen),
+     ;
+ 
+     companion object {
+         internal var mode: AspectState = FIT
+-
+-        internal fun get(index: Int) = entries.find { index == it.index } ?: FIT
+     }
+ }
+ 
+@@ -60,9 +65,8 @@ enum class HwDecState(val title: String, val mpvValue: String) {
+     ;
+ 
+     companion object {
+-        internal val isWSA = Build.MODEL == "Subsystem for Android(TM)" ||
+-            Build.BRAND == "Windows" ||
+-            Build.BOARD == "windows"
++        private val isWSA = Build.MODEL == "Subsystem for Android(TM)" ||
++            Build.BRAND == "Windows" || Build.BOARD == "windows"
+ 
+         internal val defaultHwDec = when {
+             isWSA -> SW
+@@ -75,11 +79,21 @@ enum class HwDecState(val title: String, val mpvValue: String) {
+  * Player's Statistics Page handler
+  */
+ @Suppress("unused")
+-enum class PlayerStatsPage(val page: Int, val textRes: StringResource) {
+-    OFF(0, MR.strings.off),
+-    PAGE1(1, MR.strings.player_statistics_page_1),
+-    PAGE2(2, MR.strings.player_statistics_page_2),
+-    PAGE3(3, MR.strings.player_statistics_page_3),
++enum class PlayerStatsPage(val stringRes: StringResource) {
++    OFF(stringRes = MR.strings.off),
++    PAGE1(stringRes = MR.strings.player_statistics_page_1),
++    PAGE2(stringRes = MR.strings.player_statistics_page_2),
++    PAGE3(stringRes = MR.strings.player_statistics_page_3),
++}
++
++/**
++ * Player's debanding handler
++ */
++enum class VideoDebanding(val stringRes: StringResource) {
++    DISABLED(stringRes = MR.strings.pref_debanding_disabled),
++    CPU(stringRes = MR.strings.pref_debanding_cpu),
++    GPU(stringRes = MR.strings.pref_debanding_gpu),
++    YUV420P(stringRes = MR.strings.pref_debanding_yuv420p),
+ }
+ 
+ enum class AudioChannels(val propertyName: String, val propertyValue: String, val textRes: StringResource) {
+diff --git a/i18n/src/commonMain/resources/MR/base/strings.xml b/i18n/src/commonMain/resources/MR/base/strings.xml
+index 2e364c06d9..a4e1400d0c 100644
+--- a/i18n/src/commonMain/resources/MR/base/strings.xml
++++ b/i18n/src/commonMain/resources/MR/base/strings.xml
+@@ -1007,6 +1007,7 @@
+     <string name="pref_debanding_disabled">Disabled</string>
+     <string name="pref_debanding_cpu">CPU</string>
+     <string name="pref_debanding_gpu">GPU</string>
++    <string name="pref_debanding_yuv420p">YUV420P</string>
+     <string name="recent_anime_time">Ep. %1$s - %2$s</string>
+     <string name="download_insufficient_space">Couldn\'t download due to low storage space</string>
+     <string name="download_queue_size_warning">Warning: large bulk downloads may lead to sources becoming slower and/or blocking Aniyomi. Tap to learn more.</string>
+@@ -1028,12 +1029,12 @@
+     <string name="label_updates">Manga</string>
+     <string name="label_anime_updates">Anime</string>
+     <string name="player_overlay_back">Back</string>
+-    <string name="enable_auto_play">"Auto-play is on"</string>
+-    <string name="disable_auto_play">"Auto-play is off"</string>
+-    <string name="video_fit_screen">"Fit to screen"</string>
+-    <string name="video_crop_screen">"Cropped to screen"</string>
+-    <string name="video_stretch_screen">"Stretched to screen"</string>
+-    <string name="video_custom_screen">"Custom aspect ratio"</string>
++    <string name="enable_auto_play">Auto-play is on</string>
++    <string name="disable_auto_play">Auto-play is off</string>
++    <string name="video_fit_screen">Fit to screen</string>
++    <string name="video_crop_screen">Cropped to screen</string>
++    <string name="video_stretch_screen">Stretched to screen</string>
++    <string name="video_custom_screen">Custom aspect ratio</string>
+     <string name="playback_speed_dialog_title">Change playback speed:</string>
+     <string name="playback_speed_dialog_reset">Reset</string>
+     <string name="settings_dialog_header">Player settings</string>

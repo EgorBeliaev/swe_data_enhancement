@@ -1,0 +1,950 @@
+diff --git a/src/org/thoughtcrime/securesms/ApplicationContext.java b/src/org/thoughtcrime/securesms/ApplicationContext.java
+index f49cba5c23b..5193a61c20e 100644
+--- a/src/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/src/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -43,6 +43,10 @@
+ import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirementProvider;
+ import org.thoughtcrime.securesms.jobs.requirements.ServiceRequirementProvider;
+ import org.thoughtcrime.securesms.jobs.requirements.SqlCipherMigrationRequirementProvider;
++import org.thoughtcrime.securesms.logging.AndroidLogger;
++import org.thoughtcrime.securesms.logging.CustomSignalProtocolLogger;
++import org.thoughtcrime.securesms.logging.PersistentLogger;
++import org.thoughtcrime.securesms.logging.UncaughtExceptionLogger;
+ import org.thoughtcrime.securesms.push.SignalServiceNetworkAccess;
+ import org.thoughtcrime.securesms.service.DirectoryRefreshListener;
+ import org.thoughtcrime.securesms.service.ExpiringMessageManager;
+@@ -55,7 +59,6 @@
+ import org.webrtc.voiceengine.WebRtcAudioManager;
+ import org.webrtc.voiceengine.WebRtcAudioUtils;
+ import org.whispersystems.libsignal.logging.SignalProtocolLoggerProvider;
+-import org.whispersystems.libsignal.util.AndroidSignalProtocolLogger;
+ 
+ import java.util.HashSet;
+ import java.util.Set;
+@@ -73,11 +76,12 @@
+  */
+ public class ApplicationContext extends MultiDexApplication implements DependencyInjector, DefaultLifecycleObserver {
+ 
+-  private static final String TAG = ApplicationContext.class.getName();
++  private static final String TAG = ApplicationContext.class.getSimpleName();
+ 
+   private ExpiringMessageManager expiringMessageManager;
+   private JobManager             jobManager;
+   private ObjectGraph            objectGraph;
++  private PersistentLogger       persistentLogger;
+ 
+   private volatile boolean isAppVisible;
+ 
+@@ -90,6 +94,7 @@ public void onCreate() {
+     super.onCreate();
+     initializeRandomNumberFix();
+     initializeLogging();
++    initializeCrashHandling();
+     initializeDependencyInjection();
+     initializeJobManager();
+     initializeExpiringMessageManager();
+@@ -105,7 +110,6 @@ public void onCreate() {
+   public void onStart(@NonNull LifecycleOwner owner) {
+     isAppVisible = true;
+     Log.i(TAG, "App is now visible.");
+-
+     executePendingContactSync();
+   }
+ 
+@@ -134,12 +138,24 @@ public boolean isAppVisible() {
+     return isAppVisible;
+   }
+ 
++  public PersistentLogger getPersistentLogger() {
++    return persistentLogger;
++  }
++
+   private void initializeRandomNumberFix() {
+     PRNGFixes.apply();
+   }
+ 
+   private void initializeLogging() {
+-    SignalProtocolLoggerProvider.setProvider(new AndroidSignalProtocolLogger());
++    persistentLogger = new PersistentLogger(this);
++    org.thoughtcrime.securesms.logging.Log.initialize(new AndroidLogger(), persistentLogger);
++
++    SignalProtocolLoggerProvider.setProvider(new CustomSignalProtocolLogger());
++  }
++
++  private void initializeCrashHandling() {
++    final Thread.UncaughtExceptionHandler originalHandler = Thread.getDefaultUncaughtExceptionHandler();
++    Thread.setDefaultUncaughtExceptionHandler(new UncaughtExceptionLogger(originalHandler, persistentLogger));
+   }
+ 
+   private void initializeJobManager() {
+diff --git a/src/org/thoughtcrime/securesms/crypto/KeyStoreHelper.java b/src/org/thoughtcrime/securesms/crypto/KeyStoreHelper.java
+index 6db8b24680e..6c29dcfa07b 100644
+--- a/src/org/thoughtcrime/securesms/crypto/KeyStoreHelper.java
++++ b/src/org/thoughtcrime/securesms/crypto/KeyStoreHelper.java
+@@ -152,7 +152,7 @@ public String serialize() {
+       }
+     }
+ 
+-    static SealedData fromString(@NonNull String value) {
++    public static SealedData fromString(@NonNull String value) {
+       try {
+         return JsonUtils.fromJson(value, SealedData.class);
+       } catch (IOException e) {
+diff --git a/src/org/thoughtcrime/securesms/logging/AndroidLogger.java b/src/org/thoughtcrime/securesms/logging/AndroidLogger.java
+new file mode 100644
+index 00000000000..e7695a0b65d
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/AndroidLogger.java
+@@ -0,0 +1,34 @@
++package org.thoughtcrime.securesms.logging;
++
++public class AndroidLogger extends Log.Logger {
++
++  @Override
++  public void v(String tag, String message, Throwable t) {
++    android.util.Log.v(tag, message, t);
++  }
++
++  @Override
++  public void d(String tag, String message, Throwable t) {
++    android.util.Log.d(tag, message, t);
++  }
++
++  @Override
++  public void i(String tag, String message, Throwable t) {
++    android.util.Log.i(tag, message, t);
++  }
++
++  @Override
++  public void w(String tag, String message, Throwable t) {
++    android.util.Log.w(tag, message, t);
++  }
++
++  @Override
++  public void e(String tag, String message, Throwable t) {
++    android.util.Log.e(tag, message, t);
++  }
++
++  @Override
++  public void wtf(String tag, String message, Throwable t) {
++    android.util.Log.wtf(tag, message, t);
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/CustomSignalProtocolLogger.java b/src/org/thoughtcrime/securesms/logging/CustomSignalProtocolLogger.java
+new file mode 100644
+index 00000000000..ec663813b74
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/CustomSignalProtocolLogger.java
+@@ -0,0 +1,29 @@
++package org.thoughtcrime.securesms.logging;
++
++import org.whispersystems.libsignal.logging.SignalProtocolLogger;
++
++public class CustomSignalProtocolLogger implements SignalProtocolLogger {
++  @Override
++  public void log(int priority, String tag, String message) {
++    switch (priority) {
++      case VERBOSE:
++        Log.v(tag, message);
++        break;
++      case DEBUG:
++        Log.d(tag, message);
++        break;
++      case INFO:
++        Log.i(tag, message);
++        break;
++      case WARN:
++        Log.w(tag, message);
++        break;
++      case ERROR:
++        Log.e(tag, message);
++        break;
++      case ASSERT:
++        Log.wtf(tag, message);
++        break;
++    }
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/GrowingBuffer.java b/src/org/thoughtcrime/securesms/logging/GrowingBuffer.java
+new file mode 100644
+index 00000000000..24e29d075e5
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/GrowingBuffer.java
+@@ -0,0 +1,13 @@
++package org.thoughtcrime.securesms.logging;
++
++public class GrowingBuffer {
++
++  private byte[] buffer;
++
++  public byte[] get(int minLength) {
++    if (buffer == null || buffer.length < minLength) {
++      buffer = new byte[minLength];
++    }
++    return buffer;
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/Log.java b/src/org/thoughtcrime/securesms/logging/Log.java
+new file mode 100644
+index 00000000000..a2a5ecb9ef8
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/Log.java
+@@ -0,0 +1,131 @@
++package org.thoughtcrime.securesms.logging;
++
++import android.support.annotation.MainThread;
++
++public class Log {
++
++  private static Logger[] loggers;
++
++  @MainThread
++  public static void initialize(Logger... loggers) {
++    Log.loggers = loggers;
++  }
++
++  public static void v(String tag, String message) {
++    v(tag, message, null);
++  }
++
++  public static void d(String tag, String message) {
++    d(tag, message, null);
++  }
++
++  public static void i(String tag, String message) {
++    i(tag, message, null);
++  }
++
++  public static void w(String tag, String message) {
++    w(tag, message, null);
++  }
++
++  public static void e(String tag, String message) {
++    e(tag, message, null);
++  }
++
++  public static void wtf(String tag, String message) {
++    wtf(tag, message, null);
++  }
++
++  public static void v(String tag, Throwable t) {
++    v(tag, null, t);
++  }
++
++  public static void d(String tag, Throwable t) {
++    d(tag, null, t);
++  }
++
++  public static void i(String tag, Throwable t) {
++    i(tag, null, t);
++  }
++
++  public static void w(String tag, Throwable t) {
++    w(tag, null, t);
++  }
++
++  public static void e(String tag, Throwable t) {
++    e(tag, null, t);
++  }
++
++  public static void wtf(String tag, Throwable t) {
++    wtf(tag, null, t);
++  }
++
++  public static void v(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.v(tag, message, t);
++      }
++    } else {
++      android.util.Log.v(tag, message, t);
++    }
++  }
++
++  public static void d(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.d(tag, message, t);
++      }
++    } else {
++      android.util.Log.d(tag, message, t);
++    }
++  }
++
++  public static void i(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.i(tag, message, t);
++      }
++    } else {
++      android.util.Log.i(tag, message, t);
++    }
++  }
++
++  public static void w(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.w(tag, message, t);
++      }
++    } else {
++      android.util.Log.w(tag, message, t);
++    }
++  }
++
++  public static void e(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.e(tag, message, t);
++      }
++    } else {
++      android.util.Log.e(tag, message, t);
++    }
++  }
++
++  public static void wtf(String tag, String message, Throwable t) {
++    if (loggers != null) {
++      for (Logger logger : loggers) {
++        logger.wtf(tag, message, t);
++      }
++    } else {
++      android.util.Log.wtf(tag, message, t);
++    }
++  }
++
++
++  public static abstract class Logger {
++    public abstract void v(String tag, String message, Throwable t);
++    public abstract void d(String tag, String message, Throwable t);
++    public abstract void i(String tag, String message, Throwable t);
++    public abstract void w(String tag, String message, Throwable t);
++    public abstract void e(String tag, String message, Throwable t);
++    public abstract void wtf(String tag, String message, Throwable t);
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/LogFile.java b/src/org/thoughtcrime/securesms/logging/LogFile.java
+new file mode 100644
+index 00000000000..2f2bd439102
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/LogFile.java
+@@ -0,0 +1,139 @@
++package org.thoughtcrime.securesms.logging;
++
++import android.support.annotation.NonNull;
++
++import org.thoughtcrime.securesms.util.Conversions;
++import org.thoughtcrime.securesms.util.Util;
++
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
++import java.io.EOFException;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.PushbackInputStream;
++import java.io.RandomAccessFile;
++import java.security.InvalidAlgorithmParameterException;
++import java.security.InvalidKeyException;
++import java.security.NoSuchAlgorithmException;
++import java.security.SecureRandom;
++
++import javax.crypto.BadPaddingException;
++import javax.crypto.Cipher;
++import javax.crypto.IllegalBlockSizeException;
++import javax.crypto.NoSuchPaddingException;
++import javax.crypto.ShortBufferException;
++import javax.crypto.spec.IvParameterSpec;
++import javax.crypto.spec.SecretKeySpec;
++
++class LogFile {
++
++  public static class Writer {
++
++    private final byte[]        ivBuffer         = new byte[16];
++    private final GrowingBuffer ciphertextBuffer = new GrowingBuffer();
++
++    private final byte[]               secret;
++    private final File                 file;
++    private final Cipher               cipher;
++    private final BufferedOutputStream outputStream;
++
++    Writer(@NonNull byte[] secret, @NonNull File file) throws IOException {
++      this.secret       = secret;
++      this.file         = file;
++      this.outputStream = new BufferedOutputStream(new FileOutputStream(file, true));
++
++      try {
++        this.cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
++      } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
++        throw new AssertionError(e);
++      }
++    }
++
++    void writeEntry(@NonNull String entry) throws IOException {
++      new SecureRandom().nextBytes(ivBuffer);
++
++      byte[] plaintext = entry.getBytes();
++      try {
++        cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(secret, "AES"), new IvParameterSpec(ivBuffer));
++
++        int    cipherLength = cipher.getOutputSize(plaintext.length);
++        byte[] ciphertext   = ciphertextBuffer.get(cipherLength);
++        cipherLength = cipher.doFinal(plaintext, 0, plaintext.length, ciphertext);
++
++        outputStream.write(ivBuffer);
++        outputStream.write(Conversions.intToByteArray(cipherLength));
++        outputStream.write(ciphertext, 0, cipherLength);
++
++        outputStream.flush();
++      } catch (ShortBufferException | InvalidAlgorithmParameterException | InvalidKeyException | BadPaddingException | IllegalBlockSizeException e) {
++        throw new AssertionError(e);
++      }
++    }
++
++    long getLogSize() {
++      return file.length();
++    }
++
++    void close() {
++      Util.close(outputStream);
++    }
++  }
++
++  static class Reader {
++
++    private final byte[]        ivBuffer         = new byte[16];
++    private final byte[]        intBuffer        = new byte[4];
++    private final GrowingBuffer ciphertextBuffer = new GrowingBuffer();
++
++    private final byte[]              secret;
++    private final Cipher              cipher;
++    private final BufferedInputStream inputStream;
++
++    Reader(@NonNull byte[] secret, @NonNull File file) throws IOException {
++      this.secret      = secret;
++      this.inputStream = new BufferedInputStream(new FileInputStream(file));
++
++      try {
++        this.cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
++      } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
++        throw new AssertionError(e);
++      }
++    }
++
++    String readAll() throws IOException {
++      StringBuilder builder = new StringBuilder();
++
++      String entry;
++      while ((entry = readEntry()) != null) {
++        builder.append(entry).append('\n');
++      }
++
++      return builder.toString();
++    }
++
++    private String readEntry() throws IOException {
++      try {
++        Util.readFully(inputStream, ivBuffer);
++        Util.readFully(inputStream, intBuffer);
++
++        int    length     = Conversions.byteArrayToInt(intBuffer);
++        byte[] ciphertext = ciphertextBuffer.get(length);
++
++        Util.readFully(inputStream, ciphertext, length);
++
++        try {
++          cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(secret, "AES"), new IvParameterSpec(ivBuffer));
++          byte[] plaintext = cipher.doFinal(ciphertext, 0, length);
++
++          return new String(plaintext);
++        } catch (InvalidKeyException | InvalidAlgorithmParameterException | IllegalBlockSizeException | BadPaddingException e) {
++          throw new AssertionError(e);
++        }
++      } catch (EOFException e) {
++        return null;
++      }
++    }
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/LogSecretProvider.java b/src/org/thoughtcrime/securesms/logging/LogSecretProvider.java
+new file mode 100644
+index 00000000000..8566a0e5dcc
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/LogSecretProvider.java
+@@ -0,0 +1,56 @@
++package org.thoughtcrime.securesms.logging;
++
++import android.content.Context;
++import android.os.Build;
++import android.support.annotation.NonNull;
++
++import org.thoughtcrime.securesms.crypto.KeyStoreHelper;
++import org.thoughtcrime.securesms.util.Base64;
++import org.thoughtcrime.securesms.util.TextSecurePreferences;
++
++import java.io.IOException;
++import java.security.SecureRandom;
++
++class LogSecretProvider {
++
++  static byte[] getOrCreateAttachmentSecret(@NonNull Context context) {
++    String unencryptedSecret = TextSecurePreferences.getLogUnencryptedSecret(context);
++    String encryptedSecret   = TextSecurePreferences.getLogEncryptedSecret(context);
++
++    if      (unencryptedSecret != null) return parseUnencryptedSecret(unencryptedSecret);
++    else if (encryptedSecret != null)   return parseEncryptedSecret(encryptedSecret);
++    else                                return createAndStoreSecret(context);
++  }
++
++  private static byte[] parseUnencryptedSecret(String secret) {
++    try {
++      return Base64.decode(secret);
++    } catch (IOException e) {
++      throw new AssertionError("Failed to decode the unecrypted secret.");
++    }
++  }
++
++  private static byte[] parseEncryptedSecret(String secret) {
++    if (Build.VERSION.SDK_INT > Build.VERSION_CODES.M) {
++      KeyStoreHelper.SealedData encryptedSecret = KeyStoreHelper.SealedData.fromString(secret);
++      return KeyStoreHelper.unseal(encryptedSecret);
++    } else {
++      throw new AssertionError("OS downgrade not supported. KeyStore sealed data exists on platform < M!");
++    }
++  }
++
++  private static byte[] createAndStoreSecret(@NonNull Context context) {
++    SecureRandom random = new SecureRandom();
++    byte[]       secret = new byte[32];
++    random.nextBytes(secret);
++
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++      KeyStoreHelper.SealedData encryptedSecret = KeyStoreHelper.seal(secret);
++      TextSecurePreferences.setLogEncryptedSecret(context, encryptedSecret.serialize());
++    } else {
++      TextSecurePreferences.setLogUnencryptedSecret(context, Base64.encodeBytes(secret));
++    }
++
++    return secret;
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/PersistentLogger.java b/src/org/thoughtcrime/securesms/logging/PersistentLogger.java
+new file mode 100644
+index 00000000000..a5b2faa3783
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/PersistentLogger.java
+@@ -0,0 +1,228 @@
++package org.thoughtcrime.securesms.logging;
++
++import android.content.Context;
++import android.support.annotation.AnyThread;
++import android.support.annotation.WorkerThread;
++
++import org.thoughtcrime.securesms.database.NoExternalStorageException;
++import org.thoughtcrime.securesms.util.concurrent.ListenableFuture;
++import org.thoughtcrime.securesms.util.concurrent.SettableFuture;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintStream;
++import java.text.SimpleDateFormat;
++import java.util.Arrays;
++import java.util.Date;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.concurrent.Executor;
++import java.util.concurrent.Executors;
++
++public class PersistentLogger extends Log.Logger {
++
++  private static final String TAG     = PersistentLogger.class.getSimpleName();
++
++  private static final String LOG_V   = "V";
++  private static final String LOG_D   = "D";
++  private static final String LOG_I   = "I";
++  private static final String LOG_W   = "W";
++  private static final String LOG_E   = "E";
++  private static final String LOG_WTF = "A";
++
++  private static final String           LOG_DIRECTORY   = "log";
++  private static final String           FILENAME_PREFIX = "log-";
++  private static final int              MAX_LOG_FILES   = 5;
++  private static final int              MAX_LOG_SIZE    = 300 * 1024;
++  private static final SimpleDateFormat DATE_FORMAT     = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS zzz");
++
++  private final Context  context;
++  private final Executor executor;
++  private final byte[]   secret;
++
++  private LogFile.Writer writer;
++
++  public PersistentLogger(Context context) {
++    this.context  = context.getApplicationContext();
++    this.secret   = LogSecretProvider.getOrCreateAttachmentSecret(context);
++    this.executor = Executors.newSingleThreadExecutor(r -> {
++      Thread thread = new Thread(r, "logger");
++      thread.setPriority(Thread.MIN_PRIORITY);
++      return thread;
++    });
++
++    executor.execute(this::initializeWriter);
++  }
++
++  @Override
++  public void v(String tag, String message, Throwable t) {
++    write(LOG_V, tag, message, t);
++  }
++
++  @Override
++  public void d(String tag, String message, Throwable t) {
++    write(LOG_D, tag, message, t);
++  }
++
++  @Override
++  public void i(String tag, String message, Throwable t) {
++    write(LOG_I, tag, message, t);
++  }
++
++  @Override
++  public void w(String tag, String message, Throwable t) {
++    write(LOG_W, tag, message, t);
++  }
++
++  @Override
++  public void e(String tag, String message, Throwable t) {
++    write(LOG_E, tag, message, t);
++  }
++
++  @Override
++  public void wtf(String tag, String message, Throwable t) {
++    write(LOG_WTF, tag, message, t);
++  }
++
++  @WorkerThread
++  public ListenableFuture<String> getLogs() {
++    final SettableFuture<String> future = new SettableFuture<>();
++
++    executor.execute(() -> {
++      StringBuilder builder = new StringBuilder();
++
++      try {
++        File[] logs = getSortedLogFiles();
++        for (int i = logs.length - 1; i >= 0; i--) {
++          try {
++            LogFile.Reader reader = new LogFile.Reader(secret, logs[i]);
++            builder.append(reader.readAll());
++          } catch (IOException e) {
++            android.util.Log.w(TAG, "Failed to read log at index " + i + ". Removing reference.");
++            logs[i].delete();
++          }
++        }
++
++        future.set(builder.toString());
++      } catch (NoExternalStorageException e) {
++        future.setException(e);
++      }
++    });
++
++    return future;
++  }
++
++  @WorkerThread
++  private void initializeWriter() {
++    try {
++      writer = new LogFile.Writer(secret, getOrCreateActiveLogFile());
++    } catch (NoExternalStorageException | IOException e) {
++      android.util.Log.e(TAG, "Failed to initialize writer.", e);
++    }
++  }
++
++  @AnyThread
++  private void write(String level, String tag, String message, Throwable t) {
++    executor.execute(() -> {
++      try {
++        if (writer == null) {
++          return;
++        }
++
++        if (writer.getLogSize() >= MAX_LOG_SIZE) {
++          writer.close();
++          writer = new LogFile.Writer(secret, createNewLogFile());
++          trimLogFilesOverMax();
++        }
++
++        for (String entry : buildLogEntries(level, tag, message, t)) {
++          writer.writeEntry(entry);
++        }
++
++      } catch (NoExternalStorageException e) {
++        android.util.Log.w(TAG, "Cannot persist logs.", e);
++      } catch (IOException e) {
++        android.util.Log.w(TAG, "Failed to write line. Deleting all logs and starting over.");
++        deleteAllLogs();
++        initializeWriter();
++      }
++    });
++  }
++
++  private void trimLogFilesOverMax() throws NoExternalStorageException {
++    File[] logs = getSortedLogFiles();
++    if (logs.length > MAX_LOG_FILES) {
++      for (int i = MAX_LOG_FILES; i < logs.length; i++) {
++        logs[i].delete();
++      }
++    }
++  }
++
++  private void deleteAllLogs() {
++    try {
++      File[] logs = getSortedLogFiles();
++      for (File log : logs) {
++        log.delete();
++      }
++    } catch (NoExternalStorageException e) {
++      android.util.Log.w(TAG, "Was unable to delete logs.", e);
++    }
++  }
++
++  private File getOrCreateActiveLogFile() throws NoExternalStorageException {
++    File[] logs = getSortedLogFiles();
++    if (logs.length > 0) {
++      return logs[0];
++    }
++
++    return createNewLogFile();
++  }
++
++  private File createNewLogFile() throws NoExternalStorageException {
++    return new File(getOrCreateLogDirectory(), FILENAME_PREFIX + System.currentTimeMillis());
++  }
++
++  private File[] getSortedLogFiles() throws NoExternalStorageException {
++    File[] logs = getOrCreateLogDirectory().listFiles();
++    if (logs != null) {
++      Arrays.sort(logs, (o1, o2) -> o2.getName().compareTo(o1.getName()));
++      return logs;
++    }
++    return new File[0];
++  }
++
++  private File getOrCreateLogDirectory() throws NoExternalStorageException {
++    File logDir = new File(context.getCacheDir(), LOG_DIRECTORY);
++    if (!logDir.exists() && !logDir.mkdir()) {
++      throw new NoExternalStorageException("Unable to create log directory.");
++    }
++
++    return logDir;
++  }
++
++  private List<String> buildLogEntries(String level, String tag, String message, Throwable t) {
++    List<String> entries = new LinkedList<>();
++    Date         date    = new Date();
++
++    entries.add(buildEntry(level, tag, message, date));
++
++    if (t != null) {
++      ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
++      t.printStackTrace(new PrintStream(outputStream));
++
++      String   trace = new String(outputStream.toByteArray());
++      String[] lines = trace.split("\\n");
++
++      for (String line : lines) {
++        entries.add(buildEntry(level, tag, line, date));
++      }
++    }
++
++    return entries;
++  }
++
++  private String buildEntry(String level, String tag, String message, Date date) {
++    return DATE_FORMAT.format(date) + ' ' + level + ' ' + tag + '\t' + message;
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logging/UncaughtExceptionLogger.java b/src/org/thoughtcrime/securesms/logging/UncaughtExceptionLogger.java
+new file mode 100644
+index 00000000000..a3da1aeac91
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/logging/UncaughtExceptionLogger.java
+@@ -0,0 +1,22 @@
++package org.thoughtcrime.securesms.logging;
++
++import android.support.annotation.NonNull;
++
++public class UncaughtExceptionLogger implements Thread.UncaughtExceptionHandler {
++
++  private static final String TAG = UncaughtExceptionLogger.class.getSimpleName();
++
++  private final Thread.UncaughtExceptionHandler originalHandler;
++  private final PersistentLogger                persistentLogger;
++
++  public UncaughtExceptionLogger(@NonNull Thread.UncaughtExceptionHandler originalHandler, @NonNull PersistentLogger persistentLogger) {
++    this.originalHandler  = originalHandler;
++    this.persistentLogger = persistentLogger;
++  }
++
++  @Override
++  public void uncaughtException(Thread t, Throwable e) {
++    Log.e(TAG, "", e);
++    originalHandler.uncaughtException(t, e);
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/logsubmit/SubmitLogFragment.java b/src/org/thoughtcrime/securesms/logsubmit/SubmitLogFragment.java
+index ca0f70ddbe0..5ec41336a3e 100644
+--- a/src/org/thoughtcrime/securesms/logsubmit/SubmitLogFragment.java
++++ b/src/org/thoughtcrime/securesms/logsubmit/SubmitLogFragment.java
+@@ -48,6 +48,7 @@
+ 
+ import org.json.JSONException;
+ import org.json.JSONObject;
++import org.thoughtcrime.securesms.ApplicationContext;
+ import org.thoughtcrime.securesms.R;
+ import org.thoughtcrime.securesms.logsubmit.util.Scrubber;
+ import org.thoughtcrime.securesms.util.task.ProgressDialogAsyncTask;
+@@ -58,6 +59,7 @@
+ import java.lang.ref.WeakReference;
+ import java.util.Iterator;
+ import java.util.Locale;
++import java.util.concurrent.ExecutionException;
+ 
+ import okhttp3.MediaType;
+ import okhttp3.MultipartBody;
+@@ -77,8 +79,13 @@
+  *
+  */
+ public class SubmitLogFragment extends Fragment {
++
+   private static final String TAG = SubmitLogFragment.class.getSimpleName();
+ 
++  private static final String HEADER_SYSINFO = "========== SYSINFO ========";
++  private static final String HEADER_LOGCAT  = "========== LOGCAT ========";
++  private static final String HEADER_LOGGER  = "========== LOGGER ========";
++
+   private EditText logPreview;
+   private Button   okButton;
+   private Button   cancelButton;
+@@ -309,7 +316,22 @@ protected String doInBackground(Void... voids) {
+       Context context = weakContext.get();
+       if (context == null) return null;
+ 
+-      return buildDescription(context) + "\n" + new Scrubber().scrub(grabLogcat());
++      Scrubber scrubber = new Scrubber();
++
++      String newLogs;
++      try {
++        newLogs = scrubber.scrub(ApplicationContext.getInstance(context).getPersistentLogger().getLogs().get());
++      } catch (InterruptedException | ExecutionException e) {
++        android.util.Log.w(TAG, "Failed to retrieve new logs.", e);
++        newLogs = "Failed to retrieve logs.";
++      }
++
++      return HEADER_SYSINFO + "\n\n" +
++             buildDescription(context) + "\n\n\n" +
++             HEADER_LOGCAT + "\n\n" +
++             scrubber.scrub(grabLogcat()) + "\n\n\n" +
++             HEADER_LOGGER + "\n\n" +
++             newLogs;
+     }
+ 
+     @Override
+diff --git a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+index ca2dd20d85c..37556a39603 100644
+--- a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
++++ b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+@@ -1,5 +1,6 @@
+ package org.thoughtcrime.securesms.util;
+ 
++import android.content.ContentUris;
+ import android.content.Context;
+ import android.content.SharedPreferences;
+ import android.hardware.Camera.CameraInfo;
+@@ -157,6 +158,9 @@ public class TextSecurePreferences {
+   private static final String LAST_FULL_CONTACT_SYNC_TIME = "pref_last_full_contact_sync_time";
+   private static final String NEEDS_FULL_CONTACT_SYNC     = "pref_needs_full_contact_sync";
+ 
++  private static final String LOG_ENCRYPTED_SECRET   = "pref_log_encrypted_secret";
++  private static final String LOG_UNENCRYPTED_SECRET = "pref_log_unencrypted_secret";
++
+   public static boolean isScreenLockEnabled(@NonNull Context context) {
+     return getBooleanPreference(context, SCREEN_LOCK, false);
+   }
+@@ -942,6 +946,22 @@ public static void setNeedsFullContactSync(Context context, boolean needsSync) {
+     setBooleanPreference(context, NEEDS_FULL_CONTACT_SYNC, needsSync);
+   }
+ 
++  public static void setLogEncryptedSecret(Context context, String base64Secret) {
++    setStringPreference(context, LOG_ENCRYPTED_SECRET, base64Secret);
++  }
++
++  public static String getLogEncryptedSecret(Context context) {
++    return getStringPreference(context, LOG_ENCRYPTED_SECRET, null);
++  }
++
++  public static void setLogUnencryptedSecret(Context context, String base64Secret) {
++    setStringPreference(context, LOG_UNENCRYPTED_SECRET, base64Secret);
++  }
++
++  public static String getLogUnencryptedSecret(Context context) {
++    return getStringPreference(context, LOG_UNENCRYPTED_SECRET, null);
++  }
++
+   public static void setBooleanPreference(Context context, String key, boolean value) {
+     PreferenceManager.getDefaultSharedPreferences(context).edit().putBoolean(key, value).apply();
+   }
+diff --git a/src/org/thoughtcrime/securesms/util/Util.java b/src/org/thoughtcrime/securesms/util/Util.java
+index a4dcc24cd09..9f4a33070b7 100644
+--- a/src/org/thoughtcrime/securesms/util/Util.java
++++ b/src/org/thoughtcrime/securesms/util/Util.java
+@@ -54,6 +54,8 @@
+ import org.whispersystems.libsignal.util.guava.Optional;
+ 
+ import java.io.ByteArrayOutputStream;
++import java.io.Closeable;
++import java.io.EOFException;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
+@@ -171,17 +173,9 @@ public static void wait(Object lock, long timeout) {
+     }
+   }
+ 
+-  public static void close(InputStream in) {
++  public static void close(Closeable closeable) {
+     try {
+-      in.close();
+-    } catch (IOException e) {
+-      Log.w(TAG, e);
+-    }
+-  }
+-
+-  public static void close(OutputStream out) {
+-    try {
+-      out.close();
++      closeable.close();
+     } catch (IOException e) {
+       Log.w(TAG, e);
+     }
+@@ -208,14 +202,18 @@ public static boolean isOwnNumber(Context context, Address address) {
+   }
+ 
+   public static void readFully(InputStream in, byte[] buffer) throws IOException {
++    readFully(in, buffer, buffer.length);
++  }
++
++  public static void readFully(InputStream in, byte[] buffer, int len) throws IOException {
+     int offset = 0;
+ 
+     for (;;) {
+-      int read = in.read(buffer, offset, buffer.length - offset);
+-      if (read == -1) throw new IOException("Stream ended early");
++      int read = in.read(buffer, offset, len - offset);
++      if (read == -1) throw new EOFException("Stream ended early");
+ 
+-      if (read + offset < buffer.length) offset += read;
+-      else                		           return;
++      if (read + offset < len) offset += read;
++      else                		 return;
+     }
+   }
+ 

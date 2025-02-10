@@ -1,0 +1,513 @@
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index a0b805b1ddc..d9e13ca5297 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -311,6 +311,9 @@
+     <string name="ExperienceUpgradeActivity_now_you_can_share_a_profile_photo_and_name_with_friends_on_signal">Now you can share a profile photo and name with friends on Signal</string>
+     <string name="ExperienceUpgradeActivity_signal_profiles_are_here">Signal profiles are here</string>
+ 
++    <!-- GcmBroadcastReceiver -->
++    <string name="GcmBroadcastReceiver_retrieving_a_message">Retrieving a message...</string>
++
+     <!-- GcmRefreshJob -->
+     <string name="GcmRefreshJob_Permanent_Signal_communication_failure">Permanent Signal communication failure!</string>
+     <string name="GcmRefreshJob_Signal_was_unable_to_register_with_Google_Play_Services">Signal was unable to register with Google Play Services. Signal messages and calls have been disabled, please try re-registering in Settings &gt; Advanced.</string>
+diff --git a/src/org/thoughtcrime/securesms/ApplicationContext.java b/src/org/thoughtcrime/securesms/ApplicationContext.java
+index 7561771a551..68a515a8271 100644
+--- a/src/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/src/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -37,6 +37,7 @@
+ import org.thoughtcrime.securesms.jobs.CreateSignedPreKeyJob;
+ import org.thoughtcrime.securesms.jobs.GcmRefreshJob;
+ import org.thoughtcrime.securesms.jobs.MultiDeviceContactUpdateJob;
++import org.thoughtcrime.securesms.jobs.PushNotificationReceiveJob;
+ import org.thoughtcrime.securesms.logging.AndroidLogger;
+ import org.thoughtcrime.securesms.logging.CustomSignalProtocolLogger;
+ import org.thoughtcrime.securesms.logging.Log;
+@@ -50,7 +51,6 @@
+ import org.thoughtcrime.securesms.service.RotateSignedPreKeyListener;
+ import org.thoughtcrime.securesms.service.UpdateApkRefreshListener;
+ import org.thoughtcrime.securesms.util.TextSecurePreferences;
+-import org.thoughtcrime.securesms.util.Util;
+ import org.webrtc.PeerConnectionFactory;
+ import org.webrtc.PeerConnectionFactory.InitializationOptions;
+ import org.webrtc.voiceengine.WebRtcAudioManager;
+@@ -91,6 +91,7 @@ public static ApplicationContext getInstance(Context context) {
+   @Override
+   public void onCreate() {
+     super.onCreate();
++    Log.i(TAG, "onCreate()");
+     initializeRandomNumberFix();
+     initializeLogging();
+     initializeCrashHandling();
+@@ -102,6 +103,7 @@ public void onCreate() {
+     initializePeriodicTasks();
+     initializeCircumvention();
+     initializeWebRtc();
++    initializePendingMessages();
+     NotificationChannels.create(this);
+     ProcessLifecycleOwner.get().getLifecycle().addObserver(this);
+   }
+@@ -259,4 +261,12 @@ private void executePendingContactSync() {
+       ApplicationContext.getInstance(this).getJobManager().add(new MultiDeviceContactUpdateJob(this, true));
+     }
+   }
++
++  private void initializePendingMessages() {
++    if (TextSecurePreferences.getNeedsMessagePull(this)) {
++      Log.i(TAG, "Scheduling a message fetch.");
++      ApplicationContext.getInstance(this).getJobManager().add(new PushNotificationReceiveJob());
++      TextSecurePreferences.setNeedsMessagePull(this, false);
++    }
++  }
+ }
+diff --git a/src/org/thoughtcrime/securesms/dependencies/SignalCommunicationModule.java b/src/org/thoughtcrime/securesms/dependencies/SignalCommunicationModule.java
+index a4faa115e97..d6dcbac99eb 100644
+--- a/src/org/thoughtcrime/securesms/dependencies/SignalCommunicationModule.java
++++ b/src/org/thoughtcrime/securesms/dependencies/SignalCommunicationModule.java
+@@ -1,6 +1,8 @@
+ package org.thoughtcrime.securesms.dependencies;
+ 
+ import android.content.Context;
++
++import org.thoughtcrime.securesms.gcm.GcmBroadcastReceiver;
+ import org.thoughtcrime.securesms.logging.Log;
+ 
+ import org.greenrobot.eventbus.EventBus;
+@@ -80,7 +82,8 @@
+                                      MultiDeviceProfileKeyUpdateJob.class,
+                                      SendReadReceiptJob.class,
+                                      MultiDeviceReadReceiptUpdateJob.class,
+-                                     AppProtectionPreferenceFragment.class})
++                                     AppProtectionPreferenceFragment.class,
++                                     GcmBroadcastReceiver.class})
+ public class SignalCommunicationModule {
+ 
+   private static final String TAG = SignalCommunicationModule.class.getSimpleName();
+diff --git a/src/org/thoughtcrime/securesms/gcm/GcmBroadcastReceiver.java b/src/org/thoughtcrime/securesms/gcm/GcmBroadcastReceiver.java
+index ef17a35c7e5..1e51f0a3173 100644
+--- a/src/org/thoughtcrime/securesms/gcm/GcmBroadcastReceiver.java
++++ b/src/org/thoughtcrime/securesms/gcm/GcmBroadcastReceiver.java
+@@ -2,8 +2,13 @@
+ 
+ import android.content.Context;
+ import android.content.Intent;
++import android.os.PowerManager;
+ import android.support.v4.content.WakefulBroadcastReceiver;
+ import android.text.TextUtils;
++
++import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.dependencies.InjectableType;
++import org.thoughtcrime.securesms.jobmanager.requirements.NetworkRequirement;
+ import org.thoughtcrime.securesms.logging.Log;
+ 
+ import com.google.android.gms.gcm.GoogleCloudMessaging;
+@@ -11,14 +16,27 @@
+ import org.thoughtcrime.securesms.ApplicationContext;
+ import org.thoughtcrime.securesms.jobs.PushContentReceiveJob;
+ import org.thoughtcrime.securesms.jobs.PushNotificationReceiveJob;
++import org.thoughtcrime.securesms.service.GenericForegroundService;
++import org.thoughtcrime.securesms.util.PowerManagerCompat;
+ import org.thoughtcrime.securesms.util.TextSecurePreferences;
++import org.whispersystems.signalservice.api.SignalServiceMessageReceiver;
++import org.whispersystems.signalservice.internal.util.Util;
++
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+-public class GcmBroadcastReceiver extends WakefulBroadcastReceiver {
++import javax.inject.Inject;
++
++public class GcmBroadcastReceiver extends WakefulBroadcastReceiver implements InjectableType {
+ 
+   private static final String TAG = GcmBroadcastReceiver.class.getSimpleName();
+ 
++  @Inject SignalServiceMessageReceiver messageReceiver;
++
+   @Override
+   public void onReceive(Context context, Intent intent) {
++    ApplicationContext.getInstance(context).injectDependencies(this);
++
+     GoogleCloudMessaging gcm         = GoogleCloudMessaging.getInstance(context);
+     String               messageType = gcm.getMessageType(intent);
+ 
+@@ -44,8 +62,63 @@ private void handleReceivedMessage(Context context, String data) {
+   }
+ 
+   private void handleReceivedNotification(Context context) {
+-    ApplicationContext.getInstance(context)
+-                      .getJobManager()
+-                      .add(new PushNotificationReceiveJob(context));
++    TextSecurePreferences.setNeedsMessagePull(context, true);
++
++    long          startTime    = System.currentTimeMillis();
++    PendingResult callback     = goAsync();
++    PowerManager  powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
++    boolean       doze         = PowerManagerCompat.isDeviceIdleMode(powerManager);
++    boolean       network      = new NetworkRequirement(context).isPresent();
++
++    final Object         foregroundLock    = new Object();
++    final AtomicBoolean  foregroundRunning = new AtomicBoolean(false);
++    final AtomicBoolean  taskCompleted     = new AtomicBoolean(false);
++
++    if (doze || !network) {
++      Log.i(TAG, "Starting a foreground task because we may be operating in a constrained environment. Doze: " + doze + " Network: " + network);
++      GenericForegroundService.startForegroundTask(context, context.getString(R.string.GcmBroadcastReceiver_retrieving_a_message));
++      foregroundRunning.set(true);
++      callback.finish();
++    }
++
++    new Thread("GcmMessageProcessing") {
++      @Override
++      public void run() {
++        try {
++          new PushNotificationReceiveJob(context).pullAndProcessMessages(messageReceiver, TAG, startTime);
++        } catch (IOException e) {
++          Log.i(TAG, "Failed to retrieve the envelope. Scheduling on JobManager.", e);
++          ApplicationContext.getInstance(context)
++                            .getJobManager()
++                            .add(new PushNotificationReceiveJob(context));
++        } finally {
++          synchronized (foregroundLock) {
++            if (foregroundRunning.getAndSet(false)) {
++              GenericForegroundService.stopForegroundTask(context);
++            } else {
++              callback.finish();
++            }
++            taskCompleted.set(true);
++          }
++          Log.i(TAG, "Processing complete.");
++        }
++      }
++    }.start();
++
++    if (!foregroundRunning.get()) {
++      new Thread("GcmForegroundServiceTimer") {
++        @Override
++        public void run() {
++          Util.sleep(5000);
++          synchronized (foregroundLock) {
++            if (!taskCompleted.get() && !foregroundRunning.getAndSet(true)) {
++              Log.i(TAG, "Starting a foreground task because the job is running long.");
++              GenericForegroundService.startForegroundTask(context, context.getString(R.string.GcmBroadcastReceiver_retrieving_a_message));
++              callback.finish();
++            }
++          }
++        }
++      }.start();
++    }
+   }
+ }
+\ No newline at end of file
+diff --git a/src/org/thoughtcrime/securesms/jobs/PushContentReceiveJob.java b/src/org/thoughtcrime/securesms/jobs/PushContentReceiveJob.java
+index 4787d74c60b..5e99f976d47 100644
+--- a/src/org/thoughtcrime/securesms/jobs/PushContentReceiveJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/PushContentReceiveJob.java
+@@ -54,7 +54,7 @@ public void onRun() {
+       String                sessionKey = TextSecurePreferences.getSignalingKey(context);
+       SignalServiceEnvelope envelope   = new SignalServiceEnvelope(data, sessionKey);
+ 
+-      handle(envelope);
++      processEnvelope(envelope);
+     } catch (IOException | InvalidVersionException e) {
+       Log.w(TAG, e);
+     }
+diff --git a/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java b/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
+index 9487c8cd8aa..11d4606bd0c 100644
+--- a/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
+@@ -119,6 +119,10 @@ public PushDecryptJob() {
+     super(null, null);
+   }
+ 
++  public PushDecryptJob(Context context) {
++    this(context, -1);
++  }
++
+   public PushDecryptJob(Context context, long pushMessageId) {
+     this(context, pushMessageId, -1);
+   }
+@@ -146,32 +150,20 @@ protected void initialize(@NonNull SafeData data) {
+ 
+   @Override
+   public void onRun() throws NoSuchMessageException {
+-    if (!IdentityKeyUtil.hasIdentityKey(context)) {
+-      Log.w(TAG, "Skipping job, waiting for migration...");
+-      return;
+-    }
+-
+-    if (TextSecurePreferences.getNeedsSqlCipherMigration(context)) {
+-      Log.w(TAG, "Skipping job, waiting for sqlcipher migration...");
+-      NotificationManagerCompat.from(context).notify(494949,
+-                                                     new NotificationCompat.Builder(context, NotificationChannels.getMessagesChannel(context))
+-                                                         .setSmallIcon(R.drawable.icon_notification)
+-                                                         .setPriority(NotificationCompat.PRIORITY_HIGH)
+-                                                         .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+-                                                         .setContentTitle(context.getString(R.string.PushDecryptJob_new_locked_message))
+-                                                         .setContentText(context.getString(R.string.PushDecryptJob_unlock_to_view_pending_messages))
+-                                                         .setContentIntent(PendingIntent.getActivity(context, 0, new Intent(context, ConversationListActivity.class), 0))
+-                                                         .setDefaults(NotificationCompat.DEFAULT_SOUND | NotificationCompat.DEFAULT_VIBRATE)
+-                                                         .build());
+-      return;
+-    }
++    synchronized (PushReceivedJob.RECEIVE_LOCK) {
++      if (needsMigration()) {
++        Log.w(TAG, "Skipping, waiting for migration...");
++        postMigrationNotification();
++        return;
++      }
+ 
+-    PushDatabase          database             = DatabaseFactory.getPushDatabase(context);
+-    SignalServiceEnvelope envelope             = database.get(messageId);
+-    Optional<Long>        optionalSmsMessageId = smsMessageId > 0 ? Optional.of(smsMessageId) : Optional.absent();
++      PushDatabase          database             = DatabaseFactory.getPushDatabase(context);
++      SignalServiceEnvelope envelope             = database.get(messageId);
++      Optional<Long>        optionalSmsMessageId = smsMessageId > 0 ? Optional.of(smsMessageId) : Optional.absent();
+ 
+-    handleMessage(envelope, optionalSmsMessageId);
+-    database.delete(messageId);
++      handleMessage(envelope, optionalSmsMessageId);
++      database.delete(messageId);
++    }
+   }
+ 
+   @Override
+@@ -184,7 +176,38 @@ public void onCanceled() {
+ 
+   }
+ 
+-  private void handleMessage(SignalServiceEnvelope envelope, Optional<Long> smsMessageId) {
++  public void processMessage(@NonNull SignalServiceEnvelope envelope) {
++    synchronized (PushReceivedJob.RECEIVE_LOCK) {
++      if (needsMigration()) {
++        Log.w(TAG, "Skipping and storing envelope, waiting for migration...");
++        DatabaseFactory.getPushDatabase(context).insert(envelope);
++        postMigrationNotification();
++        return;
++      }
++
++      handleMessage(envelope, Optional.absent());
++    }
++  }
++
++  private boolean needsMigration() {
++    return !IdentityKeyUtil.hasIdentityKey(context) || TextSecurePreferences.getNeedsSqlCipherMigration(context);
++  }
++
++  private void postMigrationNotification() {
++    NotificationManagerCompat.from(context).notify(494949,
++                                                   new NotificationCompat.Builder(context, NotificationChannels.getMessagesChannel(context))
++                                                                         .setSmallIcon(R.drawable.icon_notification)
++                                                                         .setPriority(NotificationCompat.PRIORITY_HIGH)
++                                                                         .setCategory(NotificationCompat.CATEGORY_MESSAGE)
++                                                                         .setContentTitle(context.getString(R.string.PushDecryptJob_new_locked_message))
++                                                                         .setContentText(context.getString(R.string.PushDecryptJob_unlock_to_view_pending_messages))
++                                                                         .setContentIntent(PendingIntent.getActivity(context, 0, new Intent(context, ConversationListActivity.class), 0))
++                                                                         .setDefaults(NotificationCompat.DEFAULT_SOUND | NotificationCompat.DEFAULT_VIBRATE)
++                                                                         .build());
++
++  }
++
++  private void handleMessage(@NonNull SignalServiceEnvelope envelope, @NonNull Optional<Long> smsMessageId) {
+     try {
+       GroupDatabase        groupDatabase = DatabaseFactory.getGroupDatabase(context);
+       SignalProtocolStore  axolotlStore  = new SignalProtocolStoreImpl(context);
+diff --git a/src/org/thoughtcrime/securesms/jobs/PushNotificationReceiveJob.java b/src/org/thoughtcrime/securesms/jobs/PushNotificationReceiveJob.java
+index f552ec6dc4a..da7014550ba 100644
+--- a/src/org/thoughtcrime/securesms/jobs/PushNotificationReceiveJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/PushNotificationReceiveJob.java
+@@ -4,10 +4,13 @@
+ import android.support.annotation.NonNull;
+ 
+ import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.database.NoSuchMessageException;
+ import org.thoughtcrime.securesms.dependencies.InjectableType;
+ import org.thoughtcrime.securesms.jobmanager.JobParameters;
+ import org.thoughtcrime.securesms.jobmanager.SafeData;
+ import org.thoughtcrime.securesms.logging.Log;
++import org.thoughtcrime.securesms.util.TextSecurePreferences;
++import org.whispersystems.libsignal.util.guava.Optional;
+ import org.whispersystems.signalservice.api.SignalServiceMessageReceiver;
+ import org.whispersystems.signalservice.api.messages.SignalServiceEnvelope;
+ import org.whispersystems.signalservice.api.push.exceptions.PushNetworkException;
+@@ -51,14 +54,19 @@ protected String getDescription() {
+ 
+   @Override
+   public void onRun() throws IOException {
+-    receiver.retrieveMessages(new SignalServiceMessageReceiver.MessageReceivedCallback() {
+-      @Override
+-      public void onMessage(SignalServiceEnvelope envelope) {
+-        handle(envelope);
+-      }
+-    });
++    pullAndProcessMessages(receiver, TAG, System.currentTimeMillis());
+   }
+ 
++  public void pullAndProcessMessages(SignalServiceMessageReceiver receiver, String tag, long startTime) throws IOException {
++    synchronized (PushReceivedJob.RECEIVE_LOCK) {
++      receiver.retrieveMessages(envelope -> {
++        Log.i(tag, "Retrieved an envelope." + timeSuffix(startTime));
++        processEnvelope(envelope);
++        Log.i(tag, "Successfully processed an envelope." + timeSuffix(startTime));
++      });
++      TextSecurePreferences.setNeedsMessagePull(context, false);
++    }
++  }
+   @Override
+   public boolean onShouldRetry(Exception e) {
+     Log.w(TAG, e);
+@@ -70,4 +78,8 @@ public void onCanceled() {
+     Log.w(TAG, "***** Failed to download pending message!");
+ //    MessageNotifier.notifyMessagesPending(getContext());
+   }
++
++  private static String timeSuffix(long startTime) {
++    return " (" + (System.currentTimeMillis() - startTime) + " ms elapsed)";
++  }
+ }
+diff --git a/src/org/thoughtcrime/securesms/jobs/PushReceivedJob.java b/src/org/thoughtcrime/securesms/jobs/PushReceivedJob.java
+index 924f93f12f1..3bb7366780e 100644
+--- a/src/org/thoughtcrime/securesms/jobs/PushReceivedJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/PushReceivedJob.java
+@@ -8,7 +8,6 @@
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+ import org.thoughtcrime.securesms.database.MessagingDatabase.SyncMessageId;
+ import org.thoughtcrime.securesms.database.RecipientDatabase;
+-import org.thoughtcrime.securesms.jobmanager.JobManager;
+ import org.thoughtcrime.securesms.jobmanager.JobParameters;
+ import org.thoughtcrime.securesms.logging.Log;
+ import org.thoughtcrime.securesms.recipients.Recipient;
+@@ -18,33 +17,34 @@ public abstract class PushReceivedJob extends ContextJob {
+ 
+   private static final String TAG = PushReceivedJob.class.getSimpleName();
+ 
++  public static final Object RECEIVE_LOCK = new Object();
++
+   protected PushReceivedJob(Context context, JobParameters parameters) {
+     super(context, parameters);
+   }
+ 
+-  public void handle(SignalServiceEnvelope envelope) {
+-    Address   source    = Address.fromExternal(context, envelope.getSource());
+-    Recipient recipient = Recipient.from(context, source, false);
+-
+-    if (!isActiveNumber(recipient)) {
+-      DatabaseFactory.getRecipientDatabase(context).setRegistered(recipient, RecipientDatabase.RegisteredState.REGISTERED);
+-      ApplicationContext.getInstance(context).getJobManager().add(new DirectoryRefreshJob(context, recipient, false));
+-    }
+-
+-    if (envelope.isReceipt()) {
+-      handleReceipt(envelope);
+-    } else if (envelope.isPreKeySignalMessage() || envelope.isSignalMessage()) {
+-      handleMessage(envelope);
+-    } else {
+-      Log.w(TAG, "Received envelope of unknown type: " + envelope.getType());
++  public void processEnvelope(@NonNull SignalServiceEnvelope envelope) {
++    synchronized (RECEIVE_LOCK) {
++      Address   source    = Address.fromExternal(context, envelope.getSource());
++      Recipient recipient = Recipient.from(context, source, false);
++
++      if (!isActiveNumber(recipient)) {
++        DatabaseFactory.getRecipientDatabase(context).setRegistered(recipient, RecipientDatabase.RegisteredState.REGISTERED);
++        ApplicationContext.getInstance(context).getJobManager().add(new DirectoryRefreshJob(context, recipient, false));
++      }
++
++      if (envelope.isReceipt()) {
++        handleReceipt(envelope);
++      } else if (envelope.isPreKeySignalMessage() || envelope.isSignalMessage()) {
++        handleMessage(envelope);
++      } else {
++        Log.w(TAG, "Received envelope of unknown type: " + envelope.getType());
++      }
+     }
+   }
+ 
+   private void handleMessage(SignalServiceEnvelope envelope) {
+-    long messageId = DatabaseFactory.getPushDatabase(context).insert(envelope);
+-    ApplicationContext.getInstance(context)
+-                      .getJobManager()
+-                      .add(new PushDecryptJob(context, messageId));
++    new PushDecryptJob(context).processMessage(envelope);
+   }
+ 
+   private void handleReceipt(SignalServiceEnvelope envelope) {
+@@ -56,6 +56,4 @@ private void handleReceipt(SignalServiceEnvelope envelope) {
+   private boolean isActiveNumber(@NonNull Recipient recipient) {
+     return recipient.resolve().getRegistered() == RecipientDatabase.RegisteredState.REGISTERED;
+   }
+-
+-
+ }
+diff --git a/src/org/thoughtcrime/securesms/service/MessageRetrievalService.java b/src/org/thoughtcrime/securesms/service/MessageRetrievalService.java
+index 8968f863b9b..4b5735deee4 100644
+--- a/src/org/thoughtcrime/securesms/service/MessageRetrievalService.java
++++ b/src/org/thoughtcrime/securesms/service/MessageRetrievalService.java
+@@ -6,6 +6,7 @@
+ import android.os.IBinder;
+ import android.support.annotation.Nullable;
+ import android.support.v4.app.NotificationCompat;
++
+ import org.thoughtcrime.securesms.logging.Log;
+ 
+ import org.thoughtcrime.securesms.ApplicationContext;
+@@ -211,10 +212,7 @@ public void run() {
+               localPipe.read(REQUEST_TIMEOUT_MINUTES, TimeUnit.MINUTES,
+                              envelope -> {
+                                Log.i(TAG, "Retrieved envelope! " + envelope.getSource());
+-
+-                               PushContentReceiveJob receiveJob = new PushContentReceiveJob(MessageRetrievalService.this);
+-                               receiveJob.handle(envelope);
+-
++                               new PushContentReceiveJob(getApplicationContext()).processEnvelope(envelope);
+                                decrementPushReceived();
+                              });
+             } catch (TimeoutException e) {
+diff --git a/src/org/thoughtcrime/securesms/util/PowerManagerCompat.java b/src/org/thoughtcrime/securesms/util/PowerManagerCompat.java
+new file mode 100644
+index 00000000000..f4b7f608685
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/util/PowerManagerCompat.java
+@@ -0,0 +1,15 @@
++package org.thoughtcrime.securesms.util;
++
++import android.os.Build;
++import android.os.PowerManager;
++import android.support.annotation.NonNull;
++
++public class PowerManagerCompat {
++
++  public static boolean isDeviceIdleMode(@NonNull PowerManager powerManager) {
++    if (Build.VERSION.SDK_INT >= 23) {
++      return powerManager.isDeviceIdleMode();
++    }
++    return false;
++  }
++}
+diff --git a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+index fadb89d7240..7e1dbf9bbcf 100644
+--- a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
++++ b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+@@ -162,6 +162,8 @@ public class TextSecurePreferences {
+   private static final String NOTIFICATION_CHANNEL_VERSION          = "pref_notification_channel_version";
+   private static final String NOTIFICATION_MESSAGES_CHANNEL_VERSION = "pref_notification_messages_channel_version";
+ 
++  private static final String NEEDS_MESSAGE_PULL = "pref_needs_message_pull";
++
+   public static boolean isScreenLockEnabled(@NonNull Context context) {
+     return getBooleanPreference(context, SCREEN_LOCK, false);
+   }
+@@ -983,6 +985,14 @@ public static void setNotificationMessagesChannelVersion(Context context, int ve
+     setIntegerPrefrence(context, NOTIFICATION_MESSAGES_CHANNEL_VERSION, version);
+   }
+ 
++  public static boolean getNeedsMessagePull(Context context) {
++    return getBooleanPreference(context, NEEDS_MESSAGE_PULL, false);
++  }
++
++  public static void setNeedsMessagePull(Context context, boolean needsMessagePull) {
++    setBooleanPreference(context, NEEDS_MESSAGE_PULL, needsMessagePull);
++  }
++
+   public static void setBooleanPreference(Context context, String key, boolean value) {
+     PreferenceManager.getDefaultSharedPreferences(context).edit().putBoolean(key, value).apply();
+   }

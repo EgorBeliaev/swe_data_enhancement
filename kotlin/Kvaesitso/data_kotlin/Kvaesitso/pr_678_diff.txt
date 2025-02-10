@@ -1,0 +1,284 @@
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchColumn.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchColumn.kt
+index 38be63670..aea6cb75a 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchColumn.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchColumn.kt
+@@ -98,6 +98,7 @@ fun SearchColumn(
+     val locations by viewModel.locationResults
+     val website by viewModel.websiteResults
+     val hiddenResults by viewModel.hiddenResults
++    val separateWorkProfile by viewModel.separateWorkProfile.collectAsState(true)
+ 
+     val bestMatch by viewModel.bestMatch
+ 
+@@ -160,11 +161,11 @@ fun SearchColumn(
+         }
+ 
+         GridResults(
+-            items = if ((showWorkProfileApps || apps.isEmpty()) && workApps.isNotEmpty()) workApps.toImmutableList() else apps.toImmutableList(),
++            items = if (separateWorkProfile) if ((showWorkProfileApps || apps.isEmpty()) && workApps.isNotEmpty()) workApps.toImmutableList() else apps.toImmutableList() else listOf(apps, workApps).flatten().sorted().toImmutableList(),
+             columns = columns,
+             reverse = reverse,
+             key = "apps",
+-            before = if (workApps.isNotEmpty() && apps.isNotEmpty()) {
++            before = if (separateWorkProfile && workApps.isNotEmpty() && apps.isNotEmpty()) {
+                 {
+                     Row(
+                         modifier = Modifier
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchVM.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchVM.kt
+index 1f600bc9d..ba24a14a1 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchVM.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/SearchVM.kt
+@@ -90,6 +90,8 @@ class SearchVM : ViewModel(), KoinComponent {
+     val favoritesEnabled = searchUiSettings.favorites
+     val hideFavorites = mutableStateOf(false)
+ 
++    val separateWorkProfile = searchUiSettings.separateWorkProfile
++
+     private val hiddenItemKeys = searchableRepository
+         .getKeys(
+             hidden = true,
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreen.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreen.kt
+index 38beb495b..1b39357b4 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreen.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreen.kt
+@@ -1,17 +1,26 @@
+ package de.mm20.launcher2.ui.settings.search
+ 
++import android.content.Context
++import android.content.pm.LauncherApps
+ import androidx.appcompat.app.AppCompatActivity
+ import androidx.compose.animation.AnimatedVisibility
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.rounded.*
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
++import androidx.core.content.getSystemService
++import androidx.lifecycle.Lifecycle
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import androidx.lifecycle.repeatOnLifecycle
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import de.mm20.launcher2.preferences.LegacySettings
+ import de.mm20.launcher2.preferences.SearchResultOrder
+@@ -20,15 +29,28 @@ import de.mm20.launcher2.ui.component.MissingPermissionBanner
+ import de.mm20.launcher2.ui.component.preferences.*
+ import de.mm20.launcher2.ui.icons.Wikipedia
+ import de.mm20.launcher2.ui.locals.LocalNavController
++import kotlinx.coroutines.flow.flow
++import kotlinx.coroutines.flow.flowOf
++import kotlinx.coroutines.flow.map
+ 
+ @Composable
+ fun SearchSettingsScreen() {
+ 
+     val viewModel: SearchSettingsScreenVM = viewModel()
+     val context = LocalContext.current
++    val lifecycleOwner = LocalLifecycleOwner.current
+ 
+     val navController = LocalNavController.current
+ 
++    val hasWorkProfile by viewModel.hasWorkProfile
++
++    LaunchedEffect(Unit) {
++        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            viewModel.onResume(context)
++        }
++    }
++
++
+     PreferenceScreen(title = stringResource(R.string.preference_screen_search)) {
+         item {
+             PreferenceCategory {
+@@ -55,7 +77,9 @@ fun SearchSettingsScreen() {
+                     }
+                 )
+ 
+-                val hasContactsPermission by viewModel.hasContactsPermission.collectAsStateWithLifecycle(null)
++                val hasContactsPermission by viewModel.hasContactsPermission.collectAsStateWithLifecycle(
++                    null
++                )
+                 AnimatedVisibility(hasContactsPermission == false) {
+                     MissingPermissionBanner(
+                         text = stringResource(R.string.missing_permission_contact_search_settings),
+@@ -77,7 +101,9 @@ fun SearchSettingsScreen() {
+                     enabled = hasContactsPermission == true
+                 )
+ 
+-                val hasCalendarPermission by viewModel.hasCalendarPermission.collectAsStateWithLifecycle(null)
++                val hasCalendarPermission by viewModel.hasCalendarPermission.collectAsStateWithLifecycle(
++                    null
++                )
+                 AnimatedVisibility(hasCalendarPermission == false) {
+                     MissingPermissionBanner(
+                         text = stringResource(R.string.missing_permission_calendar_search_settings),
+@@ -99,7 +125,9 @@ fun SearchSettingsScreen() {
+                     enabled = hasCalendarPermission == true
+                 )
+ 
+-                val hasAppShortcutsPermission by viewModel.hasAppShortcutPermission.collectAsStateWithLifecycle(null)
++                val hasAppShortcutsPermission by viewModel.hasAppShortcutPermission.collectAsStateWithLifecycle(
++                    null
++                )
+                 AnimatedVisibility(hasAppShortcutsPermission == false) {
+                     MissingPermissionBanner(
+                         text = stringResource(
+@@ -176,7 +204,7 @@ fun SearchSettingsScreen() {
+ 
+                 val locations by viewModel.locations.collectAsStateWithLifecycle(null)
+                 PreferenceWithSwitch(
+-                    title= stringResource(R.string.preference_search_locations),
++                    title = stringResource(R.string.preference_search_locations),
+                     summary = stringResource(R.string.preference_search_locations_summary),
+                     icon = Icons.Rounded.Place,
+                     switchValue = locations == true,
+@@ -218,6 +246,24 @@ fun SearchSettingsScreen() {
+                 )
+             }
+         }
++        if (hasWorkProfile) {
++            item {
++                PreferenceCategory {
++                    val separateWorkProfile by viewModel.separateWorkProfile.collectAsStateWithLifecycle(
++                        null
++                    )
++                    SwitchPreference(
++                        title = stringResource(R.string.preference_search_bar_separate_work_profile),
++                        summary = stringResource(R.string.preference_search_bar_separate_work_profile_summary),
++                        icon = Icons.Rounded.Work,
++                        value = separateWorkProfile == true,
++                        onValueChanged = {
++                            viewModel.setSeparateWorkProfile(it)
++                        }
++                    )
++                }
++            }
++        }
+         item {
+             PreferenceCategory {
+                 val autoFocus by viewModel.autoFocus.collectAsStateWithLifecycle(null)
+@@ -243,7 +289,9 @@ fun SearchSettingsScreen() {
+         }
+         item {
+             PreferenceCategory {
+-                val searchResultOrdering by viewModel.searchResultOrdering.collectAsStateWithLifecycle(null)
++                val searchResultOrdering by viewModel.searchResultOrdering.collectAsStateWithLifecycle(
++                    null
++                )
+                 ListPreference(
+                     title = stringResource(R.string.preference_search_result_ordering),
+                     items = listOf(
+@@ -257,8 +305,11 @@ fun SearchSettingsScreen() {
+                     icon = Icons.Rounded.Sort
+                 )
+ 
+-                val reverseSearchResults by viewModel.reverseSearchResults.collectAsStateWithLifecycle(null)
+-                ListPreference(title = stringResource(R.string.preference_layout_search_results),
++                val reverseSearchResults by viewModel.reverseSearchResults.collectAsStateWithLifecycle(
++                    null
++                )
++                ListPreference(
++                    title = stringResource(R.string.preference_layout_search_results),
+                     items = listOf(
+                         stringResource(R.string.search_results_order_top_down) to false,
+                         stringResource(R.string.search_results_order_bottom_up) to true,
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreenVM.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreenVM.kt
+index d234262e6..7f2fcd9e1 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreenVM.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/search/SearchSettingsScreenVM.kt
+@@ -1,6 +1,10 @@
+ package de.mm20.launcher2.ui.settings.search
+ 
++import android.content.Context
++import android.content.pm.LauncherApps
+ import androidx.appcompat.app.AppCompatActivity
++import androidx.compose.runtime.mutableStateOf
++import androidx.core.content.getSystemService
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import de.mm20.launcher2.permissions.PermissionGroup
+@@ -16,6 +20,7 @@ import de.mm20.launcher2.preferences.search.WebsiteSearchSettings
+ import de.mm20.launcher2.preferences.search.WikipediaSearchSettings
+ import de.mm20.launcher2.preferences.ui.SearchUiSettings
+ import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.flowOf
+ import kotlinx.coroutines.flow.stateIn
+ import org.koin.core.component.KoinComponent
+ import org.koin.core.component.inject
+@@ -33,6 +38,12 @@ class SearchSettingsScreenVM : ViewModel(), KoinComponent {
+     private val permissionsManager: PermissionsManager by inject()
+     private val locationSearchSettings: LocationSearchSettings by inject()
+ 
++    val hasWorkProfile = mutableStateOf(false)
++
++    fun onResume(context: Context) {
++        hasWorkProfile.value = context.getSystemService<LauncherApps>()!!.profiles.size > 1
++    }
++
+     val favorites = searchUiSettings.favorites
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
+ 
+@@ -139,6 +150,13 @@ class SearchSettingsScreenVM : ViewModel(), KoinComponent {
+         searchUiSettings.setReversedResults(reverseSearchResults)
+     }
+ 
++    val separateWorkProfile = searchUiSettings.separateWorkProfile
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
++
++    fun setSeparateWorkProfile(separateWorkProfile: Boolean) {
++        searchUiSettings.setSeparateWorkProfile(separateWorkProfile)
++    }
++
+     fun requestAppShortcutsPermission(activity: AppCompatActivity) {
+         permissionsManager.requestPermission(activity, PermissionGroup.AppShortcuts)
+     }
+diff --git a/core/i18n/src/main/res/values/strings.xml b/core/i18n/src/main/res/values/strings.xml
+index 751534aab..a9a016be2 100644
+--- a/core/i18n/src/main/res/values/strings.xml
++++ b/core/i18n/src/main/res/values/strings.xml
+@@ -898,4 +898,6 @@
+     <string name="plugin_weather_provider_enabled">Currently set as weather provider</string>
+     <string name="cached_searchable">This value is possibly outdated because of connectivity issues.</string>
+     <string name="unavailable_searchable">This item does not exist anymore.</string>
++    <string name="preference_search_bar_separate_work_profile">Separate work profile apps</string>
++    <string name="preference_search_bar_separate_work_profile_summary">Shows work profile apps in a separate list</string>
+ </resources>
+\ No newline at end of file
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+index ae9b8e388..6837c58fa 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+@@ -79,6 +79,7 @@ data class LauncherSettingsData(
+ 
+     val searchResultsReversed: Boolean = false,
+     val searchResultOrder: SearchResultOrder = SearchResultOrder.Weighted,
++    val separateWorkProfile: Boolean = true,
+ 
+     val rankingWeightFactor: WeightFactor = WeightFactor.Default,
+ 
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/SearchUiSettings.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/SearchUiSettings.kt
+index 3f869f443..eb96da40e 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/SearchUiSettings.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/SearchUiSettings.kt
+@@ -62,4 +62,13 @@ class SearchUiSettings internal constructor(
+         }
+     }
+ 
++    val separateWorkProfile
++        get() = launcherDataStore.data.map { it.separateWorkProfile }.distinctUntilChanged()
++
++    fun setSeparateWorkProfile(separateWorkProfile: Boolean) {
++        launcherDataStore.update {
++            it.copy(separateWorkProfile = separateWorkProfile)
++        }
++    }
++
+ }
+\ No newline at end of file

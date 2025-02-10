@@ -1,0 +1,257 @@
+diff --git a/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerAgent.java b/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerAgent.java
+index 00c777b49..863dc2d2b 100644
+--- a/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerAgent.java
++++ b/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerAgent.java
+@@ -50,7 +50,7 @@ public void startAgent(
+         serverProgressPanel.displayText(
+             CodeGPTBundle.get("llamaServerAgent.buildingProject.description"));
+         makeProcessHandler = new OSProcessHandler(
+-            getMakeCommandLine(params.additionalBuildParameters()));
++            getMakeCommandLine(params));
+         makeProcessHandler.addProcessListener(
+             getMakeProcessListener(params, onSuccess, onServerStopped));
+         makeProcessHandler.startNotify();
+@@ -177,12 +177,13 @@ private void showServerError(String errorText, Consumer<ServerProgressPanel> onS
+     OverlayUtil.showClosableBalloon(errorText, MessageType.ERROR, activeServerProgressPanel);
+   }
+ 
+-  private static GeneralCommandLine getMakeCommandLine(List<String> additionalCompileParameters) {
++  private static GeneralCommandLine getMakeCommandLine(LlamaServerStartupParams params) {
+     GeneralCommandLine commandLine = new GeneralCommandLine().withCharset(StandardCharsets.UTF_8);
+     commandLine.setExePath("make");
+     commandLine.withWorkDirectory(CodeGPTPlugin.getLlamaSourcePath());
+     commandLine.addParameters("-j");
+-    commandLine.addParameters(additionalCompileParameters);
++    commandLine.addParameters(params.additionalBuildParameters());
++    commandLine.withEnvironment(params.additionalEnvironmentVariables());
+     commandLine.setRedirectErrorStream(false);
+     return commandLine;
+   }
+@@ -197,6 +198,7 @@ private GeneralCommandLine getServerCommandLine(LlamaServerStartupParams params)
+         "--port", String.valueOf(params.port()),
+         "-t", String.valueOf(params.threads()));
+     commandLine.addParameters(params.additionalRunParameters());
++    commandLine.withEnvironment(params.additionalEnvironmentVariables());
+     commandLine.setRedirectErrorStream(false);
+     return commandLine;
+   }
+diff --git a/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerStartupParams.java b/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerStartupParams.java
+index d15c274fc..b459b3a34 100644
+--- a/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerStartupParams.java
++++ b/src/main/java/ee/carlrobert/codegpt/completions/llama/LlamaServerStartupParams.java
+@@ -1,8 +1,10 @@
+ package ee.carlrobert.codegpt.completions.llama;
+ 
+ import java.util.List;
++import java.util.Map;
+ 
+ public record LlamaServerStartupParams(String modelPath, int contextLength, int threads, int port,
+                                        List<String> additionalRunParameters,
+-                                       List<String> additionalBuildParameters) {
++                                       List<String> additionalBuildParameters,
++                                       Map<String, String> additionalEnvironmentVariables) {
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettings.java b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettings.java
+index 6a3b28e34..84362d349 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettings.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettings.java
+@@ -20,6 +20,8 @@
+ import java.nio.file.Paths;
+ import java.util.Arrays;
+ import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
+ import org.apache.commons.lang3.StringUtils;
+ import org.jetbrains.annotations.NotNull;
+ 
+@@ -106,4 +108,13 @@ public static List<String> getAdditionalParametersList(String additionalParamete
+             .toList();
+   }
+ 
++  public static Map<String, String> getAdditionalEnvironmentVariablesMap(
++      String additionalEnvironmentVariables) {
++    return Arrays.stream(additionalEnvironmentVariables.split(" "))
++        .map(String::trim)
++        .filter(s -> !s.isBlank() && s.contains("="))
++        .collect(Collectors.toMap(item -> item.split("=")[0].trim(),
++            item -> item.split("=")[1].trim()));
++  }
++
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettingsState.java b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettingsState.java
+index 8204c7218..34a71eaaf 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettingsState.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/LlamaSettingsState.java
+@@ -24,6 +24,7 @@ public class LlamaSettingsState {
+   private int threads = 8;
+   private String additionalParameters = "";
+   private String additionalBuildParameters = "";
++  private String additionalEnvironmentVariables = "";
+   private int topK = 40;
+   private double topP = 0.9;
+   private double minP = 0.05;
+@@ -146,6 +147,14 @@ public void setAdditionalBuildParameters(String additionalBuildParameters) {
+     this.additionalBuildParameters = additionalBuildParameters;
+   }
+ 
++  public String getAdditionalEnvironmentVariables() {
++    return additionalEnvironmentVariables;
++  }
++
++  public void setAdditionalEnvironmentVariables(String additionalEnvironmentVariables) {
++    this.additionalEnvironmentVariables = additionalEnvironmentVariables;
++  }
++
+   public int getTopK() {
+     return topK;
+   }
+@@ -221,6 +230,7 @@ public boolean equals(Object o) {
+         && Objects.equals(serverPort, that.serverPort)
+         && Objects.equals(additionalParameters, that.additionalParameters)
+         && Objects.equals(additionalBuildParameters, that.additionalBuildParameters)
++        && Objects.equals(additionalEnvironmentVariables, that.additionalEnvironmentVariables)
+         && codeCompletionsEnabled == that.codeCompletionsEnabled;
+   }
+ 
+@@ -229,7 +239,8 @@ public int hashCode() {
+     return Objects.hash(runLocalServer, useCustomModel, customLlamaModelPath, huggingFaceModel,
+         localModelPromptTemplate, remoteModelPromptTemplate, localModelInfillPromptTemplate,
+         remoteModelInfillPromptTemplate, baseHost, serverPort, contextSize, threads,
+-        additionalParameters, additionalBuildParameters, topK, topP, minP, repeatPenalty,
++        additionalParameters, additionalBuildParameters, additionalEnvironmentVariables, topK, topP,
++        minP, repeatPenalty,
+         codeCompletionsEnabled);
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaServerPreferencesForm.java b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaServerPreferencesForm.java
+index de94c25c5..907aad197 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaServerPreferencesForm.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaServerPreferencesForm.java
+@@ -58,6 +58,7 @@ public class LlamaServerPreferencesForm {
+   private final IntegerField threadsField;
+   private final JBTextField additionalParametersField;
+   private final JBTextField additionalBuildParametersField;
++  private final JBTextField additionalEnvironmentVariablesField;
+   private final ChatPromptTemplatePanel remotePromptTemplatePanel;
+   private final InfillPromptTemplatePanel infillPromptTemplatePanel;
+ 
+@@ -83,6 +84,10 @@ public LlamaServerPreferencesForm(LlamaSettingsState settings) {
+     additionalBuildParametersField = new JBTextField(settings.getAdditionalBuildParameters(), 30);
+     additionalBuildParametersField.setEnabled(!serverRunning);
+ 
++    additionalEnvironmentVariablesField = new JBTextField(
++        settings.getAdditionalEnvironmentVariables(), 30);
++    additionalEnvironmentVariablesField.setEnabled(!serverRunning);
++
+     baseHostField = new URLTextField(settings.getBaseHost(), 30);
+     apiKeyField = new JBPasswordField();
+     apiKeyField.setColumns(30);
+@@ -132,6 +137,7 @@ public void resetForm(LlamaSettingsState state) {
+     threadsField.setValue(state.getThreads());
+     additionalParametersField.setText(state.getAdditionalParameters());
+     additionalBuildParametersField.setText(state.getAdditionalBuildParameters());
++    additionalEnvironmentVariablesField.setText(state.getAdditionalEnvironmentVariables());
+     remotePromptTemplatePanel.setPromptTemplate(state.getRemoteModelPromptTemplate()); // ?
+     infillPromptTemplatePanel.setPromptTemplate(state.getRemoteModelInfillPromptTemplate());
+     apiKeyField.setText(CredentialsStore.getCredential(LLAMA_API_KEY));
+@@ -204,6 +210,14 @@ public JComponent createRunLocalServerForm(LlamaServerAgent llamaServerAgent) {
+                 createComment(
+                     "settingsConfigurable.service.llama.additionalBuildParameters.comment"))
+             .addVerticalGap(4)
++            .addLabeledComponent(
++                CodeGPTBundle.get(
++                    "settingsConfigurable.service.llama.additionalEnvironmentVariables.label"),
++                additionalEnvironmentVariablesField)
++            .addComponentToRightColumn(
++                createComment(
++                    "settingsConfigurable.service.llama.additionalEnvironmentVariables.comment"))
++            .addVerticalGap(4)
+             .addComponentFillVertically(new JPanel(), 0)
+             .getPanel()))
+         .getPanel());
+@@ -236,7 +250,8 @@ private JButton getServerButton(
+                 getThreads(),
+                 getServerPort(),
+                 getListOfAdditionalParameters(),
+-                getListOfAdditionalBuildParameters()
++                getListOfAdditionalBuildParameters(),
++                getMapOfAdditionalEnvironmentVariables()
+             ),
+             serverProgressPanel,
+             () -> {
+@@ -316,6 +331,7 @@ private void setFormEnabled(boolean enabled) {
+     threadsField.setEnabled(enabled);
+     additionalParametersField.setEnabled(enabled);
+     additionalBuildParametersField.setEnabled(enabled);
++    additionalEnvironmentVariablesField.setEnabled(enabled);
+   }
+ 
+   public boolean isRunLocalServer() {
+@@ -362,6 +378,15 @@ public List<String> getListOfAdditionalBuildParameters() {
+     return LlamaSettings.getAdditionalParametersList(additionalBuildParametersField.getText());
+   }
+ 
++  public String getAdditionalEnvironmentVariables() {
++    return additionalEnvironmentVariablesField.getText();
++  }
++
++  public Map<String, String> getMapOfAdditionalEnvironmentVariables() {
++    return LlamaSettings.getAdditionalEnvironmentVariablesMap(
++        additionalEnvironmentVariablesField.getText());
++  }
++
+   public PromptTemplate getPromptTemplate() {
+     return isRunLocalServer() ? llamaModelPreferencesForm.getPromptTemplate()
+         : remotePromptTemplatePanel.getPromptTemplate();
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
+index 950d26503..6313db077 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
+@@ -42,6 +42,8 @@ public LlamaSettingsState getCurrentState() {
+     state.setThreads(llamaServerPreferencesForm.getThreads());
+     state.setAdditionalParameters(llamaServerPreferencesForm.getAdditionalParameters());
+     state.setAdditionalBuildParameters(llamaServerPreferencesForm.getAdditionalBuildParameters());
++    state.setAdditionalEnvironmentVariables(
++        llamaServerPreferencesForm.getAdditionalEnvironmentVariables());
+ 
+     var modelPreferencesForm = llamaServerPreferencesForm.getLlamaModelPreferencesForm();
+     state.setCustomLlamaModelPath(modelPreferencesForm.getCustomLlamaModelPath());
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/actions/LlamaServerToggleActions.kt b/src/main/kotlin/ee/carlrobert/codegpt/actions/LlamaServerToggleActions.kt
+index 74f844302..f0ac40fd3 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/actions/LlamaServerToggleActions.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/actions/LlamaServerToggleActions.kt
+@@ -14,8 +14,7 @@ import ee.carlrobert.codegpt.completions.llama.LlamaServerStartupParams
+ import ee.carlrobert.codegpt.settings.GeneralSettings
+ import ee.carlrobert.codegpt.settings.service.ServiceType.LLAMA_CPP
+ import ee.carlrobert.codegpt.settings.service.llama.LlamaSettings
+-import ee.carlrobert.codegpt.settings.service.llama.LlamaSettings.getAdditionalParametersList
+-import ee.carlrobert.codegpt.settings.service.llama.LlamaSettings.isRunnable
++import ee.carlrobert.codegpt.settings.service.llama.LlamaSettings.*
+ import ee.carlrobert.codegpt.settings.service.llama.form.ServerProgressPanel
+ import ee.carlrobert.codegpt.ui.OverlayUtil.showNotification
+ import ee.carlrobert.codegpt.ui.OverlayUtil.stickyNotification
+@@ -75,7 +74,8 @@ abstract class LlamaServerToggleActions(
+                 settings.threads,
+                 settings.serverPort,
+                 getAdditionalParametersList(settings.additionalParameters),
+-                getAdditionalParametersList(settings.additionalBuildParameters)
++                getAdditionalParametersList(settings.additionalBuildParameters),
++                getAdditionalEnvironmentVariablesMap(settings.additionalEnvironmentVariables)
+             ),
+             serverProgressPanel,
+             {
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index e851963b7..576d71e39 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -80,7 +80,9 @@ settingsConfigurable.service.llama.threads.comment=The number of threads availab
+ settingsConfigurable.service.llama.additionalParameters.label=Additional parameters:
+ settingsConfigurable.service.llama.additionalParameters.comment=<html>Additional command-line parameters for the server startup process, separated by commas. See the full <a href="https://github.com/ggerganov/llama.cpp/blob/master/examples/server/README.md">list of options</a>.<p><i>Example: "--n-gpu-layers, 1,  --no-mmap, --mlock"</i></p></html>
+ settingsConfigurable.service.llama.additionalBuildParameters.label=Additional build parameters:
+-settingsConfigurable.service.llama.additionalBuildParameters.comment=<html>Additional command-line parameters for the server build process, separated by commas. See the full <a href="https://github.com/ggerganov/llama.cpp/tree/master?tab=readme-ov-file#build">list of build options</a>.<p><i>Example: "LLAMA_CUBLAS=1,CUDA_DOCKER_ARCH=all"</i></p></html>
++settingsConfigurable.service.llama.additionalBuildParameters.comment=<html>Additional command-line parameters for the server build process, separated by commas. See the full <a href="https://github.com/ggerganov/llama.cpp/tree/master?tab=readme-ov-file#build">list of build options</a>.<p><i>Example: "LLAMA_CUDA=1,CUDA_DOCKER_ARCH=all"</i></p></html>
++settingsConfigurable.service.llama.additionalEnvironmentVariables.label=Additional environment variables:
++settingsConfigurable.service.llama.additionalEnvironmentVariables.comment=<html>Additional environment variables for the server build and run process, separated by whitespaces. Can be used to e.g. set CUDA variables (see the full <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#env-vars">list of env vars</a>)<p><i>Example: "CUDA_VISIBLE_DEVICES=0,1"</i></p></html>
+ settingsConfigurable.service.llama.baseHost.label=Base host:
+ settingsConfigurable.service.llama.baseHost.comment=URL to existing LLama server
+ settingsConfigurable.service.llama.startServer.label=Start server

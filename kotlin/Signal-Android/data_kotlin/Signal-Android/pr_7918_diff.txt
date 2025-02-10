@@ -1,0 +1,104 @@
+diff --git a/src/org/thoughtcrime/securesms/contactshare/ContactUtil.java b/src/org/thoughtcrime/securesms/contactshare/ContactUtil.java
+index 1352e16bac6..14246478dc7 100644
+--- a/src/org/thoughtcrime/securesms/contactshare/ContactUtil.java
++++ b/src/org/thoughtcrime/securesms/contactshare/ContactUtil.java
+@@ -18,12 +18,15 @@
+ import com.google.i18n.phonenumbers.PhoneNumberUtil;
+ import com.google.i18n.phonenumbers.Phonenumber.PhoneNumber;
+ 
++import org.thoughtcrime.securesms.R;
++import org.thoughtcrime.securesms.components.emoji.EmojiStrings;
+ import org.thoughtcrime.securesms.contactshare.Contact.Email;
+ import org.thoughtcrime.securesms.contactshare.Contact.Phone;
+ import org.thoughtcrime.securesms.contactshare.Contact.PostalAddress;
+ import org.thoughtcrime.securesms.database.Address;
+ import org.thoughtcrime.securesms.mms.PartAuthority;
+ import org.thoughtcrime.securesms.recipients.Recipient;
++import org.thoughtcrime.securesms.util.SpanUtil;
+ import org.thoughtcrime.securesms.util.Util;
+ 
+ import java.io.IOException;
+@@ -43,6 +46,16 @@ public static long getContactIdFromUri(@NonNull Uri uri) {
+     }
+   }
+ 
++  public static @NonNull CharSequence getStringSummary(@NonNull Context context, @NonNull Contact contact) {
++    String  contactName = ContactUtil.getDisplayName(contact);
++
++    if (!TextUtils.isEmpty(contactName)) {
++      return context.getString(R.string.MessageNotifier_contact_message, EmojiStrings.BUST_IN_SILHOUETTE, contactName);
++    }
++
++    return SpanUtil.italic(context.getString(R.string.MessageNotifier_unknown_contact_message));
++  }
++
+   public static @NonNull String getDisplayName(@Nullable Contact contact) {
+     if (contact == null) {
+       return "";
+diff --git a/src/org/thoughtcrime/securesms/database/ThreadDatabase.java b/src/org/thoughtcrime/securesms/database/ThreadDatabase.java
+index e83fd6ae32f..43226f11f74 100644
+--- a/src/org/thoughtcrime/securesms/database/ThreadDatabase.java
++++ b/src/org/thoughtcrime/securesms/database/ThreadDatabase.java
+@@ -30,6 +30,8 @@
+ 
+ import net.sqlcipher.database.SQLiteDatabase;
+ 
++import org.thoughtcrime.securesms.contactshare.Contact;
++import org.thoughtcrime.securesms.contactshare.ContactUtil;
+ import org.thoughtcrime.securesms.database.GroupDatabase.GroupRecord;
+ import org.thoughtcrime.securesms.database.MessagingDatabase.MarkedMessageInfo;
+ import org.thoughtcrime.securesms.database.RecipientDatabase.RecipientSettings;
+@@ -567,7 +569,7 @@ public boolean update(long threadId, boolean unarchive) {
+       MessageRecord record;
+ 
+       if (reader != null && (record = reader.getNext()) != null) {
+-        updateThread(threadId, count, record.getBody(), getAttachmentUriFor(record),
++        updateThread(threadId, count, getFormattedBodyFor(record), getAttachmentUriFor(record),
+                      record.getTimestamp(), record.getDeliveryStatus(), record.getDeliveryReceiptCount(),
+                      record.getType(), unarchive, record.getExpiresIn(), record.getReadReceiptCount());
+         notifyConversationListListeners();
+@@ -583,6 +585,15 @@ public boolean update(long threadId, boolean unarchive) {
+     }
+   }
+ 
++  private @NonNull String getFormattedBodyFor(@NonNull MessageRecord messageRecord) {
++    if (messageRecord.isMms() && ((MediaMmsMessageRecord) messageRecord).getSharedContacts().size() > 0) {
++      Contact contact = ((MediaMmsMessageRecord) messageRecord).getSharedContacts().get(0);
++      return ContactUtil.getStringSummary(context, contact).toString();
++    }
++
++    return messageRecord.getBody();
++  }
++
+   private @Nullable Uri getAttachmentUriFor(MessageRecord record) {
+     if (!record.isMms() || record.isMmsNotification() || record.isGroupAction()) return null;
+ 
+diff --git a/src/org/thoughtcrime/securesms/notifications/MessageNotifier.java b/src/org/thoughtcrime/securesms/notifications/MessageNotifier.java
+index df846d47b0d..7d334cfc413 100644
+--- a/src/org/thoughtcrime/securesms/notifications/MessageNotifier.java
++++ b/src/org/thoughtcrime/securesms/notifications/MessageNotifier.java
+@@ -39,7 +39,6 @@
+ 
+ import org.thoughtcrime.securesms.ConversationActivity;
+ import org.thoughtcrime.securesms.R;
+-import org.thoughtcrime.securesms.components.emoji.EmojiStrings;
+ import org.thoughtcrime.securesms.contactshare.ContactUtil;
+ import org.thoughtcrime.securesms.contactshare.Contact;
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+@@ -433,14 +432,8 @@ private static NotificationState constructNotificationState(@NonNull  Context co
+       if (KeyCachingService.isLocked(context)) {
+         body = SpanUtil.italic(context.getString(R.string.MessageNotifier_locked_message));
+       } else if (record.isMms() && !((MmsMessageRecord) record).getSharedContacts().isEmpty()) {
+-        Contact contact     = ((MmsMessageRecord) record).getSharedContacts().get(0);
+-        String  contactName = ContactUtil.getDisplayName(contact);
+-
+-        if (!TextUtils.isEmpty(contactName)) {
+-          body = context.getString(R.string.MessageNotifier_contact_message, EmojiStrings.BUST_IN_SILHOUETTE, contactName);
+-        } else {
+-          body = SpanUtil.italic(context.getString(R.string.MessageNotifier_unknown_contact_message));
+-        }
++        Contact contact = ((MmsMessageRecord) record).getSharedContacts().get(0);
++        body = ContactUtil.getStringSummary(context, contact);
+       } else if (record.isMms() && TextUtils.isEmpty(body) && !((MmsMessageRecord) record).getSlideDeck().getSlides().isEmpty()) {
+         body = SpanUtil.italic(context.getString(R.string.MessageNotifier_media_message));
+         slideDeck = ((MediaMmsMessageRecord)record).getSlideDeck();

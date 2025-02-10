@@ -1,0 +1,2208 @@
+diff --git a/.gitignore b/.gitignore
+index 78533cf29..bd27c3812 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,6 +6,7 @@ codegpt-core/src/main/java/grammar/*
+ !codegpt-core/src/main/java/grammar/TypeScriptParserBase.java
+ 
+ .gradle
++.kotlin
+ build/
+ !gradle/wrapper/gradle-wrapper.jar
+ !**/src/main/**/build/
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 43e166f72..c655f3e9f 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -12,7 +12,7 @@ jsoup = "1.17.2"
+ jtokkit = "1.0.0"
+ junit = "5.10.2"
+ kotlin = "2.0.0"
+-llm-client = "0.8.11"
++llm-client = "0.8.12"
+ okio = "3.9.0"
+ tree-sitter = "0.22.6a"
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/CodeGPTKeys.java b/src/main/java/ee/carlrobert/codegpt/CodeGPTKeys.java
+index 94bbdea39..e45f80e85 100644
+--- a/src/main/java/ee/carlrobert/codegpt/CodeGPTKeys.java
++++ b/src/main/java/ee/carlrobert/codegpt/CodeGPTKeys.java
+@@ -1,6 +1,7 @@
+ package ee.carlrobert.codegpt;
+ 
+ import com.intellij.openapi.util.Key;
++import ee.carlrobert.codegpt.ui.DocumentationDetails;
+ import ee.carlrobert.llm.client.codegpt.CodeGPTUserDetails;
+ import java.util.List;
+ 
+@@ -14,4 +15,6 @@ public class CodeGPTKeys {
+       Key.create("codegpt.imageAttachmentFilePath");
+   public static final Key<CodeGPTUserDetails> CODEGPT_USER_DETAILS =
+       Key.create("codegpt.userDetails");
++  public static final Key<DocumentationDetails> ADDED_DOCUMENTATION =
++      Key.create("codegpt.addedDocumentation");
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/completions/CompletionRequestProvider.java b/src/main/java/ee/carlrobert/codegpt/completions/CompletionRequestProvider.java
+index 034b2037a..7d5b1f71f 100644
+--- a/src/main/java/ee/carlrobert/codegpt/completions/CompletionRequestProvider.java
++++ b/src/main/java/ee/carlrobert/codegpt/completions/CompletionRequestProvider.java
+@@ -54,6 +54,7 @@
+ import ee.carlrobert.llm.client.openai.completion.request.OpenAIImageUrl;
+ import ee.carlrobert.llm.client.openai.completion.request.OpenAIMessageImageURLContent;
+ import ee.carlrobert.llm.client.openai.completion.request.OpenAIMessageTextContent;
++import ee.carlrobert.llm.client.openai.completion.request.RequestDocumentationDetails;
+ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Files;
+@@ -227,6 +228,14 @@ public OpenAIChatCompletionRequest buildOpenAIChatCompletionRequest(
+       // tri-state boolean
+       requestBuilder.setWebSearchIncluded(true);
+     }
++    var documentationDetails =
++        callParameters.getMessage().getDocumentationDetails();
++    if (documentationDetails != null) {
++      var requestDocumentationDetails = new RequestDocumentationDetails();
++      requestDocumentationDetails.setName(documentationDetails.getName());
++      requestDocumentationDetails.setUrl(documentationDetails.getUrl());
++      requestBuilder.setDocumentationDetails(requestDocumentationDetails);
++    }
+     return requestBuilder.build();
+   }
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/conversations/message/Message.java b/src/main/java/ee/carlrobert/codegpt/conversations/message/Message.java
+index d22ed2cb9..c9a405cf4 100644
+--- a/src/main/java/ee/carlrobert/codegpt/conversations/message/Message.java
++++ b/src/main/java/ee/carlrobert/codegpt/conversations/message/Message.java
+@@ -2,6 +2,7 @@
+ 
+ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonProperty;
++import ee.carlrobert.codegpt.ui.DocumentationDetails;
+ import ee.carlrobert.llm.client.you.completion.YouSerpResult;
+ import java.util.List;
+ import java.util.Objects;
+@@ -18,6 +19,7 @@ public class Message {
+   private List<String> referencedFilePaths;
+   private @Nullable String imageFilePath;
+   private boolean webSearchIncluded;
++  private DocumentationDetails documentationDetails;
+ 
+   public Message(String prompt, String response) {
+     this(prompt);
+@@ -90,6 +92,14 @@ public void setWebSearchIncluded(boolean webSearchIncluded) {
+     this.webSearchIncluded = webSearchIncluded;
+   }
+ 
++  public DocumentationDetails getDocumentationDetails() {
++    return documentationDetails;
++  }
++
++  public void setDocumentationDetails(DocumentationDetails documentationDetails) {
++    this.documentationDetails = documentationDetails;
++  }
++
+   @Override
+   public boolean equals(Object obj) {
+     if (obj == this) {
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java b/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
+index f0074b286..0a95adad6 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/ServiceType.java
+@@ -76,7 +76,12 @@ public boolean isImageActionSupported() {
+             .getState()
+             .getChatCompletionSettings()
+             .getModel();
+-        yield List.of("gpt-4o", "gpt-4o-mini", "claude-3-opus").contains(codegptModel);
++        yield List.of(
++            "gpt-4o",
++            "gpt-4o-mini",
++            "claude-3-opus",
++            "claude-3.5-sonnet"
++        ).contains(codegptModel);
+       case OPENAI:
+         var openaiModel = ApplicationManager.getApplication().getService(OpenAISettings.class)
+             .getState()
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
+index b324025e8..cadc93b2d 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ChatToolWindowTabPanel.java
+@@ -252,6 +252,12 @@ private Unit handleSubmit(String text, boolean webSearchIncluded) {
+     }
+     message.setUserMessage(text);
+     message.setWebSearchIncluded(webSearchIncluded);
++
++    var addedDocumentation = CodeGPTKeys.ADDED_DOCUMENTATION.get(project);
++    if (addedDocumentation != null) {
++      message.setDocumentationDetails(addedDocumentation);
++    }
++
+     sendMessage(message, ConversationType.DEFAULT);
+     return Unit.INSTANCE;
+   }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/UserMessagePanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/UserMessagePanel.java
+index a65161a41..311642869 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/UserMessagePanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/UserMessagePanel.java
+@@ -8,15 +8,22 @@
+ import com.intellij.ui.components.JBLabel;
+ import com.intellij.util.ui.JBFont;
+ import com.intellij.util.ui.JBUI;
++import ee.carlrobert.codegpt.CodeGPTBundle;
++import ee.carlrobert.codegpt.CodeGPTKeys;
+ import ee.carlrobert.codegpt.Icons;
+ import ee.carlrobert.codegpt.conversations.message.Message;
++import ee.carlrobert.codegpt.events.Details;
+ import ee.carlrobert.codegpt.settings.GeneralSettings;
++import ee.carlrobert.codegpt.toolwindow.ui.WebpageList;
+ import java.awt.BorderLayout;
+ import java.io.IOException;
+ import java.nio.file.Files;
+ import java.nio.file.Paths;
++import java.util.UUID;
++import javax.swing.DefaultListModel;
+ import javax.swing.JPanel;
+ import javax.swing.SwingConstants;
++import org.jetbrains.annotations.Nullable;
+ 
+ public class UserMessagePanel extends JPanel {
+ 
+@@ -31,9 +38,13 @@ public UserMessagePanel(Project project, Message message, Disposable parentDispo
+     setBackground(ColorUtil.brighter(getBackground(), 2));
+     add(headerPanel, BorderLayout.NORTH);
+ 
++    var additionalContextPanel = getAdditionalContextPanel(project, message);
++    if (additionalContextPanel != null) {
++      add(additionalContextPanel, BorderLayout.CENTER);
++    }
++
+     var referencedFilePaths = message.getReferencedFilePaths();
+     if (referencedFilePaths != null && !referencedFilePaths.isEmpty()) {
+-      add(new SelectedFilesAccordion(project, referencedFilePaths), BorderLayout.CENTER);
+       add(createResponseBody(
+           project,
+           message.getUserMessage(),
+@@ -43,6 +54,30 @@ public UserMessagePanel(Project project, Message message, Disposable parentDispo
+     }
+   }
+ 
++  public @Nullable JPanel getAdditionalContextPanel(Project project, Message message) {
++    var addedDocumentation = CodeGPTKeys.ADDED_DOCUMENTATION.get(project);
++    var referencedFilePaths = message.getReferencedFilePaths();
++    if (addedDocumentation == null
++        && (referencedFilePaths == null
++        || referencedFilePaths.isEmpty())) {
++      return null;
++    }
++
++    var panel = new JPanel(new BorderLayout());
++    panel.setOpaque(false);
++    if (addedDocumentation != null) {
++      var listModel = new DefaultListModel<Details>();
++      listModel.addElement(new Details(UUID.randomUUID().toString(), addedDocumentation.getName(),
++          addedDocumentation.getUrl(), addedDocumentation.getUrl()));
++      panel.add(createWebpageListPanel(new WebpageList(listModel)), BorderLayout.NORTH);
++    }
++
++    if (referencedFilePaths != null && !referencedFilePaths.isEmpty()) {
++      panel.add(new SelectedFilesAccordion(project, referencedFilePaths), BorderLayout.NORTH);
++    }
++    return panel;
++  }
++
+   public void displayImage(String imageFilePath) {
+     try {
+       var path = Paths.get(imageFilePath);
+@@ -77,4 +112,21 @@ private JBLabel createDisplayNameLabel() {
+         .withFont(JBFont.label().asBold())
+         .withBorder(JBUI.Borders.emptyBottom(6));
+   }
++
++  private static JPanel createWebpageListPanel(WebpageList webpageList) {
++    var title = new JPanel(new BorderLayout());
++    title.setOpaque(false);
++    title.setBorder(JBUI.Borders.empty(8, 0));
++    title.add(new JBLabel(CodeGPTBundle.get("userMessagePanel.documentation.title"))
++        .withFont(JBUI.Fonts.miniFont()), BorderLayout.LINE_START);
++    var listPanel = new JPanel(new BorderLayout());
++    listPanel.setOpaque(false);
++    listPanel.add(webpageList, BorderLayout.LINE_START);
++
++    var panel = new JPanel(new BorderLayout());
++    panel.setOpaque(false);
++    panel.add(title, BorderLayout.NORTH);
++    panel.add(listPanel, BorderLayout.CENTER);
++    return panel;
++  }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/ui/OverlayUtil.java b/src/main/java/ee/carlrobert/codegpt/ui/OverlayUtil.java
+index 4996ff8f2..a0a27f5a5 100644
+--- a/src/main/java/ee/carlrobert/codegpt/ui/OverlayUtil.java
++++ b/src/main/java/ee/carlrobert/codegpt/ui/OverlayUtil.java
+@@ -103,7 +103,7 @@ public static int showTokenLimitExceededDialog() {
+             CodeGPTBundle.get("dialog.tokenLimitExceeded.title"),
+             CodeGPTBundle.get("dialog.tokenLimitExceeded.description"))
+         .yesText(CodeGPTBundle.get("dialog.continue"))
+-        .noText(CodeGPTBundle.get("dialog.cancel"))
++        .noText(CodeGPTBundle.get("shared.cancel"))
+         .icon(Default)
+         .doNotAsk(new DoNotAskOption.Adapter() {
+           @Override
+@@ -132,7 +132,7 @@ public static int showTokenSoftLimitWarningDialog(int tokenCount) {
+             CodeGPTBundle.get("dialog.tokenSoftLimitExceeded.title"),
+             format(CodeGPTBundle.get("dialog.tokenSoftLimitExceeded.description"), tokenCount))
+         .yesText(CodeGPTBundle.get("dialog.continue"))
+-        .noText(CodeGPTBundle.get("dialog.cancel"))
++        .noText(CodeGPTBundle.get("shared.cancel"))
+         .icon(Default)
+         .doNotAsk(new DoNotAskOption.Adapter() {
+           @Override
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationSettings.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationSettings.kt
+new file mode 100644
+index 000000000..d2041c9f4
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationSettings.kt
+@@ -0,0 +1,20 @@
++package ee.carlrobert.codegpt.settings.documentation
++
++import com.intellij.openapi.components.*
++
++@Service
++@State(
++    name = "CodeGPT_DocumentationSettings",
++    storages = [Storage("CodeGPT_DocumentationSettings.xml")]
++)
++class DocumentationSettings :
++    SimplePersistentStateComponent<DocumentationSettingsState>(DocumentationSettingsState())
++
++class DocumentationSettingsState : BaseState() {
++    var documentations by list<DocumentationDetailsState>()
++}
++
++class DocumentationDetailsState : BaseState() {
++    var name by string("CodeGPT Docs")
++    var url by string("https://docs.codegpt.ee")
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsConfigurable.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsConfigurable.kt
+new file mode 100644
+index 000000000..8a08969ef
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsConfigurable.kt
+@@ -0,0 +1,28 @@
++package ee.carlrobert.codegpt.settings.documentation
++
++import com.intellij.openapi.options.Configurable
++import javax.swing.JComponent
++
++class DocumentationsConfigurable : Configurable {
++
++    private lateinit var component: DocumentationsSettingsForm
++
++    override fun getDisplayName(): String {
++        return "CodeGPT: Documentations"
++    }
++
++    override fun createComponent(): JComponent {
++        component = DocumentationsSettingsForm()
++        return component.createPanel()
++    }
++
++    override fun isModified(): Boolean = component.isModified()
++
++    override fun apply() {
++        component.applyChanges()
++    }
++
++    override fun reset() {
++        component.resetChanges()
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsSettingsForm.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsSettingsForm.kt
+new file mode 100644
+index 000000000..9d34a8b2f
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/documentation/DocumentationsSettingsForm.kt
+@@ -0,0 +1,138 @@
++package ee.carlrobert.codegpt.settings.documentation
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.actionSystem.AnAction
++import com.intellij.openapi.actionSystem.AnActionEvent
++import com.intellij.openapi.components.service
++import com.intellij.openapi.ui.DialogPanel
++import com.intellij.ui.ToolbarDecorator
++import com.intellij.ui.dsl.builder.Align
++import com.intellij.ui.dsl.builder.panel
++import com.intellij.ui.table.JBTable
++import java.awt.Dimension
++import javax.swing.table.DefaultTableModel
++
++class DocumentationsSettingsForm {
++
++    private val tableModel = DefaultTableModel(arrayOf("Name", "URL"), 0)
++    private val table = JBTable(tableModel).apply {
++        setupTableColumns()
++    }
++    private val documentationSettings = service<DocumentationSettings>()
++    private var originalDocumentations: List<DocumentationDetailsState> = emptyList()
++
++    init {
++        setupForm()
++    }
++
++    fun createPanel(): DialogPanel {
++        return panel {
++            row {
++                val toolbarDecorator = ToolbarDecorator.createDecorator(table)
++                    .setAddAction { handleAddItem() }
++                    .setRemoveAction { handleRemoveItem() }
++                    .addExtraAction(object :
++                        AnAction("Duplicate", "Duplicate documentation", AllIcons.Actions.Copy) {
++                        override fun actionPerformed(e: AnActionEvent) {
++                            handleDuplicateItem()
++                        }
++                    })
++                    .disableUpDownActions()
++
++                cell(toolbarDecorator.createPanel())
++                    .align(Align.FILL)
++                    .resizableColumn()
++                    .applyToComponent {
++                        preferredSize = Dimension(650, 250)
++                    }
++            }
++        }
++    }
++
++    fun applyChanges() {
++        val newDocumentations = (0 until tableModel.rowCount).map { row ->
++            DocumentationDetailsState().apply {
++                name = tableModel.getValueAt(row, 0) as String
++                url = tableModel.getValueAt(row, 1) as String
++            }
++        }
++        documentationSettings.state.documentations.clear()
++        documentationSettings.state.documentations.addAll(newDocumentations)
++        originalDocumentations = newDocumentations
++    }
++
++    fun isModified(): Boolean {
++        val currentDocumentations = (0 until tableModel.rowCount).map { row ->
++            DocumentationDetailsState().apply {
++                name = tableModel.getValueAt(row, 0) as String
++                url = tableModel.getValueAt(row, 1) as String
++            }
++        }
++        return currentDocumentations != originalDocumentations
++    }
++
++    fun resetChanges() {
++        tableModel.rowCount = 0
++        setupForm()
++    }
++
++    private fun handleAddItem() {
++        addDocumentationToTable(DocumentationDetailsState().apply {
++            name = "New Documentation"
++            url = "https://example.com"
++        })
++    }
++
++    private fun handleDuplicateItem() {
++        val selectedRow = table.selectedRow
++        if (selectedRow != -1) {
++            val originalName = tableModel.getValueAt(selectedRow, 0) as String
++            val originalUrl = tableModel.getValueAt(selectedRow, 1) as String
++            addDocumentationToTable(DocumentationDetailsState().apply {
++                name = "$originalName Copy"
++                url = originalUrl
++            })
++        }
++    }
++
++    private fun addDocumentationToTable(doc: DocumentationDetailsState) {
++        tableModel.addRow(arrayOf(doc.name, doc.url))
++        selectLastRowAndUpdateUI()
++    }
++
++    private fun selectLastRowAndUpdateUI() {
++        val lastRow = table.rowCount - 1
++        table.setRowSelectionInterval(lastRow, lastRow)
++        scrollToLastRow()
++    }
++
++    private fun handleRemoveItem() {
++        val selectedRow = table.selectedRow
++        if (selectedRow != -1) {
++            tableModel.removeRow(selectedRow)
++
++            val newSelectedRow = if (selectedRow > 0) selectedRow - 1 else 0
++            if (table.rowCount > 0) {
++                table.setRowSelectionInterval(newSelectedRow, newSelectedRow)
++            }
++        }
++    }
++
++    private fun setupForm() {
++        originalDocumentations = documentationSettings.state.documentations.toList()
++        originalDocumentations.forEach { doc ->
++            tableModel.addRow(arrayOf(doc.name, doc.url))
++        }
++    }
++
++    private fun scrollToLastRow() {
++        table.scrollRectToVisible(table.getCellRect(table.rowCount - 1, 0, true))
++    }
++
++    private fun JBTable.setupTableColumns() {
++        columnModel.apply {
++            getColumn(0).preferredWidth = 200
++            getColumn(1).preferredWidth = 450
++        }
++    }
++}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/WebpageList.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/WebpageList.kt
+index a7f66af00..05c69f7e0 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/WebpageList.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/WebpageList.kt
+@@ -39,6 +39,7 @@ class WebpageList(model: DefaultListModel<Details>) : JBList<Details>(model) {
+     private fun setupUI() {
+         border = JBUI.Borders.emptyBottom(8)
+         cellRenderer = WebpageListCellRenderer()
++        isOpaque = false
+         setEmptyText("")
+     }
+ 
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/AddDocumentationPopup.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/AddDocumentationPopup.kt
+new file mode 100644
+index 000000000..2f338cdad
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/AddDocumentationPopup.kt
+@@ -0,0 +1,77 @@
++package ee.carlrobert.codegpt.ui
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties
++import com.fasterxml.jackson.annotation.JsonProperty
++import com.intellij.openapi.components.service
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.ui.DialogWrapper
++import com.intellij.ui.components.JBCheckBox
++import com.intellij.ui.components.JBTextField
++import com.intellij.ui.dsl.builder.LabelPosition
++import com.intellij.ui.dsl.builder.TopGap
++import com.intellij.ui.dsl.builder.panel
++import ee.carlrobert.codegpt.CodeGPTBundle
++import ee.carlrobert.codegpt.CodeGPTKeys
++import ee.carlrobert.codegpt.settings.documentation.DocumentationDetailsState
++import ee.carlrobert.codegpt.settings.documentation.DocumentationSettings
++import javax.swing.JComponent
++
++class AddDocumentationDialog(private val project: Project) : DialogWrapper(project) {
++
++    private var nameField = JBTextField("", 40).apply {
++        emptyText.text = "CodeGPT docs"
++    }
++    private var urlField = JBTextField("", 40).apply {
++        emptyText.text = "https://docs.codegpt.ee"
++    }
++    private var saveCheckbox =
++        JBCheckBox(CodeGPTBundle.get("addDocumentation.popup.form.saveCheckbox.label"), true)
++
++    val documentationDetails: DocumentationDetails
++        get() = DocumentationDetails(nameField.text, urlField.text)
++
++    init {
++        title = CodeGPTBundle.get("addDocumentation.popup.title")
++        init()
++    }
++
++    override fun createCenterPanel(): JComponent = panel {
++        row {
++            cell(nameField)
++                .label(
++                    CodeGPTBundle.get("addDocumentation.popup.form.name.label"),
++                    LabelPosition.TOP
++                )
++                .focused()
++        }
++        row {
++            cell(urlField)
++                .label(
++                    CodeGPTBundle.get("addDocumentation.popup.form.url.label"),
++                    LabelPosition.TOP
++                )
++        }.rowComment(CodeGPTBundle.get("addDocumentation.popup.form.url.comment"))
++        row { cell(saveCheckbox) }.topGap(TopGap.SMALL)
++    }
++
++    override fun doOKAction() {
++        val documentationDetails = DocumentationDetails(nameField.text, urlField.text)
++        project.putUserData(CodeGPTKeys.ADDED_DOCUMENTATION, documentationDetails)
++
++        if (saveCheckbox.isSelected) {
++            val newState = DocumentationDetailsState()
++            newState.url = documentationDetails.url
++            newState.name = documentationDetails.name
++
++            service<DocumentationSettings>().state.documentations.add(newState)
++        }
++
++        super.doOKAction()
++    }
++}
++
++@JsonIgnoreProperties(ignoreUnknown = true)
++data class DocumentationDetails(
++    @JsonProperty(value = "name") var name: String,
++    @JsonProperty(value = "url") var url: String
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt
+index 89c049290..a7cb70a3c 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPane.kt
+@@ -22,7 +22,10 @@ import javax.swing.text.DefaultStyledDocument
+ import javax.swing.text.StyleConstants
+ import javax.swing.text.StyleContext
+ 
+-class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
++class CustomTextPane(
++    private val highlightedTextRanges: MutableList<Pair<TextRange, Boolean>>,
++    private val onSubmit: (String) -> Unit
++) : JTextPane() {
+ 
+     init {
+         isOpaque = false
+@@ -39,7 +42,15 @@ class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
+         inputMap.put(KeyStroke.getKeyStroke("ENTER"), "text-submit")
+         actionMap.put("text-submit", object : AbstractAction() {
+             override fun actionPerformed(e: ActionEvent) {
+-                onSubmit(text)
++                var textWithoutActions = text
++                highlightedTextRanges.forEach {
++                    val (textRange, replacement) = it
++                    if (replacement) {
++                        textWithoutActions =
++                            textWithoutActions.replace(text.substring(textRange.startOffset, textRange.endOffset), "")
++                    }
++                }
++                onSubmit(textWithoutActions.trim())
+             }
+         })
+     }
+@@ -47,7 +58,8 @@ class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
+     fun appendHighlightedText(
+         text: String,
+         searchChar: Char = '@',
+-        withWhitespace: Boolean = true
++        withWhitespace: Boolean = true,
++        replacement: Boolean = true
+     ): TextRange? {
+         val lastIndex = this.text.lastIndexOf(searchChar)
+         if (lastIndex != -1) {
+@@ -68,8 +80,9 @@ class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
+                 JBUI.CurrentTheme.GotItTooltip.codeBackground(true)
+             )
+ 
+-            document.remove(lastIndex + 1, document.length - (lastIndex + 1))
+-            document.insertString(lastIndex + 1, text, fileNameStyle)
++            val startOffset = lastIndex + 1
++            document.remove(startOffset, document.length - startOffset)
++            document.insertString(startOffset, text, fileNameStyle)
+             styledDocument.setCharacterAttributes(
+                 lastIndex,
+                 text.length,
+@@ -83,7 +96,11 @@ class CustomTextPane(private val onSubmit: (String) -> Unit) : JTextPane() {
+                     styleContext.getStyle(StyleContext.DEFAULT_STYLE)
+                 )
+             }
+-            return TextRange(lastIndex, lastIndex + text.length)
++            val modifiedStartOffset = if (searchChar == '@') startOffset - 1 else startOffset
++            val endOffset = startOffset + text.length + (if (withWhitespace) 1 else 0)
++            val textRange = TextRange(modifiedStartOffset, endOffset)
++            highlightedTextRanges.add(Pair(textRange, replacement))
++            return textRange
+         }
+         return null
+     }
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPaneKeyAdapter.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPaneKeyAdapter.kt
+index 86896e099..c9992c7bc 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPaneKeyAdapter.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/CustomTextPaneKeyAdapter.kt
+@@ -5,7 +5,8 @@ import com.intellij.openapi.components.service
+ import com.intellij.openapi.project.Project
+ import com.intellij.openapi.util.TextRange
+ import com.jetbrains.rd.util.AtomicReference
+-import ee.carlrobert.codegpt.conversations.Conversation
++import ee.carlrobert.codegpt.CodeGPTKeys
++import ee.carlrobert.codegpt.ui.textarea.suggestion.SuggestionsPopupManager
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+@@ -17,16 +18,20 @@ import javax.swing.text.StyledDocument
+ class CustomTextPaneKeyAdapter(
+     private val project: Project,
+     private val textPane: CustomTextPane,
++    private val highlightedTextRanges: MutableList<Pair<TextRange, Boolean>>,
+     onWebSearchIncluded: () -> Unit
+ ) : KeyAdapter() {
+ 
+-    private val suggestionsPopupManager = SuggestionsPopupManager(project, textPane, onWebSearchIncluded)
++    private val suggestionsPopupManager =
++        SuggestionsPopupManager(project, textPane, onWebSearchIncluded)
+     private val popupOpenedAtRange: AtomicReference<TextRange?> = AtomicReference(null)
+ 
+     override fun keyReleased(e: KeyEvent) {
+         if (textPane.text.isEmpty()) {
+             // TODO: Remove only the files that were added via shortcuts
+             project.service<FileSearchService>().removeFilesFromSession()
++            project.putUserData(CodeGPTKeys.ADDED_DOCUMENTATION, null)
++            highlightedTextRanges.clear()
+             suggestionsPopupManager.hidePopup()
+             return
+         }
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt
+index d19e8067c..d61ef9390 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/FileSearchService.kt
+@@ -14,9 +14,9 @@ import java.io.File
+ class FileSearchService private constructor(val project: Project) {
+     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+ 
+-    fun searchFiles(searchText: String): List<String> = runBlocking {
++    fun searchFiles(searchText: String): List<VirtualFile> = runBlocking {
+         withContext(scope.coroutineContext) {
+-            FileUtil.searchProjectFiles(project, searchText).map { it.path }
++            FileUtil.searchProjectFiles(project, searchText)
+         }
+     }
+ 
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionListCellRenderer.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionListCellRenderer.kt
+deleted file mode 100644
+index 728a8a55f..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionListCellRenderer.kt
++++ /dev/null
+@@ -1,194 +0,0 @@
+-package ee.carlrobert.codegpt.ui.textarea
+-
+-import com.intellij.icons.AllIcons
+-import com.intellij.openapi.components.service
+-import com.intellij.openapi.fileTypes.FileTypeManager
+-import com.intellij.ui.ColorUtil
+-import com.intellij.ui.JBColor
+-import com.intellij.ui.dsl.builder.AlignX
+-import com.intellij.ui.dsl.builder.panel
+-import com.intellij.ui.dsl.gridLayout.UnscaledGaps
+-import com.intellij.util.ui.JBUI
+-import com.intellij.util.ui.JBUI.CurrentTheme.GotItTooltip
+-import ee.carlrobert.codegpt.settings.GeneralSettings
+-import ee.carlrobert.codegpt.settings.persona.PersonaSettings
+-import ee.carlrobert.codegpt.settings.service.ServiceType
+-import java.awt.Component
+-import java.awt.Dimension
+-import javax.swing.*
+-
+-class SuggestionListCellRenderer(
+-    private val textPane: CustomTextPane
+-) : DefaultListCellRenderer() {
+-
+-    override fun getListCellRendererComponent(
+-        list: JList<*>?,
+-        value: Any?,
+-        index: Int,
+-        isSelected: Boolean,
+-        cellHasFocus: Boolean
+-    ): Component =
+-        super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus).apply {
+-            setOpaque(false)
+-        }.let { component ->
+-            if (component is JLabel && value is SuggestionItem) {
+-                renderSuggestionItem(component, value, list, index, isSelected, cellHasFocus)
+-            } else {
+-                component
+-            }
+-        }
+-
+-    private fun renderSuggestionItem(
+-        component: JLabel,
+-        value: SuggestionItem,
+-        list: JList<*>?,
+-        index: Int,
+-        isSelected: Boolean,
+-        cellHasFocus: Boolean
+-    ): JPanel = when (value) {
+-        is SuggestionItem.FileItem -> renderFileItem(component, value)
+-        is SuggestionItem.FolderItem -> renderFolderItem(component, value)
+-        is SuggestionItem.ActionItem -> renderActionItem(component, value)
+-        is SuggestionItem.PersonaItem -> renderPersonaItem(component, value)
+-    }.apply {
+-        setupPanelProperties(list, index, isSelected, cellHasFocus)
+-    }
+-
+-    private fun renderFileItem(component: JLabel, item: SuggestionItem.FileItem): JPanel {
+-        val icon = when {
+-            item.file.isDirectory -> AllIcons.Nodes.Folder
+-            else -> service<FileTypeManager>().getFileTypeByFileName(item.file.name).icon
+-        }
+-        return createDefaultPanel(component, icon, item.file.name, item.file.path, true)
+-    }
+-
+-    private fun renderFolderItem(component: JLabel, item: SuggestionItem.FolderItem): JPanel {
+-        return createDefaultPanel(
+-            component,
+-            AllIcons.Nodes.Folder,
+-            item.folder.name,
+-            item.folder.path,
+-            true
+-        )
+-    }
+-
+-    private fun renderActionItem(component: JLabel, item: SuggestionItem.ActionItem): JPanel {
+-        val description = if (item.action == DefaultAction.PERSONAS)
+-            service<PersonaSettings>().state.selectedPersona.name
+-        else null
+-
+-        return createDefaultPanel(
+-            component.apply {
+-                disabledIcon = item.action.icon
+-                isEnabled = item.action.enabled()
+-            },
+-            item.action.icon,
+-            item.action.displayName,
+-            description
+-        )
+-    }
+-
+-    private fun renderPersonaItem(component: JLabel, item: SuggestionItem.PersonaItem): JPanel {
+-        return createDefaultPanel(
+-            component,
+-            AllIcons.General.User,
+-            item.personaDetails.name,
+-            item.personaDetails.instructions,
+-        )
+-    }
+-
+-    private fun getSearchText(text: String): String? {
+-        val lastAtIndex = text.lastIndexOf('@')
+-        if (lastAtIndex == -1) return null
+-
+-        val lastColonIndex = text.lastIndexOf(':')
+-        if (lastColonIndex == -1) return null
+-
+-        return text.substring(lastColonIndex + 1).takeIf { it.isNotEmpty() }
+-    }
+-
+-    private fun generateHighlightedHtml(title: String, searchText: String): String {
+-        val searchIndex = title.indexOf(searchText, ignoreCase = true)
+-        if (searchIndex == -1) return title
+-
+-        val prefix = title.substring(0, searchIndex)
+-        val highlight = title.substring(
+-            searchIndex,
+-            (searchIndex + searchText.length).coerceAtMost(title.length)
+-        )
+-        val suffix = title.substring((searchIndex + searchText.length).coerceAtMost(title.length))
+-
+-        val foregroundHex = ColorUtil.toHex(GotItTooltip.codeForeground(true))
+-        val backgroundHex = ColorUtil.toHex(GotItTooltip.codeBackground(true))
+-
+-        return "<html>$prefix<span style=\"color: $foregroundHex;background-color: $backgroundHex;\">$highlight</span>$suffix</html>"
+-    }
+-
+-    private fun createDefaultPanel(
+-        label: JLabel,
+-        labelIcon: Icon,
+-        title: String,
+-        description: String? = null,
+-        truncateFromStart: Boolean = false
+-    ): JPanel {
+-        val searchText = getSearchText(textPane.text)
+-        label.apply {
+-            icon = labelIcon
+-            iconTextGap = 4
+-            text = if (searchText != null) {
+-                generateHighlightedHtml(title, searchText)
+-            } else {
+-                title
+-            }
+-        }
+-
+-        return panel {
+-            row {
+-                cell(label)
+-                if (description != null) {
+-                    text(description.truncate(480 - label.width - 32, truncateFromStart))
+-                        .customize(UnscaledGaps(left = 8))
+-                        .align(AlignX.RIGHT)
+-                        .applyToComponent {
+-                            font = JBUI.Fonts.smallFont()
+-                            foreground = JBColor.gray
+-                        }
+-                }
+-            }
+-        }.apply {
+-            toolTipText = description
+-        }
+-    }
+-
+-    private fun JPanel.setupPanelProperties(
+-        list: JList<*>?,
+-        index: Int,
+-        isSelected: Boolean,
+-        cellHasFocus: Boolean
+-    ) {
+-        preferredSize = Dimension(480, 30)
+-        border = JBUI.Borders.empty(0, 4, 0, 4)
+-
+-        val isHovered = list?.getClientProperty("hoveredIndex") == index
+-        if (isHovered || isSelected || cellHasFocus) {
+-            background = UIManager.getColor("List.selectionBackground")
+-            foreground = UIManager.getColor("List.selectionForeground")
+-        }
+-    }
+-
+-    private fun String.truncate(maxWidth: Int, truncateFromStart: Boolean = false): String {
+-        val fontMetrics = getFontMetrics(JBUI.Fonts.smallFont())
+-        if (fontMetrics.stringWidth(this) <= maxWidth) return this
+-
+-        val ellipsis = "..."
+-        var truncated = this
+-        while (fontMetrics.stringWidth(ellipsis + truncated) > maxWidth && truncated.isNotEmpty()) {
+-            truncated = if (truncateFromStart) {
+-                truncated.drop(1)
+-            } else {
+-                truncated.dropLast(1)
+-            }
+-        }
+-        return if (truncateFromStart) ellipsis + truncated else truncated + ellipsis
+-    }
+-}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionStrategy.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionStrategy.kt
+deleted file mode 100644
+index b81941b52..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionStrategy.kt
++++ /dev/null
+@@ -1,102 +0,0 @@
+-package ee.carlrobert.codegpt.ui.textarea
+-
+-import com.intellij.openapi.application.readAction
+-import com.intellij.openapi.components.service
+-import com.intellij.openapi.fileEditor.FileEditorManager
+-import com.intellij.openapi.project.Project
+-import com.intellij.openapi.roots.ContentIterator
+-import com.intellij.openapi.roots.ProjectFileIndex
+-import com.intellij.openapi.vfs.VirtualFile
+-import ee.carlrobert.codegpt.util.ResourceUtil
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.withContext
+-import java.io.File
+-import java.nio.file.Path
+-
+-interface SuggestionStrategy {
+-    suspend fun getSuggestions(project: Project, searchText: String? = null): List<SuggestionItem>
+-}
+-
+-class FileSuggestionStrategy : SuggestionStrategy {
+-    override suspend fun getSuggestions(
+-        project: Project,
+-        searchText: String?
+-    ): List<SuggestionItem> {
+-        if (searchText == null) {
+-            val projectFileIndex = project.service<ProjectFileIndex>()
+-            return readAction {
+-                project.service<FileEditorManager>().openFiles
+-                    .filter { projectFileIndex.isInContent(it) }
+-                    .take(10)
+-                    .map { SuggestionItem.FileItem(File(it.path)) }
+-            }
+-        }
+-        return project.service<FileSearchService>().searchFiles(searchText)
+-            .take(10)
+-            .map { SuggestionItem.FileItem(File(it)) }
+-    }
+-}
+-
+-class FolderSuggestionStrategy : SuggestionStrategy {
+-    private val projectFoldersCache = mutableMapOf<Project, List<String>>()
+-
+-    override suspend fun getSuggestions(
+-        project: Project,
+-        searchText: String?
+-    ): List<SuggestionItem> {
+-        if (searchText == null) {
+-            return getProjectFolders(project)
+-                .take(10)
+-                .map { SuggestionItem.FolderItem(Path.of(it).toFile()) }
+-        }
+-        return getProjectFolders(project)
+-            .filter { it.contains(searchText, ignoreCase = true) }
+-            .take(10)
+-            .map { SuggestionItem.FolderItem(Path.of(it).toFile()) }
+-    }
+-
+-    private suspend fun getProjectFolders(project: Project): List<String> {
+-        return projectFoldersCache.getOrPut(project) {
+-            findProjectFolders(project)
+-        }
+-    }
+-
+-    private suspend fun findProjectFolders(project: Project): List<String> =
+-        withContext(Dispatchers.IO) {
+-            val uniqueFolders = mutableSetOf<String>()
+-            val iterator = ContentIterator { file: VirtualFile ->
+-                if (file.isDirectory && !file.name.startsWith(".")) {
+-                    val folderPath = file.path
+-                    if (uniqueFolders.none { it.startsWith(folderPath) }) {
+-                        uniqueFolders.removeAll { it.startsWith(folderPath) }
+-                        uniqueFolders.add(folderPath)
+-                    }
+-                }
+-                true
+-            }
+-
+-            project.service<ProjectFileIndex>().iterateContent(iterator)
+-            uniqueFolders.toList()
+-        }
+-}
+-
+-class PersonaSuggestionStrategy : SuggestionStrategy {
+-    override suspend fun getSuggestions(
+-        project: Project,
+-        searchText: String?
+-    ): List<SuggestionItem> {
+-        if (searchText == null) {
+-            return ResourceUtil.getFilteredPersonaSuggestions(null)
+-        }
+-        return ResourceUtil.getFilteredPersonaSuggestions {
+-            it.name.contains(searchText, true)
+-        }
+-    }
+-}
+-
+-class DefaultSuggestionStrategy : SuggestionStrategy {
+-    override suspend fun getSuggestions(
+-        project: Project,
+-        searchText: String?
+-    ): List<SuggestionItem> = emptyList()
+-}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt
+deleted file mode 100644
+index 824369e8e..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionsPopupManager.kt
++++ /dev/null
+@@ -1,272 +0,0 @@
+-package ee.carlrobert.codegpt.ui.textarea
+-
+-import com.intellij.icons.AllIcons
+-import com.intellij.openapi.application.runInEdt
+-import com.intellij.openapi.components.service
+-import com.intellij.openapi.options.ShowSettingsUtil
+-import com.intellij.openapi.project.Project
+-import com.intellij.openapi.ui.popup.JBPopup
+-import com.intellij.openapi.ui.popup.JBPopupFactory
+-import com.intellij.openapi.vfs.VfsUtilCore
+-import com.intellij.openapi.vfs.VirtualFile
+-import com.intellij.openapi.vfs.VirtualFileManager
+-import com.intellij.openapi.vfs.VirtualFileVisitor
+-import com.intellij.ui.components.JBScrollPane
+-import com.intellij.ui.dsl.builder.panel
+-import com.intellij.ui.dsl.gridLayout.UnscaledGaps
+-import com.intellij.util.ui.JBUI
+-import com.intellij.vcsUtil.showAbove
+-import ee.carlrobert.codegpt.CodeGPTBundle
+-import ee.carlrobert.codegpt.settings.GeneralSettings
+-import ee.carlrobert.codegpt.settings.service.ServiceType
+-import ee.carlrobert.codegpt.settings.persona.PersonaDetails
+-import ee.carlrobert.codegpt.settings.persona.PersonaSettings
+-import ee.carlrobert.codegpt.settings.persona.PersonasConfigurable
+-import kotlinx.coroutines.Dispatchers
+-import kotlinx.coroutines.runBlocking
+-import kotlinx.coroutines.withContext
+-import java.awt.Dimension
+-import java.awt.Point
+-import java.io.File
+-import java.nio.file.Paths
+-import javax.swing.DefaultListModel
+-import javax.swing.Icon
+-import javax.swing.JComponent
+-import javax.swing.ScrollPaneConstants
+-import javax.swing.event.ListDataEvent
+-import javax.swing.event.ListDataListener
+-
+-enum class DefaultAction(
+-    val displayName: String,
+-    val code: String,
+-    val icon: Icon,
+-    val enabled: () -> Boolean = { true }
+-) {
+-    FILES("Files →", "file:", AllIcons.FileTypes.Any_type),
+-    FOLDERS("Folders →", "folder:", AllIcons.Nodes.Folder),
+-    PERSONAS("Personas →", "persona:", AllIcons.General.User),
+-    SEARCH_WEB("Web", "web", AllIcons.General.Web, {
+-        GeneralSettings.getSelectedService() == ServiceType.CODEGPT
+-    }),
+-    DOCS("Docs (coming soon) →", "docs:", AllIcons.Toolwindows.Documentation, {
+-        false
+-    }),
+-    CREATE_NEW_PERSONA("Create new persona", "", AllIcons.General.Add),
+-}
+-
+-sealed class SuggestionItem {
+-    data class FileItem(val file: File) : SuggestionItem()
+-    data class FolderItem(val folder: File) : SuggestionItem()
+-    data class ActionItem(val action: DefaultAction) : SuggestionItem()
+-    data class PersonaItem(val personaDetails: PersonaDetails) : SuggestionItem()
+-}
+-
+-val DEFAULT_ACTIONS = mutableListOf(
+-    SuggestionItem.ActionItem(DefaultAction.FILES),
+-    SuggestionItem.ActionItem(DefaultAction.FOLDERS),
+-    SuggestionItem.ActionItem(DefaultAction.PERSONAS),
+-    SuggestionItem.ActionItem(DefaultAction.SEARCH_WEB),
+-    SuggestionItem.ActionItem(DefaultAction.DOCS),
+-)
+-
+-class SuggestionsPopupManager(
+-    private val project: Project,
+-    private val textPane: CustomTextPane,
+-    private val onWebSearchIncluded: () -> Unit
+-) {
+-
+-    private var currentActionStrategy: SuggestionStrategy = DefaultSuggestionStrategy()
+-    private val appliedActions: MutableList<SuggestionItem.ActionItem> = mutableListOf()
+-    private var popup: JBPopup? = null
+-    private var originalLocation: Point? = null
+-    private val listModel = DefaultListModel<SuggestionItem>().apply {
+-        addListDataListener(object : ListDataListener {
+-            override fun intervalAdded(e: ListDataEvent) = adjustPopupSize()
+-            override fun intervalRemoved(e: ListDataEvent) {}
+-            override fun contentsChanged(e: ListDataEvent) {}
+-        })
+-    }
+-    private val list = SuggestionList(listModel, textPane) {
+-        when (it) {
+-            is SuggestionItem.ActionItem -> handleActionSelection(it)
+-            is SuggestionItem.FileItem -> handleFileSelection(it.file.path)
+-            is SuggestionItem.FolderItem -> handleFolderSelection(it.folder.path)
+-            is SuggestionItem.PersonaItem -> handlePersonaSelection(it.personaDetails)
+-        }
+-    }
+-    private val scrollPane: JBScrollPane = JBScrollPane(list).apply {
+-        border = JBUI.Borders.empty()
+-        verticalScrollBarPolicy = ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
+-        horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
+-    }
+-
+-    fun showPopup(component: JComponent) {
+-        popup = createPopup(component)
+-        popup?.showAbove(component)
+-        originalLocation = component.locationOnScreen
+-        reset(true)
+-        // TODO: Apply initial focus to the popup until a proper search mechanism is in place.
+-        requestFocus()
+-        selectNext()
+-    }
+-
+-    fun hidePopup() {
+-        popup?.cancel()
+-    }
+-
+-    fun isPopupVisible(): Boolean {
+-        return popup?.isVisible ?: false
+-    }
+-
+-    fun requestFocus() {
+-        list.requestFocus()
+-    }
+-
+-    fun selectNext() {
+-        list.selectNext()
+-    }
+-
+-    fun updateSuggestions(searchText: String? = null) {
+-        val suggestions = runBlocking {
+-            withContext(Dispatchers.Default) {
+-                currentActionStrategy.getSuggestions(project, searchText)
+-            }
+-        }
+-        runInEdt {
+-            listModel.clear()
+-            listModel.addAll(suggestions)
+-            list.revalidate()
+-            list.repaint()
+-        }
+-    }
+-
+-    fun reset(clearPrevious: Boolean = true) {
+-        if (clearPrevious) {
+-            listModel.clear()
+-        }
+-        listModel.addAll(DEFAULT_ACTIONS)
+-        popup?.content?.revalidate()
+-        popup?.content?.repaint()
+-    }
+-
+-    private fun handleActionSelection(item: SuggestionItem.ActionItem) {
+-        if (item.action == DefaultAction.CREATE_NEW_PERSONA) {
+-            hidePopup()
+-            service<ShowSettingsUtil>().showSettingsDialog(
+-                project,
+-                PersonasConfigurable::class.java
+-            )
+-            return
+-        }
+-        if (item.action == DefaultAction.SEARCH_WEB) {
+-            hidePopup()
+-            onWebSearchIncluded()
+-            textPane.appendHighlightedText(item.action.code, withWhitespace = true)
+-            return
+-        }
+-
+-        appliedActions.add(item)
+-        currentActionStrategy = when (item.action) {
+-            DefaultAction.FILES -> {
+-                FileSuggestionStrategy()
+-            }
+-
+-            DefaultAction.FOLDERS -> {
+-                FolderSuggestionStrategy()
+-            }
+-
+-            DefaultAction.PERSONAS -> {
+-                PersonaSuggestionStrategy()
+-            }
+-
+-            else -> {
+-                DefaultSuggestionStrategy()
+-            }
+-        }
+-        updateSuggestions()
+-        textPane.appendHighlightedText(item.action.code, withWhitespace = false)
+-        textPane.requestFocus()
+-    }
+-
+-    private fun handleFileSelection(filePath: String) {
+-        val selectedFile = service<VirtualFileManager>().findFileByNioPath(Paths.get(filePath))
+-        selectedFile?.let { file ->
+-            textPane.appendHighlightedText(file.name, ':')
+-            project.service<FileSearchService>().addFileToSession(file)
+-        }
+-        hidePopup()
+-    }
+-
+-    private fun handleFolderSelection(folderPath: String) {
+-        textPane.appendHighlightedText(folderPath, ':')
+-
+-        val folder = service<VirtualFileManager>().findFileByNioPath(Paths.get(folderPath))
+-        if (folder != null) {
+-            VfsUtilCore.visitChildrenRecursively(folder, object : VirtualFileVisitor<Any>() {
+-                override fun visitFile(file: VirtualFile): Boolean {
+-                    if (!file.isDirectory) {
+-                        project.service<FileSearchService>().addFileToSession(file)
+-                    }
+-                    return true
+-                }
+-            })
+-        }
+-
+-        hidePopup()
+-    }
+-
+-    private fun handlePersonaSelection(personaDetails: PersonaDetails) {
+-        service<PersonaSettings>().state.selectedPersona.apply {
+-            id = personaDetails.id
+-            name = personaDetails.name
+-            instructions = personaDetails.instructions
+-        }
+-        textPane.appendHighlightedText(personaDetails.name, ':')
+-        hidePopup()
+-    }
+-
+-    private fun adjustPopupSize() {
+-        val maxVisibleRows = 15
+-        val newRowCount = minOf(listModel.size(), maxVisibleRows)
+-        list.setVisibleRowCount(newRowCount)
+-        list.revalidate()
+-        list.repaint()
+-
+-        popup?.size = Dimension(list.preferredSize.width, list.preferredSize.height + 32)
+-
+-        originalLocation?.let { original ->
+-            val newY = original.y - list.preferredSize.height - 32
+-            popup?.setLocation(Point(original.x, maxOf(newY, 0)))
+-        }
+-    }
+-
+-    private fun createPopup(
+-        preferableFocusComponent: JComponent? = null,
+-    ): JBPopup {
+-        val popupPanel = panel {
+-            row { cell(scrollPane).customize(UnscaledGaps.EMPTY) }
+-            separator()
+-            row {
+-                text(CodeGPTBundle.get("shared.escToCancel"))
+-                    .customize(UnscaledGaps(left = 4))
+-                    .applyToComponent {
+-                        font = JBUI.Fonts.smallFont()
+-                    }
+-            }
+-        }
+-        return service<JBPopupFactory>()
+-            .createComponentPopupBuilder(popupPanel, preferableFocusComponent)
+-            .setMovable(true)
+-            .setCancelOnClickOutside(false)
+-            .setCancelOnWindowDeactivation(false)
+-            .setRequestFocus(true)
+-            .setMinSize(Dimension(480, 30))
+-            .setCancelCallback {
+-                originalLocation = null
+-                currentActionStrategy = DefaultSuggestionStrategy()
+-                true
+-            }
+-            .setResizable(true)
+-            .createPopup()
+-    }
+-}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt
+index c718d33bd..2808dd3a6 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/UserInputPanel.kt
+@@ -7,6 +7,7 @@ import com.intellij.openapi.actionSystem.AnActionEvent
+ import com.intellij.openapi.components.service
+ import com.intellij.openapi.observable.properties.AtomicBooleanProperty
+ import com.intellij.openapi.project.Project
++import com.intellij.openapi.util.TextRange
+ import com.intellij.ui.components.AnActionLink
+ import com.intellij.ui.dsl.builder.AlignX
+ import com.intellij.ui.dsl.builder.RightGap
+@@ -30,9 +31,11 @@ class UserInputPanel(
+     private val onStop: () -> Unit
+ ) : JPanel(BorderLayout()) {
+ 
+-    private val textPane = CustomTextPane { handleSubmit() }
++    private val highlightedTextRanges: MutableList<Pair<TextRange, Boolean>> = mutableListOf()
++
++    private val textPane = CustomTextPane(highlightedTextRanges) { handleSubmit(it) }
+         .apply {
+-            addKeyListener(CustomTextPaneKeyAdapter(project, this) {
++            addKeyListener(CustomTextPaneKeyAdapter(project, this, highlightedTextRanges) {
+                 webSearchIncluded = true
+             })
+         }
+@@ -44,7 +47,7 @@ class UserInputPanel(
+             Icons.Send
+         ) {
+             override fun actionPerformed(e: AnActionEvent) {
+-                handleSubmit()
++                handleSubmit(textPane.text)
+             }
+         }
+     )
+@@ -103,13 +106,10 @@ class UserInputPanel(
+ 
+     override fun getInsets(): Insets = JBUI.insets(4)
+ 
+-    private fun handleSubmit() {
+-        val text = textPane.text
+-            // TODO
+-            .replace("@web", "")
+-            .trim()
++    private fun handleSubmit(text: String) {
+         if (text.isNotEmpty()) {
+             onSubmit(text, webSearchIncluded)
++            highlightedTextRanges.clear()
+             textPane.text = ""
+         }
+     }
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionList.kt
+similarity index 90%
+rename from src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt
+rename to src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionList.kt
+index e8c18dde7..87eb2abff 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/SuggestionList.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionList.kt
+@@ -1,7 +1,10 @@
+-package ee.carlrobert.codegpt.ui.textarea
++package ee.carlrobert.codegpt.ui.textarea.suggestion
+ 
+ import com.intellij.ui.components.JBList
+ import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import ee.carlrobert.codegpt.ui.textarea.suggestion.item.SuggestionItem
++import ee.carlrobert.codegpt.ui.textarea.suggestion.renderer.SuggestionListCellRenderer
+ import java.awt.KeyboardFocusManager
+ import java.awt.event.KeyAdapter
+ import java.awt.event.KeyEvent
+@@ -58,7 +61,7 @@ class SuggestionList(
+ 
+     private fun handleEnterKey() {
+         val item = model.getElementAt(selectedIndex)
+-        if (item is SuggestionItem.ActionItem && item.action.enabled() || item !is SuggestionItem.ActionItem) {
++        if (item.enabled) {
+             onSelected(item)
+         }
+     }
+@@ -80,7 +83,7 @@ class SuggestionList(
+         val index = locationToIndex(e.point)
+         if (index >= 0) {
+             val item = model.getElementAt(index)
+-            if (item is SuggestionItem.ActionItem && item.action.enabled() || item !is SuggestionItem.ActionItem) {
++            if (item.enabled) {
+                 onSelected(item)
+             }
+             e.consume()
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupBuilder.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupBuilder.kt
+new file mode 100644
+index 000000000..94bb76a15
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupBuilder.kt
+@@ -0,0 +1,59 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion
++
++import com.intellij.openapi.components.service
++import com.intellij.openapi.ui.popup.JBPopup
++import com.intellij.openapi.ui.popup.JBPopupFactory
++import com.intellij.ui.components.JBScrollPane
++import com.intellij.ui.dsl.builder.panel
++import com.intellij.ui.dsl.gridLayout.UnscaledGaps
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.CodeGPTBundle
++import java.awt.Dimension
++import javax.swing.JComponent
++import javax.swing.ScrollPaneConstants
++
++class SuggestionsPopupBuilder {
++
++    private var preferableFocusComponent: JComponent? = null
++    private var onCancel: () -> Boolean = { true }
++
++    fun setPreferableFocusComponent(preferableFocusComponent: JComponent): SuggestionsPopupBuilder {
++        this.preferableFocusComponent = preferableFocusComponent
++        return this
++    }
++
++    fun setOnCancel(onCancel: () -> Boolean): SuggestionsPopupBuilder {
++        this.onCancel = onCancel
++        return this
++    }
++
++    fun build(list: SuggestionList): JBPopup {
++        val scrollPane = JBScrollPane(list).apply {
++            border = JBUI.Borders.empty()
++            verticalScrollBarPolicy = ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED
++            horizontalScrollBarPolicy = ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
++        }
++        val popupPanel = panel {
++            row { cell(scrollPane).customize(UnscaledGaps.EMPTY) }
++            separator()
++            row {
++                text(CodeGPTBundle.get("shared.escToCancel"))
++                    .customize(UnscaledGaps(left = 4))
++                    .applyToComponent {
++                        font = JBUI.Fonts.smallFont()
++                    }
++            }
++        }
++
++        return service<JBPopupFactory>()
++            .createComponentPopupBuilder(popupPanel, preferableFocusComponent)
++            .setMovable(true)
++            .setCancelOnClickOutside(false)
++            .setCancelOnWindowDeactivation(false)
++            .setRequestFocus(true)
++            .setMinSize(Dimension(480, 30))
++            .setCancelCallback(onCancel)
++            .setResizable(true)
++            .createPopup()
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupManager.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupManager.kt
+new file mode 100644
+index 000000000..63c8373d8
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/SuggestionsPopupManager.kt
+@@ -0,0 +1,127 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion
++
++import com.intellij.openapi.application.runInEdt
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.ui.popup.JBPopup
++import com.intellij.vcsUtil.showAbove
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import ee.carlrobert.codegpt.ui.textarea.suggestion.item.*
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withContext
++import java.awt.Dimension
++import java.awt.Point
++import javax.swing.DefaultListModel
++import javax.swing.JComponent
++import javax.swing.event.ListDataEvent
++import javax.swing.event.ListDataListener
++
++class SuggestionsPopupManager(
++    private val project: Project,
++    private val textPane: CustomTextPane,
++    onWebSearchIncluded: () -> Unit,
++) {
++
++    private var selectedActionGroup: SuggestionGroupItem? = null
++    private var popup: JBPopup? = null
++    private var originalLocation: Point? = null
++    private val listModel = DefaultListModel<SuggestionItem>().apply {
++        addListDataListener(object : ListDataListener {
++            override fun intervalAdded(e: ListDataEvent) = adjustPopupSize()
++            override fun intervalRemoved(e: ListDataEvent) {}
++            override fun contentsChanged(e: ListDataEvent) {}
++        })
++    }
++    private val list = SuggestionList(listModel, textPane) {
++        when (it) {
++            is SuggestionActionItem -> {
++                it.execute(project, textPane)
++                hidePopup()
++            }
++
++            is SuggestionGroupItem -> {
++                selectedActionGroup = it
++                updateSuggestions()
++                textPane.appendHighlightedText(it.groupPrefix, withWhitespace = false)
++                textPane.requestFocus()
++            }
++        }
++    }
++    private val defaultActions: MutableList<SuggestionItem> = mutableListOf(
++        FileSuggestionGroupItem(project),
++        FolderSuggestionGroupItem(project),
++        PersonaSuggestionGroupItem(),
++        DocumentationSuggestionGroupItem(),
++        WebSearchActionItem(onWebSearchIncluded),
++    )
++
++    fun showPopup(component: JComponent) {
++        popup = SuggestionsPopupBuilder()
++            .setPreferableFocusComponent(component)
++            .setOnCancel {
++                originalLocation = null
++                true
++            }
++            .build(list)
++        popup?.showAbove(component)
++        originalLocation = component.locationOnScreen
++        reset(true)
++        // TODO: Apply initial focus to the popup until a proper search mechanism is in place.
++        requestFocus()
++        selectNext()
++    }
++
++    fun hidePopup() {
++        popup?.cancel()
++    }
++
++    fun isPopupVisible(): Boolean {
++        return popup?.isVisible ?: false
++    }
++
++    fun requestFocus() {
++        list.requestFocus()
++    }
++
++    fun selectNext() {
++        list.selectNext()
++    }
++
++    fun updateSuggestions(searchText: String? = null) {
++        val suggestions = runBlocking {
++            withContext(Dispatchers.Default) {
++                selectedActionGroup?.getSuggestions(searchText) ?: emptyList()
++            }
++        }
++        runInEdt {
++            listModel.clear()
++            listModel.addAll(suggestions)
++            list.revalidate()
++            list.repaint()
++        }
++    }
++
++    fun reset(clearPrevious: Boolean = true) {
++        if (clearPrevious) {
++            listModel.clear()
++        }
++        listModel.addAll(defaultActions)
++        popup?.content?.revalidate()
++        popup?.content?.repaint()
++    }
++
++    private fun adjustPopupSize() {
++        val maxVisibleRows = 15
++        val newRowCount = minOf(listModel.size(), maxVisibleRows)
++        list.setVisibleRowCount(newRowCount)
++        list.revalidate()
++        list.repaint()
++
++        popup?.size = Dimension(list.preferredSize.width, list.preferredSize.height + 32)
++
++        originalLocation?.let { original ->
++            val newY = original.y - list.preferredSize.height - 32
++            popup?.setLocation(Point(original.x, maxOf(newY, 0)))
++        }
++    }
++}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionActionItems.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionActionItems.kt
+new file mode 100644
+index 000000000..1d33b2ea8
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionActionItems.kt
+@@ -0,0 +1,124 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.item
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.components.service
++import com.intellij.openapi.options.ShowSettingsUtil
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.vfs.VirtualFile
++import ee.carlrobert.codegpt.CodeGPTBundle
++import ee.carlrobert.codegpt.CodeGPTKeys
++import ee.carlrobert.codegpt.settings.GeneralSettings
++import ee.carlrobert.codegpt.settings.documentation.DocumentationsConfigurable
++import ee.carlrobert.codegpt.settings.persona.PersonaDetails
++import ee.carlrobert.codegpt.settings.persona.PersonaSettings
++import ee.carlrobert.codegpt.settings.persona.PersonasConfigurable
++import ee.carlrobert.codegpt.settings.service.ServiceType
++import ee.carlrobert.codegpt.ui.AddDocumentationDialog
++import ee.carlrobert.codegpt.ui.DocumentationDetails
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import ee.carlrobert.codegpt.ui.textarea.FileSearchService
++
++class FileActionItem(val file: VirtualFile) : SuggestionActionItem {
++    override val displayName = file.name
++    override val icon = file.fileType.icon ?: AllIcons.FileTypes.Any_type
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        project.getService(FileSearchService::class.java).addFileToSession(file)
++        textPane.appendHighlightedText(file.name, ':', replacement = false)
++    }
++}
++
++class FolderActionItem(val folder: VirtualFile) : SuggestionActionItem {
++    override val displayName = folder.name
++    override val icon = AllIcons.Nodes.Folder
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        val fileSearchService = project.service<FileSearchService>()
++        folder.children
++            .filter { !it.isDirectory }
++            .forEach { fileSearchService.addFileToSession(it) }
++        textPane.appendHighlightedText(folder.path, ':', replacement = false)
++    }
++}
++
++class PersonaActionItem(val personaDetails: PersonaDetails) : SuggestionActionItem {
++    override val displayName = personaDetails.name
++    override val icon = AllIcons.General.User
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        service<PersonaSettings>().state.selectedPersona.apply {
++            id = personaDetails.id
++            name = personaDetails.name
++            instructions = personaDetails.instructions
++        }
++        textPane.appendHighlightedText(personaDetails.name, ':')
++    }
++}
++
++class DocumentationActionItem(
++    val documentationDetails: DocumentationDetails
++) : SuggestionActionItem {
++    override val displayName = documentationDetails.name
++    override val icon = AllIcons.Toolwindows.Documentation
++    override val enabled = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        CodeGPTKeys.ADDED_DOCUMENTATION.set(project, documentationDetails)
++        textPane.appendHighlightedText(documentationDetails.name, ':')
++    }
++}
++
++class CreateDocumentationActionItem : SuggestionActionItem {
++    override val displayName: String =
++        CodeGPTBundle.get("suggestionActionItem.createDocumentation.displayName")
++    override val icon = AllIcons.General.Add
++    override val enabled = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        val addDocumentationDialog = AddDocumentationDialog(project)
++        if (addDocumentationDialog.showAndGet()) {
++            textPane.appendHighlightedText(
++                addDocumentationDialog.documentationDetails.name,
++                searchChar = ':',
++            )
++        }
++    }
++}
++
++class ViewAllDocumentationsActionItem : SuggestionActionItem {
++    override val displayName: String =
++        "${CodeGPTBundle.get("suggestionActionItem.viewDocumentations.displayName")} →"
++    override val icon = null
++    override val enabled = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        service<ShowSettingsUtil>().showSettingsDialog(
++            project,
++            DocumentationsConfigurable::class.java
++        )
++    }
++}
++
++class CreatePersonaActionItem : SuggestionActionItem {
++    override val displayName: String =
++        CodeGPTBundle.get("suggestionActionItem.createPersona.displayName")
++    override val icon = AllIcons.General.Add
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        service<ShowSettingsUtil>().showSettingsDialog(
++            project,
++            PersonasConfigurable::class.java
++        )
++    }
++}
++
++class WebSearchActionItem(private val onWebSearchIncluded: () -> Unit) : SuggestionActionItem {
++    override val displayName: String =
++        CodeGPTBundle.get("suggestionActionItem.webSearch.displayName")
++    override val icon = AllIcons.General.Web
++    override val enabled = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++    override fun execute(project: Project, textPane: CustomTextPane) {
++        onWebSearchIncluded()
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionGroupItems.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionGroupItems.kt
+new file mode 100644
+index 000000000..46e8e2aaa
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionGroupItems.kt
+@@ -0,0 +1,116 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.item
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.application.readAction
++import com.intellij.openapi.components.service
++import com.intellij.openapi.fileEditor.FileEditorManager
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.roots.ProjectFileIndex
++import com.intellij.openapi.vfs.VirtualFile
++import ee.carlrobert.codegpt.CodeGPTBundle
++import ee.carlrobert.codegpt.settings.GeneralSettings
++import ee.carlrobert.codegpt.settings.documentation.DocumentationSettings
++import ee.carlrobert.codegpt.settings.service.ServiceType
++import ee.carlrobert.codegpt.ui.DocumentationDetails
++import ee.carlrobert.codegpt.ui.textarea.FileSearchService
++import ee.carlrobert.codegpt.util.ResourceUtil.getDefaultPersonas
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++
++class FileSuggestionGroupItem(private val project: Project) : SuggestionGroupItem {
++    override val displayName: String = CodeGPTBundle.get("suggestionGroupItem.files.displayName")
++    override val groupPrefix = "file:"
++    override val icon = AllIcons.FileTypes.Any_type
++
++    override suspend fun getSuggestions(searchText: String?): List<SuggestionActionItem> {
++        if (searchText == null) {
++            val projectFileIndex = project.service<ProjectFileIndex>()
++            return readAction {
++                project.service<FileEditorManager>().openFiles
++                    .filter { projectFileIndex.isInContent(it) }
++                    .toFileSuggestions()
++            }
++        }
++        return project.service<FileSearchService>()
++            .searchFiles(searchText)
++            .toFileSuggestions()
++    }
++
++    private fun Iterable<VirtualFile>.toFileSuggestions() = take(10).map { FileActionItem(it) }
++}
++
++class FolderSuggestionGroupItem(private val project: Project) : SuggestionGroupItem {
++    private val projectFoldersCache = mutableMapOf<Project, List<VirtualFile>>()
++
++    override val displayName: String = CodeGPTBundle.get("suggestionGroupItem.folders.displayName")
++    override val groupPrefix = "folder:"
++    override val icon = AllIcons.Nodes.Folder
++
++    override suspend fun getSuggestions(searchText: String?): List<SuggestionActionItem> {
++        if (searchText == null) {
++            return getProjectFolders(project).toFolderSuggestions()
++        }
++        return getProjectFolders(project)
++            .filter { it.path.contains(searchText, ignoreCase = true) }
++            .toFolderSuggestions()
++    }
++
++    private fun Iterable<VirtualFile>.toFolderSuggestions() = take(10).map { FolderActionItem(it) }
++
++    private suspend fun getProjectFolders(project: Project) =
++        projectFoldersCache.getOrPut(project) { findProjectFolders(project) }
++
++    private suspend fun findProjectFolders(project: Project) = withContext(Dispatchers.IO) {
++        val folders = mutableSetOf<VirtualFile>()
++        project.service<ProjectFileIndex>().iterateContent { file: VirtualFile ->
++            if (file.isDirectory && !file.name.startsWith(".")) {
++                val folderPath = file.path
++                if (folders.none { it.path.startsWith(folderPath) }) {
++                    folders.removeAll { it.path.startsWith(folderPath) }
++                    folders.add(file)
++                }
++            }
++            true
++        }
++        folders.toList()
++    }
++}
++
++class PersonaSuggestionGroupItem : SuggestionGroupItem {
++    override val displayName: String = CodeGPTBundle.get("suggestionGroupItem.personas.displayName")
++    override val groupPrefix = "persona:"
++    override val icon = AllIcons.General.User
++
++    override suspend fun getSuggestions(searchText: String?): List<SuggestionActionItem> =
++        getDefaultPersonas()
++            .filter {
++                if (searchText.isNullOrEmpty()) {
++                    true
++                } else {
++                    it.name.contains(searchText, true)
++                }
++            }
++            .map { PersonaActionItem(it) }
++            .take(10) + listOf(CreatePersonaActionItem())
++}
++
++class DocumentationSuggestionGroupItem : SuggestionGroupItem {
++    override val displayName: String = CodeGPTBundle.get("suggestionGroupItem.docs.displayName")
++    override val groupPrefix = "doc:"
++    override val icon = AllIcons.Toolwindows.Documentation
++    override val enabled = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++    override suspend fun getSuggestions(searchText: String?): List<SuggestionActionItem> =
++        service<DocumentationSettings>().state.documentations
++            .take(10)
++            .filter {
++                if (searchText.isNullOrEmpty()) {
++                    true
++                } else {
++                    it.name?.contains(searchText, true) ?: false
++                }
++            }
++            .map {
++                DocumentationActionItem(DocumentationDetails(it.name ?: "", it.url ?: ""))
++            } + listOf(CreateDocumentationActionItem(), ViewAllDocumentationsActionItem())
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionItem.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionItem.kt
+new file mode 100644
+index 000000000..a83009c66
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/item/SuggestionItem.kt
+@@ -0,0 +1,22 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.item
++
++import com.intellij.openapi.project.Project
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import javax.swing.Icon
++
++interface SuggestionItem {
++    val displayName: String
++    val icon: Icon?
++    val enabled: Boolean
++        get() = true
++}
++
++interface SuggestionActionItem : SuggestionItem {
++    fun execute(project: Project, textPane: CustomTextPane)
++}
++
++interface SuggestionGroupItem : SuggestionItem {
++    val groupPrefix: String
++
++    suspend fun getSuggestions(searchText: String? = null): List<SuggestionItem>
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRenderer.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRenderer.kt
+new file mode 100644
+index 000000000..d28fccc7a
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRenderer.kt
+@@ -0,0 +1,158 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.renderer
++
++import com.intellij.icons.AllIcons
++import com.intellij.openapi.components.service
++import com.intellij.openapi.fileTypes.FileTypeManager
++import com.intellij.ui.JBColor
++import com.intellij.ui.dsl.builder.AlignX
++import com.intellij.ui.dsl.builder.panel
++import com.intellij.ui.dsl.gridLayout.UnscaledGaps
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.settings.persona.PersonaSettings
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import ee.carlrobert.codegpt.ui.textarea.suggestion.item.*
++import ee.carlrobert.codegpt.ui.textarea.suggestion.renderer.SuggestionItemRendererTextUtils.highlightSearchText
++import ee.carlrobert.codegpt.ui.textarea.suggestion.renderer.SuggestionItemRendererTextUtils.searchText
++import ee.carlrobert.codegpt.ui.textarea.suggestion.renderer.SuggestionItemRendererTextUtils.truncate
++import java.awt.image.BufferedImage
++import javax.swing.Icon
++import javax.swing.ImageIcon
++import javax.swing.JLabel
++import javax.swing.JPanel
++
++interface ItemRenderer {
++    fun render(component: JLabel, value: SuggestionItem): JPanel
++}
++
++abstract class BaseItemRenderer(private val textPane: CustomTextPane) : ItemRenderer {
++    protected fun createPanel(
++        label: JLabel,
++        icon: Icon,
++        title: String,
++        description: String?,
++        toolTipText: String?,
++        truncateFromStart: Boolean = false
++    ): JPanel {
++        val searchText = textPane.text.searchText()
++        label.apply {
++            this.icon = icon
++            iconTextGap = 4
++            text = searchText?.let { title.highlightSearchText(it) } ?: title
++        }
++
++        return panel {
++            row {
++                cell(label)
++                if (description != null) {
++                    text(description.truncate(480 - label.width - 32, truncateFromStart))
++                        .customize(UnscaledGaps(left = 8))
++                        .align(AlignX.RIGHT)
++                        .applyToComponent {
++                            font = JBUI.Fonts.smallFont()
++                            foreground = JBColor.gray
++                        }
++                }
++            }
++        }.apply {
++            this.toolTipText = toolTipText ?: description
++        }
++    }
++}
++
++class FileItemRenderer(textPane: CustomTextPane) : BaseItemRenderer(textPane) {
++    override fun render(component: JLabel, value: SuggestionItem): JPanel {
++        val item = value as FileActionItem
++        val icon =
++            if (item.file.isDirectory) AllIcons.Nodes.Folder else service<FileTypeManager>().getFileTypeByFileName(
++                item.file.name
++            ).icon
++        return createPanel(component, icon, item.file.name, item.file.path, null, true)
++    }
++}
++
++class FolderItemRenderer(textPane: CustomTextPane) : BaseItemRenderer(textPane) {
++    override fun render(component: JLabel, value: SuggestionItem): JPanel {
++        val item = value as FolderActionItem
++        return createPanel(
++            component,
++            item.icon,
++            item.displayName,
++            item.folder.path,
++            null,
++            true
++        )
++    }
++}
++
++class DefaultItemRenderer(textPane: CustomTextPane) : BaseItemRenderer(textPane) {
++    companion object {
++        private val EMPTY_ICON = ImageIcon(BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB))
++    }
++
++    override fun render(component: JLabel, value: SuggestionItem): JPanel {
++        val label = component.apply {
++            isEnabled = value.enabled
++        }
++        return createPanel(
++            label,
++            value.icon ?: EMPTY_ICON,
++            getTitle(value),
++            getDescription(value),
++            if (value.enabled) null else "This action can only be used with CodeGPT provider."
++        ).apply {
++            isEnabled = value.enabled
++        }
++    }
++
++    private fun getTitle(item: SuggestionItem) =
++        if (item is SuggestionGroupItem) {
++            "${item.displayName} →"
++        } else {
++            item.displayName
++        }
++
++    private fun getDescription(item: SuggestionItem) =
++        if (item is PersonaSuggestionGroupItem) {
++            service<PersonaSettings>().state.selectedPersona.name
++        } else {
++            null
++        }
++}
++
++class PersonaItemRenderer(textPane: CustomTextPane) : BaseItemRenderer(textPane) {
++    override fun render(component: JLabel, value: SuggestionItem): JPanel {
++        val item = value as PersonaActionItem
++        return createPanel(
++            component,
++            AllIcons.General.User,
++            item.displayName,
++            item.personaDetails.instructions,
++            null,
++        )
++    }
++}
++
++class DocumentationItemRenderer(textPane: CustomTextPane) : BaseItemRenderer(textPane) {
++    override fun render(component: JLabel, value: SuggestionItem): JPanel {
++        val item = value as DocumentationActionItem
++        return createPanel(
++            component,
++            AllIcons.Toolwindows.Documentation,
++            item.displayName,
++            item.documentationDetails.url,
++            null,
++        )
++    }
++}
++
++class RendererFactory(private val textPane: CustomTextPane) {
++    fun getRenderer(item: SuggestionItem): ItemRenderer {
++        return when (item) {
++            is FileActionItem -> FileItemRenderer(textPane)
++            is FolderActionItem -> FolderItemRenderer(textPane)
++            is PersonaActionItem -> PersonaItemRenderer(textPane)
++            is DocumentationActionItem -> DocumentationItemRenderer(textPane)
++            else -> DefaultItemRenderer(textPane)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRendererTextUtils.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRendererTextUtils.kt
+new file mode 100644
+index 000000000..63a527fe1
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionItemRendererTextUtils.kt
+@@ -0,0 +1,57 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.renderer
++
++import com.intellij.ui.ColorUtil
++import com.intellij.util.ui.JBUI
++import com.intellij.util.ui.JBUI.CurrentTheme.GotItTooltip
++import javax.swing.JLabel
++
++object SuggestionItemRendererTextUtils {
++
++    fun String.searchText(): String? {
++        val lastAtIndex = this.lastIndexOf('@')
++        if (lastAtIndex == -1) return null
++
++        val lastColonIndex = this.lastIndexOf(':')
++        if (lastColonIndex == -1) return null
++
++        return this.substring(lastColonIndex + 1).takeIf { it.isNotEmpty() }
++    }
++
++    fun String.truncate(maxWidth: Int, truncateFromStart: Boolean = false): String {
++        val fontMetrics = getFontMetrics(JBUI.Fonts.smallFont())
++        if (fontMetrics.stringWidth(this) <= maxWidth) return this
++
++        val ellipsis = "..."
++        var truncated = this
++        while (fontMetrics.stringWidth(ellipsis + truncated) > maxWidth && truncated.isNotEmpty()) {
++            truncated = if (truncateFromStart) {
++                truncated.drop(1)
++            } else {
++                truncated.dropLast(1)
++            }
++        }
++        return if (truncateFromStart) ellipsis + truncated else truncated + ellipsis
++    }
++
++    fun String.highlightSearchText(searchText: String): String {
++        val searchIndex = this.indexOf(searchText, ignoreCase = true)
++        if (searchIndex == -1) return this
++
++        val prefix = this.substring(0, searchIndex)
++        val highlight =
++            this.substring(
++                searchIndex,
++                (searchIndex + searchText.length).coerceAtMost(this.length)
++            )
++        val suffix = this.substring((searchIndex + searchText.length).coerceAtMost(this.length))
++
++        val foregroundHex = ColorUtil.toHex(GotItTooltip.codeForeground(true))
++        val backgroundHex = ColorUtil.toHex(GotItTooltip.codeBackground(true))
++
++        return "<html>$prefix<span style=\"color: $foregroundHex;background-color: $backgroundHex;\">$highlight</span>$suffix</html>"
++    }
++
++    private fun getFontMetrics(font: java.awt.Font) = JBUI.Fonts.smallFont().let {
++        JLabel().getFontMetrics(font)
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionListCellRenderer.kt b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionListCellRenderer.kt
+new file mode 100644
+index 000000000..737029f05
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/ui/textarea/suggestion/renderer/SuggestionListCellRenderer.kt
+@@ -0,0 +1,49 @@
++package ee.carlrobert.codegpt.ui.textarea.suggestion.renderer
++
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.ui.textarea.CustomTextPane
++import ee.carlrobert.codegpt.ui.textarea.suggestion.item.SuggestionItem
++import java.awt.Component
++import java.awt.Dimension
++import javax.swing.*
++
++class SuggestionListCellRenderer(textPane: CustomTextPane) : DefaultListCellRenderer() {
++    private val rendererFactory = RendererFactory(textPane)
++
++    override fun getListCellRendererComponent(
++        list: JList<*>?,
++        value: Any?,
++        index: Int,
++        isSelected: Boolean,
++        cellHasFocus: Boolean
++    ): Component =
++        super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus).apply {
++            setOpaque(false)
++        }.let { component ->
++            if (component is JLabel && value is SuggestionItem) {
++                rendererFactory.getRenderer(value)
++                    .render(component, value)
++                    .apply {
++                        setupPanelProperties(list, index, isSelected, cellHasFocus)
++                    }
++            } else {
++                component
++            }
++        }
++
++    private fun JPanel.setupPanelProperties(
++        list: JList<*>?,
++        index: Int,
++        isSelected: Boolean,
++        cellHasFocus: Boolean
++    ) {
++        preferredSize = Dimension(480, 30)
++        border = JBUI.Borders.empty(0, 4, 0, 4)
++
++        val isHovered = list?.getClientProperty("hoveredIndex") == index
++        if (isHovered || isSelected || cellHasFocus) {
++            background = UIManager.getColor("List.selectionBackground")
++            foreground = UIManager.getColor("List.selectionForeground")
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/util/ResourceUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/util/ResourceUtil.kt
+index c1c9d5aef..e3a7d80a5 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/util/ResourceUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/util/ResourceUtil.kt
+@@ -3,24 +3,10 @@ package ee.carlrobert.codegpt.util
+ import com.fasterxml.jackson.core.type.TypeReference
+ import com.fasterxml.jackson.databind.ObjectMapper
+ import ee.carlrobert.codegpt.settings.persona.PersonaDetails
+-import ee.carlrobert.codegpt.ui.textarea.DefaultAction
+-import ee.carlrobert.codegpt.ui.textarea.SuggestionItem
+ import ee.carlrobert.codegpt.util.file.FileUtil.getResourceContent
+ 
+ object ResourceUtil {
+ 
+-    fun getFilteredPersonaSuggestions(
+-        filterPredicate: ((PersonaDetails) -> Boolean)? = null
+-    ): List<SuggestionItem> {
+-        var personaDetails = getDefaultPersonas()
+-        if (filterPredicate != null) {
+-            personaDetails = personaDetails.filter(filterPredicate).toMutableList()
+-        }
+-        return personaDetails
+-            .map { SuggestionItem.PersonaItem(it) }
+-            .take(10) + listOf(SuggestionItem.ActionItem(DefaultAction.CREATE_NEW_PERSONA))
+-    }
+-
+     fun getDefaultPersonas(): MutableList<PersonaDetails> {
+         return ObjectMapper().readValue(
+             getResourceContent("/prompts.json"),
+diff --git a/src/main/resources/META-INF/plugin.xml b/src/main/resources/META-INF/plugin.xml
+index e23fd5581..f16ed341c 100644
+--- a/src/main/resources/META-INF/plugin.xml
++++ b/src/main/resources/META-INF/plugin.xml
+@@ -50,6 +50,8 @@
+             instance="ee.carlrobert.codegpt.settings.advanced.AdvancedSettingsConfigurable"/>
+         <applicationConfigurable id="settings.codegpt.personas" parentId="settings.codegpt" displayName="Personas"
+           instance="ee.carlrobert.codegpt.settings.persona.PersonasConfigurable"/>
++        <applicationConfigurable id="settings.codegpt.dcoumentations" parentId="settings.codegpt" displayName="Documentations"
++          instance="ee.carlrobert.codegpt.settings.documentation.DocumentationsConfigurable"/>
+         <applicationConfigurable
+           parentId="settings.codegpt"
+           instance="ee.carlrobert.codegpt.telemetry.ui.preferences.TelemetryConfigurable"
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index 9bb2c6526..b4a82d20f 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -163,7 +163,6 @@ dialog.tokenLimitExceeded.title=Token Limit Exceeded
+ dialog.tokenLimitExceeded.description=The maximum default token limit has been reached. Do you want to proceed with the conversation despite the higher messaging cost?
+ dialog.tokenSoftLimitExceeded.title=Soft Limit Exceeded
+ dialog.tokenSoftLimitExceeded.description=Warning: The 'git diff' output contains %d tokens, indicating a substantial amount of changes. Are you sure you want to continue?
+-dialog.cancel=Cancel
+ dialog.continue=Continue
+ editor.diff.title=CodeGPT Diff
+ editor.diff.local.content.title=CodeGPT suggested code
+@@ -217,6 +216,8 @@ shared.promptTemplate=Prompt template:
+ shared.infillPromptTemplate=Infill template:
+ shared.apiVersion=API version:
+ shared.escToCancel=Esc to cancel
++shared.cancel=Cancel
++shared.confirm=Confirm
+ shared.configuration=Configuration
+ shared.port=Port:
+ shared.discard=Discard
+@@ -247,4 +248,18 @@ smartTextPane.submitButton.title=Send Message
+ smartTextPane.submitButton.description=Send message
+ smartTextPane.stopButton.title=Stop
+ smartTextPane.stopButton.description=Stop completion
+-chatMessageResponseBody.webPagesTitle=WEB PAGES
+\ No newline at end of file
++chatMessageResponseBody.webPagesTitle=WEB PAGES
++addDocumentation.popup.title=Add Documentation
++addDocumentation.popup.form.name.label=Name:
++addDocumentation.popup.form.url.label=URL:
++addDocumentation.popup.form.url.comment=Enter the full web address of the documentation.
++addDocumentation.popup.form.saveCheckbox.label=Save for future reference
++userMessagePanel.documentation.title=DOCUMENTATION
++suggestionGroupItem.files.displayName=Files
++suggestionGroupItem.folders.displayName=Folders
++suggestionGroupItem.personas.displayName=Personas
++suggestionGroupItem.docs.displayName=Docs
++suggestionActionItem.webSearch.displayName=Web
++suggestionActionItem.viewDocumentations.displayName=View all
++suggestionActionItem.createPersona.displayName=Create new persona
++suggestionActionItem.createDocumentation.displayName=Create new documentation
+\ No newline at end of file

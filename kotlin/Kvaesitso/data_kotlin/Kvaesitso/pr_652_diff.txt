@@ -1,0 +1,149 @@
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreen.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreen.kt
+index 8f51ebb4d..9b74ea494 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreen.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreen.kt
+@@ -9,6 +9,7 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.res.stringResource
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.lifecycle.viewmodel.compose.viewModel
++import de.mm20.launcher2.ktx.isAtLeastApiLevel
+ import de.mm20.launcher2.preferences.ColorScheme
+ import de.mm20.launcher2.preferences.Font
+ import de.mm20.launcher2.ui.R
+@@ -16,6 +17,7 @@ import de.mm20.launcher2.ui.component.preferences.ListPreference
+ import de.mm20.launcher2.ui.component.preferences.Preference
+ import de.mm20.launcher2.ui.component.preferences.PreferenceCategory
+ import de.mm20.launcher2.ui.component.preferences.PreferenceScreen
++import de.mm20.launcher2.ui.component.preferences.SwitchPreference
+ import de.mm20.launcher2.ui.component.preferences.value
+ import de.mm20.launcher2.ui.locals.LocalNavController
+ import de.mm20.launcher2.ui.theme.getTypography
+@@ -50,6 +52,17 @@ fun AppearanceSettingsScreen() {
+                         navController?.navigate("settings/appearance/themes")
+                     }
+                 )
++                if (isAtLeastApiLevel(31)) {
++                    val compatModeColors by viewModel.compatModeColors.collectAsState()
++                    SwitchPreference(
++                        title = stringResource(id = R.string.preference_force_compat_system_colors),
++                        summary = stringResource(id = R.string.preference_force_compat_system_colors_summary),
++                        value = compatModeColors,
++                        onValueChanged = {
++                            viewModel.setCompatModeColors(it)
++                        }
++                    )
++                }
+                 val font by viewModel.font.collectAsState()
+                 ListPreference(
+                     title = stringResource(R.string.preference_font),
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreenVM.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreenVM.kt
+index 697980231..4ffa4c732 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreenVM.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/appearance/AppearanceSettingsScreenVM.kt
+@@ -33,6 +33,12 @@ class AppearanceSettingsScreenVM : ViewModel(), KoinComponent {
+         }
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
+ 
++    val compatModeColors = uiSettings.compatModeColors
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), false)
++
++    fun setCompatModeColors(enabled: Boolean) {
++        uiSettings.setCompatModeColors(enabled)
++    }
+ 
+     val font = uiSettings.font
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/theme/colorscheme/Custom.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/theme/colorscheme/Custom.kt
+index fb89602bc..a0d018d8c 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/theme/colorscheme/Custom.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/theme/colorscheme/Custom.kt
+@@ -3,12 +3,16 @@ package de.mm20.launcher2.ui.theme.colorscheme
+ import android.os.Build
+ import androidx.compose.material3.ColorScheme
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.toArgb
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.core.content.ContextCompat
++import androidx.datastore.core.DataStore
+ import de.mm20.launcher2.preferences.LegacySettings
++import de.mm20.launcher2.preferences.ui.UiSettings
+ import de.mm20.launcher2.themes.CorePalette
+ import de.mm20.launcher2.themes.DefaultDarkColorScheme
+ import de.mm20.launcher2.themes.DefaultLightColorScheme
+@@ -18,6 +22,9 @@ import de.mm20.launcher2.themes.Theme
+ import de.mm20.launcher2.themes.get
+ import de.mm20.launcher2.themes.merge
+ import de.mm20.launcher2.ui.locals.LocalWallpaperColors
++import kotlinx.coroutines.flow.map
++import org.koin.androidx.compose.inject
++import org.koin.core.component.inject
+ 
+ @Composable
+ fun lightColorSchemeOf(theme: Theme): ColorScheme {
+@@ -77,8 +84,13 @@ fun colorSchemeOf(colorScheme: FullColorScheme, corePalette: PartialCorePalette)
+ 
+ @Composable
+ fun systemCorePalette(): CorePalette<Int> {
+-    val context = LocalContext.current
+-    if (Build.VERSION.SDK_INT >= 31) {
++    val uiSettings: UiSettings by inject()
++    val compatModeColors by remember {
++        uiSettings.compatModeColors
++    }.collectAsState(false)
++
++    if (Build.VERSION.SDK_INT >= 31 && !compatModeColors) {
++        val context = LocalContext.current
+         return CorePalette(
+             primary = ContextCompat.getColor(context, android.R.color.system_accent1_500),
+             secondary = ContextCompat.getColor(context, android.R.color.system_accent2_500),
+diff --git a/core/i18n/src/main/res/values/strings.xml b/core/i18n/src/main/res/values/strings.xml
+index a4ec25518..ab70c2b6e 100644
+--- a/core/i18n/src/main/res/values/strings.xml
++++ b/core/i18n/src/main/res/values/strings.xml
+@@ -447,6 +447,8 @@
+     <string name="preference_colors_auto_generate">Generate from primary color</string>
+     <string name="preference_category_custom_colors_light">Light color scheme</string>
+     <string name="preference_category_custom_colors_dark">Dark color scheme</string>
++    <string name="preference_force_compat_system_colors">Ignore system colors</string>
++    <string name="preference_force_compat_system_colors_summary">Request color scheme via Material You Compat</string>
+     <string name="preference_font">Font</string>
+     <string name="preference_font_system">System default</string>
+     <string name="preference_screen_about">About</string>
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+index e78862045..f00889063 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+@@ -11,6 +11,7 @@ data class LauncherSettingsData(
+ 
+     val uiColorScheme: ColorScheme = ColorScheme.System,
+     val uiTheme: ThemeDescriptor = ThemeDescriptor.Default,
++    val uiCompatModeColors: Boolean = false,
+     val uiFont: Font = Font.Outfit,
+     val uiBaseLayout: BaseLayout = BaseLayout.PullDown,
+     val uiOrientation: ScreenOrientation = ScreenOrientation.Auto,
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/UiSettings.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/UiSettings.kt
+index 76707e150..3d6e0162c 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/UiSettings.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/UiSettings.kt
+@@ -144,6 +144,17 @@ class UiSettings internal constructor(
+             it.uiColorScheme
+         }.distinctUntilChanged()
+ 
++    val compatModeColors
++        get() = launcherDataStore.data.map {
++            it.uiCompatModeColors
++        }.distinctUntilChanged()
++
++    fun setCompatModeColors(enabled: Boolean) {
++        launcherDataStore.update {
++            it.copy(uiCompatModeColors = enabled)
++        }
++    }
++
+     val statusBarColor
+         get() = launcherDataStore.data.map {
+             it.systemBarsStatusColors

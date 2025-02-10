@@ -1,0 +1,178 @@
+diff --git a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
+index 6313db077..d147ce0ae 100644
+--- a/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
++++ b/src/main/java/ee/carlrobert/codegpt/settings/service/llama/form/LlamaSettingsForm.java
+@@ -22,6 +22,7 @@ public LlamaSettingsForm(LlamaSettingsState settings) {
+     llamaRequestPreferencesForm = new LlamaRequestPreferencesForm(settings);
+     codeCompletionConfigurationForm = new CodeCompletionConfigurationForm(
+         settings.isCodeCompletionsEnabled(),
++        null,
+         null);
+     init();
+   }
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/CodeCompletionRequestFactory.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/CodeCompletionRequestFactory.kt
+index f71d45704..95df8fc89 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/CodeCompletionRequestFactory.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/CodeCompletionRequestFactory.kt
+@@ -118,18 +118,24 @@ object CodeCompletionRequestFactory {
+     fun buildOllamaRequest(details: InfillRequest): OllamaCompletionRequest {
+         val settings = service<OllamaSettings>().state
+         val stopTokens = buildList {
+-            if (settings.fimTemplate.stopTokens != null) addAll(settings.fimTemplate.stopTokens!!)
+             if (details.stopTokens.isNotEmpty()) addAll(details.stopTokens)
+-        }.ifEmpty { null }
++        }.toMutableList()
++        val prompt = if (settings.fimOverride) {
++            settings.fimTemplate.stopTokens?.let { stopTokens.addAll(it) }
++            settings.fimTemplate.buildPrompt(details)
++        } else {
++            details.prefix
++        }
+ 
+         return OllamaCompletionRequest.Builder(
+             settings.model,
+-            settings.fimTemplate.buildPrompt(details)
++            prompt
+         )
++            .setSuffix(if (settings.fimOverride) null else details.suffix)
+             .setStream(true)
+             .setOptions(
+                 OllamaParameters.Builder()
+-                    .stop(stopTokens)
++                    .stop(stopTokens.ifEmpty { null })
+                     .numPredict(MAX_TOKENS)
+                     .temperature(0.4)
+                     .build()
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/CodeCompletionConfigurationForm.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/CodeCompletionConfigurationForm.kt
+index 3def827a5..90149c59a 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/CodeCompletionConfigurationForm.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/CodeCompletionConfigurationForm.kt
+@@ -6,6 +6,7 @@ import com.intellij.openapi.ui.ComboBox
+ import com.intellij.ui.EnumComboBoxModel
+ import com.intellij.ui.components.JBCheckBox
+ import com.intellij.ui.components.JBLabel
++import com.intellij.ui.dsl.builder.panel
+ import com.intellij.util.ui.FormBuilder
+ import ee.carlrobert.codegpt.CodeGPTBundle
+ import ee.carlrobert.codegpt.codecompletions.InfillPromptTemplate
+@@ -17,6 +18,7 @@ import javax.swing.JPanel
+ 
+ class CodeCompletionConfigurationForm(
+     codeCompletionsEnabled: Boolean,
++    fimOverride: Boolean?,
+     fimTemplate: InfillPromptTemplate?
+ ) {
+ 
+@@ -27,19 +29,32 @@ class CodeCompletionConfigurationForm(
+     private val promptTemplateComboBox =
+         ComboBox(EnumComboBoxModel(InfillPromptTemplate::class.java)).apply {
+             item = fimTemplate
++            isEnabled = fimOverride == null || fimOverride == false
+             addItemListener {
+                 updatePromptTemplateHelpTooltip(it.item as InfillPromptTemplate)
+             }
+         }
+     private val promptTemplateHelpText = JBLabel(General.ContextHelp)
++    private val fimOverrideCheckbox = JBCheckBox(
++        CodeGPTBundle.get("codeCompletionsForm.overrideFimTemplate.label"),
++        fimOverride ?: false
++    )
+ 
+     fun getForm(): JPanel {
+         val formBuilder = FormBuilder.createFormBuilder()
+             .addComponent(codeCompletionsEnabledCheckBox)
+         if (fimTemplate != null) {
++            formBuilder.addComponent(panel {
++                row {
++                    cell(fimOverrideCheckbox)
++                        .visible(fimOverride != null)
++                        .onChanged { promptTemplateComboBox.isEnabled = !it.isSelected }
++                        .comment(CodeGPTBundle.get("codeCompletionsForm.overrideFimTemplate.description"))
++                }
++            })
+             formBuilder.addVerticalGap(4)
+                 .addLabeledComponent(
+-                    "FIM template:",
++                    CodeGPTBundle.get("codeCompletionsForm.selectFimTemplate"),
+                     JPanel(FlowLayout(FlowLayout.LEADING, 0, 0)).apply {
+                         add(promptTemplateComboBox)
+                         add(Box.createHorizontalStrut(4))
+@@ -61,6 +76,14 @@ class CodeCompletionConfigurationForm(
+             promptTemplateComboBox.item = template
+         }
+ 
++    var fimOverride: Boolean?
++        get() = fimOverrideCheckbox.isSelected
++        set(value) {
++            if (value != null) {
++                fimOverrideCheckbox.isSelected = value
++            }
++        }
++
+     private fun updatePromptTemplateHelpTooltip(template: InfillPromptTemplate) {
+         promptTemplateHelpText.setToolTipText(null)
+ 
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettings.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettings.kt
+index cf0cdb298..e7321f4da 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettings.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettings.kt
+@@ -14,6 +14,7 @@ class OllamaSettingsState : BaseState() {
+     var host by string("http://localhost:11434")
+     var model by string()
+     var codeCompletionsEnabled by property(false)
+-    var fimTemplate by enum<InfillPromptTemplate>(InfillPromptTemplate.CODE_LLAMA)
++    var fimOverride by property(true)
++    var fimTemplate by enum<InfillPromptTemplate>(InfillPromptTemplate.CODE_QWEN_2_5)
+     var availableModels by list<String>()
+ }
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettingsForm.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettingsForm.kt
+index b2e3b5331..5956c9a9c 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettingsForm.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/service/ollama/OllamaSettingsForm.kt
+@@ -51,6 +51,7 @@ class OllamaSettingsForm {
+         val settings = service<OllamaSettings>().state
+         codeCompletionConfigurationForm = CodeCompletionConfigurationForm(
+             settings.codeCompletionsEnabled,
++            settings.fimOverride,
+             settings.fimTemplate
+         )
+         val emptyModelsComboBoxModel =
+@@ -123,6 +124,7 @@ class OllamaSettingsForm {
+             modelComboBox.item = model ?: ""
+             codeCompletionConfigurationForm.isCodeCompletionsEnabled = codeCompletionsEnabled
+             codeCompletionConfigurationForm.fimTemplate = fimTemplate
++            codeCompletionConfigurationForm.fimOverride != fimOverride
+         }
+         apiKeyField.text = getCredential(OLLAMA_API_KEY)
+     }
+@@ -133,6 +135,7 @@ class OllamaSettingsForm {
+             model = modelComboBox.item
+             codeCompletionsEnabled = codeCompletionConfigurationForm.isCodeCompletionsEnabled
+             fimTemplate = codeCompletionConfigurationForm.fimTemplate!!
++            fimOverride = codeCompletionConfigurationForm.fimOverride ?: false
+         }
+         setCredential(OLLAMA_API_KEY, getApiKey())
+     }
+@@ -142,6 +145,7 @@ class OllamaSettingsForm {
+                 || (modelComboBox.item != model && modelComboBox.isEnabled)
+                 || codeCompletionConfigurationForm.isCodeCompletionsEnabled != codeCompletionsEnabled
+                 || codeCompletionConfigurationForm.fimTemplate != fimTemplate
++                || codeCompletionConfigurationForm.fimOverride != fimOverride
+                 || getApiKey() != getCredential(OLLAMA_API_KEY)
+     }
+ 
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index 78171c7ef..9e16c10b3 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -252,6 +252,9 @@ shared.chatCompletions=Chat Completions
+ shared.codeCompletions=Code Completions
+ codeCompletionsForm.enableFeatureText=Enable code completions
+ codeCompletionsForm.parseResponseAsChatCompletions=Parse response as Chat Completions
++codeCompletionsForm.overrideFimTemplate.label=Use built-in FIM template
++codeCompletionsForm.overrideFimTemplate.description=If checked, Ollama will automatically detect the corresponding FIM template for the selected model.
++codeCompletionsForm.selectFimTemplate=FIM template:
+ codeCompletionsForm.maxTokensLabel=Max tokens:
+ codeCompletionsForm.maxTokensComment=The maximum number of tokens that will be generated in the code completion.
+ editCodePopover.title=Edit Code

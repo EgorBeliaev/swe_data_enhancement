@@ -1,0 +1,382 @@
+diff --git a/src/org/thoughtcrime/securesms/camera/Camera1Controller.java b/src/org/thoughtcrime/securesms/camera/Camera1Controller.java
+index b5ddc8c723e..b680f0b0332 100644
+--- a/src/org/thoughtcrime/securesms/camera/Camera1Controller.java
++++ b/src/org/thoughtcrime/securesms/camera/Camera1Controller.java
+@@ -7,7 +7,6 @@
+ 
+ import org.thoughtcrime.securesms.logging.Log;
+ 
+-import java.io.IOException;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
+@@ -16,6 +15,9 @@ public class Camera1Controller {
+ 
+   private static final String TAG = Camera1Controller.class.getSimpleName();
+ 
++  private final int screenWidth;
++  private final int screenHeight;
++
+   private Camera               camera;
+   private int                  cameraId;
+   private OrderEnforcer<Stage> enforcer;
+@@ -23,10 +25,12 @@ public class Camera1Controller {
+   private SurfaceTexture       previewSurface;
+   private int                  screenRotation;
+ 
+-  public Camera1Controller(int preferredDirection, @NonNull EventListener eventListener) {
++  public Camera1Controller(int preferredDirection, int screenWidth, int screenHeight, @NonNull EventListener eventListener) {
+     this.eventListener = eventListener;
+     this.enforcer      = new OrderEnforcer<>(Stage.INITIALIZED, Stage.PREVIEW_STARTED);
+     this.cameraId      = Camera.getNumberOfCameras() > 1  ? preferredDirection : Camera.CameraInfo.CAMERA_FACING_BACK;
++    this.screenWidth   = screenWidth;
++    this.screenHeight  = screenHeight;
+   }
+ 
+   public void initialize() {
+@@ -49,11 +53,18 @@ public void initialize() {
+       return;
+     }
+ 
+-    Camera.Parameters  params     = camera.getParameters();
+-    Camera.Size        maxSize    = getMaxSupportedPreviewSize(camera);
+-    final List<String> focusModes = params.getSupportedFocusModes();
++    Camera.Parameters  params      = camera.getParameters();
++    Camera.Size        previewSize = getClosestSize(camera.getParameters().getSupportedPreviewSizes(), screenWidth, screenHeight);
++    Camera.Size        pictureSize = getClosestSize(camera.getParameters().getSupportedPictureSizes(), screenWidth, screenHeight);
++    final List<String> focusModes  = params.getSupportedFocusModes();
++
++    Log.d(TAG, "Preview size: " + previewSize.width + "x" + previewSize.height + "  Picture size: " + pictureSize.width + "x" + pictureSize.height);
+ 
+-    params.setPreviewSize(maxSize.width, maxSize.height);
++    params.setPreviewSize(previewSize.width, previewSize.height);
++    params.setPictureSize(pictureSize.width, pictureSize.height);
++    params.setFlashMode(Camera.Parameters.FLASH_MODE_OFF);
++    params.setColorEffect(Camera.Parameters.EFFECT_NONE);
++    params.setWhiteBalance(Camera.Parameters.WHITE_BALANCE_AUTO);
+ 
+     if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
+       params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE);
+@@ -61,6 +72,7 @@ public void initialize() {
+       params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+     }
+ 
++
+     camera.setParameters(params);
+ 
+     enforcer.markCompleted(Stage.INITIALIZED);
+@@ -96,6 +108,14 @@ public void linkSurface(@NonNull SurfaceTexture surfaceTexture) {
+     });
+   }
+ 
++  public void capture(@NonNull CaptureCallback callback) {
++    enforcer.run(Stage.PREVIEW_STARTED, () -> {
++      camera.takePicture(null, null, null, (data, camera) -> {
++        callback.onCaptureAvailable(data, cameraId == Camera.CameraInfo.CAMERA_FACING_FRONT);
++      });
++    });
++  }
++
+   public int flip() {
+     Log.d(TAG, "flip()");
+     SurfaceTexture surfaceTexture = previewSurface;
+@@ -115,13 +135,15 @@ public void setScreenRotation(int screenRotation) {
+       Log.d(TAG, "setScreenRotation(" + screenRotation + ") executing");
+       this.screenRotation = screenRotation;
+ 
+-      int rotation = getCameraRotationForScreen(screenRotation);
+-      camera.setDisplayOrientation(rotation);
++      int previewRotation = getPreviewRotation(screenRotation);
++      int outputRotation  = getOutputRotation(screenRotation);
+ 
+-      Log.d(TAG, "Set camera rotation to: " + rotation);
++      Log.d(TAG, "Preview rotation: " + previewRotation + "  Output rotation: " + outputRotation);
++
++      camera.setDisplayOrientation(previewRotation);
+ 
+       Camera.Parameters params = camera.getParameters();
+-      params.setRotation(rotation);
++      params.setRotation(outputRotation);
+       camera.setParameters(params);
+     });
+   }
+@@ -136,33 +158,58 @@ private Properties getProperties() {
+     return new Properties(Camera.getNumberOfCameras(), previewSize.width, previewSize.height);
+   }
+ 
+-  private Camera.Size getMaxSupportedPreviewSize(Camera camera) {
+-    List<Camera.Size> cameraSizes = camera.getParameters().getSupportedPreviewSizes();
+-    Collections.sort(cameraSizes, DESC_SIZE_COMPARATOR);
+-    return cameraSizes.get(0);
++  private Camera.Size getClosestSize(List<Camera.Size> sizes, int width, int height) {
++    Collections.sort(sizes, ASC_SIZE_COMPARATOR);
++
++    int i = 0;
++    while (i < sizes.size() && (sizes.get(i).width * sizes.get(i).height) < (width * height)) {
++      i++;
++    }
++
++    return sizes.get(Math.min(i, sizes.size() - 1));
+   }
+ 
+-  private int getCameraRotationForScreen(int screenRotation) {
+-    int degrees = 0;
++  private int getOutputRotation(int displayRotationCode) {
++    int degrees = convertRotationToDegrees(displayRotationCode);
+ 
+-    switch (screenRotation) {
+-      case Surface.ROTATION_0:   degrees = 0;   break;
+-      case Surface.ROTATION_90:  degrees = 90;  break;
+-      case Surface.ROTATION_180: degrees = 180; break;
+-      case Surface.ROTATION_270: degrees = 270; break;
++    Camera.CameraInfo info = new Camera.CameraInfo();
++    Camera.getCameraInfo(cameraId, info);
++
++    if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
++      return (info.orientation + degrees) % 360;
++    } else {
++      return (info.orientation - degrees + 360) % 360;
+     }
++  }
++
++  private int getPreviewRotation(int displayRotationCode) {
++    int degrees = convertRotationToDegrees(displayRotationCode);
+ 
+     Camera.CameraInfo info = new Camera.CameraInfo();
+     Camera.getCameraInfo(cameraId, info);
+ 
++    int result;
+     if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
+-      return (360 - ((info.orientation + degrees) % 360)) % 360;
++      result = (info.orientation + degrees) % 360;
++      result = (360 - result) % 360;
+     } else {
+-      return (info.orientation - degrees + 360) % 360;
++      result = (info.orientation - degrees + 360) % 360;
+     }
++
++    return result;
+   }
+ 
+-  private final Comparator<Camera.Size> DESC_SIZE_COMPARATOR = (o1, o2) -> Integer.compare(o2.width * o2.height, o1.width * o1.height);
++  private int convertRotationToDegrees(int screenRotation) {
++    switch (screenRotation) {
++      case Surface.ROTATION_0:   return 0;
++      case Surface.ROTATION_90:  return 90;
++      case Surface.ROTATION_180: return 180;
++      case Surface.ROTATION_270: return 270;
++    }
++    return 0;
++  }
++
++  private final Comparator<Camera.Size> ASC_SIZE_COMPARATOR = (o1, o2) -> Integer.compare(o1.width * o1.height, o2.width * o2.height);
+ 
+   private enum Stage {
+     INITIALIZED, PREVIEW_STARTED
+@@ -194,7 +241,7 @@ public int getPreviewHeight() {
+ 
+     @Override
+     public String toString() {
+-      return "cameraCount: " + camera + "  previewWidth: " + previewWidth + "  previewHeight: " + previewHeight;
++      return "cameraCount: " + cameraCount + "  previewWidth: " + previewWidth + "  previewHeight: " + previewHeight;
+     }
+   }
+ 
+@@ -202,4 +249,8 @@ interface EventListener {
+     void onPropertiesAvailable(@NonNull Properties properties);
+     void onCameraUnavailable();
+   }
++
++  interface CaptureCallback {
++    void onCaptureAvailable(@NonNull byte[] jpegData, boolean frontFacing);
++  }
+ }
+diff --git a/src/org/thoughtcrime/securesms/camera/Camera1Fragment.java b/src/org/thoughtcrime/securesms/camera/Camera1Fragment.java
+index c8000088e4a..0a0c7dfde6d 100644
+--- a/src/org/thoughtcrime/securesms/camera/Camera1Fragment.java
++++ b/src/org/thoughtcrime/securesms/camera/Camera1Fragment.java
+@@ -1,35 +1,43 @@
+ package org.thoughtcrime.securesms.camera;
+ 
+ import android.annotation.SuppressLint;
+-import android.annotation.TargetApi;
+ import android.content.res.Configuration;
+ import android.graphics.Bitmap;
+ import android.graphics.Matrix;
++import android.graphics.Point;
+ import android.graphics.PointF;
+ import android.graphics.SurfaceTexture;
++import android.graphics.drawable.Drawable;
+ import android.hardware.Camera;
+-import android.media.MediaActionSound;
+-import android.os.Build;
+ import android.os.Bundle;
+ import android.support.annotation.NonNull;
+ import android.support.annotation.Nullable;
+ import android.support.v4.app.Fragment;
++import android.view.Display;
+ import android.view.GestureDetector;
+ import android.view.LayoutInflater;
+ import android.view.MotionEvent;
+ import android.view.TextureView;
+ import android.view.View;
+ import android.view.ViewGroup;
++import android.view.WindowManager;
+ import android.view.animation.Animation;
+ import android.view.animation.AnimationUtils;
+ import android.widget.Button;
+ import android.widget.ImageButton;
+ 
++import com.bumptech.glide.load.MultiTransformation;
++import com.bumptech.glide.load.Transformation;
++import com.bumptech.glide.load.resource.bitmap.CenterCrop;
++import com.bumptech.glide.request.target.SimpleTarget;
++import com.bumptech.glide.request.transition.Transition;
++
+ import org.thoughtcrime.securesms.R;
+ import org.thoughtcrime.securesms.logging.Log;
++import org.thoughtcrime.securesms.mms.GlideApp;
++import org.thoughtcrime.securesms.util.ServiceUtil;
+ import org.thoughtcrime.securesms.util.Stopwatch;
+ import org.thoughtcrime.securesms.util.TextSecurePreferences;
+-import org.thoughtcrime.securesms.util.concurrent.LifecycleBoundTask;
+ 
+ import java.io.ByteArrayOutputStream;
+ 
+@@ -59,8 +67,14 @@ public void onCreate(@Nullable Bundle savedInstanceState) {
+       throw new IllegalStateException("Parent activity must implement the Controller interface.");
+     }
+ 
++    WindowManager windowManager = ServiceUtil.getWindowManager(getActivity());
++    Display       display       = windowManager.getDefaultDisplay();
++    Point         displaySize   = new Point();
++
++    display.getSize(displaySize);
++
+     controller    = (Controller) getActivity();
+-    camera        = new Camera1Controller(TextSecurePreferences.getDirectCaptureCameraId(getContext()), this);
++    camera        = new Camera1Controller(TextSecurePreferences.getDirectCaptureCameraId(getContext()), displaySize.x, displaySize.y, this);
+     orderEnforcer = new OrderEnforcer<>(Stage.SURFACE_AVAILABLE, Stage.CAMERA_PROPERTIES_AVAILABLE);
+   }
+ 
+@@ -190,42 +204,40 @@ private void initControls() {
+   private void onCaptureClicked() {
+     orderEnforcer.reset();
+ 
+-    Stopwatch fastCaptureTimer = new Stopwatch("Fast Capture");
++    Stopwatch fastCaptureTimer = new Stopwatch("Capture");
+ 
+-    Bitmap preview = cameraPreview.getBitmap();
+-    fastCaptureTimer.split("captured");
++    camera.capture((jpegData, frontFacing) -> {
++      fastCaptureTimer.split("captured");
+ 
+-    LifecycleBoundTask.run(getLifecycle(), () -> {
+-      Bitmap full = preview;
+-      if (Build.VERSION.SDK_INT < 28) {
+-        PointF scale  = getScaleTransform(cameraPreview.getWidth(), cameraPreview.getHeight(), properties.getPreviewWidth(), properties.getPreviewHeight());
+-        Matrix matrix = new Matrix();
++      Transformation<Bitmap> transformation = frontFacing ? new MultiTransformation<>(new CenterCrop(), new FlipTransformation())
++                                                          : new CenterCrop();
+ 
+-        matrix.setScale(scale.x, scale.y);
++      GlideApp.with(this)
++              .asBitmap()
++              .load(jpegData)
++              .transform(transformation)
++              .override(cameraPreview.getWidth(), cameraPreview.getHeight())
++              .into(new SimpleTarget<Bitmap>() {
++                @Override
++                public void onResourceReady(@NonNull Bitmap resource, @Nullable Transition<? super Bitmap> transition) {
++                  fastCaptureTimer.split("transform");
+ 
+-        int adjWidth  = (int) (cameraPreview.getWidth() / scale.x);
+-        int adjHeight = (int) (cameraPreview.getHeight() / scale.y);
+-
+-        full = Bitmap.createBitmap(preview, 0, 0, adjWidth, adjHeight, matrix, true);
+-      }
++                  ByteArrayOutputStream stream = new ByteArrayOutputStream();
++                  resource.compress(Bitmap.CompressFormat.JPEG, 80, stream);
++                  fastCaptureTimer.split("compressed");
+ 
+-      fastCaptureTimer.split("transformed");
++                  byte[] data = stream.toByteArray();
++                  fastCaptureTimer.split("bytes");
++                  fastCaptureTimer.stop(TAG);
+ 
+-      ByteArrayOutputStream stream = new ByteArrayOutputStream();
+-      full.compress(Bitmap.CompressFormat.JPEG, 80, stream);
+-      fastCaptureTimer.split("compressed");
++                  controller.onImageCaptured(data);
++                }
+ 
+-      byte[] data = stream.toByteArray();
+-      fastCaptureTimer.split("bytes");
+-      fastCaptureTimer.stop(TAG);
+-
+-      return data;
+-    }, data -> {
+-      if (data != null) {
+-        controller.onImageCaptured(data);
+-      } else {
+-        controller.onCameraError();
+-      }
++                @Override
++                public void onLoadFailed(@Nullable Drawable errorDrawable) {
++                  controller.onCameraError();
++                }
++              });
+     });
+   }
+ 
+@@ -260,7 +272,11 @@ private void updatePreviewScale() {
+     PointF scale  = getScaleTransform(cameraPreview.getWidth(), cameraPreview.getHeight(), properties.getPreviewWidth(), properties.getPreviewHeight());
+     Matrix matrix = new Matrix();
+ 
++    float camWidth  = isPortrait() ? Math.min(cameraPreview.getWidth(), cameraPreview.getHeight()) : Math.max(cameraPreview.getWidth(), cameraPreview.getHeight());
++    float camHeight = isPortrait() ? Math.max(cameraPreview.getWidth(), cameraPreview.getHeight()) : Math.min(cameraPreview.getWidth(), cameraPreview.getHeight());
++
+     matrix.setScale(scale.x, scale.y);
++    matrix.postTranslate((camWidth - (camWidth * scale.x)) / 2, (camHeight - (camHeight * scale.y)) / 2);
+     cameraPreview.setTransform(matrix);
+   }
+ 
+diff --git a/src/org/thoughtcrime/securesms/camera/FlipTransformation.java b/src/org/thoughtcrime/securesms/camera/FlipTransformation.java
+new file mode 100644
+index 00000000000..3545b9fb852
+--- /dev/null
++++ b/src/org/thoughtcrime/securesms/camera/FlipTransformation.java
+@@ -0,0 +1,33 @@
++package org.thoughtcrime.securesms.camera;
++
++import android.graphics.Bitmap;
++import android.graphics.Canvas;
++import android.graphics.Matrix;
++import android.support.annotation.NonNull;
++
++import com.bumptech.glide.load.engine.bitmap_recycle.BitmapPool;
++import com.bumptech.glide.load.resource.bitmap.BitmapTransformation;
++
++import java.security.MessageDigest;
++
++public class FlipTransformation extends BitmapTransformation {
++
++  @Override
++  protected Bitmap transform(@NonNull BitmapPool pool, @NonNull Bitmap toTransform, int outWidth, int outHeight) {
++    Bitmap output = pool.get(toTransform.getWidth(), toTransform.getHeight(), toTransform.getConfig());
++
++    Canvas canvas = new Canvas(output);
++    Matrix matrix = new Matrix();
++    matrix.setScale(-1, 1);
++    matrix.postTranslate(toTransform.getWidth(), 0);
++
++    canvas.drawBitmap(toTransform, matrix, null);
++
++    return output;
++  }
++
++  @Override
++  public void updateDiskCacheKey(@NonNull MessageDigest messageDigest) {
++    messageDigest.update(FlipTransformation.class.getSimpleName().getBytes());
++  }
++}

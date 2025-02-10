@@ -1,0 +1,184 @@
+diff --git a/core/keys/src/main/kotlin/app/aaps/core/keys/StringKey.kt b/core/keys/src/main/kotlin/app/aaps/core/keys/StringKey.kt
+index 3c7dc7d1070..5eb5e2a9474 100644
+--- a/core/keys/src/main/kotlin/app/aaps/core/keys/StringKey.kt
++++ b/core/keys/src/main/kotlin/app/aaps/core/keys/StringKey.kt
+@@ -51,4 +51,5 @@ enum class StringKey(
+     TidepoolUsername("tidepool_username", ""),
+     TidepoolPassword("tidepool_password", "", isPassword = true),
+     TidepoolTestLogin(key = "tidepool_test_login", ""),
++    GarminRequestKey(key = "garmin_aaps_key", defaultValue = ""),
+ }
+\ No newline at end of file
+diff --git a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/garmin/GarminPlugin.kt b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/garmin/GarminPlugin.kt
+index d74170d8324..39c20255b0e 100644
+--- a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/garmin/GarminPlugin.kt
++++ b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/garmin/GarminPlugin.kt
+@@ -20,7 +20,10 @@ import app.aaps.core.interfaces.sharedPreferences.SP
+ import app.aaps.core.keys.BooleanKey
+ import app.aaps.core.keys.IntKey
+ import app.aaps.core.keys.Preferences
++import app.aaps.core.keys.StringKey
++import app.aaps.core.validators.DefaultEditTextValidator
+ import app.aaps.core.validators.preferences.AdaptiveIntPreference
++import app.aaps.core.validators.preferences.AdaptiveStringPreference
+ import app.aaps.core.validators.preferences.AdaptiveSwitchPreference
+ import app.aaps.plugins.sync.R
+ import com.google.gson.JsonArray
+@@ -72,7 +75,21 @@ class GarminPlugin @Inject constructor(
+ 
+     /** HTTP Server for local HTTP server communication (device app requests values) .*/
+     private var server: HttpServer? = null
+-    var garminMessenger: GarminMessenger? = null
++    @VisibleForTesting
++    var garminMessengerField: GarminMessenger? = null
++    val garminMessenger: GarminMessenger
++        get() {
++            return synchronized(this) {
++                garminMessengerField ?: createGarminMessenger().also { garminMessengerField = it }
++            }
++        }
++
++    private fun resetGarminMessenger() {
++        synchronized(this) {
++            garminMessengerField?.dispose()
++            garminMessengerField = null
++        }
++    }
+ 
+     /** Garmin ConnectIQ application id for native communication. Phone pushes values. */
+     private val glucoseAppIds = mapOf(
+@@ -96,25 +113,29 @@ class GarminPlugin @Inject constructor(
+     var newValue: Condition = valueLock.newCondition()
+     private var lastGlucoseValueTimestamp: Long? = null
+     private val glucoseUnitStr get() = if (loopHub.glucoseUnit == GlucoseUnit.MGDL) "mgdl" else "mmoll"
+-    private val garminAapsKey get() = sp.getString("garmin_aaps_key", "")
++    private val garminAapsKey get() = preferences.get(StringKey.GarminRequestKey) ?: ""
+ 
+     private fun onPreferenceChange(event: EventPreferenceChange) {
+         when (event.changedKey) {
+             "communication_debug_mode"                                           -> setupGarminMessenger()
+             BooleanKey.GarminLocalHttpServer.key, IntKey.GarminLocalHttpPort.key -> setupHttpServer()
+-            "garmin_aaps_key"                                                    -> sendPhoneAppMessage()
++            StringKey.GarminRequestKey.key                                       -> sendPhoneAppMessage()
+         }
+     }
+ 
+     private fun setupGarminMessenger() {
++        resetGarminMessenger()
++        createGarminMessenger()
++    }
++
++    private fun createGarminMessenger(): GarminMessenger {
+         val enableDebug = sp.getBoolean("communication_ciq_debug_mode", false)
+-        garminMessenger?.dispose()
+-        garminMessenger = null
+         aapsLogger.info(LTag.GARMIN, "initialize IQ messenger in debug=$enableDebug")
+-        garminMessenger = GarminMessenger(
+-            aapsLogger, context, glucoseAppIds, { _, _ -> },
+-            true, enableDebug
+-        ).also { disposable.add(it) }
++        return GarminMessenger(
++            aapsLogger, context, glucoseAppIds, { _, _ -> }, true, enableDebug
++        ).also {
++            disposable.add(it)
++        }
+     }
+ 
+     override fun onStart() {
+@@ -195,11 +216,11 @@ class GarminPlugin @Inject constructor(
+     }
+ 
+     private fun sendPhoneAppMessage(device: GarminDevice) {
+-        garminMessenger?.sendMessage(device, getGlucoseMessage())
++        garminMessenger.sendMessage(device, getGlucoseMessage())
+     }
+ 
+     private fun sendPhoneAppMessage() {
+-        garminMessenger?.sendMessage(getGlucoseMessage())
++        garminMessenger.sendMessage(getGlucoseMessage())
+     }
+ 
+     @VisibleForTesting
+@@ -465,6 +486,12 @@ class GarminPlugin @Inject constructor(
+             initialExpandedChildrenCount = 0
+             addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.GarminLocalHttpServer, title = R.string.garmin_local_http_server))
+             addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.GarminLocalHttpPort, title = R.string.garmin_local_http_server_port))
++            addPreference(AdaptiveStringPreference(
++                ctx = context,
++                stringKey = StringKey.GarminRequestKey,
++                title = R.string.garmin_request_key,
++                summary = R.string.garmin_request_key_summary,
++                validatorParams = DefaultEditTextValidator.Parameters(emptyAllowed = true)))
+         }
+     }
+ }
+diff --git a/plugins/sync/src/main/res/values/strings.xml b/plugins/sync/src/main/res/values/strings.xml
+index c8ade8e1ac3..94e1d512915 100644
+--- a/plugins/sync/src/main/res/values/strings.xml
++++ b/plugins/sync/src/main/res/values/strings.xml
+@@ -243,5 +243,7 @@
+     <string name="wear_action_loop_state_now_invalid">Invalid</string>
+     <string name="wear_action_loop_state_now_pump_disconnected">Pump disconnected</string>
+     <string name="wear_action_loop_state_now_pump_reconnected">Pump reconnected</string>
++    <string name="garmin_request_key">Request Key</string>
++    <string name="garmin_request_key_summary">Optional key to secure HTTP communication between Garmin device and AAPS.</string>
+ 
+ </resources>
+\ No newline at end of file
+diff --git a/plugins/sync/src/test/kotlin/app/aaps/plugins/sync/garmin/GarminPluginTest.kt b/plugins/sync/src/test/kotlin/app/aaps/plugins/sync/garmin/GarminPluginTest.kt
+index 0fdb1f21730..03d29c8bcdc 100644
+--- a/plugins/sync/src/test/kotlin/app/aaps/plugins/sync/garmin/GarminPluginTest.kt
++++ b/plugins/sync/src/test/kotlin/app/aaps/plugins/sync/garmin/GarminPluginTest.kt
+@@ -8,7 +8,9 @@ import app.aaps.core.data.model.TrendArrow
+ import app.aaps.core.interfaces.rx.events.EventNewBG
+ import app.aaps.core.keys.BooleanKey
+ import app.aaps.core.keys.IntKey
++import app.aaps.core.keys.StringKey
+ import app.aaps.core.validators.preferences.AdaptiveIntPreference
++import app.aaps.core.validators.preferences.AdaptiveStringPreference
+ import app.aaps.core.validators.preferences.AdaptiveSwitchPreference
+ import app.aaps.shared.tests.TestBaseWithProfile
+ import com.google.common.truth.Truth
+@@ -67,6 +69,10 @@ class GarminPluginTest : TestBaseWithProfile() {
+                 it.sharedPrefs = sharedPrefs
+                 it.config = config
+             }
++            if (it is AdaptiveStringPreference) {
++                it.preferences = preferences
++                it.sharedPrefs = sharedPrefs
++            }
+         }
+     }
+ 
+@@ -236,7 +242,7 @@ class GarminPluginTest : TestBaseWithProfile() {
+ 
+     @Test
+     fun requestHandler_KeyRequiredAndProvided() {
+-        `when`(sp.getString("garmin_aaps_key", "")).thenReturn("foo")
++        `when`(preferences.get(StringKey.GarminRequestKey)).thenReturn("foo")
+         val uri = createUri(mapOf("key" to "foo"))
+         val handler = gp.requestHandler { u: URI -> assertEquals(uri, u); "OK" }
+         assertEquals(
+@@ -248,9 +254,9 @@ class GarminPluginTest : TestBaseWithProfile() {
+ 
+     @Test
+     fun requestHandler_KeyRequired() {
+-        gp.garminMessenger = mock(GarminMessenger::class.java)
++        gp.garminMessengerField = mock(GarminMessenger::class.java)
+ 
+-        `when`(sp.getString("garmin_aaps_key", "")).thenReturn("foo")
++        `when`(preferences.get(StringKey.GarminRequestKey)).thenReturn("foo")
+         val uri = createUri(emptyMap())
+         val handler = gp.requestHandler { u: URI -> assertEquals(uri, u); "OK" }
+         assertEquals(
+@@ -280,8 +286,8 @@ class GarminPluginTest : TestBaseWithProfile() {
+ 
+     @Test
+     fun onConnectDevice() {
+-        gp.garminMessenger = mock(GarminMessenger::class.java)
+-        `when`(sp.getString("garmin_aaps_key", "")).thenReturn("foo")
++        gp.garminMessengerField = mock(GarminMessenger::class.java)
++        `when`(preferences.get(StringKey.GarminRequestKey)).thenReturn("foo")
+         val device = GarminDevice(mock(), 1, "Edge")
+         gp.onConnectDevice(device)
+ 

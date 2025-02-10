@@ -1,0 +1,120 @@
+diff --git a/core/data/src/main/kotlin/app/aaps/core/data/configuration/Constants.kt b/core/data/src/main/kotlin/app/aaps/core/data/configuration/Constants.kt
+index cb5d60ff5f8..9b69f7e4ca0 100644
+--- a/core/data/src/main/kotlin/app/aaps/core/data/configuration/Constants.kt
++++ b/core/data/src/main/kotlin/app/aaps/core/data/configuration/Constants.kt
+@@ -16,7 +16,7 @@ object Constants {
+     // Circadian Percentage Profile
+     const val CPP_MIN_PERCENTAGE = 30
+     const val CPP_MAX_PERCENTAGE = 250
+-    const val CPP_MIN_TIMESHIFT = -6
++    const val CPP_MIN_TIMESHIFT = -23
+     const val CPP_MAX_TIMESHIFT = 23
+     const val MAX_PROFILE_SWITCH_DURATION = (7 * 24 * 60).toDouble()// [min] ~ 7 days
+ 
+diff --git a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
+index 34a76183160..9b1cdd71385 100644
+--- a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
++++ b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
+@@ -772,10 +772,11 @@ class DataHandlerMobile @Inject constructor(
+         if (command.percentage < Constants.CPP_MIN_PERCENTAGE || command.percentage > Constants.CPP_MAX_PERCENTAGE) {
+             sendError(rh.gs(app.aaps.core.ui.R.string.valueoutofrange, "Profile-Percentage"))
+         }
+-        if (command.timeShift < 0 || command.timeShift > 23) {
++        if (command.timeShift < Constants.CPP_MIN_TIMESHIFT || command.timeShift > Constants.CPP_MAX_TIMESHIFT) {
+             sendError(rh.gs(app.aaps.core.ui.R.string.valueoutofrange, "Profile-Timeshift"))
+         }
+-        val message = rh.gs(R.string.profile_message, command.timeShift, command.percentage)
++        val profileName = profileFunction.getOriginalProfileName()
++        val message = rh.gs(R.string.profile_message, profileName, command.timeShift, command.percentage)
+         rxBus.send(
+             EventMobileToWear(
+                 EventData.ConfirmAction(
+@@ -1763,7 +1764,7 @@ class DataHandlerMobile @Inject constructor(
+         //check for validity
+         if (command.percentage < Constants.CPP_MIN_PERCENTAGE || command.percentage > Constants.CPP_MAX_PERCENTAGE)
+             return
+-        if (command.timeShift < 0 || command.timeShift > 23)
++        if (command.timeShift < Constants.CPP_MIN_TIMESHIFT || command.timeShift > Constants.CPP_MAX_TIMESHIFT)
+             return
+         profileFunction.getProfile() ?: return
+         //send profile to pump
+diff --git a/plugins/sync/src/main/res/values/strings.xml b/plugins/sync/src/main/res/values/strings.xml
+index 94e1d512915..288e90faf66 100644
+--- a/plugins/sync/src/main/res/values/strings.xml
++++ b/plugins/sync/src/main/res/values/strings.xml
+@@ -199,7 +199,7 @@
+     <string name="grams_short">g</string>
+     <string name="hour_short">h</string>
+     <string name="no_active_profile">No active profile switch!</string>
+-    <string name="profile_message">Profile:\n\nTimeshift: %1$d\nPercentage: %2$d%%\"</string>
++    <string name="profile_message">Profile: %1$s\nTimeshift: %2$d h\nPercentage: %3$d%%</string>
+     <string name="target_only_aps_mode">Targets only apply in APS mode!</string>
+     <string name="no_history">No history data!</string>
+     <string name="temp_target">Temp Target</string>
+diff --git a/wear/build.gradle.kts b/wear/build.gradle.kts
+index 76582489943..4471fc9b77e 100644
+--- a/wear/build.gradle.kts
++++ b/wear/build.gradle.kts
+@@ -102,6 +102,7 @@ dependencies {
+     implementation(project(":core:interfaces"))
+     implementation(project(":core:keys"))
+     implementation(project(":core:ui"))
++    implementation(project(":core:data"))
+ 
+     implementation(libs.androidx.appcompat)
+     implementation(libs.androidx.core)
+diff --git a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/LoopStateTimedActivity.kt b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/LoopStateTimedActivity.kt
+index f9ec47d2c55..61d719da925 100644
+--- a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/LoopStateTimedActivity.kt
++++ b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/LoopStateTimedActivity.kt
+@@ -65,7 +65,7 @@ class LoopStateTimedActivity : ViewSelectorActivity() {
+                 val title = if (isHours)
+                     getString(R.string.action_duration_h)
+                 else
+-                    getString(R.string.action_duration)
++                    getString(app.aaps.core.ui.R.string.duration_min_label)
+                 editDuration = PlusMinusEditText(
+                     viewAdapter,
+                     minValue.toDouble(), minValue.toDouble(),
+diff --git a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/ProfileSwitchActivity.kt b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/ProfileSwitchActivity.kt
+index b7c543bdbbb..ed96a3f41c5 100644
+--- a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/ProfileSwitchActivity.kt
++++ b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/ProfileSwitchActivity.kt
+@@ -7,6 +7,7 @@ import android.view.LayoutInflater
+ import android.view.View
+ import android.view.ViewGroup
+ import android.widget.ImageView
++import app.aaps.core.data.configuration.Constants
+ import app.aaps.core.interfaces.rx.events.EventWearToMobile
+ import app.aaps.core.interfaces.rx.weardata.EventData.ActionProfileSwitchPreCheck
+ import app.aaps.core.interfaces.utils.SafeParse
+@@ -30,7 +31,6 @@ class ProfileSwitchActivity : ViewSelectorActivity() {
+             finish()
+             return
+         }
+-        if (timeshift < 0) timeshift += 24
+         setAdapter(MyGridViewPagerAdapter())
+     }
+ 
+@@ -48,8 +48,8 @@ class ProfileSwitchActivity : ViewSelectorActivity() {
+             0    -> {
+                 val viewAdapter = EditPlusMinusViewAdapter.getViewAdapter(sp, applicationContext, container, false)
+                 val view = viewAdapter.root
+-                var initValue = SafeParse.stringToDouble(editTimeshift?.editText?.text.toString(), timeshift.toDouble())
+-                editTimeshift = PlusMinusEditText(viewAdapter, initValue, 0.0, 23.0, 1.0, DecimalFormat("0"), true, getString(R.string.action_timeshift), true)
++                val initValue = SafeParse.stringToDouble(editTimeshift?.editText?.text.toString(), timeshift.toDouble())
++                editTimeshift = PlusMinusEditText(viewAdapter, initValue, Constants.CPP_MIN_TIMESHIFT.toDouble(), Constants.CPP_MAX_TIMESHIFT.toDouble(), 1.0, DecimalFormat("0"), true, getString(R.string.action_timeshift), true)
+                 container.addView(view)
+                 view.requestFocus()
+                 view
+@@ -58,8 +58,8 @@ class ProfileSwitchActivity : ViewSelectorActivity() {
+             1    -> {
+                 val viewAdapter = EditPlusMinusViewAdapter.getViewAdapter(sp, applicationContext, container, false)
+                 val view = viewAdapter.root
+-                var initValue = SafeParse.stringToDouble(editPercentage?.editText?.text.toString(), percentage.toDouble())
+-                editPercentage = PlusMinusEditText(viewAdapter, initValue, 30.0, 250.0, 1.0, DecimalFormat("0"), false, getString(R.string.action_percentage))
++                val initValue = SafeParse.stringToDouble(editPercentage?.editText?.text.toString(), percentage.toDouble())
++                editPercentage = PlusMinusEditText(viewAdapter, initValue, 30.0, 250.0, 5.0, DecimalFormat("0"), false, getString(R.string.action_percentage))
+                 container.addView(view)
+                 view
+             }

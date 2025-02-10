@@ -1,0 +1,413 @@
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/unitconverter/UnitConverterItem.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/unitconverter/UnitConverterItem.kt
+index 4df5736fe..87eea4c91 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/unitconverter/UnitConverterItem.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/search/unitconverter/UnitConverterItem.kt
+@@ -3,11 +3,13 @@ package de.mm20.launcher2.ui.launcher.search.unitconverter
+ import android.icu.text.DateFormat
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.*
++import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.rounded.*
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextOverflow
+@@ -15,6 +17,7 @@ import androidx.compose.ui.unit.dp
+ import de.mm20.launcher2.search.data.CurrencyUnitConverter
+ import de.mm20.launcher2.search.data.UnitConverter
+ import de.mm20.launcher2.ui.R
++import de.mm20.launcher2.unitconverter.Dimension
+ import java.util.*
+ 
+ @Composable
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreen.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreen.kt
+index ed090fd6d..5bcd1d988 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreen.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreen.kt
+@@ -1,19 +1,49 @@
+ package de.mm20.launcher2.ui.settings.unitconverter
+ 
++import android.icu.util.Currency
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.material3.LinearProgressIndicator
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.pluralStringResource
+ import androidx.compose.ui.res.stringResource
+ import androidx.lifecycle.viewmodel.compose.viewModel
++import de.mm20.launcher2.preferences.search.UnitConverterSettings
+ import de.mm20.launcher2.ui.R
++import de.mm20.launcher2.ui.component.preferences.Preference
+ import de.mm20.launcher2.ui.component.preferences.PreferenceCategory
+ import de.mm20.launcher2.ui.component.preferences.PreferenceScreen
+ import de.mm20.launcher2.ui.component.preferences.SwitchPreference
++import de.mm20.launcher2.ui.launcher.search.unitconverter.getDimensionIcon
++import de.mm20.launcher2.unitconverter.converters.CurrencyConverter
++import de.mm20.launcher2.unitconverter.converters.SimpleFactorConverter
++import de.mm20.launcher2.unitconverter.converters.TemperatureConverter
++import org.koin.androidx.compose.inject
+ 
+ @Composable
+ fun UnitConverterSettingsScreen() {
++    val settings: UnitConverterSettings by inject()
+     val viewModel: UnitConverterSettingsScreenVM = viewModel()
+-    PreferenceScreen(title = stringResource(R.string.preference_search_unitconverter)) {
++    val loading by viewModel.loading
++
++    val currenciesEnabled by settings.currencies.collectAsState(initial = false)
++
++    LaunchedEffect(currenciesEnabled) {
++        viewModel.loadCurrencies()
++    }
++
++    PreferenceScreen(title = stringResource(R.string.preference_search_unitconverter),
++        helpUrl = "https://kvaesitso.mm20.de/docs/user-guide/search/unit-converter") {
++        if (loading) {
++            item {
++                LinearProgressIndicator(
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++        }
+         item {
+             PreferenceCategory {
+                 val unitConverter by viewModel.unitConverter.collectAsState()
+@@ -36,6 +66,46 @@ fun UnitConverterSettingsScreen() {
+                     }
+                 )
+             }
++            PreferenceCategory(
++                title = stringResource(R.string.preference_search_supportedunits)
++            ) {
++                for (converter in viewModel.convertersList.value) {
++                    val units = buildString {
++                        when (converter) {
++                            is SimpleFactorConverter -> {
++                                converter.standardUnits.forEachIndexed { index, unit ->
++                                    if (index > 0) append(", ")
++                                    append(pluralStringResource(unit.nameResource, 1))
++                                    append(" (${unit.symbol})")
++                                }
++                            }
++
++                            is TemperatureConverter -> {
++                                converter.units.forEachIndexed { index, unit ->
++                                    if (index > 0) append(", ")
++                                    append(pluralStringResource(unit.nameResource, 1))
++                                    append(" (${unit.symbol})")
++                                }
++
++                            }
++                            is CurrencyConverter -> {
++                                viewModel.currenciesList.value.forEachIndexed { index, currency ->
++                                    if (index > 0) append(", ")
++                                    append(Currency.getInstance(currency)?.displayName ?: currency)
++                                    append(" ($currency)")
++                                }
++                            }
++                        }
++                    }
++
++                    Preference(
++                        title = stringResource(converter.dimension.resource),
++                        icon = getDimensionIcon(converter.dimension),
++                        summary = units
++                    )
++                }
++            }
+         }
++
+     }
+ }
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreenVM.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreenVM.kt
+index 1d4f3e6b3..bc5db0e92 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreenVM.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/unitconverter/UnitConverterSettingsScreenVM.kt
+@@ -1,9 +1,16 @@
+ package de.mm20.launcher2.ui.settings.unitconverter
+ 
++import androidx.compose.runtime.mutableStateOf
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+ import de.mm20.launcher2.preferences.search.UnitConverterSettings
++import de.mm20.launcher2.unitconverter.UnitConverterRepository
++import de.mm20.launcher2.unitconverter.converters.Converter
++import de.mm20.launcher2.unitconverter.converters.CurrencyConverter
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.flow.SharingStarted
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+@@ -13,6 +20,11 @@ import org.koin.core.component.inject
+ class UnitConverterSettingsScreenVM: ViewModel(), KoinComponent {
+ 
+     private val settings: UnitConverterSettings by inject()
++    private val repository: UnitConverterRepository by inject()
++
++    val loading = mutableStateOf(false)
++    val convertersList = mutableStateOf(emptyList<Converter>())
++    val currenciesList = mutableStateOf(emptyList<String>())
+ 
+     val unitConverter = settings.enabled
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
+@@ -25,4 +37,18 @@ class UnitConverterSettingsScreenVM: ViewModel(), KoinComponent {
+     fun setCurrencyConverter(currencyConverter: Boolean) {
+         settings.setCurrencies(currencyConverter)
+     }
++    fun loadCurrencies() {
++        loading.value = true
++        viewModelScope.launch(Dispatchers.Default) {
++            convertersList.value = repository.availableConverters(
++                settings.currencies.distinctUntilChanged().first()
++            )
++
++            val currencyConverter = convertersList.value.find { it is CurrencyConverter }
++            if (currencyConverter != null) {
++                currenciesList.value = (currencyConverter as CurrencyConverter).getAbbreviations()
++            }
++        }
++        loading.value = false
++    }
+ }
+\ No newline at end of file
+diff --git a/core/i18n/src/main/res/values/strings.xml b/core/i18n/src/main/res/values/strings.xml
+index 3d5590cc9..b0cfcc65b 100644
+--- a/core/i18n/src/main/res/values/strings.xml
++++ b/core/i18n/src/main/res/values/strings.xml
+@@ -608,6 +608,7 @@
+     <string name="preference_search_unitconverter_summary">Usage: 1.5 kg or 4 cm &gt;&gt; in</string>
+     <string name="preference_search_currencyconverter">Currency converter</string>
+     <string name="preference_search_currencyconverter_summary">Periodically download exchange rates to convert currencies</string>
++    <string name="preference_search_supportedunits">Supported units\n(use abbreviation on search box)</string>
+     <string name="preference_search_wikipedia">Wikipedia</string>
+     <string name="preference_search_wikipedia_summary">Search the free encyclopedia</string>
+     <string name="preference_search_websites">Websites</string>
+diff --git a/core/i18n/src/main/res/values/units.xml b/core/i18n/src/main/res/values/units.xml
+index 7cad40bf9..d80ac70c8 100644
+--- a/core/i18n/src/main/res/values/units.xml
++++ b/core/i18n/src/main/res/values/units.xml
+@@ -3,6 +3,20 @@
+     <!--
+     Important note: Unit symbols may not contain spaces.
+     -->
++    <!-- DIMENSIONS -->
++    <string name="dimension_length">Length</string>
++    <string name="dimension_mass">Mass</string>
++    <string name="dimension_velocity">Velocity</string>
++    <string name="dimension_volume">Volume</string>
++    <string name="dimension_area">Area</string>
++    <string name="dimension_currency">Currency</string>
++    <string name="dimension_data">Data</string>
++    <string name="dimension_bitrate">Bitrate</string>
++    <string name="dimension_pressure">Pressure</string>
++    <string name="dimension_energy">Energy</string>
++    <string name="dimension_frequency">Frequency</string>
++    <string name="dimension_temperature">Temperature</string>
++    <string name="dimension_time">Time</string>
+     <!-- UNITS OF LENGTH -->
+     <string name="unit_meter_symbol">m</string>
+     <plurals name="unit_meter">
+diff --git a/data/currencies/src/main/java/de/mm20/launcher2/currencies/CurrencyRepository.kt b/data/currencies/src/main/java/de/mm20/launcher2/currencies/CurrencyRepository.kt
+index 1e67d3e2d..a34762c5c 100644
+--- a/data/currencies/src/main/java/de/mm20/launcher2/currencies/CurrencyRepository.kt
++++ b/data/currencies/src/main/java/de/mm20/launcher2/currencies/CurrencyRepository.kt
+@@ -161,6 +161,12 @@ class CurrencyRepository(
+         }
+     }
+ 
++    suspend fun getKnownUnits(): List<String> {
++        return withContext(Dispatchers.IO) {
++            AppDatabase.getInstance(context).currencyDao().getAllCurrencies().map { it.symbol }
++        }
++    }
++
+     suspend fun isValidCurrency(symbol: String): Boolean {
+         val isoSymbol = currencySymbolAliases[symbol] ?: symbol
+         return withContext(Dispatchers.IO) {
+diff --git a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/Dimension.kt b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/Dimension.kt
+index 3b8fa93ac..08d056c54 100644
+--- a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/Dimension.kt
++++ b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/Dimension.kt
+@@ -1,17 +1,19 @@
+ package de.mm20.launcher2.unitconverter
+ 
+-enum class Dimension {
+-    Length,
+-    Mass,
+-    Velocity,
+-    Volume,
+-    Area,
+-    Currency,
+-    Data,
+-    Bitrate,
+-    Pressure,
+-    Energy,
+-    Frequency,
+-    Temperature,
+-    Time
++import androidx.annotation.StringRes
++
++enum class Dimension(@StringRes val resource: Int) {
++    Length(R.string.dimension_length),
++    Mass(R.string.dimension_mass),
++    Velocity(R.string.dimension_velocity),
++    Volume(R.string.dimension_volume),
++    Area(R.string.dimension_area),
++    Currency(R.string.dimension_currency),
++    Data(R.string.dimension_data),
++    Bitrate(R.string.dimension_bitrate),
++    Pressure(R.string.dimension_pressure),
++    Energy(R.string.dimension_energy),
++    Frequency(R.string.dimension_frequency),
++    Temperature(R.string.dimension_temperature),
++    Time(R.string.dimension_time),
+ }
+\ No newline at end of file
+diff --git a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/UnitConverterRepository.kt b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/UnitConverterRepository.kt
+index e5555bcaa..6ed575246 100644
+--- a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/UnitConverterRepository.kt
++++ b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/UnitConverterRepository.kt
+@@ -5,6 +5,7 @@ import de.mm20.launcher2.currencies.CurrencyRepository
+ import de.mm20.launcher2.preferences.search.UnitConverterSettings
+ import de.mm20.launcher2.search.data.UnitConverter
+ import de.mm20.launcher2.unitconverter.converters.AreaConverter
++import de.mm20.launcher2.unitconverter.converters.Converter
+ import de.mm20.launcher2.unitconverter.converters.CurrencyConverter
+ import de.mm20.launcher2.unitconverter.converters.DataConverter
+ import de.mm20.launcher2.unitconverter.converters.LengthConverter
+@@ -25,6 +26,7 @@ import org.koin.core.component.KoinComponent
+ 
+ interface UnitConverterRepository {
+     fun search(query: String): Flow<UnitConverter?>
++    fun availableConverters(includeCurrencies: Boolean) : List<Converter>
+ }
+ 
+ internal class UnitConverterRepositoryImpl(
+@@ -53,11 +55,29 @@ internal class UnitConverterRepositoryImpl(
+         }
+     }
+ 
++    override fun availableConverters(includeCurrencies: Boolean) : List<Converter> {
++        val converters = mutableListOf(
++            MassConverter(context),
++            LengthConverter(context),
++            DataConverter(context),
++            TimeConverter(context),
++            VelocityConverter(context),
++            AreaConverter(context),
++            TemperatureConverter(context)
++        )
++        if (includeCurrencies) converters.add(CurrencyConverter(currencyRepository))
++
++        return converters
++    }
++
+     private suspend fun queryUnitConverter(
+         query: String,
+         includeCurrencies: Boolean
+     ): UnitConverter? {
+-        if (!query.matches(Regex("[0-9,.:]+ [^\\s]+")) && !query.matches(Regex("[0-9,.:]+ [^\\s]+ >> [^\\s]+"))) return null
++        if (!query.matches(Regex("[0-9,.:]+ [^\\s]+")) &&
++            !query.matches(Regex("[0-9,.:]+ [^\\s]+ >> [^\\s]+")) &&
++            !query.matches(Regex("[0-9,.:]+ [^\\s]+ > [^\\s]+")) &&
++            !query.matches(Regex("[0-9,.:]+ [^\\s]+ - [^\\s]+"))) return null
+         val valueStr: String
+         val unitStr: String
+         val targetUnitStr: String?
+@@ -70,17 +90,7 @@ internal class UnitConverterRepositoryImpl(
+         val value = valueStr.toDoubleOrNull() ?: valueStr.replace(',', '.').toDoubleOrNull()
+         ?: return null
+ 
+-        val converters = mutableListOf(
+-            MassConverter(context),
+-            LengthConverter(context),
+-            DataConverter(context),
+-            TimeConverter(context),
+-            VelocityConverter(context),
+-            AreaConverter(context),
+-            TemperatureConverter(context)
+-        )
+-
+-        if (includeCurrencies) converters.add(CurrencyConverter(currencyRepository))
++        val converters = availableConverters(includeCurrencies)
+ 
+         for (converter in converters) {
+             if (!converter.isValidUnit(unitStr)) continue
+diff --git a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/CurrencyConverter.kt b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/CurrencyConverter.kt
+index 18457cf40..7f4ca6c3e 100644
+--- a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/CurrencyConverter.kt
++++ b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/CurrencyConverter.kt
+@@ -10,8 +10,8 @@ import de.mm20.launcher2.unitconverter.Dimension
+ import de.mm20.launcher2.unitconverter.UnitValue
+ import java.text.DecimalFormat
+ import java.util.Locale
+-import java.util.Currency as JCurrency
+ import kotlin.math.abs
++import java.util.Currency as JCurrency
+ 
+ class CurrencyConverter(
+     private val repository: CurrencyRepository,
+@@ -19,6 +19,10 @@ class CurrencyConverter(
+ 
+     override val dimension: Dimension = Dimension.Currency
+ 
++    suspend fun getAbbreviations() : List<String> {
++        return repository.getKnownUnits()
++    }
++
+ 
+     private val topCurrencies = arrayOf("USD", "EUR", "JPY", "GBP", "AUD")
+ 
+diff --git a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/TemperatureConverter.kt b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/TemperatureConverter.kt
+index 00eca44b8..01c6229c5 100644
+--- a/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/TemperatureConverter.kt
++++ b/data/unitconverter/src/main/java/de/mm20/launcher2/unitconverter/converters/TemperatureConverter.kt
+@@ -7,7 +7,7 @@ import de.mm20.launcher2.unitconverter.*
+ class TemperatureConverter(context: Context) : Converter {
+     override val dimension = Dimension.Temperature
+ 
+-    private val units = listOf(
++    val units = listOf(
+         TemperatureMeasureUnit(
+             context.getString(R.string.unit_degree_celsius_symbol),
+             R.plurals.unit_degree_celsius,
+@@ -102,14 +102,14 @@ class TemperatureConverter(context: Context) : Converter {
+     }
+ }
+ 
+-private data class TemperatureMeasureUnit(
++data class TemperatureMeasureUnit(
+     override val symbol: String,
+     override val nameResource: Int,
+     val unit: TemperatureUnit
+ ) :
+     MeasureUnit
+ 
+-private enum class TemperatureUnit {
++enum class TemperatureUnit {
+     DegreeCelsius,
+     DegreeFahrenheit,
+     Kelvin,
+diff --git a/docs/docs/user-guide/search/unit-converter.md b/docs/docs/user-guide/search/unit-converter.md
+index 6b16286c4..d4bd3c28f 100644
+--- a/docs/docs/user-guide/search/unit-converter.md
++++ b/docs/docs/user-guide/search/unit-converter.md
+@@ -14,6 +14,8 @@ Examples:
+ You can also specify a target unit like this:
+ 
+ - `14 ft >> m`
++- `14 ft > m`
++- `14 ft - m`
+ 
+ If you don't specify a target unit, all supported units in the dimension of the input unit are returned.
+ 

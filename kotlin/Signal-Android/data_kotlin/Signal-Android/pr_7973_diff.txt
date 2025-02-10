@@ -1,0 +1,243 @@
+diff --git a/build.gradle b/build.gradle
+index 8c66b93f2f8..d1e752724b0 100644
+--- a/build.gradle
++++ b/build.gradle
+@@ -66,8 +66,9 @@ dependencies {
+     compile 'com.android.support:preference-v14:27.0.2'
+     compile 'com.android.support:gridlayout-v7:27.0.2'
+     compile 'com.android.support:multidex:1.0.2'
+-    compile "com.android.support:exifinterface:27.0.2"
+-    compile "android.arch.lifecycle:extensions:1.1.1"
++    compile 'com.android.support:exifinterface:27.0.2'
++    compile 'android.arch.lifecycle:extensions:1.1.1'
++    compile 'android.arch.lifecycle:common-java8:1.1.1'
+ 
+     compile 'com.google.android.gms:play-services-gcm:9.6.1'
+     compile 'com.google.android.gms:play-services-maps:9.6.1'
+@@ -166,6 +167,7 @@ dependencyVerification {
+         'com.android.support:multidex:7cd48755c7cfdb6dd2d21cbb02236ec390f6ac91cde87eb62f475b259ab5301d',
+         'com.android.support:exifinterface:0e7cd526c4468895cd8549def46b3d33c8bcfb1ae4830569898d8c7326b15bb2',
+         'android.arch.lifecycle:extensions:429426b2feec2245ffc5e75b3b5309bedb36159cf06dc71843ae43526ac289b6',
++        'android.arch.lifecycle:common-java8:7078b5c8ccb94203df9cc2a463c69cf0021596e6cf966d78fbfd697aaafe0630',
+         'com.google.android.gms:play-services-gcm:312e61253a236f2d9b750b9c04fc92fd190d23b0b2755c99de6ce4a28b259dae',
+         'com.google.android.gms:play-services-places:abf3a4a3b146ec7e6e753be62775e512868cf37d6f88ffe2d81167b33b57132b',
+         'com.google.android.gms:play-services-maps:45e8021e7ddac4a44a82a0e9698991389ded3023d35c58f38dbd86d54211ec0e',
+diff --git a/src/org/thoughtcrime/securesms/ApplicationContext.java b/src/org/thoughtcrime/securesms/ApplicationContext.java
+index d198e31cff7..ce71c2f9c65 100644
+--- a/src/org/thoughtcrime/securesms/ApplicationContext.java
++++ b/src/org/thoughtcrime/securesms/ApplicationContext.java
+@@ -17,9 +17,13 @@
+ package org.thoughtcrime.securesms;
+ 
+ import android.annotation.SuppressLint;
++import android.arch.lifecycle.DefaultLifecycleObserver;
++import android.arch.lifecycle.LifecycleOwner;
++import android.arch.lifecycle.ProcessLifecycleOwner;
+ import android.content.Context;
+ import android.os.AsyncTask;
+ import android.os.Build;
++import android.support.annotation.NonNull;
+ import android.support.multidex.MultiDexApplication;
+ import android.util.Log;
+ 
+@@ -35,6 +39,7 @@
+ import org.thoughtcrime.securesms.jobmanager.requirements.NetworkRequirementProvider;
+ import org.thoughtcrime.securesms.jobs.CreateSignedPreKeyJob;
+ import org.thoughtcrime.securesms.jobs.GcmRefreshJob;
++import org.thoughtcrime.securesms.jobs.MultiDeviceContactUpdateJob;
+ import org.thoughtcrime.securesms.jobs.requirements.MasterSecretRequirementProvider;
+ import org.thoughtcrime.securesms.jobs.requirements.ServiceRequirementProvider;
+ import org.thoughtcrime.securesms.jobs.requirements.SqlCipherMigrationRequirementProvider;
+@@ -66,7 +71,7 @@
+  *
+  * @author Moxie Marlinspike
+  */
+-public class ApplicationContext extends MultiDexApplication implements DependencyInjector {
++public class ApplicationContext extends MultiDexApplication implements DependencyInjector, DefaultLifecycleObserver {
+ 
+   private static final String TAG = ApplicationContext.class.getName();
+ 
+@@ -74,6 +79,8 @@ public class ApplicationContext extends MultiDexApplication implements Dependenc
+   private JobManager             jobManager;
+   private ObjectGraph            objectGraph;
+ 
++  private volatile boolean isAppVisible;
++
+   public static ApplicationContext getInstance(Context context) {
+     return (ApplicationContext)context.getApplicationContext();
+   }
+@@ -91,6 +98,21 @@ public void onCreate() {
+     initializePeriodicTasks();
+     initializeCircumvention();
+     initializeWebRtc();
++    ProcessLifecycleOwner.get().getLifecycle().addObserver(this);
++  }
++
++  @Override
++  public void onStart(@NonNull LifecycleOwner owner) {
++    isAppVisible = true;
++    Log.i(TAG, "App is now visible.");
++
++    executePendingContactSync();
++  }
++
++  @Override
++  public void onStop(@NonNull LifecycleOwner owner) {
++    isAppVisible = false;
++    Log.i(TAG, "App is no longer visible.");
+   }
+ 
+   @Override
+@@ -108,6 +130,10 @@ public ExpiringMessageManager getExpiringMessageManager() {
+     return expiringMessageManager;
+   }
+ 
++  public boolean isAppVisible() {
++    return isAppVisible;
++  }
++
+   private void initializeRandomNumberFix() {
+     PRNGFixes.apply();
+   }
+@@ -216,4 +242,10 @@ protected Void doInBackground(Void... params) {
+     task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+   }
+ 
++
++  private void executePendingContactSync() {
++    if (TextSecurePreferences.needsFullContactSync(this)) {
++      ApplicationContext.getInstance(this).getJobManager().add(new MultiDeviceContactUpdateJob(this, true));
++    }
++  }
+ }
+diff --git a/src/org/thoughtcrime/securesms/jobs/MultiDeviceContactUpdateJob.java b/src/org/thoughtcrime/securesms/jobs/MultiDeviceContactUpdateJob.java
+index ab16ef633ba..589139196bf 100644
+--- a/src/org/thoughtcrime/securesms/jobs/MultiDeviceContactUpdateJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/MultiDeviceContactUpdateJob.java
+@@ -11,6 +11,7 @@
+ import android.support.annotation.Nullable;
+ import android.util.Log;
+ 
++import org.thoughtcrime.securesms.ApplicationContext;
+ import org.thoughtcrime.securesms.contacts.ContactAccessor;
+ import org.thoughtcrime.securesms.contacts.ContactAccessor.ContactData;
+ import org.thoughtcrime.securesms.crypto.MasterSecret;
+@@ -45,6 +46,7 @@
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.util.Collection;
++import java.util.concurrent.TimeUnit;
+ 
+ import javax.inject.Inject;
+ 
+@@ -54,15 +56,27 @@ public class MultiDeviceContactUpdateJob extends MasterSecretJob implements Inje
+ 
+   private static final String TAG = MultiDeviceContactUpdateJob.class.getSimpleName();
+ 
++  private static final long FULL_SYNC_TIME = TimeUnit.HOURS.toMillis(6);
++
+   @Inject transient SignalServiceMessageSender messageSender;
+ 
+   private final @Nullable String address;
+ 
++  private boolean forceSync;
++
+   public MultiDeviceContactUpdateJob(@NonNull Context context) {
+-    this(context, null);
++    this(context, false);
++  }
++
++  public MultiDeviceContactUpdateJob(@NonNull Context context, boolean forceSync) {
++    this(context, null, forceSync);
+   }
+ 
+   public MultiDeviceContactUpdateJob(@NonNull Context context, @Nullable Address address) {
++    this(context, address, true);
++  }
++
++  public MultiDeviceContactUpdateJob(@NonNull Context context, @Nullable Address address, boolean forceSync) {
+     super(context, JobParameters.newBuilder()
+                                 .withRequirement(new NetworkRequirement(context))
+                                 .withRequirement(new MasterSecretRequirement(context))
+@@ -70,6 +84,8 @@ public MultiDeviceContactUpdateJob(@NonNull Context context, @Nullable Address a
+                                 .withPersistence()
+                                 .create());
+ 
++    this.forceSync = forceSync;
++
+     if (address != null) this.address = address.serialize();
+     else                 this.address = null;
+   }
+@@ -126,7 +142,21 @@ private void generateFullContactUpdate()
+       Log.w(TAG, "No contact permissions, skipping multi-device contact update...");
+       return;
+     }
+-    
++
++    boolean isAppVisible      = ApplicationContext.getInstance(context).isAppVisible();
++    long    timeSinceLastSync = System.currentTimeMillis() - TextSecurePreferences.getLastFullContactSyncTime(context);
++
++    Log.d(TAG, "Requesting a full contact sync. forced = " + forceSync + ", appVisible = " + isAppVisible + ", timeSinceLastSync = " + timeSinceLastSync + " ms");
++
++    if (!forceSync && !isAppVisible && timeSinceLastSync < FULL_SYNC_TIME) {
++      Log.i(TAG, "App is backgrounded and the last contact sync was too soon (" + timeSinceLastSync + " ms ago). Marking that we need a sync. Skipping multi-device contact update...");
++      TextSecurePreferences.setNeedsFullContactSync(context, true);
++      return;
++    }
++
++    TextSecurePreferences.setLastFullContactSyncTime(context, System.currentTimeMillis());
++    TextSecurePreferences.setNeedsFullContactSync(context, false);
++
+     File contactDataFile = createTempFile("multidevice-contact-update");
+ 
+     try {
+diff --git a/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java b/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
+index e433cdf6e56..74db33589c3 100644
+--- a/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
++++ b/src/org/thoughtcrime/securesms/jobs/PushDecryptJob.java
+@@ -479,7 +479,7 @@ private void handleSynchronizeRequestMessage(@NonNull RequestMessage message)
+     if (message.isContactsRequest()) {
+       ApplicationContext.getInstance(context)
+                         .getJobManager()
+-                        .add(new MultiDeviceContactUpdateJob(getContext()));
++                        .add(new MultiDeviceContactUpdateJob(getContext(), true));
+     }
+ 
+     if (message.isGroupsRequest()) {
+diff --git a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+index 511f1e8836c..ca2dd20d85c 100644
+--- a/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
++++ b/src/org/thoughtcrime/securesms/util/TextSecurePreferences.java
+@@ -154,6 +154,9 @@ public class TextSecurePreferences {
+   private static final String SERVICE_OUTAGE         = "pref_service_outage";
+   private static final String LAST_OUTAGE_CHECK_TIME = "pref_last_outage_check_time";
+ 
++  private static final String LAST_FULL_CONTACT_SYNC_TIME = "pref_last_full_contact_sync_time";
++  private static final String NEEDS_FULL_CONTACT_SYNC     = "pref_needs_full_contact_sync";
++
+   public static boolean isScreenLockEnabled(@NonNull Context context) {
+     return getBooleanPreference(context, SCREEN_LOCK, false);
+   }
+@@ -923,6 +926,22 @@ public static boolean getServiceOutage(Context context) {
+     return getBooleanPreference(context, SERVICE_OUTAGE, false);
+   }
+ 
++  public static long getLastFullContactSyncTime(Context context) {
++    return getLongPreference(context, LAST_FULL_CONTACT_SYNC_TIME, 0);
++  }
++
++  public static void setLastFullContactSyncTime(Context context, long timestamp) {
++    setLongPreference(context, LAST_FULL_CONTACT_SYNC_TIME, timestamp);
++  }
++
++  public static boolean needsFullContactSync(Context context) {
++    return getBooleanPreference(context, NEEDS_FULL_CONTACT_SYNC, false);
++  }
++
++  public static void setNeedsFullContactSync(Context context, boolean needsSync) {
++    setBooleanPreference(context, NEEDS_FULL_CONTACT_SYNC, needsSync);
++  }
++
+   public static void setBooleanPreference(Context context, String key, boolean value) {
+     PreferenceManager.getDefaultSharedPreferences(context).edit().putBoolean(key, value).apply();
+   }

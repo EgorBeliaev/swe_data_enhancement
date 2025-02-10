@@ -1,0 +1,131 @@
+[
+    {
+        "title": "feat: add project context to code completions"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "This PR adds context to the code-completions.\r\n\r\nQuite a few of the models support repository-level completions via special tokens:\r\n[CodeQwen 1.5](https://github.com/QwenLM/CodeQwen1.5?tab=readme-ov-file#2-file-level-code-completion-fill-in-the-middle)\r\n[DeepSeek Coder](https://github.com/deepseek-ai/DeepSeek-Coder?tab=readme-ov-file#2-code-insertion)\r\n[CodeGemma](https://huggingface.co/google/codegemma-7b#for-code-completion)\r\n[StarCoder2](https://huggingface.co/spaces/bigcode/bigcode-playground/blob/main/app.py)\r\n\r\nConsider this simple Java example from an old project of mine ([movieland](https://github.com/PhilKes/movieland)).\r\n`MovieUtils.java`:\r\n```java\r\n@Service\r\npublic class MovieUtils {\r\n    private final MovieService movieService;\r\n\r\n    public MovieUtils(MovieService movieService) {\r\n        this.movieService = movieService;\r\n    }\r\n    public List<Movie> getMoviesSortedByPlaytime(String name) {\r\n        return <CURSOR>\r\n    }\r\n     \r\n}\r\n```\r\nObviously in examples like this, the code-completion without context can not be of much help since the model doesnt know the contents of the [MovieService](https://github.com/PhilKes/movieland/blob/master/movieland-backend/src/main/java/com/phil/movieland/rest/service/MovieService.java) or [Movie](https://github.com/PhilKes/movieland/blob/master/movieland-backend/src/main/java/com/phil/movieland/data/entity/Movie.java) class of my project.\r\n\r\n## Proposal \r\nTo get further context for a specific code-completion example we have to somehow parse the given code and then decide what other project files could be useful.\r\nTo do that, I am leveraging the **IntelliJ OpenAPI's Program Structure Interface ([PSI](https://plugins.jetbrains.com/docs/intellij/psi.html))**, which the IDEs use internally to parse the source code files.\r\nIntelliJ provides a `PSI` implementation for every programming language they support (see e.g. [Supported Languages](https://www.jetbrains.com/help/idea/discover-intellij-idea.html#IntelliJ-IDEA-supported-languages), [IntelliJ Modules](https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html#modules-specific-to-functionality), [Other Bundles Plugins](https://plugins.jetbrains.com/docs/intellij/plugin-dependencies.html#preparing-sandbox))\r\nThese are the steps to determine the context files for a java project:\r\n1. Determine the `PsiElement` at the cursor position (in the above example: `PsiWhiteSpace`)\r\n2. Find the closest parent `PsiMethod` or `PsiClass` (in the above example: `PsiMethod:getMoviesSortedByPlaytime`)\r\n3. Determine all `PsiTypeElement`s that are used inside of that parent (e.g. method parameters, return value type, local variables) (in the above example: `PsiTypeElement:Movie`, `PsiTypeElement:String`)\r\n4. If the parent is a `PsiMethod` also class and static fields of the parent `PsiClass` are taken into account  (see example `movieService` field) (in the above example: `PsiTypeElement:MovieService`)\r\n5. For all found `PsiTypeElement`s the `VirtualFile` containing its source code is evaluated (only for project files, library or jdk files/classes are ignored) (in the above example: `Movie.java`, `MovieService.java`)\r\n6. The contents of the found `VirtualFile`s are prepended to the code-completion prompts according to the models' prompt formats for repository-level completions.\r\n\r\n## Results\r\nI have tested the described example with all models that support repository-level completions and tried to accumulate the results here: [Code_Completions_Context_Model Google Sheet](https://docs.google.com/spreadsheets/d/e/2PACX-1vTpuif13yyXrEK9M3XVTjwHV8DDSZ3qmolfGoUGSA_6pk1kSEfUQSoGP2UcsKrIFD8XGmb3TEX7BPaB/pubhtml). Be aware that I only tested the described scenario and did not do large test runs, the measurement were all done once to get a basic overview of the performance and the code quality ratings are purely subjective (system specs: Linux Mint 20.3 with AMD Ryzen 2700X + GTX 1070 8GB VRAM)\r\n\r\n_Note: I am not sure yet why the DeepSeekCoder 6.7b tests without context returned absolute jibberish_\r\n\r\nFor all models I tested the code-completions as they were and then with the new context included.\r\nAs you can see in the spread sheet, the **completions without context gave terrible results** with method calls on the `movieService` instance that do not even exist.\r\nThe **best result was achieved with `CodeQwen 1.5 (IQ4_NL / Q_2_K)` with context**, which returned a great, working completion:\r\n```java\r\npublic List<Movie> getMoviesSortedByPlaytime(String name) {\r\n    return movieService.queryAllMovies(name).stream() .sorted(Comparator.comparingLong(Movie::getLength\r\n}\r\n```\r\nIt found the correct method `MovieService.queryAllMovies` to use and also understood the `Movie.length` field is interpreted as its playtime.\r\n\r\n_Note: I disabled the code-completion from being stopped at \"\\n\" for this test, but didn't increase the `maxTokens`_\r\n\r\n### Advantages:\r\n- Much better completions in many scenarios\r\n- Some smaller models (e.g. DeepSeekCoder 1.3b-instruct.Q5_K_M) returned quite good results while still having a low response time (~2s)\r\n- Newer models such as `CodeQwen 1.5` performs very good with context size up to 64k tokens (see https://qwenlm.github.io/blog/codeqwen1.5/#codeqwen-are-long-context-coders)\r\n- In theory we could also add library source code to the prompt since they can be evaluated with `PSI` as well. Since models are only trained on specific timestamps, this could be used to \"keep them up-to-date\" with newer library source code\r\n\r\n### Disadvantages:\r\n- Prompts have much more tokens (e.g. 131 without context vs 2024 with context), therefore also higher response times\r\n- Implementation to retrieve context is language specific (e.g. have to provide different implementation for Java, Python, JavaScript)\r\n\r\n## Open Questions\r\n- Which model is the best compromise between response time and completion quality?\r\n- Which level of depth should the context include?\r\n- Implement the context search for other languages than Java\r\n- Should the user have an option to include/exclude this automatic context for code-completions?"
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": "Another great thing about PSI, we can not only use IntelliJ's language support, IntellIJ Ultimate also offers e.g. a [Spring API](https://plugins.jetbrains.com/docs/intellij/spring-api.html#beans) which is based on PSI. This offers the ability to access a `CommonSpringModel` which allows us to easily find e.g. Spring Beans (`SpringModelSearchers#findBeans`) that are used to provide further context for the completion. This could be a great improvement later on, when using it in a Spring project."
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": "![image](https://github.com/carlrobertoh/CodeGPT/assets/39240633/ebce05ed-3c9f-4637-b10c-ff6e54bef16a)\r\nThe JetBrains IDEs also offer a neat little tool [PSI Viewer](https://www.jetbrains.com/help/idea/psi-viewer.html)(`Tools` -> `View PSI Structure of Current File`) to view the `PSI` tree of a file, which could be very helpful in extracting the correct `PsiElement`s during development."
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": "This is really awesome work and one of the missing pieces of CodeGPT! \ud83d\ude80 \ud83d\udcaf \r\n\r\nFew comments:\r\n\r\n> Note: I disabled the code-completion from being stopped at \"\\n\" for this test, but didn't increase the maxTokens\r\n\r\nHmm, cancelling the request at '\\n' was removed in the latest release. Also, `maxTokens` are calculated dynamically instead of letting the user decide. The current solution is somewhat funky, but it works quite well in some situations.\r\n\r\n> In theory we could also add library source code to the prompt since they can be evaluated with PSI as well. Since models are only trained on specific timestamps, this could be used to \"keep them up-to-date\" with newer library source code\r\n\r\nYes, and I think we should already include this change in the current branch. This shouldn't require any additional implementation IF you remove the `PsiTarget` -> `VirtualFile` mapping and take the content directly from the PSI element.\r\n\r\n> Prompts have much more tokens (e.g. 131 without context vs 2024 with context), therefore also higher response times\r\n\r\nThis is inevitable, we just need to find the perfect balance.\r\n\r\n> Which model is the best compromise between response time and completion quality?\r\n\r\nCurrently, most users are using the OpenAI provider, which means that `gpt-3.5-turbo-instruct` should be considered the primary model for code completions.\r\n\r\n> Should the user have an option to include/exclude this automatic context for code-completions?\r\n\r\nI think so, similarily to how we allow users to enable/disable completion post-processing. Eventually, we can remove them altogether, as they can be relatively hard for users to understand."
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": "> > In theory we could also add library source code to the prompt since they can be evaluated with PSI as well. Since models are only trained on specific timestamps, this could be used to \"keep them up-to-date\" with newer library source code\r\n> \r\n> Yes, and I think we should already include this change in the current branch. This shouldn't require any additional implementation IF you remove the `PsiTarget` -> `VirtualFile` mapping and take the content directly from the PSI element.\r\n> >\r\nGetting the text contents from the `PsiTarget` does work, but for library code it will not return the source code, but the compiled code. For example if I have a reference to Jackson's `ObjectMapper` the text content of its `PsiTarget`/`PsiClassImpl` is:\r\n\r\n\r\n<details>\r\n  <summary>PsiClassImpl#ObjectMapper</summary>\r\n  \r\n```java\r\npublic class ObjectMapper extends com.fasterxml.jackson.core.ObjectCodec implements com.fasterxml.jackson.core.Versioned, java.io.Serializable {\r\n    private static final long serialVersionUID = 2L;\r\n    protected static final com.fasterxml.jackson.databind.AnnotationIntrospector DEFAULT_ANNOTATION_INTROSPECTOR;\r\n    protected static final com.fasterxml.jackson.databind.cfg.BaseSettings DEFAULT_BASE;\r\n    protected final com.fasterxml.jackson.core.JsonFactory _jsonFactory;\r\n    protected com.fasterxml.jackson.databind.type.TypeFactory _typeFactory;\r\n    protected com.fasterxml.jackson.databind.InjectableValues _injectableValues;\r\n    protected com.fasterxml.jackson.databind.jsontype.SubtypeResolver _subtypeResolver;\r\n    protected final com.fasterxml.jackson.databind.cfg.ConfigOverrides _configOverrides;\r\n    protected final com.fasterxml.jackson.databind.cfg.CoercionConfigs _coercionConfigs;\r\n    protected com.fasterxml.jackson.databind.introspect.SimpleMixInResolver _mixIns;\r\n    protected com.fasterxml.jackson.databind.SerializationConfig _serializationConfig;\r\n    protected com.fasterxml.jackson.databind.ser.DefaultSerializerProvider _serializerProvider;\r\n    protected com.fasterxml.jackson.databind.ser.SerializerFactory _serializerFactory;\r\n    protected com.fasterxml.jackson.databind.DeserializationConfig _deserializationConfig;\r\n    protected com.fasterxml.jackson.databind.deser.DefaultDeserializationContext _deserializationContext;\r\n    protected java.util.Set<java.lang.Object> _registeredModuleTypes;\r\n    protected final java.util.concurrent.ConcurrentHashMap<com.fasterxml.jackson.databind.JavaType,com.fasterxml.jackson.databind.JsonDeserializer<java.lang.Object>> _rootDeserializers;\r\n\r\n    public ObjectMapper() { /* compiled code */ }\r\n\r\n    public ObjectMapper(com.fasterxml.jackson.core.JsonFactory jf) { /* compiled code */ }\r\n\r\n    protected ObjectMapper(com.fasterxml.jackson.databind.ObjectMapper src) { /* compiled code */ }\r\n\r\n    protected ObjectMapper(com.fasterxml.jackson.databind.ObjectMapper src, com.fasterxml.jackson.core.JsonFactory factory) { /* compiled code */ }\r\n\r\n    public ObjectMapper(com.fasterxml.jackson.core.JsonFactory jf, com.fasterxml.jackson.databind.ser.DefaultSerializerProvider sp, com.fasterxml.jackson.databind.deser.DefaultDeserializationContext dc) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.introspect.ClassIntrospector defaultClassIntrospector() { /* compiled code */ }\r\n\r\n    public com.fasterxml.jackson.databind.ObjectMapper copy() { /* compiled code */ }\r\n\r\n    public com.fasterxml.jackson.databind.ObjectMapper copyWith(com.fasterxml.jackson.core.JsonFactory factory) { /* compiled code */ }\r\n\r\n    protected void _checkInvalidCopy(java.lang.Class<?> exp) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.ObjectReader _newReader(com.fasterxml.jackson.databind.DeserializationConfig config) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.ObjectReader _newReader(com.fasterxml.jackson.databind.DeserializationConfig config, com.fasterxml.jackson.databind.JavaType valueType, java.lang.Object valueToUpdate, com.fasterxml.jackson.core.FormatSchema schema, com.fasterxml.jackson.databind.InjectableValues injectableValues) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.ObjectWriter _newWriter(com.fasterxml.jackson.databind.SerializationConfig config) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.ObjectWriter _newWriter(com.fasterxml.jackson.databind.SerializationConfig config, com.fasterxml.jackson.core.FormatSchema schema) { /* compiled code */ }\r\n\r\n    protected com.fasterxml.jackson.databind.ObjectWriter _newWriter(com.fasterxml.jackson.databind.SerializationConfig config, com.fasterxml.jackson.databind.JavaType rootType, com.fasterxml.jackson.core.PrettyPrinter pp) { /* compiled code */ }\r\n\r\n    public com.fasterxml.jackson.core.Version version() { /* compiled code */ }\r\n\r\n    public com.fasterxml.jackson.databind.ObjectMapper registerModule(com.fasterxml.jackson.databind.Module module) { /* compiled code */ }\r\n...\r\n}\r\n```\r\n</details>\r\n\r\nI think to get the actual source code it has to be downloaded first (for e.g. java usually libraries provide separate `sources.jar`, which is downloaded by [DownloadSourcesAction](https://github.com/JetBrains/intellij-community/blob/57f19ccb362b9dedc4fb374c58cf2bfd756a3b3a/java/idea-ui/src/com/intellij/jarFinder/AbstractAttachSourceProvider.java#L111) \r\n\r\n\r\n> > Which model is the best compromise between response time and completion quality?\r\n> \r\n> Currently, most users are using the OpenAI provider, which means that `gpt-3.5-turbo-instruct` should be considered the primary model for code completions.\r\n> \r\n> >\r\nI haven't tested this with ChatGPT, as far as I know `gpt-3.5-turbo-instruct` was only trained with the FIM tokens, not repository-level completion tokens like the mentioned open source models. We would have to come up with our own syntax for prompting ChatGPT, although I am not sure how reliable that would be. \r\n\r\n> > Should the user have an option to include/exclude this automatic context for code-completions?\r\n> \r\n> I think so, similarly to how we allow users to enable/disable completion post-processing. Eventually, we can remove them altogether, as they can be relatively hard for users to understand.\r\n> >\r\nI agree, I think customizability has been mentioned many times as one of the advantages of the CodeGPT plugin, so we should keep doing that. It will also take some time to find the best configuration either way.\r\n\r\n"
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": "> Getting the text contents from the PsiTarget does work, but for library code it will not return the source code, but the compiled code. For example if I have a reference to Jackson's ObjectMapper the text content of its PsiTarget/PsiClassImpl is:\r\n\r\nAhh, ok. In that case, can we include the functionality only if the user has downloaded the source code?"
+    },
+    {
+        "author": {
+            "login": "PhilKes"
+        },
+        "body": "> > Getting the text contents from the PsiTarget does work, but for library code it will not return the source code, but the compiled code. For example if I have a reference to Jackson's ObjectMapper the text content of its PsiTarget/PsiClassImpl is:\r\n> \r\n> Ahh, ok. In that case, can we include the functionality only if the user has downloaded the source code?\r\n\r\nFor library code, yes. I am experimenting with triggering the download source action programatically, but I don't think thats a good solution. Perhaps we put a hint in the settings that its benefitial to enable Maven/Gradle auto-download of the sources, then all library sources that are available would be present at the time of the code-completion.\r\nI also think this is just a problem with Java, since there is a separation between the compiled `.jar` and the `sources.jar`. If you e.g. go to the definition of some library code in JavaScript, or GoLang you end up directly in the sources. But I do not have an overview of which languages/package-managers have compiled library code and sources separately.\r\nFor now we could simply check if [ClsMethodImpl.sourceMirrorMethod](https://github.com/JetBrains/intellij-community/blob/57f19ccb362b9dedc4fb374c58cf2bfd756a3b3a/java/java-psi-impl/src/com/intellij/psi/impl/compiled/ClsMethodImpl.java#L247)/[ClsClassImpl.getSourceMirrorClass](https://github.com/JetBrains/intellij-community/blob/master/java/java-psi-impl/src/com/intellij/psi/impl/compiled/ClsClassImpl.java#L507) is present, if yes, we include the library code, if not, we ignore it?\r\n\r\nWe should also make a list of what languages we want to support for the 1st release of this feature.\r\nThere also IntelliJ plugins providing more specific PSI extensions for frameworks such as Spring, VueJS, Angular,... that we can add later on"
+    },
+    {
+        "author": {
+            "login": "carlrobertoh"
+        },
+        "body": "> For now we could simply check if [ClsMethodImpl.sourceMirrorMethod](https://github.com/JetBrains/intellij-community/blob/57f19ccb362b9dedc4fb374c58cf2bfd756a3b3a/java/java-psi-impl/src/com/intellij/psi/impl/compiled/ClsMethodImpl.java#L247)/[ClsClassImpl.getSourceMirrorClass](https://github.com/JetBrains/intellij-community/blob/master/java/java-psi-impl/src/com/intellij/psi/impl/compiled/ClsClassImpl.java#L507) is present, if yes, we include the library code, if not, we ignore it?\r\n\r\nYes, that would work. We can focus on it in a later phase.\r\n\r\n> There also IntelliJ plugins providing more specific PSI extensions for frameworks such as Spring, VueJS, Angular,... that we can add later on\r\n\r\nNot sure what the impact on the extension's size would be when integrating with all of these plugins."
+    }
+]

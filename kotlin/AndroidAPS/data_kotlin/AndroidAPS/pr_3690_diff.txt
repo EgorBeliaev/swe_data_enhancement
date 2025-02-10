@@ -1,0 +1,169 @@
+diff --git a/core/interfaces/src/main/kotlin/app/aaps/core/interfaces/pump/PumpSync.kt b/core/interfaces/src/main/kotlin/app/aaps/core/interfaces/pump/PumpSync.kt
+index 1d45d28c85b..cf28fd00da1 100644
+--- a/core/interfaces/src/main/kotlin/app/aaps/core/interfaces/pump/PumpSync.kt
++++ b/core/interfaces/src/main/kotlin/app/aaps/core/interfaces/pump/PumpSync.kt
+@@ -7,9 +7,10 @@ import app.aaps.core.data.model.TE
+ import app.aaps.core.data.pump.defs.PumpType
+ import app.aaps.core.data.time.T
+ import app.aaps.core.data.ue.Sources
++import app.aaps.core.interfaces.R
+ import app.aaps.core.interfaces.profile.Profile
++import app.aaps.core.interfaces.resources.ResourceHelper
+ import app.aaps.core.interfaces.utils.DateUtil
+-import app.aaps.core.interfaces.utils.DecimalFormatter
+ import kotlin.math.max
+ import kotlin.math.min
+ import kotlin.math.roundToInt
+@@ -95,18 +96,14 @@ interface PumpSync {
+                 if (isAbsolute) rate
+                 else profile.getBasal(time) * rate / 100
+ 
+-            fun toStringFull(dateUtil: DateUtil, decimalFormatter: DecimalFormatter): String {
++            fun toStringFull(dateUtil: DateUtil, rh: ResourceHelper): String {
+                 return when {
+                     isAbsolute -> {
+-                        decimalFormatter.to2Decimal(rate) + "U/h @" +
+-                            dateUtil.timeString(timestamp) +
+-                            " " + getPassedDurationToTimeInMinutes(dateUtil.now()) + "/" + durationInMinutes + "'"
++                        rh.gs(R.string.temp_basal_absolute_rate, rate, dateUtil.timeString(timestamp), getPassedDurationToTimeInMinutes(dateUtil.now()), durationInMinutes)
+                     }
+ 
+                     else       -> { // percent
+-                        rate.toString() + "% @" +
+-                            dateUtil.timeString(timestamp) +
+-                            " " + getPassedDurationToTimeInMinutes(dateUtil.now()) + "/" + durationInMinutes + "'"
++                        rh.gs(R.string.temp_basal_percent_rate, rate, dateUtil.timeString(timestamp), getPassedDurationToTimeInMinutes(dateUtil.now()), durationInMinutes)
+                     }
+                 }
+             }
+@@ -138,10 +135,8 @@ interface PumpSync {
+             private fun getPassedDurationToTimeInMinutes(time: Long): Int =
+                 ((min(time, end) - timestamp) / 60.0 / 1000).roundToInt()
+ 
+-            fun toStringFull(dateUtil: DateUtil, decimalFormatter: DecimalFormatter): String =
+-                "E " + decimalFormatter.to2Decimal(rate) + "U/h @" +
+-                    dateUtil.timeString(timestamp) +
+-                    " " + getPassedDurationToTimeInMinutes(dateUtil.now()) + "/" + T.msecs(duration).mins() + "min"
++            fun toStringFull(dateUtil: DateUtil, rh: ResourceHelper): String =
++                rh.gs(R.string.temp_basal_extended_bolus, rate, dateUtil.timeString(timestamp), getPassedDurationToTimeInMinutes(dateUtil.now()), T.msecs(duration).mins())
+         }
+ 
+         data class Bolus(val timestamp: Long, val amount: Double)
+diff --git a/core/interfaces/src/main/res/values/strings.xml b/core/interfaces/src/main/res/values/strings.xml
+index 1815ce63f3c..8a35525c432 100644
+--- a/core/interfaces/src/main/res/values/strings.xml
++++ b/core/interfaces/src/main/res/values/strings.xml
+@@ -69,5 +69,8 @@
+     <string name="default_custom_watchface_external_comment">Default watchface including external views for followers, you can click on EXPORT WATCHFACE button to generate a template</string>
+     <string name="wear_default_watchface">Default Watchface</string>
+     <string name="wear_more_watchfaces">More watchfaces</string>
++    <string name="temp_basal_absolute_rate">%1$.2f U/h @%2$s %3$d/%4$d\'</string>
++    <string name="temp_basal_percent_rate">%1$.2f%% @%2$s %3$d/%4$d\'</string>
++    <string name="temp_basal_extended_bolus">E %1$.2f U/h @%2$s %3$d/%4$d min</string>
+ 
+ </resources>
+diff --git a/pump/combov2/src/main/kotlin/info/nightscout/pump/combov2/ComboV2Plugin.kt b/pump/combov2/src/main/kotlin/info/nightscout/pump/combov2/ComboV2Plugin.kt
+index 188d3e3fcdc..27717cd0a7a 100644
+--- a/pump/combov2/src/main/kotlin/info/nightscout/pump/combov2/ComboV2Plugin.kt
++++ b/pump/combov2/src/main/kotlin/info/nightscout/pump/combov2/ComboV2Plugin.kt
+@@ -1487,7 +1487,7 @@ class ComboV2Plugin @Inject constructor(
+         temporaryBasal?.let {
+             lines += rh.gs(
+                 R.string.combov2_short_status_temp_basal,
+-                it.toStringFull(dateUtil, decimalFormatter)
++                it.toStringFull(dateUtil, rh)
+             )
+         }
+ 
+diff --git a/pump/danar/src/main/kotlin/app/aaps/pump/danar/AbstractDanaRPlugin.kt b/pump/danar/src/main/kotlin/app/aaps/pump/danar/AbstractDanaRPlugin.kt
+index 642128f2291..8ee65d8225e 100644
+--- a/pump/danar/src/main/kotlin/app/aaps/pump/danar/AbstractDanaRPlugin.kt
++++ b/pump/danar/src/main/kotlin/app/aaps/pump/danar/AbstractDanaRPlugin.kt
+@@ -433,10 +433,10 @@ abstract class AbstractDanaRPlugin protected constructor(
+         }
+         val (temporaryBasal, extendedBolus) = pumpSync.expectedPumpState()
+         if (temporaryBasal != null) {
+-            ret += "Temp: ${temporaryBasal.toStringFull(dateUtil, decimalFormatter)}\n"
++            ret += "Temp: ${temporaryBasal.toStringFull(dateUtil, rh)}\n"
+         }
+         if (extendedBolus != null) {
+-            ret += "Extended: ${extendedBolus.toStringFull(dateUtil, decimalFormatter)}\n"
++            ret += "Extended: ${extendedBolus.toStringFull(dateUtil, rh)}\n"
+         }
+         if (!veryShort) {
+             ret += "TDD: ${decimalFormatter.to0Decimal(danaPump.dailyTotalUnits)} / ${danaPump.maxDailyTotalUnits} U\n"
+diff --git a/pump/equil/src/main/kotlin/app/aaps/pump/equil/EquilPumpPlugin.kt b/pump/equil/src/main/kotlin/app/aaps/pump/equil/EquilPumpPlugin.kt
+index 80625aa86cf..a8a1d4ee66e 100644
+--- a/pump/equil/src/main/kotlin/app/aaps/pump/equil/EquilPumpPlugin.kt
++++ b/pump/equil/src/main/kotlin/app/aaps/pump/equil/EquilPumpPlugin.kt
+@@ -343,10 +343,10 @@ import javax.inject.Singleton
+         }
+         val (temporaryBasal, extendedBolus, _, profile) = pumpSync.expectedPumpState()
+         if (temporaryBasal != null && profile != null) {
+-            ret += rh.gs(R.string.equil_common_short_status_temp_basal, temporaryBasal.toStringFull(dateUtil, decimalFormatter) + "\n")
++            ret += rh.gs(R.string.equil_common_short_status_temp_basal, temporaryBasal.toStringFull(dateUtil, rh) + "\n")
+         }
+         if (extendedBolus != null) {
+-            ret += rh.gs(R.string.equil_common_short_status_extended_bolus, extendedBolus.toStringFull(dateUtil, decimalFormatter) + "\n")
++            ret += rh.gs(R.string.equil_common_short_status_extended_bolus, extendedBolus.toStringFull(dateUtil, rh) + "\n")
+         }
+         ret += rh.gs(R.string.equil_common_short_status_reservoir, reservoirLevel)
+         return ret.trim { it <= ' ' }
+diff --git a/pump/omnipod-common/src/main/res/values/strings.xml b/pump/omnipod-common/src/main/res/values/strings.xml
+index 21af59b636a..c52a9e0ab03 100644
+--- a/pump/omnipod-common/src/main/res/values/strings.xml
++++ b/pump/omnipod-common/src/main/res/values/strings.xml
+@@ -196,7 +196,7 @@
+     <!-- Omnipod - Short status -->
+     <string name="omnipod_common_short_status_no_active_pod">No Active Pod</string>
+     <string name="omnipod_common_short_status_last_connection">LastConn: %1$d min ago</string>
+-    <string name="omnipod_common_short_status_last_bolus">LastBolus: %1$s @ %2$s</string>
++    <string name="omnipod_common_short_status_last_bolus">LastBolus: %1$s U @ %2$s</string>
+     <string name="omnipod_common_short_status_temp_basal">Temp: %1$s</string>
+     <string name="omnipod_common_short_status_extended_bolus">Extended: %1$s</string>
+     <string name="omnipod_common_short_status_reservoir">Reserv: %1$sU</string>
+diff --git a/pump/omnipod-dash/src/main/kotlin/app/aaps/pump/omnipod/dash/OmnipodDashPumpPlugin.kt b/pump/omnipod-dash/src/main/kotlin/app/aaps/pump/omnipod/dash/OmnipodDashPumpPlugin.kt
+index 56a4b57df5c..b0ae8ad9256 100644
+--- a/pump/omnipod-dash/src/main/kotlin/app/aaps/pump/omnipod/dash/OmnipodDashPumpPlugin.kt
++++ b/pump/omnipod-dash/src/main/kotlin/app/aaps/pump/omnipod/dash/OmnipodDashPumpPlugin.kt
+@@ -1060,7 +1060,7 @@ class OmnipodDashPumpPlugin @Inject constructor(
+         temporaryBasal?.run {
+             ret += rh.gs(
+                 app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_temp_basal,
+-                this.toStringFull(dateUtil, decimalFormatter)
++                this.toStringFull(dateUtil, rh)
+             ) + "\n"
+         }
+         ret += rh.gs(
+diff --git a/pump/omnipod-eros/src/main/java/app/aaps/pump/omnipod/eros/OmnipodErosPumpPlugin.java b/pump/omnipod-eros/src/main/java/app/aaps/pump/omnipod/eros/OmnipodErosPumpPlugin.java
+index ad5a68c745b..4dda23f821a 100644
+--- a/pump/omnipod-eros/src/main/java/app/aaps/pump/omnipod/eros/OmnipodErosPumpPlugin.java
++++ b/pump/omnipod-eros/src/main/java/app/aaps/pump/omnipod/eros/OmnipodErosPumpPlugin.java
+@@ -826,10 +826,10 @@ public String shortStatus(boolean veryShort) {
+         }
+         PumpSync.PumpState pumpState = pumpSync.expectedPumpState();
+         if (pumpState.getTemporaryBasal() != null && pumpState.getProfile() != null) {
+-            ret += rh.gs(app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_temp_basal, pumpState.getTemporaryBasal().toStringFull(dateUtil, decimalFormatter) + "\n");
++            ret += rh.gs(app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_temp_basal, pumpState.getTemporaryBasal().toStringFull(dateUtil, rh) + "\n");
+         }
+         if (pumpState.getExtendedBolus() != null) {
+-            ret += rh.gs(app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_extended_bolus, pumpState.getExtendedBolus().toStringFull(dateUtil, decimalFormatter) + "\n");
++            ret += rh.gs(app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_extended_bolus, pumpState.getExtendedBolus().toStringFull(dateUtil, rh) + "\n");
+         }
+         ret += rh.gs(app.aaps.pump.omnipod.common.R.string.omnipod_common_short_status_reservoir, (getReservoirLevel() > OmnipodConstants.MAX_RESERVOIR_READING ? "50+" : decimalFormatter.to0Decimal(getReservoirLevel()))) + "\n";
+         if (isUseRileyLinkBatteryLevel()) {
+diff --git a/pump/pump-common/src/main/kotlin/app/aaps/pump/common/PumpPluginAbstract.kt b/pump/pump-common/src/main/kotlin/app/aaps/pump/common/PumpPluginAbstract.kt
+index 97ff6cd6e06..948b73c9a57 100644
+--- a/pump/pump-common/src/main/kotlin/app/aaps/pump/common/PumpPluginAbstract.kt
++++ b/pump/pump-common/src/main/kotlin/app/aaps/pump/common/PumpPluginAbstract.kt
+@@ -292,8 +292,8 @@ abstract class PumpPluginAbstract protected constructor(
+                 ret += "LastBolus: ${decimalFormatter.to2Decimal(pumpStatusData.lastBolusAmount!!)}U @${DateFormat.format("HH:mm", it)}\n"
+             }
+         }
+-        pumpSync.expectedPumpState().temporaryBasal?.let { ret += "Temp: ${it.toStringFull(dateUtil, decimalFormatter)}\n" }
+-        pumpSync.expectedPumpState().extendedBolus?.let { ret += "Extended: ${it.toStringFull(dateUtil, decimalFormatter)}\n" }
++        pumpSync.expectedPumpState().temporaryBasal?.let { ret += "Temp: ${it.toStringFull(dateUtil, rh)}\n" }
++        pumpSync.expectedPumpState().extendedBolus?.let { ret += "Extended: ${it.toStringFull(dateUtil, rh)}\n" }
+         ret += "IOB: ${pumpStatusData.iob}U\n"
+         ret += "Reserv: ${decimalFormatter.to0Decimal(pumpStatusData.reservoirRemainingUnits)}U\n"
+         ret += "Batt: ${pumpStatusData.batteryRemaining}\n"

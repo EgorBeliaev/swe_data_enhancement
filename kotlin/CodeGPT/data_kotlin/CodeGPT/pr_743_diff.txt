@@ -1,0 +1,982 @@
+diff --git a/DESCRIPTION.md b/DESCRIPTION.md
+index aae35b791..ebfbb2219 100644
+--- a/DESCRIPTION.md
++++ b/DESCRIPTION.md
+@@ -26,6 +26,10 @@ CodeGPT offers a wide range of features to enhance your development experience:
+ 
+ Get instant coding advice through a ChatGPT-like interface that accepts image input. Ask questions, share screenshots, seek explanations, or get guidance on your projects without leaving your IDE.
+ 
++### Auto Apply
++
++Automatically insert AI-suggested code directly into your active file. Click the Auto Apply icon to stream changes, view them in diff style, and approve or reject edits directly.
++
+ **Use images**
+ 
+ Chat with your images. Upload manually or let CodeGPT auto-detect your screenshots.
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index c16dd51d6..5124a9eaa 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -12,7 +12,7 @@ jsoup = "1.17.2"
+ jtokkit = "1.1.0"
+ junit = "5.11.0"
+ kotlin = "2.0.0"
+-llm-client = "0.8.22"
++llm-client = "0.8.23"
+ okio = "3.9.0"
+ tree-sitter = "0.22.6a"
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/Icons.java b/src/main/java/ee/carlrobert/codegpt/Icons.java
+index d86d3d88b..b3e267154 100644
+--- a/src/main/java/ee/carlrobert/codegpt/Icons.java
++++ b/src/main/java/ee/carlrobert/codegpt/Icons.java
+@@ -28,6 +28,9 @@ public final class Icons {
+   public static final Icon Ollama = IconLoader.getIcon("/icons/ollama.svg", Icons.class);
+   public static final Icon User = IconLoader.getIcon("/icons/user.svg", Icons.class);
+   public static final Icon Upload = IconLoader.getIcon("/icons/upload.svg", Icons.class);
++  public static final Icon Lightning = IconLoader.getIcon("/icons/lightning.svg", Icons.class);
++  public static final Icon LightningDisabled =
++      IconLoader.getIcon("/icons/lightning.svg", Icons.class);
+   public static final Icon GreenCheckmark =
+       IconLoader.getIcon("/icons/greenCheckmark.svg", Icons.class);
+   public static final Icon SendToTheLeft =
+diff --git a/src/main/java/ee/carlrobert/codegpt/actions/ActionType.java b/src/main/java/ee/carlrobert/codegpt/actions/ActionType.java
+index f8ab4a56d..5a3d51b41 100644
+--- a/src/main/java/ee/carlrobert/codegpt/actions/ActionType.java
++++ b/src/main/java/ee/carlrobert/codegpt/actions/ActionType.java
+@@ -12,6 +12,7 @@ public enum ActionType {
+   EDIT_CODE,
+   CREATE_NEW_FILE,
+   COPY_CODE,
++  AUTO_APPLY,
+   REPLACE_IN_MAIN_EDITOR,
+   INSERT_AT_CARET,
+   RELOAD_MESSAGE,
+diff --git a/src/main/java/ee/carlrobert/codegpt/actions/TrackableAction.java b/src/main/java/ee/carlrobert/codegpt/actions/TrackableAction.java
+index 66ad38ee9..92343967f 100644
+--- a/src/main/java/ee/carlrobert/codegpt/actions/TrackableAction.java
++++ b/src/main/java/ee/carlrobert/codegpt/actions/TrackableAction.java
+@@ -2,7 +2,6 @@
+ 
+ import com.intellij.openapi.actionSystem.AnAction;
+ import com.intellij.openapi.actionSystem.AnActionEvent;
+-import com.intellij.openapi.editor.Editor;
+ import ee.carlrobert.codegpt.telemetry.TelemetryAction;
+ import javax.swing.Icon;
+ import org.jetbrains.annotations.NotNull;
+@@ -10,16 +9,13 @@
+ public abstract class TrackableAction extends AnAction {
+ 
+   private final ActionType actionType;
+-  protected final Editor editor;
+ 
+   public TrackableAction(
+-      @NotNull Editor editor,
+       String text,
+       String description,
+       Icon icon,
+       ActionType actionType) {
+     super(text, description, icon);
+-    this.editor = editor;
+     this.actionType = actionType;
+   }
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
+index d03a1c175..d6d307f45 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ToolWindowCompletionResponseEventListener.java
+@@ -116,7 +116,6 @@ public void handleCompleted(String fullMessage, ChatCompletionParameters callPar
+     ApplicationManager.getApplication().invokeLater(() -> {
+       try {
+         responsePanel.enableActions();
+-        responseContainer.enableActions();
+         if (!responseContainer.isResponseReceived() && !fullMessage.isEmpty()) {
+           responseContainer.withResponse(fullMessage);
+         }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/ResponseEditorPanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/ResponseEditorPanel.java
+index 6e7643e4e..a8b593c5b 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/ResponseEditorPanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/ResponseEditorPanel.java
+@@ -11,7 +11,6 @@
+ import com.intellij.openapi.actionSystem.AnAction;
+ import com.intellij.openapi.actionSystem.AnActionEvent;
+ import com.intellij.openapi.actionSystem.DefaultActionGroup;
+-import com.intellij.openapi.actionSystem.DefaultCompactActionGroup;
+ import com.intellij.openapi.editor.Editor;
+ import com.intellij.openapi.editor.EditorFactory;
+ import com.intellij.openapi.editor.colors.EditorColorsManager;
+@@ -28,19 +27,15 @@
+ import com.intellij.util.ui.JBUI;
+ import ee.carlrobert.codegpt.CodeGPTBundle;
+ import ee.carlrobert.codegpt.actions.toolwindow.ReplaceCodeInMainEditorAction;
+-import ee.carlrobert.codegpt.toolwindow.chat.CompareWithOriginalActionLink;
+-import ee.carlrobert.codegpt.toolwindow.chat.DirectApplyActionLink;
++import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.AutoApplyAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.CopyAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.DiffAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.EditAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.InsertAtCaretAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.NewFileAction;
+ import ee.carlrobert.codegpt.toolwindow.chat.editor.actions.ReplaceSelectionAction;
+-import ee.carlrobert.codegpt.ui.IconActionButton;
+ import ee.carlrobert.codegpt.util.EditorUtil;
+ import java.awt.BorderLayout;
+-import java.awt.FlowLayout;
+-import javax.swing.Box;
+ import javax.swing.JPanel;
+ import org.jetbrains.annotations.NotNull;
+ import org.jetbrains.annotations.Nullable;
+@@ -48,7 +43,6 @@
+ public class ResponseEditorPanel extends JPanel implements Disposable {
+ 
+   private final Editor editor;
+-  private final JPanel directLinksPanel = new JPanel(new FlowLayout(FlowLayout.TRAILING, 0, 0));
+ 
+   public ResponseEditorPanel(
+       Project project,
+@@ -75,28 +69,16 @@ public ResponseEditorPanel(
+       }
+     }
+     configureEditor(
++        project,
+         (EditorEx) editor,
+         readOnly,
+         new ContextMenuPopupHandler.Simple(group),
+         findLanguageExtensionMapping(markdownLanguage).getValue());
+     add(editor.getComponent(), BorderLayout.CENTER);
+ 
+-    if (highlightedText != null && !highlightedText.isEmpty()) {
+-      directLinksPanel.setVisible(false);
+-      directLinksPanel.setBorder(JBUI.Borders.emptyTop(8));
+-      directLinksPanel.add(new CompareWithOriginalActionLink(project, editor, highlightedText));
+-      directLinksPanel.add(Box.createHorizontalStrut(12));
+-      directLinksPanel.add(new DirectApplyActionLink(project, editor, highlightedText));
+-      add(directLinksPanel, BorderLayout.SOUTH);
+-    }
+-
+     Disposer.register(disposableParent, this);
+   }
+ 
+-  public void showEditorActions() {
+-    directLinksPanel.setVisible(true);
+-  }
+-
+   @Override
+   public void dispose() {
+     EditorFactory.getInstance().releaseEditor(editor);
+@@ -107,6 +89,7 @@ public Editor getEditor() {
+   }
+ 
+   private void configureEditor(
++      Project project,
+       EditorEx editorEx,
+       boolean readOnly,
+       ContextMenuPopupHandler popupHandler,
+@@ -133,22 +116,28 @@ private void configureEditor(
+     editorEx.setVerticalScrollbarVisible(false);
+     editorEx.getContentComponent().setBorder(JBUI.Borders.emptyLeft(4));
+     editorEx.setBorder(IdeBorderFactory.createBorder(ColorUtil.fromHex("#48494b")));
+-    editorEx.setPermanentHeaderComponent(createHeaderComponent(editorEx, extension, readOnly));
++    editorEx.setPermanentHeaderComponent(
++        createHeaderComponent(project, editorEx, extension, readOnly));
+     editorEx.setHeaderComponent(null);
+   }
+ 
+-  private JPanel createHeaderComponent(EditorEx editorEx, String extension, boolean readOnly) {
+-    var headerComponent = new JPanel(new BorderLayout());
+-    headerComponent.setBorder(
++  private JPanel createHeaderComponent(
++      Project project,
++      EditorEx editorEx,
++      String extension,
++      boolean readOnly) {
++    var headerPanel = new JPanel(new BorderLayout());
++    headerPanel.setBorder(
+         JBUI.Borders.compound(
+             JBUI.Borders.customLine(ColorUtil.fromHex("#48494b"), 1, 1, 0, 1),
+             JBUI.Borders.empty(4)));
+-    headerComponent.add(createExpandLink(editorEx), BorderLayout.LINE_START);
++    headerPanel.add(createExpandLink(editorEx), BorderLayout.LINE_START);
+     if (!readOnly) {
+-      headerComponent.add(
+-          createHeaderActions(extension, editorEx).getComponent(), BorderLayout.LINE_END);
++      headerPanel.add(
++          createHeaderActions(project, extension, editorEx, headerPanel).getComponent(),
++          BorderLayout.LINE_END);
+     }
+-    return headerComponent;
++    return headerPanel;
+   }
+ 
+   private String getLinkText(boolean expanded) {
+@@ -178,20 +167,20 @@ private ActionLink createExpandLink(EditorEx editorEx) {
+     return expandLink;
+   }
+ 
+-  private ActionToolbar createHeaderActions(String extension, EditorEx editorEx) {
+-    var actionGroup = new DefaultCompactActionGroup("EDITOR_TOOLBAR_ACTION_GROUP", false);
+-    actionGroup.add(new CopyAction(editor));
+-    actionGroup.add(new ReplaceSelectionAction(editor));
+-    actionGroup.add(new InsertAtCaretAction(editor));
++  private ActionToolbar createHeaderActions(
++      Project project,
++      String extension,
++      EditorEx editorEx,
++      JPanel headerPanel) {
++    var actionGroup = new DefaultActionGroup("EDITOR_TOOLBAR_ACTION_GROUP", false);
++    actionGroup.add(new AutoApplyAction(project, editorEx, headerPanel));
++    actionGroup.add(new InsertAtCaretAction(editorEx));
++    actionGroup.add(new CopyAction(editorEx));
+     actionGroup.addSeparator();
+ 
+-    var wrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+-    wrapper.add(new IconActionButton(new CopyAction(editor)));
+-    wrapper.add(Box.createHorizontalStrut(4));
+-    wrapper.add(new IconActionButton(new ReplaceSelectionAction(editor)));
+-
+     var menu = new JBPopupMenu();
+     menu.add(new JBMenuItem(new DiffAction(editorEx, menu.getLocation())));
++    menu.add(new JBMenuItem(new ReplaceSelectionAction(editorEx, menu.getLocation())));
+     menu.add(new JBMenuItem(new EditAction(editorEx)));
+     menu.add(new JBMenuItem(new NewFileAction(editorEx, extension)));
+ 
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/CopyAction.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/CopyAction.java
+index 6823fdfc0..2d5a76d2b 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/CopyAction.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/CopyAction.java
+@@ -15,18 +15,20 @@
+ 
+ public class CopyAction extends TrackableAction {
+ 
+-  public CopyAction(@NotNull Editor editor) {
++  private final @NotNull Editor toolwindowEditor;
++
++  public CopyAction(@NotNull Editor toolwindowEditor) {
+     super(
+-        editor,
+         CodeGPTBundle.get("toolwindow.chat.editor.action.copy.title"),
+         CodeGPTBundle.get("toolwindow.chat.editor.action.copy.description"),
+         Actions.Copy,
+         ActionType.COPY_CODE);
++    this.toolwindowEditor = toolwindowEditor;
+   }
+ 
+   @Override
+   public void handleAction(@NotNull AnActionEvent event) {
+-    StringSelection stringSelection = new StringSelection(editor.getDocument().getText());
++    StringSelection stringSelection = new StringSelection(toolwindowEditor.getDocument().getText());
+     Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+     clipboard.setContents(stringSelection, null);
+ 
+@@ -36,8 +38,8 @@ public void handleAction(@NotNull AnActionEvent event) {
+       locationOnScreen.y = locationOnScreen.y - 16;
+ 
+       OverlayUtil.showInfoBalloon(
+-              CodeGPTBundle.get("toolwindow.chat.editor.action.copy.success"),
+-              locationOnScreen);
++          CodeGPTBundle.get("toolwindow.chat.editor.action.copy.success"),
++          locationOnScreen);
+     }
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/DiffAction.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/DiffAction.java
+index b1ea4d4c4..98f6c1f13 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/DiffAction.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/DiffAction.java
+@@ -19,7 +19,7 @@ public class DiffAction extends AbstractAction {
+   private final Point locationOnScreen;
+ 
+   public DiffAction(EditorEx editor, @Nullable Point locationOnScreen) {
+-    super("Diff", Actions.DiffWithClipboard);
++    super("Diff Selection", Actions.DiffWithClipboard);
+     this.editor = editor;
+     this.locationOnScreen = locationOnScreen;
+   }
+@@ -28,7 +28,7 @@ public DiffAction(EditorEx editor, @Nullable Point locationOnScreen) {
+   public void actionPerformed(ActionEvent event) {
+     var project = requireNonNull(editor.getProject());
+     var mainEditor = FileEditorManager.getInstance(project).getSelectedTextEditor();
+-    if (mainEditor != null && !EditorUtil.hasSelection(mainEditor) && locationOnScreen != null) {
++    if (mainEditor == null || !EditorUtil.hasSelection(mainEditor)) {
+       OverlayUtil.showSelectedEditorSelectionWarning(project, locationOnScreen);
+       return;
+     }
+@@ -36,6 +36,6 @@ public void actionPerformed(ActionEvent event) {
+     EditorDiffUtil.showDiff(
+         project,
+         editor,
+-        mainEditor.getSelectionModel().getSelectedText());
++        requireNonNull(mainEditor.getSelectionModel().getSelectedText()));
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/InsertAtCaretAction.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/InsertAtCaretAction.java
+index 015bdd7fb..a8160cb00 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/InsertAtCaretAction.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/InsertAtCaretAction.java
+@@ -17,13 +17,15 @@
+ 
+ public class InsertAtCaretAction extends TrackableAction {
+ 
+-  public InsertAtCaretAction(@NotNull Editor editor) {
++  private final @NotNull Editor toolwindowEditor;
++
++  public InsertAtCaretAction(@NotNull Editor toolwindowEditor) {
+     super(
+-        editor,
+         CodeGPTBundle.get("toolwindow.chat.editor.action.insertAtCaret.title"),
+         CodeGPTBundle.get("toolwindow.chat.editor.action.insertAtCaret.description"),
+         Icons.SendToTheLeft,
+         ActionType.INSERT_AT_CARET);
++    this.toolwindowEditor = toolwindowEditor;
+   }
+ 
+   @Override
+@@ -48,7 +50,7 @@ private Point getLocationOnScreen(AnActionEvent event) {
+ 
+   @Nullable
+   private Editor getSelectedTextEditor() {
+-    return Optional.ofNullable(editor.getProject())
++    return Optional.ofNullable(toolwindowEditor.getProject())
+         .map(FileEditorManager::getInstance)
+         .map(FileEditorManager::getSelectedTextEditor)
+         .orElse(null);
+@@ -58,7 +60,7 @@ private void insertTextAtCaret(Editor mainEditor) {
+     runUndoTransparentWriteAction(() -> {
+       mainEditor.getDocument().insertString(
+           mainEditor.getCaretModel().getOffset(),
+-          editor.getDocument().getText());
++          toolwindowEditor.getDocument().getText());
+       return null;
+     });
+   }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/ReplaceSelectionAction.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/ReplaceSelectionAction.java
+index 6bfd0b8c6..ea30c4127 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/ReplaceSelectionAction.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/ReplaceSelectionAction.java
+@@ -3,36 +3,41 @@
+ import static java.util.Objects.requireNonNull;
+ 
+ import com.intellij.icons.AllIcons.Actions;
+-import com.intellij.openapi.actionSystem.AnActionEvent;
+-import com.intellij.openapi.editor.Editor;
++import com.intellij.openapi.editor.ex.EditorEx;
+ import ee.carlrobert.codegpt.CodeGPTBundle;
+-import ee.carlrobert.codegpt.actions.ActionType;
+-import ee.carlrobert.codegpt.actions.TrackableAction;
+ import ee.carlrobert.codegpt.ui.OverlayUtil;
+ import ee.carlrobert.codegpt.util.EditorUtil;
++import java.awt.Point;
++import java.awt.event.ActionEvent;
++import javax.swing.AbstractAction;
+ import org.jetbrains.annotations.NotNull;
++import org.jetbrains.annotations.Nullable;
+ 
+-public class ReplaceSelectionAction extends TrackableAction {
++public class ReplaceSelectionAction extends AbstractAction {
+ 
+-  public ReplaceSelectionAction(@NotNull Editor editor) {
++  private final @NotNull EditorEx toolwindowEditor;
++  private final Point locationOnScreen;
++
++  public ReplaceSelectionAction(
++      @NotNull EditorEx toolwindowEditor,
++      @Nullable Point locationOnScreen) {
+     super(
+-        editor,
+         CodeGPTBundle.get("toolwindow.chat.editor.action.replaceSelection.title"),
+-        CodeGPTBundle.get("toolwindow.chat.editor.action.replaceSelection.description"),
+-        Actions.Replace,
+-        ActionType.REPLACE_IN_MAIN_EDITOR);
++        Actions.Replace);
++    this.toolwindowEditor = toolwindowEditor;
++    this.locationOnScreen = locationOnScreen;
+   }
+ 
+   @Override
+-  public void handleAction(@NotNull AnActionEvent event) {
+-    var project = requireNonNull(event.getProject());
++  public void actionPerformed(ActionEvent event) {
++    var project = requireNonNull(toolwindowEditor.getProject());
+     if (EditorUtil.isMainEditorTextSelected(project)) {
+       var mainEditor = EditorUtil.getSelectedEditor(project);
+       if (mainEditor != null) {
+-        EditorUtil.replaceEditorSelection(mainEditor, editor.getDocument().getText());
++        EditorUtil.replaceEditorSelection(mainEditor, toolwindowEditor.getDocument().getText());
+       }
+     } else {
+-      OverlayUtil.showSelectedEditorSelectionWarning(event);
++      OverlayUtil.showSelectedEditorSelectionWarning(project, locationOnScreen);
+     }
+   }
+ }
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ChatMessageResponseBody.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ChatMessageResponseBody.java
+index 57998ea18..58ca66dce 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ChatMessageResponseBody.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ChatMessageResponseBody.java
+@@ -98,14 +98,6 @@ public ChatMessageResponseBody(
+     }
+   }
+ 
+-  public void enableActions() {
+-    if (highlightedText != null
+-        && !highlightedText.isEmpty()
+-        && currentlyProcessedEditorPanel != null) {
+-      currentlyProcessedEditorPanel.showEditorActions();
+-    }
+-  }
+-
+   public ChatMessageResponseBody withResponse(String response) {
+     try {
+       for (var message : MarkdownUtil.splitCodeBlocks(response)) {
+@@ -173,7 +165,7 @@ public void displayError(String message) {
+           "<html><p style=\"margin-top: 4px; margin-bottom: 8px;\">%s</p></html>",
+           message);
+       if (responseReceived) {
+-        add(createTextPane(errorText, false));
++        add(createTextPane(errorText));
+       } else {
+         currentlyProcessedTextPane.setText(errorText);
+       }
+@@ -269,12 +261,6 @@ private void processText(String markdownText, boolean caretVisible) {
+   }
+ 
+   private void prepareProcessingText(boolean caretVisible) {
+-    if (highlightedText != null
+-        && !highlightedText.isEmpty()
+-        && currentlyProcessedEditorPanel != null) {
+-      currentlyProcessedEditorPanel.showEditorActions();
+-    }
+-
+     currentlyProcessedEditorPanel = null;
+     currentlyProcessedTextPane = createTextPane("", caretVisible);
+     add(currentlyProcessedTextPane);
+@@ -316,6 +302,10 @@ private void failWebDocsProgress(EventDetails eventDetails) {
+     }
+   }
+ 
++  private JTextPane createTextPane(String text) {
++    return createTextPane(text, false);
++  }
++
+   private JTextPane createTextPane(String text, boolean caretVisible) {
+     var textPane = UIUtil.createTextPane(text, false, event -> {
+       if (FileUtil.exists(event.getDescription()) && ACTIVATED.equals(event.getEventType())) {
+diff --git a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ResponsePanel.java b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ResponsePanel.java
+index 9c813fd97..235ec7d81 100644
+--- a/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ResponsePanel.java
++++ b/src/main/java/ee/carlrobert/codegpt/toolwindow/chat/ui/ResponsePanel.java
+@@ -128,7 +128,7 @@ static class Body extends JPanel {
+ 
+     Body() {
+       super(new BorderLayout());
+-      setBorder(JBUI.Borders.empty(4, 8, 8, 8));
++      setBorder(JBUI.Borders.empty(4, 8));
+     }
+ 
+     public void addContent(JComponent content) {
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/events/CodeGPTEvent.kt b/src/main/kotlin/ee/carlrobert/codegpt/events/CodeGPTEvent.kt
+index c4b19706b..b963b795c 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/events/CodeGPTEvent.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/events/CodeGPTEvent.kt
+@@ -26,7 +26,7 @@ data class Event @JsonCreator constructor(
+         ANALYZE_WEB_DOC_COMPLETED,
+         ANALYZE_WEB_DOC_FAILED,
+         PROCESS_CONTEXT,
+-        WEB_SEARCH_ITEM
++        WEB_SEARCH_ITEM,
+     }
+ }
+ 
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/CompareWithOriginalActionLink.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/CompareWithOriginalActionLink.kt
+deleted file mode 100644
+index 6927ff10d..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/CompareWithOriginalActionLink.kt
++++ /dev/null
+@@ -1,36 +0,0 @@
+-package ee.carlrobert.codegpt.toolwindow.chat
+-
+-import com.intellij.icons.AllIcons.Actions
+-import com.intellij.openapi.actionSystem.AnAction
+-import com.intellij.openapi.actionSystem.AnActionEvent
+-import com.intellij.openapi.editor.Editor
+-import com.intellij.openapi.project.Project
+-import ee.carlrobert.codegpt.CodeGPTBundle
+-import ee.carlrobert.codegpt.util.EditorDiffUtil
+-
+-class CompareWithOriginalActionLink(
+-    project: Project,
+-    toolwindowEditor: Editor,
+-    highlightedText: String,
+-) : ToolwindowEditorActionLink(
+-    project,
+-    CodeGPTBundle.get("action.compareWithOriginal.title"),
+-    CompareWithOriginalAction(project, toolwindowEditor, highlightedText),
+-    highlightedText
+-) {
+-
+-    init {
+-        setIcon(Actions.Diff)
+-    }
+-
+-    class CompareWithOriginalAction(
+-        private val project: Project,
+-        private val toolwindowEditor: Editor,
+-        private val highlightedText: String
+-    ) : AnAction() {
+-
+-        override fun actionPerformed(e: AnActionEvent) {
+-            EditorDiffUtil.showDiff(project, toolwindowEditor, highlightedText)
+-        }
+-    }
+-}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/DirectApplyActionLink.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/DirectApplyActionLink.kt
+deleted file mode 100644
+index 09a6863f2..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/DirectApplyActionLink.kt
++++ /dev/null
+@@ -1,52 +0,0 @@
+-package ee.carlrobert.codegpt.toolwindow.chat
+-
+-import com.intellij.icons.AllIcons.Actions
+-import com.intellij.openapi.actionSystem.AnAction
+-import com.intellij.openapi.actionSystem.AnActionEvent
+-import com.intellij.openapi.command.WriteCommandAction
+-import com.intellij.openapi.editor.Editor
+-import com.intellij.openapi.editor.ScrollType
+-import com.intellij.openapi.fileEditor.FileEditorManager
+-import com.intellij.openapi.project.Project
+-import ee.carlrobert.codegpt.CodeGPTBundle
+-
+-class DirectApplyActionLink(
+-    project: Project,
+-    toolwindowEditor: Editor,
+-    highlightedText: String,
+-) : ToolwindowEditorActionLink(
+-    project,
+-    CodeGPTBundle.get("action.applyDirectly.title"),
+-    DirectApplyAction(project, toolwindowEditor, highlightedText),
+-    highlightedText
+-) {
+-
+-    init {
+-        setIcon(Actions.Selectall)
+-    }
+-
+-    class DirectApplyAction(
+-        private val project: Project,
+-        private val toolwindowEditor: Editor,
+-        private val highlightedText: String
+-    ) : AnAction() {
+-
+-        override fun actionPerformed(e: AnActionEvent) {
+-            val mainEditor = FileEditorManager.getInstance(project).selectedTextEditor
+-                ?: throw IllegalStateException("No editor selected")
+-            val startIndex = mainEditor.document.text.indexOf(highlightedText)
+-            if (startIndex == -1) {
+-                return
+-            }
+-
+-            val endIndex = startIndex + highlightedText.length
+-            val replacement = toolwindowEditor.document.text
+-
+-            WriteCommandAction.runWriteCommandAction(project) {
+-                mainEditor.document.replaceString(startIndex, endIndex, replacement)
+-                mainEditor.caretModel.moveToOffset(startIndex + replacement.length)
+-                mainEditor.scrollingModel.scrollToCaret(ScrollType.CENTER)
+-            }
+-        }
+-    }
+-}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/ToolwindowEditorActionLink.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/ToolwindowEditorActionLink.kt
+deleted file mode 100644
+index 27ecf29a5..000000000
+--- a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/ToolwindowEditorActionLink.kt
++++ /dev/null
+@@ -1,39 +0,0 @@
+-package ee.carlrobert.codegpt.toolwindow.chat
+-
+-import com.intellij.openapi.actionSystem.AnAction
+-import com.intellij.openapi.application.runInEdt
+-import com.intellij.openapi.components.service
+-import com.intellij.openapi.editor.event.DocumentEvent
+-import com.intellij.openapi.editor.event.DocumentListener
+-import com.intellij.openapi.fileEditor.FileEditorManager
+-import com.intellij.openapi.project.Project
+-import com.intellij.ui.components.AnActionLink
+-
+-open class ToolwindowEditorActionLink(
+-    private val project: Project,
+-    title: String,
+-    action: AnAction,
+-    private val highlightedText: String,
+-) : AnActionLink(title, action) {
+-
+-    private val mainEditor = project.service<FileEditorManager>().selectedTextEditor
+-    private val documentListener = object : DocumentListener {
+-        override fun documentChanged(event: DocumentEvent) {
+-            updateActionState()
+-        }
+-    }
+-
+-    init {
+-        mainEditor?.document?.addDocumentListener(documentListener)
+-        autoHideOnDisable = false
+-    }
+-
+-    private fun updateActionState() {
+-        val mainEditor = project.service<FileEditorManager>().selectedTextEditor
+-        val startIndex = mainEditor?.document?.text?.indexOf(highlightedText)
+-        runInEdt {
+-            isEnabled = startIndex != null && startIndex != -1
+-            toolTipText = if (isEnabled) null else "Original editor state has changed"
+-        }
+-    }
+-}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/AutoApplyAction.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/AutoApplyAction.kt
+new file mode 100644
+index 000000000..68c6ab02b
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/chat/editor/actions/AutoApplyAction.kt
+@@ -0,0 +1,185 @@
++package ee.carlrobert.codegpt.toolwindow.chat.editor.actions
++
++import com.intellij.diff.DiffManager
++import com.intellij.diff.chains.SimpleDiffRequestChain
++import com.intellij.diff.editor.ChainDiffVirtualFile
++import com.intellij.notification.NotificationType
++import com.intellij.openapi.actionSystem.AnActionEvent
++import com.intellij.openapi.application.runInEdt
++import com.intellij.openapi.components.service
++import com.intellij.openapi.editor.Editor
++import com.intellij.openapi.fileEditor.FileEditorManager
++import com.intellij.openapi.progress.ProgressIndicator
++import com.intellij.openapi.progress.ProgressManager
++import com.intellij.openapi.progress.Task
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.util.Key
++import com.intellij.testFramework.LightVirtualFile
++import com.intellij.ui.components.ActionLink
++import com.intellij.ui.components.JBLabel
++import com.intellij.util.ui.JBUI
++import ee.carlrobert.codegpt.CodeGPTBundle
++import ee.carlrobert.codegpt.Icons
++import ee.carlrobert.codegpt.actions.ActionType
++import ee.carlrobert.codegpt.actions.TrackableAction
++import ee.carlrobert.codegpt.completions.CompletionClientProvider
++import ee.carlrobert.codegpt.settings.GeneralSettings
++import ee.carlrobert.codegpt.settings.service.ServiceType
++import ee.carlrobert.codegpt.ui.OverlayUtil
++import ee.carlrobert.codegpt.util.EditorDiffUtil.createDiffRequest
++import ee.carlrobert.codegpt.util.EditorUtil
++import ee.carlrobert.codegpt.util.EditorUtil.getSelectedEditor
++import ee.carlrobert.llm.client.codegpt.request.AutoApplyRequest
++import ee.carlrobert.llm.client.codegpt.response.CodeGPTException
++import java.awt.FlowLayout
++import java.util.*
++import javax.swing.JButton
++import javax.swing.JPanel
++
++class AutoApplyAction(
++    private val project: Project,
++    private val toolwindowEditor: Editor,
++    private val headerPanel: JPanel,
++) : TrackableAction(
++    CodeGPTBundle.get("toolwindow.chat.editor.action.autoApply.title"),
++    CodeGPTBundle.get("toolwindow.chat.editor.action.autoApply.description"),
++    Icons.Lightning,
++    ActionType.AUTO_APPLY
++) {
++    private lateinit var diffRequestId: UUID
++
++    companion object {
++        private val DIFF_REQUEST_KEY = Key.create<String>("codegpt.autoApply.diffRequest")
++    }
++
++    override fun update(e: AnActionEvent) {
++        val isCodeGPTSelected = GeneralSettings.getSelectedService() == ServiceType.CODEGPT
++
++        e.presentation.apply {
++            isEnabled = isCodeGPTSelected
++            icon = if (isCodeGPTSelected) Icons.Lightning else Icons.LightningDisabled
++            text = if (isCodeGPTSelected) {
++                CodeGPTBundle.get("toolwindow.chat.editor.action.autoApply.title")
++            } else {
++                CodeGPTBundle.get("toolwindow.chat.editor.action.autoApply.disabledTitle")
++            }
++        }
++    }
++
++    override fun handleAction(event: AnActionEvent) {
++        val mainEditor = getSelectedEditor(project)
++            ?: throw IllegalStateException("Unable to find active editor")
++        val request = AutoApplyRequest().apply {
++            suggestedChanges = toolwindowEditor.document.text
++            fileContent = mainEditor.document.text
++        }
++
++        headerPanel.getComponent(1).isVisible = false
++
++        val acceptLink = createDisabledActionLink("Accept")
++        val rejectLink = createDisabledActionLink("Reject")
++
++        val actionsPanel = JPanel(FlowLayout(FlowLayout.TRAILING, 8, 0)).apply {
++            border = JBUI.Borders.empty(4, 0)
++            add(acceptLink)
++            add(JBLabel("|"))
++            add(rejectLink)
++        }
++        headerPanel.add(actionsPanel)
++
++        ProgressManager.getInstance().run(
++            ApplyChangesBackgroundTask(
++                project,
++                request,
++                { modifiedFileContent ->
++                    acceptLink.setupLink(mainEditor, actionsPanel) {
++                        EditorUtil.updateEditorDocument(mainEditor, modifiedFileContent)
++                    }
++                    rejectLink.setupLink(mainEditor, actionsPanel)
++                    showDiff(mainEditor, modifiedFileContent)
++                },
++                {
++                    val errorMessage = if (it is CodeGPTException) {
++                        it.detail
++                    } else {
++                        "Something went wrong while applying changes. ${it.message}"
++                    }
++                    OverlayUtil.showNotification(errorMessage, NotificationType.ERROR)
++                    resetState(mainEditor, actionsPanel)
++                })
++        )
++    }
++
++    private fun JButton.setupLink(
++        mainEditor: Editor,
++        actionsPanel: JPanel,
++        onAction: (() -> Unit)? = null
++    ) {
++        isEnabled = true
++        addActionListener {
++            resetState(mainEditor, actionsPanel)
++            onAction?.invoke()
++        }
++    }
++
++    private fun showDiff(mainEditor: Editor, modifiedFileContent: String) {
++        diffRequestId = UUID.randomUUID()
++
++        val tempDiffFile = LightVirtualFile(mainEditor.virtualFile.name, modifiedFileContent)
++        val diffRequest = createDiffRequest(project, tempDiffFile, mainEditor).apply {
++            putUserData(DIFF_REQUEST_KEY, diffRequestId.toString())
++        }
++
++        runInEdt {
++            service<DiffManager>().showDiff(project, diffRequest)
++        }
++    }
++
++    private fun createDisabledActionLink(text: String): ActionLink {
++        return ActionLink(text).apply {
++            isEnabled = false
++            autoHideOnDisable = false
++        }
++    }
++
++    private fun resetState(mainEditor: Editor, actionsPanel: JPanel) {
++        headerPanel.remove(actionsPanel)
++        headerPanel.getComponent(1).isVisible = true
++        val fileEditorManager = project.service<FileEditorManager>()
++        fileEditorManager.openFile(mainEditor.virtualFile, true)
++
++        val diffFile = fileEditorManager.openFiles.firstOrNull {
++            it is ChainDiffVirtualFile && it.chain.requests
++                .filterIsInstance<SimpleDiffRequestChain.DiffRequestProducerWrapper>()
++                .any { chainRequest ->
++                    chainRequest.request.getUserData(DIFF_REQUEST_KEY) == diffRequestId.toString()
++                }
++        }
++        if (diffFile != null) {
++            fileEditorManager.closeFile(diffFile)
++        }
++    }
++}
++
++internal class ApplyChangesBackgroundTask(
++    project: Project,
++    private val request: AutoApplyRequest,
++    private val onSuccess: (modifiedFileContent: String) -> Unit,
++    private val onFailure: (ex: Exception) -> Unit,
++) : Task.Backgroundable(project, "Apply changes", true) {
++
++    override fun run(indicator: ProgressIndicator) {
++        indicator.isIndeterminate = false
++        indicator.fraction = 1.0
++        indicator.text = "CodeGPT: Applying changes"
++
++        try {
++            val modifiedFileContent = CompletionClientProvider.getCodeGPTClient()
++                .applySuggestedChanges(request)
++                .modifiedFileContent
++            onSuccess(modifiedFileContent)
++        } catch (ex: Exception) {
++            onFailure(ex)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/ResponseBodyProgressPanel.kt b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/ResponseBodyProgressPanel.kt
+index 409d1b38a..3fc7979e3 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/ResponseBodyProgressPanel.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/toolwindow/ui/ResponseBodyProgressPanel.kt
+@@ -9,6 +9,7 @@ import com.intellij.util.ui.JBUI
+ import ee.carlrobert.codegpt.Icons
+ import ee.carlrobert.codegpt.events.EventDetails
+ import ee.carlrobert.codegpt.events.ProcessContextEventDetails
++import ee.carlrobert.codegpt.util.MarkdownUtil.convertMdToHtml
+ import java.awt.FlowLayout
+ import javax.swing.*
+ 
+@@ -22,21 +23,27 @@ class ResponseBodyProgressPanel : JPanel() {
+ 
+     init {
+         layout = BoxLayout(this, BoxLayout.Y_AXIS)
+-        border = JBUI.Borders.emptyBottom(8)
++        border = JBUI.Borders.empty(4, 0, 8, 0)
+     }
+ 
+     fun updateProgressContainer(text: String, icon: Icon?) {
+         runInEdt {
+             removeAll()
+-            val wrapper: JComponent
+-            if (icon != null) {
+-                wrapper = JBLabel(text, icon, SwingConstants.LEADING)
+-                wrapper.horizontalTextPosition = SwingConstants.LEADING
++            val wrapper = if (icon != null) {
++                JBLabel(
++                    "<html>" + convertMdToHtml(text) + "</html>",
++                    icon,
++                    SwingConstants.LEADING
++                ).apply {
++                    horizontalAlignment = SwingConstants.LEFT
++                    horizontalTextPosition = SwingConstants.RIGHT
++                }
+             } else {
+-                wrapper = JPanel(FlowLayout(FlowLayout.LEADING, 0, 0))
+-                wrapper.add(JBLabel(text))
+-                wrapper.add(Box.createHorizontalStrut(4))
+-                wrapper.add(processSpinner)
++                JPanel(FlowLayout(FlowLayout.LEADING, 0, 0)).apply {
++                    add(JBLabel("<html>" + convertMdToHtml(text) + "</html>"))
++                    add(Box.createHorizontalStrut(4))
++                    add(processSpinner)
++                }
+             }
+             add(JBUI.Panels.simplePanel(wrapper))
+             revalidate()
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/util/EditorDiffUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/util/EditorDiffUtil.kt
+index 18e1a03f2..fb4308d68 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/util/EditorDiffUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/util/EditorDiffUtil.kt
+@@ -32,7 +32,7 @@ object EditorDiffUtil {
+             createTempDiffContent(mainEditor, toolwindowEditor, highlightedText)
+         )
+         DiffManager.getInstance()
+-            .showDiff(project, createDiffRequest(project, tempFile, mainEditor, mainEditorFile))
++            .showDiff(project, createDiffRequest(project, tempFile, mainEditor))
+     }
+ 
+     private fun createTempDiffContent(
+@@ -48,11 +48,11 @@ object EditorDiffUtil {
+                 mainDocumentContent.substring(endIndex)
+     }
+ 
+-    private fun createDiffRequest(
++    @JvmStatic
++    fun createDiffRequest(
+         project: Project,
+         tempFile: VirtualFile,
+         mainEditor: Editor,
+-        mainEditorFile: VirtualFile
+     ): SimpleDiffRequest {
+         val diffContentFactory = DiffContentFactory.getInstance()
+         val tempFileDiffContent = diffContentFactory.create(project, tempFile).apply {
+@@ -61,9 +61,9 @@ object EditorDiffUtil {
+ 
+         return SimpleDiffRequest(
+             CodeGPTBundle.get("editor.diff.title"),
+-            diffContentFactory.create(project, mainEditorFile),
++            diffContentFactory.create(project, mainEditor.virtualFile),
+             tempFileDiffContent,
+-            mainEditorFile.name,
++            mainEditor.virtualFile.name,
+             CodeGPTBundle.get("editor.diff.local.content.title")
+         ).apply {
+             putUserData(
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/util/EditorUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/util/EditorUtil.kt
+index f72d2c7c5..e99e12174 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/util/EditorUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/util/EditorUtil.kt
+@@ -68,8 +68,7 @@ object EditorUtil {
+ 
+     @JvmStatic
+     fun getSelectedEditor(project: Project): Editor? {
+-        val editorManager = FileEditorManager.getInstance(project)
+-        return editorManager?.selectedTextEditor
++        return FileEditorManager.getInstance(project)?.selectedTextEditor
+     }
+ 
+     @JvmStatic
+diff --git a/src/main/resources/icons/lighting_disabled.svg b/src/main/resources/icons/lighting_disabled.svg
+new file mode 100644
+index 000000000..9d7465c63
+--- /dev/null
++++ b/src/main/resources/icons/lighting_disabled.svg
+@@ -0,0 +1,4 @@
++<!-- Copyright 2000-2023 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license. -->
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++  <path fill-rule="evenodd" clip-rule="evenodd" d="M8.24408 6.65516C8.05415 6.43616 7.96859 6.14552 8.00959 5.85854L8.50238 2.40901L3.10978 8.99996H6.99954C7.28943 8.99996 7.56505 9.12576 7.75499 9.34476C7.94493 9.56376 8.03048 9.85441 7.98949 10.1414L7.4967 13.5909L12.8893 6.99996H8.99954C8.70965 6.99996 8.43402 6.87416 8.24408 6.65516ZM9.74593 0.775195C9.81752 0.274069 9.18453 -0.00392066 8.86398 0.387867L1.66768 9.18334C1.40057 9.50981 1.63285 9.99996 2.05466 9.99996H6.99954L6.25314 15.2247C6.18155 15.7259 6.81454 16.0038 7.1351 15.6121L14.3314 6.81658C14.5985 6.49012 14.3662 5.99996 13.9444 5.99996H8.99954L9.74593 0.775195Z" fill="#9AA7B0" fill-opacity="0.4"/>
++</svg>
+diff --git a/src/main/resources/icons/lightning.svg b/src/main/resources/icons/lightning.svg
+new file mode 100644
+index 000000000..4ac384edd
+--- /dev/null
++++ b/src/main/resources/icons/lightning.svg
+@@ -0,0 +1,4 @@
++<!-- Copyright 2000-2023 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license. -->
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path fill-rule="evenodd" clip-rule="evenodd" d="M8.24408 6.65516C8.05415 6.43616 7.96859 6.14552 8.00959 5.85854L8.50238 2.40901L3.10978 8.99996H6.99954C7.28943 8.99996 7.56505 9.12576 7.75499 9.34476C7.94493 9.56376 8.03048 9.85441 7.98949 10.1414L7.4967 13.5909L12.8893 6.99996H8.99954C8.70965 6.99996 8.43402 6.87416 8.24408 6.65516ZM9.74593 0.775195C9.81752 0.274069 9.18453 -0.00392066 8.86398 0.387867L1.66768 9.18334C1.40057 9.50981 1.63285 9.99996 2.05466 9.99996H6.99954L6.25314 15.2247C6.18155 15.7259 6.81454 16.0038 7.1351 15.6121L14.3314 6.81658C14.5985 6.49012 14.3662 5.99996 13.9444 5.99996H8.99954L9.74593 0.775195Z" fill="#E66D17"/>
++</svg>
+diff --git a/src/main/resources/icons/lightning_dark.svg b/src/main/resources/icons/lightning_dark.svg
+new file mode 100644
+index 000000000..251f75413
+--- /dev/null
++++ b/src/main/resources/icons/lightning_dark.svg
+@@ -0,0 +1,4 @@
++<!-- Copyright 2000-2023 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license. -->
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path fill-rule="evenodd" clip-rule="evenodd" d="M8.24408 6.65516C8.05415 6.43616 7.96859 6.14552 8.00959 5.85854L8.50238 2.40901L3.10978 8.99996H6.99954C7.28943 8.99996 7.56505 9.12576 7.75499 9.34476C7.94493 9.56376 8.03048 9.85441 7.98949 10.1414L7.4967 13.5909L12.8893 6.99996H8.99954C8.70965 6.99996 8.43402 6.87416 8.24408 6.65516ZM9.74593 0.775195C9.81752 0.274069 9.18453 -0.00392066 8.86398 0.387867L1.66768 9.18334C1.40057 9.50981 1.63285 9.99996 2.05466 9.99996H6.99954L6.25314 15.2247C6.18155 15.7259 6.81454 16.0038 7.1351 15.6121L14.3314 6.81658C14.5985 6.49012 14.3662 5.99996 13.9444 5.99996H8.99954L9.74593 0.775195Z" fill="#C77D55"/>
++</svg>
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index 9232bc7f1..b88945067 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -26,7 +26,7 @@ action.statusbar.disableCompletions.text=Disable Completions
+ action.statusbar.disableCompletions.description=Disable Code Completions
+ action.statusbar.disableCompletions.MainMenu.text=Disable Completions
+ action.compareWithOriginal.title=Compare with Original
+-action.applyDirectly.title=Apply Directly
++action.applyDirectly.title=Auto Apply
+ settings.displayName=CodeGPT: Settings
+ settings.openaiQuotaExceeded=OpenAI quota exceeded.
+ settingsConfigurable.displayName.label=Display name:
+@@ -172,7 +172,9 @@ editor.diff.local.content.title=CodeGPT suggested code
+ toolwindow.chat.editor.action.copy.title=Copy
+ toolwindow.chat.editor.action.copy.description=Copy generated code
+ toolwindow.chat.editor.action.copy.success=Code copied!
+-toolwindow.chat.editor.action.diff.title=Diff
++toolwindow.chat.editor.action.autoApply.title=Auto Apply
++toolwindow.chat.editor.action.autoApply.disabledTitle=Auto Apply is only available with CodeGPT provider
++toolwindow.chat.editor.action.autoApply.description=Apply suggested changes automatically
+ toolwindow.chat.editor.action.diff.description=Diff editor code against the generated one
+ toolwindow.chat.editor.action.edit.title=Edit Source
+ toolwindow.chat.editor.action.disableEditing.title=Disable Editing

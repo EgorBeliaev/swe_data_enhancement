@@ -1,0 +1,939 @@
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 96e14091b..577965d26 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -42,7 +42,7 @@ intellij {
+   pluginName.set(properties("pluginName"))
+   version.set(properties("platformVersion"))
+   type.set(properties("platformType"))
+-  plugins.set(listOf("java", "PythonCore:241.14494.240", "Git4Idea"))
++  plugins.set(listOf("java", "PythonCore:241.14494.240", "Git4Idea", "org.jetbrains.kotlin"))
+ }
+ 
+ changelog {
+@@ -62,6 +62,8 @@ dependencies {
+     // vulnerable transitive dependency
+     exclude(group = "org.jsoup", module = "jsoup")
+   }
++  implementation(kotlin("stdlib"))
++  implementation(kotlin("reflect"))
+   implementation(libs.jsoup)
+   implementation(libs.commons.text)
+   implementation(libs.jtokkit)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillPromptTemplate.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillPromptTemplate.kt
+index 3e63fed15..ae4eeab27 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillPromptTemplate.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillPromptTemplate.kt
+@@ -1,5 +1,8 @@
+ package ee.carlrobert.codegpt.codecompletions
+ 
++import ee.carlrobert.codegpt.codecompletions.psi.structure.ClassStructureSerializer
++import org.jetbrains.kotlin.utils.addToStdlib.ifNotEmpty
++
+ enum class InfillPromptTemplate(val label: String, val stopTokens: List<String>? = listOf("\n\n")) {
+ 
+     OPENAI("OpenAI") {
+@@ -71,16 +74,37 @@ enum class InfillPromptTemplate(val label: String, val stopTokens: List<String>?
+         override fun buildPrompt(infillDetails: InfillRequest): String {
+             val infillPrompt =
+                 "<|fim_prefix|> ${infillDetails.prefix} <|fim_suffix|>${infillDetails.suffix} <|fim_middle|>"
+-            return if (infillDetails.context == null || infillDetails.context.contextElements.isEmpty()) {
+-                infillPrompt
+-            } else {
+-                "<|repo_name|>${infillDetails.context.getRepoName()}\n" +
+-                        infillDetails.context.contextElements.map {
+-                            "<|file_sep|>${it.filePath()} \n" +
+-                                    it.text()
+-                        }.joinToString("") { it + "\n" } +
+-                        "<|file_sep|>${infillDetails.context.enclosingElement.filePath()} \n" +
+-                        infillPrompt
++
++            return when {
++                infillDetails.dependenciesStructure != null -> {
++                    "<|repo_name|>${infillDetails.repositoryName}\n" +
++                            infillDetails.dependenciesStructure.joinToString(separator = "\n", prefix = "\n") {
++                                "<|file_sep|>${it.name.value}\n${ClassStructureSerializer.serialize(it)}\n"
++                            } +
++                            infillDetails.context?.contextElements?.ifNotEmpty {
++                                map {
++                                    "<|file_sep|>${it.filePath()} \n" +
++                                            it.text()
++                                }.joinToString("") { it + "\n" } +
++                                        "<|file_sep|>${infillDetails.context.enclosingElement.filePath()} \n"
++                            } +
++                            infillPrompt
++
++                }
++
++                infillDetails.context != null && infillDetails.context.contextElements.isNotEmpty() -> {
++                    "<|repo_name|>${infillDetails.context.getRepoName()}\n" +
++                            infillDetails.context.contextElements.map {
++                                "<|file_sep|>${it.filePath()} \n" +
++                                        it.text()
++                            }.joinToString("") { it + "\n" } +
++                            "<|file_sep|>${infillDetails.context.enclosingElement.filePath()} \n" +
++                            infillPrompt
++                }
++
++                else -> {
++                    infillPrompt
++                }
+             }
+         }
+     },
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequest.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequest.kt
+index d00c09223..320b1adeb 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequest.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequest.kt
+@@ -7,6 +7,7 @@ import com.intellij.psi.PsiElement
+ import ee.carlrobert.codegpt.EncodingManager
+ import ee.carlrobert.codegpt.codecompletions.psi.filePath
+ import ee.carlrobert.codegpt.codecompletions.psi.readText
++import ee.carlrobert.codegpt.codecompletions.psi.structure.models.ClassStructure
+ 
+ const val MAX_PROMPT_TOKENS = 256
+ 
+@@ -15,6 +16,8 @@ class InfillRequest private constructor(
+     val suffix: String,
+     val caretOffset: Int,
+     val fileDetails: FileDetails?,
++    val repositoryName: String?,
++    val dependenciesStructure: Set<ClassStructure>?,
+     val context: InfillContext?,
+     val stopTokens: List<String>,
+ ) {
+@@ -27,6 +30,8 @@ class InfillRequest private constructor(
+         private val caretOffset: Int
+         private var fileDetails: FileDetails? = null
+         private var additionalContext: String? = null
++        private var repositoryName: String? = null
++        private var dependenciesStructure: Set<ClassStructure>? = null
+         private var context: InfillContext? = null
+         private var stopTokens: List<String>
+ 
+@@ -61,6 +66,12 @@ class InfillRequest private constructor(
+         fun additionalContext(additionalContext: String) =
+             apply { this.additionalContext = additionalContext }
+ 
++        fun addRepositoryName(repositoryName: String) =
++            apply { this.repositoryName = repositoryName }
++
++        fun addDependenciesStructure(dependenciesStructure: Set<ClassStructure>) =
++            apply { this.dependenciesStructure = dependenciesStructure }
++
+         fun context(context: InfillContext) = apply { this.context = context }
+ 
+         private fun getStopTokens(type: CompletionType): List<String> {
+@@ -94,6 +105,8 @@ class InfillRequest private constructor(
+                 suffix,
+                 caretOffset,
+                 fileDetails,
++                repositoryName,
++                dependenciesStructure,
+                 context,
+                 stopTokens,
+             )
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequestUtil.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequestUtil.kt
+index fe1d0856a..93782e3c6 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequestUtil.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/InfillRequestUtil.kt
+@@ -7,9 +7,11 @@ import com.intellij.refactoring.suggested.startOffset
+ import ee.carlrobert.codegpt.EncodingManager
+ import ee.carlrobert.codegpt.codecompletions.psi.CompletionContextService
+ import ee.carlrobert.codegpt.codecompletions.psi.readText
++import ee.carlrobert.codegpt.codecompletions.psi.structure.PsiStructureProvider
+ import ee.carlrobert.codegpt.settings.configuration.ConfigurationSettings
+ import ee.carlrobert.codegpt.util.GitUtil
+ 
++
+ object InfillRequestUtil {
+ 
+     suspend fun buildInfillRequest(
+@@ -34,7 +36,18 @@ object InfillRequestUtil {
+         }
+ 
+         if (service<ConfigurationSettings>().state.codeCompletionSettings.contextAwareEnabled) {
+-            getInfillContext(request, caretOffset)?.let { infillRequestBuilder.context(it) }
++            getInfillContext(request, caretOffset)?.let {
++                infillRequestBuilder.context(it)
++                infillRequestBuilder.addRepositoryName(it.getRepoName())
++            }
++        }
++
++        if (service<ConfigurationSettings>().state.codeCompletionSettings.collectDependencyStructure) {
++            val psiStructure = PsiStructureProvider().get(listOf(request.file))
++            if (psiStructure.isNotEmpty()) {
++                infillRequestBuilder.addDependenciesStructure(psiStructure)
++                infillRequestBuilder.addRepositoryName(psiStructure.first().repositoryName)
++            }
+         }
+ 
+         return infillRequestBuilder.build()
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/ClassStructureSerializer.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/ClassStructureSerializer.kt
+new file mode 100644
+index 000000000..765130fb7
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/ClassStructureSerializer.kt
+@@ -0,0 +1,159 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure
++
++import ee.carlrobert.codegpt.codecompletions.psi.structure.models.*
++import org.jetbrains.kotlin.utils.addToStdlib.ifNotEmpty
++
++object ClassStructureSerializer {
++
++    private const val INDENTATION = "    "
++
++    /**
++     * The original class:
++     * package org.example.package1
++     *
++     * import org.example.package2.ClassInPackage2
++     *
++     * class ClassInPackage1 {
++     *
++     *     fun someMethod1(classInPackage2: ClassInPackage2): String = classInPackage2.someMethod2()
++     * }
++     *
++     * Serialized representation of the structure:
++     * package org.example.package1
++     *
++     * class ClassInPackage1 {
++     *       fun someMethod1(classInPackage2: org.example.package2.ClassInPackage2): String
++     * }
++     */
++    fun serialize(classStructure: ClassStructure): String =
++        serializeInternal(classStructure)
++
++    private fun serializeInternal(classStructure: ClassStructure, level: Int = 1): String {
++        val currentBodyIndention = INDENTATION.repeat(level)
++        val currentClassIndention = INDENTATION.repeat(level - 1)
++
++        val modifiers = classStructure.modifierList.ifNotEmpty { joinToString(" ", postfix = " ") }.orEmpty()
++        val classType = classStructure.classType.name.lowercase()
++        val className = classStructure.simpleName.value
++        val supertypes = classStructure.supertypes.joinToString(", ") { it.value }
++        val packageName = classStructure.packageName
++
++        val primaryConstructor = classStructure.constructors.firstOrNull()?.let { serializePrimaryConstructor(it) }
++        val secondaryConstructors = classStructure.constructors
++            .drop(1)
++            .ifNotEmpty {
++                joinToString("\n$currentBodyIndention", prefix = currentBodyIndention) {
++                    serializeSecondaryConstructor(it)
++                }
++            }
++            .orEmpty()
++
++        val fields = classStructure.fields
++            .ifNotEmpty {
++                joinToString(
++                    "\n$currentBodyIndention",
++                    prefix = currentBodyIndention
++                ) { serializeField(it) }
++            }
++            .orEmpty()
++
++        val methods = classStructure.methods
++            .ifNotEmpty {
++                joinToString(
++                    "\n$currentBodyIndention",
++                    prefix = currentBodyIndention
++                ) { serializeMethod(it) }
++            }
++            .orEmpty()
++
++        val enumEntries = classStructure.enumEntries
++            .ifNotEmpty {
++                joinToString(",\n$currentBodyIndention", prefix = currentBodyIndention) { it.value }
++            }
++            .orEmpty()
++
++        val innerClasses = classStructure.classes
++            .ifNotEmpty {
++                joinToString("\n\n") {
++                    serializeInternal(it, level + 1)
++                }
++            }
++            .orEmpty()
++
++        return buildString {
++            if (level == 1) {
++                append("package ${packageName.ifEmpty { "Unknown" }}\n\n")
++            }
++
++            if (classStructure.classType == ClassType.COMPANION_OBJECT) {
++                append("$currentClassIndention${modifiers} object")
++            } else {
++                append("$currentClassIndention$modifiers$classType $className")
++            }
++
++            if (primaryConstructor != null) {
++                append("($primaryConstructor)")
++            }
++
++            if (supertypes.isNotEmpty()) {
++                append(" : $supertypes")
++            }
++            append(" {\n")
++
++            if (classStructure.classType == ClassType.ENUM) {
++                append("$enumEntries\n")
++            }
++
++            if (secondaryConstructors.isNotEmpty()) {
++                append("$currentBodyIndention$secondaryConstructors\n")
++            }
++
++            if (fields.isNotEmpty()) {
++                append("$fields\n")
++            }
++
++            if (methods.isNotEmpty()) {
++                append("$methods\n")
++            }
++
++            if (innerClasses.isNotEmpty()) {
++                append("$innerClasses\n")
++            }
++
++            append("$currentClassIndention}")
++        }
++    }
++
++    private fun serializePrimaryConstructor(constructor: ConstructorStructure): String {
++        val parameters = constructor.parameters.joinToString(", ") { serializeParameter(it) }
++        return parameters
++    }
++
++    private fun serializeSecondaryConstructor(constructor: ConstructorStructure): String {
++        val parameters = constructor.parameters.joinToString(", ") { serializeParameter(it) }
++        val modifiers = constructor.modifiers.joinToString(" ")
++        return "$modifiers constructor($parameters)"
++    }
++
++    private fun serializeField(field: FieldStructure): String {
++        val modifiers = field.modifiers.joinToString(" ")
++        val name = field.name
++        val type = field.type.value
++        return "$modifiers $name: $type"
++    }
++
++    private fun serializeMethod(method: MethodStructure): String {
++        val modifiers = method.modifiers.ifNotEmpty { joinToString(" ", postfix = " ") }.orEmpty()
++        val name = method.name
++        val returnType = method.returnType.value
++        val parameters = method.parameters.joinToString(", ") { serializeParameter(it) }
++        return "${modifiers}fun $name($parameters): $returnType"
++    }
++
++    private fun serializeParameter(parameter: ParameterInfo): String {
++        val name = parameter.name
++        val type = parameter.type.value
++        val modifiers = parameter.modifiers.joinToString(" ")
++        return "$modifiers $name: $type"
++    }
++}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/KotlinFileAnalyzer.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/KotlinFileAnalyzer.kt
+new file mode 100644
+index 000000000..14abdd956
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/KotlinFileAnalyzer.kt
+@@ -0,0 +1,321 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure
++
++import com.intellij.openapi.roots.PackageIndex
++import com.intellij.psi.PsiElement
++import com.intellij.psi.PsiJavaFile
++import com.intellij.psi.PsiManager
++import com.intellij.psi.search.GlobalSearchScope
++import com.intellij.psi.search.PsiShortNamesCache
++import com.intellij.psi.util.PsiTreeUtil
++import ee.carlrobert.codegpt.codecompletions.psi.structure.models.*
++import org.jetbrains.kotlin.asJava.classes.KtLightClass
++import org.jetbrains.kotlin.lexer.KtTokens
++import org.jetbrains.kotlin.psi.*
++
++class KotlinFileAnalyzer(
++    private val psiFileQueue: PsiFileQueue,
++    private val ktFile: KtFile,
++) {
++
++    private val psiManager = PsiManager.getInstance(ktFile.project)
++
++    private val filePackageTypes: Map<String, String> by lazy {
++        val types = mutableListOf<String>()
++        // Process files in our current packages
++        ktFile.containingDirectory
++            ?.children
++            ?.forEach { file ->
++                types.addAll(getDependencyFqNames(file))
++            }
++
++        importMap.entries
++            .forEach { (importPath, importDirective) ->
++                if (importDirective.isAllUnder) {
++                    val packagePath = importPath.substringBeforeLast(".*")
++                    types.addAll(getTypesInPackage(packagePath))
++                } else {
++                    types.add(importPath)
++                }
++            }
++
++        val resultMap = mutableMapOf<String, String>()
++        types.forEach { fqTypeString ->
++            val parts = fqTypeString.split(".")
++            // key com.example.domain.MergeRequestState.MyEnum.TWO -> MergeRequestState.MyEnum.TWO
++            val key = parts.filter { it.isNotEmpty() && it[0].isUpperCase() }.joinToString(".")
++
++            resultMap[key] = fqTypeString
++        }
++
++        return@lazy resultMap.toMap()
++    }
++
++    private fun getDependencyFqNames(file: PsiElement): List<String> {
++        val types = mutableListOf<String>()
++        when (file) {
++            is KtFile -> PsiTreeUtil.findChildrenOfType(file, KtClassOrObject::class.java)
++                .forEach { ktClassOrObject ->
++                    types.add("${ktClassOrObject.fqName}")
++                }
++
++            is PsiJavaFile -> file.classes.forEach { javaClass ->
++                types.add("${file.packageName}.${javaClass.name}")
++            }
++        }
++        return types
++    }
++
++    private val importMap = ktFile.importDirectives
++        .mapNotNull { import ->
++            val path = import.importPath?.pathStr
++            if (path != null) {
++                path to import
++            } else {
++                null
++            }
++        }
++        .toMap()
++
++    fun analyze(): Set<ClassStructure> {
++        val classStructures = mutableSetOf<ClassStructure>()
++
++        val classes = PsiTreeUtil.findChildrenOfType(ktFile, KtClassOrObject::class.java)
++            .filter { it.parent is KtFile }
++            .filterNot { it is KtEnumEntry }
++            .toList()
++
++        for (ktClass in classes) {
++            getClassStructure(ktClass)?.also { classStructure ->
++                classStructures.add(classStructure)
++            }
++        }
++
++        return classStructures
++    }
++
++    private fun getClassStructure(ktClass: KtClassOrObject): ClassStructure? {
++        val classNameString = ktClass.fqName?.asString() ?: return null
++        val className = ClassName(classNameString)
++
++        val classType = when {
++            ktClass is KtClass && ktClass.isEnum() -> ClassType.ENUM
++            ktClass is KtClass -> ClassType.CLASS
++            ktClass is KtObjectDeclaration && ktClass.isCompanion() -> ClassType.COMPANION_OBJECT
++            ktClass is KtObjectDeclaration -> ClassType.OBJECT
++            else -> ClassType.CLASS
++        }
++
++        val classStructure = ClassStructure(
++            name = className,
++            simpleName = ClassName(ktClass.name.orEmpty()),
++            classType = classType,
++            modifierList = getModifiers(ktClass),
++            packageName = ktClass.fqName?.parent()?.asString().orEmpty(),
++            repositoryName = ktFile.project.name,
++        )
++
++        analyzeSupertypes(
++            ktClass, classStructure
++        )
++
++        ktClass.children.forEach { child ->
++            analyzePsiElement(child, classStructure)
++        }
++
++        return classStructure
++    }
++
++    private fun getModifiers(ktModifierListOwner: KtModifierListOwner): List<String> {
++        val modifiers = mutableListOf<String>()
++
++        if (ktModifierListOwner.hasModifier(KtTokens.PUBLIC_KEYWORD)) modifiers.add("public")
++        if (ktModifierListOwner.hasModifier(KtTokens.PRIVATE_KEYWORD)) modifiers.add("private")
++        if (ktModifierListOwner.hasModifier(KtTokens.PROTECTED_KEYWORD)) modifiers.add("protected")
++        if (ktModifierListOwner.hasModifier(KtTokens.INTERNAL_KEYWORD)) modifiers.add("internal")
++
++        if (ktModifierListOwner.hasModifier(KtTokens.OVERRIDE_KEYWORD)) modifiers.add("override")
++        if (ktModifierListOwner.hasModifier(KtTokens.OPEN_KEYWORD)) modifiers.add("open")
++        if (ktModifierListOwner.hasModifier(KtTokens.FINAL_KEYWORD)) modifiers.add("final")
++        if (ktModifierListOwner.hasModifier(KtTokens.ABSTRACT_KEYWORD)) modifiers.add("abstract")
++        if (ktModifierListOwner.hasModifier(KtTokens.SEALED_KEYWORD)) modifiers.add("sealed")
++
++        if (ktModifierListOwner.hasModifier(KtTokens.SUSPEND_KEYWORD)) modifiers.add("suspend")
++        if (ktModifierListOwner.hasModifier(KtTokens.TAILREC_KEYWORD)) modifiers.add("tailrec")
++        if (ktModifierListOwner.hasModifier(KtTokens.OPERATOR_KEYWORD)) modifiers.add("operator")
++        if (ktModifierListOwner.hasModifier(KtTokens.INFIX_KEYWORD)) modifiers.add("infix")
++        if (ktModifierListOwner.hasModifier(KtTokens.INLINE_KEYWORD)) modifiers.add("inline")
++        if (ktModifierListOwner.hasModifier(KtTokens.EXTERNAL_KEYWORD)) modifiers.add("external")
++
++        if (ktModifierListOwner.hasModifier(KtTokens.CONST_KEYWORD)) modifiers.add("const")
++        if (ktModifierListOwner.hasModifier(KtTokens.LATEINIT_KEYWORD)) modifiers.add("lateinit")
++
++        if (ktModifierListOwner.hasModifier(KtTokens.DATA_KEYWORD)) modifiers.add("data")
++        if (ktModifierListOwner.hasModifier(KtTokens.INNER_KEYWORD)) modifiers.add("inner")
++        if (ktModifierListOwner.hasModifier(KtTokens.COMPANION_KEYWORD)) modifiers.add("companion")
++
++        when (ktModifierListOwner) {
++            is KtProperty -> {
++                if (ktModifierListOwner.isVar) {
++                    modifiers.add("var")
++                } else {
++                    modifiers.add("val")
++                }
++            }
++
++            is KtVariableDeclaration -> {
++                if (ktModifierListOwner.isVar) {
++                    modifiers.add("var")
++                } else {
++                    modifiers.add("val")
++                }
++            }
++
++            is KtParameter -> {
++                val valOrVarKeyword = ktModifierListOwner.valOrVarKeyword
++                if (valOrVarKeyword != null) {
++                    modifiers.add(valOrVarKeyword.text)
++                }
++            }
++        }
++
++        return modifiers
++    }
++
++    private fun analyzeSupertypes(ktClass: KtClassOrObject, classStructure: ClassStructure) {
++        ktClass.superTypeListEntries.forEach { superTypeEntry ->
++            val shortTypeName = superTypeEntry.typeReference?.text ?: "TypeUnknown"
++            val resolvedSuperType = resolveType(shortTypeName)
++            classStructure.supertypes.add(resolvedSuperType)
++        }
++    }
++
++    private fun analyzePsiElement(
++        element: PsiElement,
++        classStructure: ClassStructure,
++    ) {
++        when (element) {
++            is KtConstructor<*> -> {
++                classStructure.constructors.add(analyzeConstructor(element))
++            }
++
++            is KtProperty -> {
++                classStructure.fields.add(analyzeProperty(element))
++            }
++
++            is KtNamedFunction -> {
++                classStructure.methods.add(analyzeFunction(element))
++            }
++
++            is KtEnumEntry -> {
++                element.name?.also { entryName ->
++                    classStructure.enumEntries.add(EnumEntryName(entryName))
++                }
++            }
++
++            is KtClassBody -> {
++                element.children.forEach { child ->
++                    analyzePsiElement(child, classStructure)
++                }
++            }
++
++            is KtClassOrObject -> {
++                getClassStructure(element)?.also { includeClassStructure ->
++                    classStructure.classes.add(includeClassStructure)
++                }
++            }
++        }
++    }
++
++    private fun analyzeConstructor(
++        constructor: KtConstructor<*>,
++    ): ConstructorStructure {
++        val parameters = constructor.valueParameters.map { parameter ->
++            val type = parameter.typeReference?.text ?: "TypeUnknown"
++            val resolvedType = resolveType(type)
++            ParameterInfo(parameter.name!!, resolvedType, getModifiers(parameter))
++        }
++        val modifierList = getModifiers(constructor)
++        return ConstructorStructure(parameters, modifierList)
++    }
++
++    private fun analyzeProperty(property: KtProperty): FieldStructure {
++        val type = property.typeReference?.text ?: "TypeUnknown"
++        val resolvedType = resolveType(type)
++        val modifierList = getModifiers(property)
++        return FieldStructure(property.name!!, resolvedType, modifierList)
++    }
++
++    private fun analyzeFunction(function: KtFunction): MethodStructure {
++        val returnType = function.typeReference?.text ?: "TypeUnknown"
++        val resolvedReturnType = resolveType(returnType)
++        val parameters = function.valueParameters.map { parameter ->
++            val type = parameter.typeReference?.text ?: "TypeUnknown"
++            val resolvedType = resolveType(type)
++            ParameterInfo(parameter.name!!, resolvedType, getModifiers(parameter))
++        }
++        val modifierList = getModifiers(function)
++        return MethodStructure(function.name!!, resolvedReturnType, parameters, modifierList)
++    }
++
++    private fun resolveType(shortType: String): ClassName {
++        val resolvedType = filePackageTypes[shortType] ?: shortType
++
++        putTypeToAnalyzeQueue(resolvedType)
++
++        return ClassName(resolvedType)
++    }
++
++    private fun getTypesInPackage(packagePath: String?): List<String> {
++        if (packagePath == null) return emptyList()
++
++        val packageDirectories = PackageIndex.getInstance(ktFile.project)
++            .getDirsByPackageName(packagePath, false)
++            .toList()
++
++        val types = mutableListOf<String>()
++        for (directory in packageDirectories) {
++            directory.children
++                .mapNotNull { virtualFile ->
++                    psiManager.findFile(virtualFile)
++                }
++                .forEach { psiFile ->
++                    types.addAll(getDependencyFqNames(psiFile))
++                }
++        }
++
++        return types
++    }
++
++    private fun putTypeToAnalyzeQueue(fqName: String) {
++        val shortName = fqName.substringAfterLast('.')
++
++        val classes = PsiShortNamesCache.getInstance(ktFile.project)
++            .getClassesByName(shortName, GlobalSearchScope.projectScope(ktFile.project))
++
++        val foundKtFiles = classes
++            .mapNotNull { psiClass ->
++                when {
++                    psiClass is KtLightClass -> {
++                        val classQualifiedName = psiClass.kotlinOrigin?.fqName?.asString()
++                        if (classQualifiedName == fqName) {
++                            psiClass.kotlinOrigin?.containingKtFile
++                        } else {
++                            null
++                        }
++                    }
++
++                    else -> {
++                        if (psiClass.qualifiedName == fqName) {
++                            psiClass.containingFile
++                        } else {
++                            null
++                        }
++                    }
++                }
++            }
++
++        foundKtFiles.forEach { psiFile ->
++            psiFileQueue.put(psiFile)
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiFileQueue.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiFileQueue.kt
+new file mode 100644
+index 000000000..30763971d
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiFileQueue.kt
+@@ -0,0 +1,19 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure
++
++import com.intellij.psi.PsiFile
++
++class PsiFileQueue(
++    initial: List<PsiFile>
++) {
++
++    private val queue = ArrayDeque(initial)
++
++    @Synchronized
++    fun pop(): PsiFile? =
++        queue.removeFirstOrNull()
++
++    @Synchronized
++    fun put(psiFile: PsiFile) {
++        queue.add(psiFile)
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiStructureProvider.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiStructureProvider.kt
+new file mode 100644
+index 000000000..e4bf3136e
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/PsiStructureProvider.kt
+@@ -0,0 +1,36 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure
++
++import com.intellij.openapi.application.ApplicationManager
++import com.intellij.openapi.application.ReadAction
++import com.intellij.psi.PsiFile
++import ee.carlrobert.codegpt.codecompletions.psi.structure.models.ClassStructure
++import org.jetbrains.kotlin.psi.KtFile
++
++class PsiStructureProvider {
++
++    private val kotlinFileAnalyzerAvailable: Boolean =
++        ApplicationManager.getApplication().hasComponent(KotlinFileAnalyzer::class.java)
++
++    fun get(psiFiles: List<PsiFile>): Set<ClassStructure> =
++        ReadAction.compute<Set<ClassStructure>, Throwable> {
++            val classStructureSet = mutableSetOf<ClassStructure>()
++            val processedPsiFiles = mutableSetOf<PsiFile?>()
++            val psiFileQueue = PsiFileQueue(psiFiles)
++
++            while (true) {
++                val psiFile = psiFileQueue.pop()
++                when {
++                    processedPsiFiles.contains(psiFile) -> Unit
++
++                    kotlinFileAnalyzerAvailable && psiFile is KtFile -> {
++                        classStructureSet.addAll(KotlinFileAnalyzer(psiFileQueue, psiFile).analyze())
++                        processedPsiFiles.add(psiFile)
++                    }
++
++                    psiFile == null -> break
++                }
++            }
++
++            return@compute classStructureSet.toSet()
++        }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassLanguage.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassLanguage.kt
+new file mode 100644
+index 000000000..e87794965
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassLanguage.kt
+@@ -0,0 +1,5 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++enum class ClassLanguage {
++    KOTLIN,
++}
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassName.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassName.kt
+new file mode 100644
+index 000000000..f5a7a5db8
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassName.kt
+@@ -0,0 +1,4 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++@JvmInline
++value class ClassName(val value: String)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassStructure.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassStructure.kt
+new file mode 100644
+index 000000000..26b3095da
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassStructure.kt
+@@ -0,0 +1,17 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++data class ClassStructure(
++    val name: ClassName,
++    val simpleName: ClassName,
++    val classType: ClassType,
++    val modifierList: List<String>,
++    val packageName: String,
++    val repositoryName: String,
++    val lang: ClassLanguage = ClassLanguage.KOTLIN,
++    val constructors: MutableList<ConstructorStructure> = mutableListOf(),
++    val fields: MutableList<FieldStructure> = mutableListOf(),
++    val methods: MutableList<MethodStructure> = mutableListOf(),
++    val supertypes: MutableList<ClassName> = mutableListOf(),
++    val enumEntries: MutableList<EnumEntryName> = mutableListOf(),
++    val classes: MutableList<ClassStructure> = mutableListOf()
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassType.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassType.kt
+new file mode 100644
+index 000000000..ac9e5dc34
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ClassType.kt
+@@ -0,0 +1,8 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++enum class ClassType {
++    ENUM,
++    CLASS,
++    OBJECT,
++    COMPANION_OBJECT,
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ConstructorStructure.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ConstructorStructure.kt
+new file mode 100644
+index 000000000..8e91ac2e2
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ConstructorStructure.kt
+@@ -0,0 +1,6 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++data class ConstructorStructure(
++    val parameters: List<ParameterInfo>,
++    val modifiers: List<String>,
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/EnumEntryName.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/EnumEntryName.kt
+new file mode 100644
+index 000000000..3221bc548
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/EnumEntryName.kt
+@@ -0,0 +1,4 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++@JvmInline
++value class EnumEntryName(val value: String)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/FieldStructure.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/FieldStructure.kt
+new file mode 100644
+index 000000000..21a9f6dc6
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/FieldStructure.kt
+@@ -0,0 +1,7 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++data class FieldStructure(
++    val name: String,
++    val type: ClassName,
++    val modifiers: List<String>,
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/MethodStructure.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/MethodStructure.kt
+new file mode 100644
+index 000000000..c53a748eb
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/MethodStructure.kt
+@@ -0,0 +1,8 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++data class MethodStructure(
++    val name: String,
++    val returnType: ClassName,
++    val parameters: List<ParameterInfo>,
++    val modifiers: List<String>,
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ParameterInfo.kt b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ParameterInfo.kt
+new file mode 100644
+index 000000000..87a62a3c3
+--- /dev/null
++++ b/src/main/kotlin/ee/carlrobert/codegpt/codecompletions/psi/structure/models/ParameterInfo.kt
+@@ -0,0 +1,7 @@
++package ee.carlrobert.codegpt.codecompletions.psi.structure.models
++
++data class ParameterInfo(
++    val name: String,
++    val type: ClassName,
++    val modifiers: List<String>,
++)
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/CodeCompletionConfigurationForm.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/CodeCompletionConfigurationForm.kt
+index 4f09c4669..4337d5058 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/CodeCompletionConfigurationForm.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/CodeCompletionConfigurationForm.kt
+@@ -21,6 +21,11 @@ class CodeCompletionConfigurationForm {
+         service<ConfigurationSettings>().state.codeCompletionSettings.gitDiffEnabled
+     )
+ 
++    private val collectDependencyStructureBox = JBCheckBox(
++        CodeGPTBundle.get("configurationConfigurable.section.codeCompletion.collectDependencyStructure.title"),
++        service<ConfigurationSettings>().state.codeCompletionSettings.collectDependencyStructure
++    )
++
+     fun createPanel(): DialogPanel {
+         return panel {
+             row {
+@@ -35,6 +40,10 @@ class CodeCompletionConfigurationForm {
+                 cell(gitDiffCheckBox)
+                     .comment(CodeGPTBundle.get("configurationConfigurable.section.codeCompletion.gitDiff.description"))
+             }
++            row {
++                cell(collectDependencyStructureBox)
++                    .comment(CodeGPTBundle.get("configurationConfigurable.section.codeCompletion.collectDependencyStructure.description"))
++            }
+         }
+     }
+ 
+@@ -49,6 +58,7 @@ class CodeCompletionConfigurationForm {
+             this.multiLineEnabled = multiLineCompletionsCheckBox.isSelected
+             this.treeSitterProcessingEnabled = treeSitterProcessingCheckBox.isSelected
+             this.gitDiffEnabled = gitDiffCheckBox.isSelected
++            this.collectDependencyStructure = collectDependencyStructureBox.isSelected
+         }
+     }
+ }
+\ No newline at end of file
+diff --git a/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/ConfigurationSettings.kt b/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/ConfigurationSettings.kt
+index 0d8692c59..50533ca56 100644
+--- a/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/ConfigurationSettings.kt
++++ b/src/main/kotlin/ee/carlrobert/codegpt/settings/configuration/ConfigurationSettings.kt
+@@ -43,5 +43,6 @@ class CodeCompletionSettingsState : BaseState() {
+     var multiLineEnabled by property(true)
+     var treeSitterProcessingEnabled by property(true)
+     var gitDiffEnabled by property(true)
++    var collectDependencyStructure by property(true)
+     var contextAwareEnabled by property(false)
+ }
+\ No newline at end of file
+diff --git a/src/main/resources/META-INF/plugin-kotlin.xml b/src/main/resources/META-INF/plugin-kotlin.xml
+new file mode 100644
+index 000000000..c28e1e2cc
+--- /dev/null
++++ b/src/main/resources/META-INF/plugin-kotlin.xml
+@@ -0,0 +1,6 @@
++<idea-plugin>
++    <extensions defaultExtensionNs="com.intellij">
++        <applicationService
++                serviceImplementation="ee.carlrobert.codegpt.codecompletions.psi.structure.KotlinFileAnalyzer"/>
++    </extensions>
++</idea-plugin>
+diff --git a/src/main/resources/META-INF/plugin.xml b/src/main/resources/META-INF/plugin.xml
+index d91c3a8b8..42c11e983 100644
+--- a/src/main/resources/META-INF/plugin.xml
++++ b/src/main/resources/META-INF/plugin.xml
+@@ -4,6 +4,7 @@
+     <vendor email="carlrobertoh@gmail.com" url="https://carlrobert.ee">Carl-Robert Linnupuu</vendor>
+     <depends>com.intellij.modules.platform</depends>
+     <depends>com.intellij.modules.lang</depends>
++    <depends optional="true" config-file="plugin-kotlin.xml">org.jetbrains.kotlin</depends>
+     <depends optional="true" config-file="plugin-java.xml">com.intellij.modules.java</depends>
+     <depends optional="true" config-file="plugin-python.xml">com.intellij.modules.python</depends>
+ <!--    TODO-->
+diff --git a/src/main/resources/messages/codegpt.properties b/src/main/resources/messages/codegpt.properties
+index 7db6cbbcd..a66f0f524 100644
+--- a/src/main/resources/messages/codegpt.properties
++++ b/src/main/resources/messages/codegpt.properties
+@@ -142,6 +142,8 @@ configurationConfigurable.section.codeCompletion.multiLineCompletions.descriptio
+ configurationConfigurable.section.codeCompletion.postProcess.title=Enable tree-sitter post-processing
+ configurationConfigurable.section.codeCompletion.postProcess.description=If checked, the completion will be post-processed using the tree-sitter parser.
+ configurationConfigurable.section.codeCompletion.gitDiff.title=Enable git diff context
++configurationConfigurable.section.codeCompletion.collectDependencyStructure.title=Collect the dependencies of the analyzed file.
++configurationConfigurable.section.codeCompletion.collectDependencyStructure.description=Enabling the setting allows the plugin to collect the dependency structure, which increases the accuracy of the proposed data, but consumes more tokens per request. Currently, it is implemented only for the Kotlin language.
+ configurationConfigurable.section.codeCompletion.gitDiff.description=If checked, the user's most recent unstaged git diff will be included when requesting completion.
+ settingsConfigurable.service.llama.topK.label=Top K:
+ settingsConfigurable.service.llama.topK.comment=Limit the next token selection to the K most probable tokens (default: 40)

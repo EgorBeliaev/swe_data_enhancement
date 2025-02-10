@@ -1,0 +1,2253 @@
+diff --git a/.idea/kotlinc.xml b/.idea/kotlinc.xml
+index 8d81632f8..fe63bb677 100644
+--- a/.idea/kotlinc.xml
++++ b/.idea/kotlinc.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <project version="4">
+   <component name="KotlinJpsPluginSettings">
+-    <option name="version" value="1.9.22" />
++    <option name="version" value="1.9.23" />
+   </component>
+ </project>
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideClockTime.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideClockTime.kt
+new file mode 100644
+index 000000000..8df012f57
+--- /dev/null
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideClockTime.kt
+@@ -0,0 +1,85 @@
++package de.mm20.launcher2.ui.base
++
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.compositionLocalOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import de.mm20.launcher2.preferences.ui.ClockWidgetSettings
++import kotlinx.coroutines.awaitCancellation
++import org.koin.androidx.compose.inject
++
++@Composable
++fun ProvideClockTime(content: @Composable () -> Unit) {
++
++    val context = LocalContext.current
++    val clockSettings: ClockWidgetSettings by inject()
++    val showSeconds by clockSettings.showSeconds.collectAsState(initial = false)
++    val isCompact by clockSettings.compact.collectAsState(initial = false)
++
++    var time by remember { mutableStateOf(System.currentTimeMillis()) }
++
++    val lifecycleOwner = LocalLifecycleOwner.current
++    LaunchedEffect(showSeconds, isCompact) {
++        time = System.currentTimeMillis()
++
++        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            time = System.currentTimeMillis()
++            val handler = Handler(Looper.myLooper()!!)
++            val receiver = object : BroadcastReceiver() {
++                override fun onReceive(context: Context?, intent: Intent?) {
++                    time = System.currentTimeMillis()
++                }
++            }
++            val callback = object : Runnable {
++                override fun run() {
++                    time = System.currentTimeMillis()
++                    handler.postDelayed(this, 1000 - (time % 1000))
++                }
++            }
++
++            if (!isCompact && showSeconds) {
++                context.registerReceiver(receiver, IntentFilter().apply {
++                    addAction(Intent.ACTION_TIME_CHANGED)
++                })
++
++                handler.postDelayed(callback, 1000 - (time % 1000))
++            }
++            else {
++                context.registerReceiver(receiver, IntentFilter().apply {
++                    addAction(Intent.ACTION_TIME_CHANGED)
++                    addAction(Intent.ACTION_TIME_TICK)
++                })
++            }
++
++            try {
++                awaitCancellation()
++            } finally {
++                context.unregisterReceiver(receiver)
++                handler.removeCallbacks(callback)
++            }
++        }
++    }
++
++    CompositionLocalProvider(
++        LocalClockTime provides time,
++        content = content
++    )
++}
++
++val LocalClockTime = compositionLocalOf { System.currentTimeMillis() }
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideCurrentTime.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideCurrentTime.kt
+index 502f63fd6..08c967481 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideCurrentTime.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/base/ProvideCurrentTime.kt
+@@ -4,8 +4,14 @@ import android.content.BroadcastReceiver
+ import android.content.Context
+ import android.content.Intent
+ import android.content.IntentFilter
+-import android.util.Log
+-import androidx.compose.runtime.*
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.compositionLocalOf
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalLifecycleOwner
+ import androidx.lifecycle.Lifecycle
+@@ -23,15 +29,18 @@ fun ProvideCurrentTime(content: @Composable () -> Unit) {
+     LaunchedEffect(null) {
+         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+             time = System.currentTimeMillis()
++
+             val receiver = object : BroadcastReceiver() {
+                 override fun onReceive(context: Context?, intent: Intent?) {
+                     time = System.currentTimeMillis()
+                 }
+             }
++
+             context.registerReceiver(receiver, IntentFilter().apply {
+-                addAction(Intent.ACTION_TIME_TICK)
+                 addAction(Intent.ACTION_TIME_CHANGED)
++                addAction(Intent.ACTION_TIME_TICK)
+             })
++
+             try {
+                 awaitCancellation()
+             } finally {
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/component/ShapedLauncherIcon.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/component/ShapedLauncherIcon.kt
+index fb831220e..7fc45136c 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/component/ShapedLauncherIcon.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/component/ShapedLauncherIcon.kt
+@@ -250,7 +250,7 @@ fun ShapedLauncherIcon(
+                     _badge.progress?.let {
+                         val progress by animateFloatAsState(it)
+                         CircularProgressIndicator(
+-                            modifier = Modifier.fillMaxSize(),
++                            modifier = Modifier.fillMaxSize(0.8f),
+                             progress = progress,
+                             strokeWidth = size / 48,
+                             color = MaterialTheme.colorScheme.secondaryContainer
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/SharedLauncherActivity.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/SharedLauncherActivity.kt
+index 5c93c80e8..10d6cb6b3 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/SharedLauncherActivity.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/SharedLauncherActivity.kt
+@@ -101,66 +101,66 @@ abstract class SharedLauncherActivity(
+                 LocalGestureDetector provides gestureDetector,
+             ) {
+                 LauncherTheme {
+-                    ProvideCurrentTime {
+-                        ProvideSettings {
+-                            val statusBarColor by viewModel.statusBarColor.collectAsState()
+-                            val navBarColor by viewModel.navBarColor.collectAsState()
++                    ProvideSettings {
++                        val statusBarColor by viewModel.statusBarColor.collectAsState()
++                        val navBarColor by viewModel.navBarColor.collectAsState()
+ 
+-                            val chargingAnimation by viewModel.chargingAnimation.collectAsState()
++                        val chargingAnimation by viewModel.chargingAnimation.collectAsState()
+ 
+-                            val lightStatus =
+-                                !dimBackground && (statusBarColor == SystemBarColors.Dark || statusBarColor == SystemBarColors.Auto && wallpaperColors.supportsDarkText)
+-                            val lightNav =
+-                                !dimBackground && (navBarColor == SystemBarColors.Dark || navBarColor == SystemBarColors.Auto && wallpaperColors.supportsDarkText)
++                        val lightStatus =
++                            !dimBackground && (statusBarColor == SystemBarColors.Dark || statusBarColor == SystemBarColors.Auto && wallpaperColors.supportsDarkText)
++                        val lightNav =
++                            !dimBackground && (navBarColor == SystemBarColors.Dark || navBarColor == SystemBarColors.Auto && wallpaperColors.supportsDarkText)
+ 
+-                            val hideStatus by viewModel.hideStatusBar.collectAsState()
+-                            val hideNav by viewModel.hideNavBar.collectAsState()
+-                            val layout by viewModel.baseLayout.collectAsState(null)
+-                            val bottomSearchBar by viewModel.bottomSearchBar.collectAsState()
+-                            val reverseSearchResults by viewModel.reverseSearchResults.collectAsState()
+-                            val fixedSearchBar by viewModel.fixedSearchBar.collectAsState()
++                        val hideStatus by viewModel.hideStatusBar.collectAsState()
++                        val hideNav by viewModel.hideNavBar.collectAsState()
++                        val layout by viewModel.baseLayout.collectAsState(null)
++                        val bottomSearchBar by viewModel.bottomSearchBar.collectAsState()
++                        val reverseSearchResults by viewModel.reverseSearchResults.collectAsState()
++                        val fixedSearchBar by viewModel.fixedSearchBar.collectAsState()
+ 
+-                            val fixedRotation by viewModel.fixedRotation.collectAsState()
++                        val fixedRotation by viewModel.fixedRotation.collectAsState()
+ 
+-                            LaunchedEffect(fixedRotation) {
+-                                requestedOrientation = if (fixedRotation) {
+-                                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+-                                } else {
+-                                    ActivityInfo.SCREEN_ORIENTATION_USER
+-                                }
++                        LaunchedEffect(fixedRotation) {
++                            requestedOrientation = if (fixedRotation) {
++                                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
++                            } else {
++                                ActivityInfo.SCREEN_ORIENTATION_USER
+                             }
++                        }
+ 
+ 
+-                            val systemUiController = rememberSystemUiController()
++                        val systemUiController = rememberSystemUiController()
+ 
+-                            val enterTransitionProgress = remember { mutableStateOf(1f) }
+-                            var enterTransition by remember {
+-                                mutableStateOf<EnterHomeTransition?>(
+-                                    null
+-                                )
+-                            }
++                        val enterTransitionProgress = remember { mutableStateOf(1f) }
++                        var enterTransition by remember {
++                            mutableStateOf<EnterHomeTransition?>(
++                                null
++                            )
++                        }
+ 
+-                            LaunchedEffect(null) {
+-                                enterHomeTransitionManager
+-                                    .currentTransition
+-                                    .flowWithLifecycle(lifecycle, Lifecycle.State.RESUMED)
+-                                    .collect {
+-                                        if (it != null) {
+-                                            enterTransitionProgress.value = 0f
+-                                            enterTransition = it
+-                                            enterTransitionProgress.animateTo(1f)
+-                                            enterTransition = null
+-                                        }
++                        LaunchedEffect(null) {
++                            enterHomeTransitionManager
++                                .currentTransition
++                                .flowWithLifecycle(lifecycle, Lifecycle.State.RESUMED)
++                                .collect {
++                                    if (it != null) {
++                                        enterTransitionProgress.value = 0f
++                                        enterTransition = it
++                                        enterTransitionProgress.animateTo(1f)
++                                        enterTransition = null
+                                     }
+-                            }
++                                }
++                        }
+ 
+-                            LaunchedEffect(hideStatus) {
+-                                systemUiController.isStatusBarVisible = !hideStatus
+-                            }
+-                            LaunchedEffect(hideNav) {
+-                                systemUiController.isNavigationBarVisible = !hideNav
+-                            }
++                        LaunchedEffect(hideStatus) {
++                            systemUiController.isStatusBarVisible = !hideStatus
++                        }
++                        LaunchedEffect(hideNav) {
++                            systemUiController.isNavigationBarVisible = !hideNav
++                        }
+ 
++                        ProvideCurrentTime {
+                             OverlayHost(
+                                 modifier = Modifier
+                                     .fillMaxSize()
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/ClockWidget.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/ClockWidget.kt
+index c98dfc62f..bff0311cd 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/ClockWidget.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/ClockWidget.kt
+@@ -17,18 +17,19 @@ import androidx.compose.foundation.layout.width
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.rounded.AccessTime
+ import androidx.compose.material.icons.rounded.Alarm
+ import androidx.compose.material.icons.rounded.AlignVerticalBottom
+ import androidx.compose.material.icons.rounded.AlignVerticalCenter
+ import androidx.compose.material.icons.rounded.AlignVerticalTop
+ import androidx.compose.material.icons.rounded.AutoAwesome
+ import androidx.compose.material.icons.rounded.BatteryFull
++import androidx.compose.material.icons.rounded.ColorLens
+ import androidx.compose.material.icons.rounded.DarkMode
+ import androidx.compose.material.icons.rounded.Height
+ import androidx.compose.material.icons.rounded.HorizontalSplit
+ import androidx.compose.material.icons.rounded.LightMode
+ import androidx.compose.material.icons.rounded.MusicNote
+-import androidx.compose.material.icons.rounded.Star
+ import androidx.compose.material.icons.rounded.Today
+ import androidx.compose.material.icons.rounded.Tune
+ import androidx.compose.material.icons.rounded.VerticalSplit
+@@ -65,8 +66,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
+ import de.mm20.launcher2.preferences.ClockWidgetAlignment
+ import de.mm20.launcher2.preferences.ClockWidgetColors
+ import de.mm20.launcher2.preferences.ClockWidgetStyle
++import de.mm20.launcher2.preferences.ui.ClockWidgetSettings
+ import de.mm20.launcher2.ui.R
+-import de.mm20.launcher2.ui.base.LocalTime
++import de.mm20.launcher2.ui.base.LocalClockTime
++import de.mm20.launcher2.ui.base.ProvideClockTime
+ import de.mm20.launcher2.ui.component.BottomSheetDialog
+ import de.mm20.launcher2.ui.component.preferences.Preference
+ import de.mm20.launcher2.ui.component.preferences.SwitchPreference
+@@ -75,9 +78,11 @@ import de.mm20.launcher2.ui.launcher.widgets.clock.clocks.BinaryClock
+ import de.mm20.launcher2.ui.launcher.widgets.clock.clocks.DigitalClock1
+ import de.mm20.launcher2.ui.launcher.widgets.clock.clocks.DigitalClock2
+ import de.mm20.launcher2.ui.launcher.widgets.clock.clocks.OrbitClock
++import de.mm20.launcher2.ui.launcher.widgets.clock.clocks.SegmentClock
+ import de.mm20.launcher2.ui.launcher.widgets.clock.parts.PartProvider
+ import de.mm20.launcher2.ui.locals.LocalPreferDarkContentOverWallpaper
+ import de.mm20.launcher2.ui.settings.clockwidget.ClockWidgetSettingsScreenVM
++import org.koin.androidx.compose.inject
+ 
+ @Composable
+ fun ClockWidget(
+@@ -85,158 +90,160 @@ fun ClockWidget(
+     fillScreenHeight: Boolean,
+     editMode: Boolean = false,
+ ) {
+-    val viewModel: ClockWidgetVM = viewModel()
+-    val context = LocalContext.current
+-    val compact by viewModel.compactLayout.collectAsState()
+-    val clockStyle by viewModel.clockStyle.collectAsState()
+-    val color by viewModel.color.collectAsState()
+-    val alignment by viewModel.alignment.collectAsState()
+-    val time = LocalTime.current
++    ProvideClockTime {
++        val viewModel: ClockWidgetVM = viewModel()
++        val context = LocalContext.current
++        val compact by viewModel.compactLayout.collectAsState()
++        val clockStyle by viewModel.clockStyle.collectAsState()
++        val color by viewModel.color.collectAsState()
++        val alignment by viewModel.alignment.collectAsState()
++        val time = LocalClockTime.current
+ 
+-    val contentColor =
+-        if (color == ClockWidgetColors.Auto && LocalPreferDarkContentOverWallpaper.current || color == ClockWidgetColors.Dark) {
+-            Color(0, 0, 0, 180)
+-        } else {
+-            Color.White
+-        }
++        val contentColor =
++            if (color == ClockWidgetColors.Auto && LocalPreferDarkContentOverWallpaper.current || color == ClockWidgetColors.Dark) {
++                Color(0, 0, 0, 180)
++            } else {
++                Color.White
++            }
+ 
+-    LaunchedEffect(time) {
+-        viewModel.updateTime(time)
+-    }
++        LaunchedEffect(time) {
++            viewModel.updateTime(time)
++        }
+ 
+-    val partProvider by remember { viewModel.getActivePart(context) }.collectAsStateWithLifecycle(
+-        null
+-    )
++        val partProvider by remember { viewModel.getActivePart(context) }.collectAsStateWithLifecycle(
++            null
++        )
+ 
+-    AnimatedContent(editMode, label = "ClockWidget") {
+-        if (it) {
+-            var configure by remember { mutableStateOf(false) }
+-            Column {
+-                Surface(
+-                    modifier = Modifier
+-                        .fillMaxWidth()
+-                        .padding(vertical = 8.dp),
+-                    shape = MaterialTheme.shapes.medium,
+-                    color = MaterialTheme.colorScheme.surfaceVariant,
+-                    shadowElevation = 2.dp,
+-                    tonalElevation = 2.dp,
+-                ) {
+-                    Row(
+-                        modifier = Modifier.padding(8.dp),
+-                        verticalAlignment = Alignment.CenterVertically
++        AnimatedContent(editMode, label = "ClockWidget") {
++            if (it) {
++                var configure by remember { mutableStateOf(false) }
++                Column {
++                    Surface(
++                        modifier = Modifier
++                            .fillMaxWidth()
++                            .padding(vertical = 8.dp),
++                        shape = MaterialTheme.shapes.medium,
++                        color = MaterialTheme.colorScheme.surfaceVariant,
++                        shadowElevation = 2.dp,
++                        tonalElevation = 2.dp,
+                     ) {
+-                        Box(modifier = Modifier.size(24.dp))
+-                        Text(
+-                            text = stringResource(id = R.string.preference_screen_clockwidget),
+-                            style = MaterialTheme.typography.titleMedium,
+-                            modifier = Modifier
+-                                .weight(1f)
+-                                .padding(horizontal = 8.dp),
+-                            overflow = TextOverflow.Ellipsis,
+-                            maxLines = 1
+-                        )
+-                        IconButton(onClick = {
+-                            configure = true
+-                        }) {
+-                            Icon(
+-                                imageVector = Icons.Rounded.Tune,
+-                                contentDescription = stringResource(R.string.settings)
++                        Row(
++                            modifier = Modifier.padding(8.dp),
++                            verticalAlignment = Alignment.CenterVertically
++                        ) {
++                            Box(modifier = Modifier.size(24.dp))
++                            Text(
++                                text = stringResource(id = R.string.preference_screen_clockwidget),
++                                style = MaterialTheme.typography.titleMedium,
++                                modifier = Modifier
++                                    .weight(1f)
++                                    .padding(horizontal = 8.dp),
++                                overflow = TextOverflow.Ellipsis,
++                                maxLines = 1
+                             )
++                            IconButton(onClick = {
++                                configure = true
++                            }) {
++                                Icon(
++                                    imageVector = Icons.Rounded.Tune,
++                                    contentDescription = stringResource(R.string.settings)
++                                )
++                            }
+                         }
+                     }
+-                }
+-                HorizontalDivider()
+-                if (configure) {
+-                    ConfigureClockWidgetSheet(onDismiss = { configure = false })
+-                }
+-            }
+-        } else {
+-            Column(modifier = modifier) {
+-                Box(
+-                    modifier = Modifier
+-                        .then(if(fillScreenHeight) Modifier.weight(1f) else Modifier)
+-                        .fillMaxWidth(),
+-                    contentAlignment = when (alignment) {
+-                        ClockWidgetAlignment.Center -> Alignment.Center
+-                        ClockWidgetAlignment.Top -> Alignment.TopCenter
+-                        else -> Alignment.BottomCenter
++                    HorizontalDivider()
++                    if (configure) {
++                        ConfigureClockWidgetSheet(onDismiss = { configure = false })
+                     }
+-                ) {
+-                    CompositionLocalProvider(
+-                        LocalContentColor provides contentColor
++                }
++            } else {
++                Column(modifier = modifier) {
++                    Box(
++                        modifier = Modifier
++                            .then(if (fillScreenHeight) Modifier.weight(1f) else Modifier)
++                            .fillMaxWidth(),
++                        contentAlignment = when (alignment) {
++                            ClockWidgetAlignment.Center -> Alignment.Center
++                            ClockWidgetAlignment.Top -> Alignment.TopCenter
++                            else -> Alignment.BottomCenter
++                        }
+                     ) {
+-                        if (compact == false) {
+-                            Column(
+-                                horizontalAlignment = Alignment.CenterHorizontally,
+-                            ) {
+-                                Box(
+-                                    modifier = Modifier.clickable(
+-                                        enabled = clockStyle !is ClockWidgetStyle.Empty,
+-                                        indication = null,
+-                                        interactionSource = remember { MutableInteractionSource() }
++                        CompositionLocalProvider(
++                            LocalContentColor provides contentColor
++                        ) {
++                            if (compact == false) {
++                                Column(
++                                    horizontalAlignment = Alignment.CenterHorizontally,
++                                ) {
++                                    Box(
++                                        modifier = Modifier.clickable(
++                                            enabled = clockStyle !is ClockWidgetStyle.Empty,
++                                            indication = null,
++                                            interactionSource = remember { MutableInteractionSource() }
++                                        ) {
++                                            viewModel.launchClockApp(context)
++                                        }
+                                     ) {
+-                                        viewModel.launchClockApp(context)
++                                        Clock(clockStyle, false)
+                                     }
+-                                ) {
+-                                    Clock(clockStyle, false)
+-                                }
+ 
+-                                if (partProvider != null) {
+-                                    DynamicZone(
+-                                        modifier = Modifier.padding(bottom = 8.dp),
+-                                        compact = false,
+-                                        provider = partProvider,
+-                                    )
++                                    if (partProvider != null) {
++                                        DynamicZone(
++                                            modifier = Modifier.padding(bottom = 8.dp),
++                                            compact = false,
++                                            provider = partProvider,
++                                        )
++                                    }
+                                 }
+                             }
+-                        }
+-                        if (compact == true) {
+-                            Row(
+-                                modifier = Modifier
+-                                    .fillMaxWidth()
+-                                    .padding(end = 8.dp, bottom = 16.dp),
+-                                verticalAlignment = Alignment.CenterVertically,
+-                                horizontalArrangement = Arrangement.SpaceBetween
+-                            ) {
+-                                if (partProvider != null) {
+-                                    DynamicZone(
+-                                        modifier = Modifier.weight(1f),
+-                                        compact = true,
+-                                        provider = partProvider,
+-                                    )
+-                                }
+-                                Box(
++                            if (compact == true) {
++                                Row(
+                                     modifier = Modifier
+-                                        .padding(horizontal = 16.dp)
+-                                        .height(56.dp)
+-                                        .width(2.dp)
+-                                        .background(
+-                                            LocalContentColor.current
+-                                        ),
+-                                )
+-                                Box(
+-                                    modifier = Modifier.clickable(
+-                                        enabled = clockStyle !is ClockWidgetStyle.Empty,
+-                                        indication = null,
+-                                        interactionSource = remember { MutableInteractionSource() }
++                                        .fillMaxWidth()
++                                        .padding(end = 8.dp, bottom = 16.dp),
++                                    verticalAlignment = Alignment.CenterVertically,
++                                    horizontalArrangement = Arrangement.SpaceBetween
++                                ) {
++                                    if (partProvider != null) {
++                                        DynamicZone(
++                                            modifier = Modifier.weight(1f),
++                                            compact = true,
++                                            provider = partProvider,
++                                        )
++                                    }
++                                    Box(
++                                        modifier = Modifier
++                                            .padding(horizontal = 16.dp)
++                                            .height(56.dp)
++                                            .width(2.dp)
++                                            .background(
++                                                LocalContentColor.current
++                                            ),
++                                    )
++                                    Box(
++                                        modifier = Modifier.clickable(
++                                            enabled = clockStyle !is ClockWidgetStyle.Empty,
++                                            indication = null,
++                                            interactionSource = remember { MutableInteractionSource() }
++                                        ) {
++                                            viewModel.launchClockApp(context)
++                                        }
+                                     ) {
+-                                        viewModel.launchClockApp(context)
++                                        Clock(clockStyle, true)
+                                     }
+-                                ) {
+-                                    Clock(clockStyle, true)
+                                 }
+                             }
+                         }
+                     }
+-                }
+-                val dockProvider by viewModel.dockProvider.collectAsState()
+-                if (dockProvider != null) {
+-                    Box(
+-                        modifier = Modifier
+-                            .fillMaxWidth()
+-                            .padding(bottom = 16.dp)
+-                    ) {
+-                        dockProvider?.Component(false)
++                    val dockProvider by viewModel.dockProvider.collectAsState()
++                    if (dockProvider != null) {
++                        Box(
++                            modifier = Modifier
++                                .fillMaxWidth()
++                                .padding(bottom = 16.dp)
++                        ) {
++                            dockProvider?.Component(false)
++                        }
+                     }
+                 }
+             }
+@@ -249,14 +256,18 @@ fun Clock(
+     style: ClockWidgetStyle?,
+     compact: Boolean,
+ ) {
+-    val time = LocalTime.current
+-    when (style) {
+-        is ClockWidgetStyle.Digital1 -> DigitalClock1(time, compact, style)
++    val time = LocalClockTime.current
++    val clockSettings: ClockWidgetSettings by inject()
++    val showSeconds by clockSettings.showSeconds.collectAsState(initial = false)
++    val useThemeColor by clockSettings.useThemeColor.collectAsState(initial = false)
+ 
+-        is ClockWidgetStyle.Digital2 -> DigitalClock2(time, compact)
+-        is ClockWidgetStyle.Binary -> BinaryClock(time, compact)
+-        is ClockWidgetStyle.Analog -> AnalogClock(time, compact)
+-        is ClockWidgetStyle.Orbit -> OrbitClock(time, compact)
++    when (style) {
++        is ClockWidgetStyle.Digital1 -> DigitalClock1(time, style, compact, showSeconds, useThemeColor)
++        is ClockWidgetStyle.Digital2 -> DigitalClock2(time, compact, showSeconds, useThemeColor)
++        is ClockWidgetStyle.Binary -> BinaryClock(time, compact, showSeconds, useThemeColor)
++        is ClockWidgetStyle.Analog -> AnalogClock(time, compact, showSeconds, useThemeColor)
++        is ClockWidgetStyle.Orbit -> OrbitClock(time, compact, showSeconds, useThemeColor)
++        is ClockWidgetStyle.Segment -> SegmentClock(time,  compact, showSeconds, useThemeColor)
+         is ClockWidgetStyle.Empty -> {}
+         else -> {}
+     }
+@@ -285,6 +296,8 @@ fun ConfigureClockWidgetSheet(
+     val style by viewModel.clockStyle.collectAsState()
+     val fillHeight by viewModel.fillHeight.collectAsState()
+     val alignment by viewModel.alignment.collectAsState()
++    val showSeconds by viewModel.showSeconds.collectAsState()
++    val useAccentColor by viewModel.useThemeColor.collectAsState()
+     val parts by viewModel.parts.collectAsState()
+ 
+     BottomSheetDialog(onDismissRequest = onDismiss) {
+@@ -340,13 +353,15 @@ fun ConfigureClockWidgetSheet(
+             }
+ 
+             if (color != null && compact != null) {
+-                WatchFaceSelector(
+-                    compact = compact!!,
+-                    colors = color!!,
+-                    selected = style,
+-                    onSelect = {
+-                        viewModel.setClockStyle(it)
+-                    })
++                ProvideClockTime {
++                    WatchFaceSelector(
++                        compact = compact!!,
++                        colors = color!!,
++                        selected = style,
++                        onSelect = {
++                            viewModel.setClockStyle(it)
++                        })
++                }
+             }
+ 
+             SingleChoiceSegmentedButtonRow(
+@@ -392,6 +407,32 @@ fun ConfigureClockWidgetSheet(
+                     )
+                 }
+             }
++            OutlinedCard(
++                modifier = Modifier.padding(top = 16.dp),
++            ) {
++                Column(
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    SwitchPreference(
++                        title = stringResource(R.string.preference_clock_widget_use_theme_color),
++                        icon = Icons.Rounded.ColorLens,
++                        value = useAccentColor,
++                        onValueChanged = {
++                            viewModel.setUseThemeColor(it)
++                        }
++                    )
++                    AnimatedVisibility(compact == false) {
++                        SwitchPreference(
++                            title = stringResource(R.string.preference_clock_widget_show_seconds),
++                            icon = Icons.Rounded.AccessTime,
++                            value = showSeconds,
++                            onValueChanged = {
++                                viewModel.setShowSeconds(it)
++                            }
++                        )
++                    }
++                }
++            }
+             OutlinedCard(
+                 modifier = Modifier.padding(top = 16.dp),
+             ) {
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/WatchFaceSelector.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/WatchFaceSelector.kt
+index 8627cd415..9803a9067 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/WatchFaceSelector.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/WatchFaceSelector.kt
+@@ -45,6 +45,8 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.zIndex
+ import de.mm20.launcher2.preferences.ClockWidgetColors
+ import de.mm20.launcher2.preferences.ClockWidgetStyle
++import de.mm20.launcher2.ui.R
++import de.mm20.launcher2.ui.base.ProvideClockTime
+ import de.mm20.launcher2.ui.locals.LocalDarkTheme
+ import de.mm20.launcher2.ui.locals.LocalPreferDarkContentOverWallpaper
+ import kotlinx.coroutines.launch
+@@ -75,13 +77,13 @@ fun WatchFaceSelector(
+                 mapOf(
+                     ClockStyle.DigitalClock1 to 0,
+                     ClockStyle.DigitalClock1_Outlined to 0,
+-                    ClockStyle.DigitalClock1_MDY to 0,
+                     ClockStyle.DigitalClock1_OnePlus to 0,
+                     ClockStyle.DigitalClock2 to 1,
+                     ClockStyle.AnalogClock to 2,
+                     ClockStyle.OrbitClock to 3,
+                     ClockStyle.BinaryClock to 4,
+-                    ClockStyle.EmptyClock to 5,
++                    ClockStyle.SegmentClock to 5,
++                    ClockStyle.EmptyClock to 6,
+                 )
+             }
+             val pagerState = rememberPagerState(
+@@ -256,13 +258,13 @@ fun getClockstyleName(context: Context, style: ClockWidgetStyle): String {
+     return when (style) {
+         ClockStyle.DigitalClock1,
+         ClockStyle.DigitalClock1_Outlined,
+-        ClockStyle.DigitalClock1_MDY,
+-        ClockStyle.DigitalClock1_OnePlus -> "Bold"
+-        ClockStyle.DigitalClock2 -> "Simple"
+-        ClockStyle.OrbitClock -> "Orbit"
+-        ClockStyle.BinaryClock -> "Binary"
+-        ClockStyle.AnalogClock -> "Hands"
+-        ClockStyle.EmptyClock -> "Empty"
++        ClockStyle.DigitalClock1_OnePlus -> context.getString(R.string.clock_style_digital1)
++        ClockStyle.DigitalClock2 -> context.getString(R.string.clock_style_digital2)
++        ClockStyle.OrbitClock -> context.getString(R.string.clock_style_orbit)
++        ClockStyle.BinaryClock -> context.getString(R.string.clock_style_binary)
++        ClockStyle.AnalogClock -> context.getString(R.string.clock_style_analog)
++        ClockStyle.SegmentClock -> context.getString(R.string.clock_style_segment)
++        ClockStyle.EmptyClock -> context.getString(R.string.clock_style_empty)
+         else -> ""
+     }
+ }
+@@ -274,9 +276,9 @@ fun getVariantName(context: Context, style: ClockWidgetStyle): String {
+         ClockStyle.OrbitClock,
+         ClockStyle.BinaryClock,
+         ClockStyle.AnalogClock,
+-        ClockStyle.EmptyClock -> "Standard"
+-        ClockStyle.DigitalClock1_Outlined -> "Outlined"
+-        ClockStyle.DigitalClock1_MDY -> "Material You"
++        ClockStyle.SegmentClock,
++        ClockStyle.EmptyClock -> context.getString(R.string.clock_variant_standard)
++        ClockStyle.DigitalClock1_Outlined -> context.getString(R.string.clock_variant_outlined)
+         ClockStyle.DigitalClock1_OnePlus -> "OnePlus"
+         else -> ""
+ 
+@@ -287,11 +289,11 @@ fun getVariantName(context: Context, style: ClockWidgetStyle): String {
+ object ClockStyle {
+     val DigitalClock1 = ClockWidgetStyle.Digital1()
+     val DigitalClock1_Outlined = ClockWidgetStyle.Digital1(outlined = true)
+-    val DigitalClock1_MDY = ClockWidgetStyle.Digital1(variant = ClockWidgetStyle.Digital1.Variant.MDY)
+     val DigitalClock1_OnePlus = ClockWidgetStyle.Digital1(variant = ClockWidgetStyle.Digital1.Variant.OnePlus)
+     val DigitalClock2 = ClockWidgetStyle.Digital2
+     val OrbitClock = ClockWidgetStyle.Orbit
+     val AnalogClock = ClockWidgetStyle.Analog
+     val BinaryClock = ClockWidgetStyle.Binary
++    val SegmentClock = ClockWidgetStyle.Segment
+     val EmptyClock = ClockWidgetStyle.Empty
+ }
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/AnalogClock.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/AnalogClock.kt
+index 716faa913..905477fdb 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/AnalogClock.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/AnalogClock.kt
+@@ -4,41 +4,68 @@ import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.material3.LocalContentColor
++import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.geometry.center
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.StrokeCap
+ import androidx.compose.ui.graphics.drawscope.Fill
+ import androidx.compose.ui.graphics.drawscope.rotate
+ import androidx.compose.ui.unit.dp
+-import de.mm20.launcher2.preferences.LegacySettings
+-import java.util.*
++import de.mm20.launcher2.ui.locals.LocalDarkTheme
++import java.util.Calendar
+ 
+ @Composable
+ fun AnalogClock(
+     time: Long,
+     compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean,
+ ) {
+     val verticalLayout = !compact
+     val date = Calendar.getInstance()
+     date.timeInMillis = time
++    val second = date[Calendar.SECOND]
+     val minute = date[Calendar.MINUTE]
+     val hour = date[Calendar.HOUR]
+ 
+     val size = if (verticalLayout) 128.dp else 56.dp
+     val strokeWidth = if (verticalLayout) 4.dp else 2.dp
+ 
+-    val color = LocalContentColor.current
++    val color = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
++            else MaterialTheme.colorScheme.primaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.primary
++        }
++    }
++    else {
++        LocalContentColor.current
++    }
++
++    val secondaryColor = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.onPrimaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primary
++            else MaterialTheme.colorScheme.primaryContainer
++        }
++    }
++    else {
++        LocalContentColor.current.invert()
++    }
++
++    val contentColor = LocalContentColor.current
++
+     Canvas(modifier = Modifier
+-        .padding(bottom = if (verticalLayout) 8.dp else 0.dp)
++        .padding(top = if (verticalLayout) 8.dp else 0.dp,
++            bottom = if (verticalLayout) 8.dp else 0.dp)
+         .size(size)) {
+-        drawCircle(
+-            color,
+-            radius = strokeWidth.toPx(),
+-            center = this.size.center,
+-            style = Fill
+-        )
+-        rotate(hour.toFloat() / 12f * 360f + (minute.toFloat() / 60f) * 30f, this.size.center) {
++        rotate(hour.toFloat() / 12f * 360f + ((minute.toFloat() / 60f) * 30f) + (second.toFloat() / 120f), this.size.center) {
+             drawLine(
+                 color,
+                 this.size.center, this.size.center.copy(y = this.size.height * 0.25f),
+@@ -46,7 +73,7 @@ fun AnalogClock(
+                 cap = StrokeCap.Round
+             )
+         }
+-        rotate(minute.toFloat() / 60f * 360f, this.size.center) {
++        rotate(minute.toFloat() / 60f * 360f + (second.toFloat() / 60f) * 6f, this.size.center) {
+             drawLine(
+                 color,
+                 this.size.center, this.size.center.copy(y = this.size.height * 0.1f),
+@@ -54,5 +81,29 @@ fun AnalogClock(
+                 cap = StrokeCap.Round,
+             )
+         }
++        if (verticalLayout && showSeconds) {
++            rotate((second.toFloat() / 60f) * 360f, this.size.center) {
++                drawLine(
++                    contentColor,
++                    this.size.center, this.size.center.copy(y = this.size.height * 0.05f),
++                    strokeWidth = (strokeWidth / 2).toPx(),
++                    cap = StrokeCap.Round
++                )
++            }
++        }
++        drawCircle(
++            secondaryColor,
++            radius = (strokeWidth * 1.5f).toPx(),
++            center = this.size.center,
++            style = Fill
++        )
+     }
+-}
+\ No newline at end of file
++}
++
++private fun Color.invert(alpha: Float? = null): Color =
++    Color(
++        1f - red,
++        1f - green,
++        1f - blue,
++        alpha ?: this.alpha, colorSpace
++    )
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/BinaryClock.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/BinaryClock.kt
+index 235d95625..2c39b68a1 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/BinaryClock.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/BinaryClock.kt
+@@ -1,47 +1,94 @@
+ package de.mm20.launcher2.ui.launcher.widgets.clock.clocks
+ 
+ import androidx.compose.foundation.background
+-import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
+ import androidx.compose.material3.LocalContentColor
++import androidx.compose.material3.MaterialTheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.unit.dp
+-import java.util.*
++import de.mm20.launcher2.ui.locals.LocalDarkTheme
++import java.util.Calendar
+ 
+ @Composable
+ fun BinaryClock(
+     time: Long,
+     compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean,
+ ) {
+     val verticalLayout = !compact
+     val date = Calendar.getInstance()
+     date.timeInMillis = time
++    val second = date[Calendar.SECOND]
+     val minute = date[Calendar.MINUTE]
+     var hour = date[Calendar.HOUR]
+     if (hour == 0) hour = 12
++
++    val color = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
++            else MaterialTheme.colorScheme.primaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.primary
++        }
++    }
++    else {
++        LocalContentColor.current
++    }
++
++    // FIXME: Accent color by setting
++    val disabledColor = LocalContentColor.current.copy(alpha = 0.45f)
++
+     if (verticalLayout) {
+-        Row(
+-            modifier = Modifier.padding(vertical = 24.dp)
++        Column(
++            horizontalAlignment = Alignment.End
+         ) {
+-            for (i in 0 until 10) {
+-                val active = if (i < 4) {
+-                    hour and (1 shl (3 - i)) != 0
+-                } else {
+-                    minute and (1 shl (9 - i)) != 0
+-                }
+-                Box(
+-                    modifier = Modifier
+-                        .padding(4.dp)
+-                        .size(12.dp)
+-                        .background(
+-                            LocalContentColor.current.copy(
+-                                if (active) 1f else 0.45f
++            Row(
++                modifier = Modifier.padding(start = 0.dp, top = 24.dp, end = 0.dp, bottom = 6.dp)
++            ) {
++                for (i in 0 until 10) {
++                    val active = if (i < 4) {
++                        hour and (1 shl (3 - i)) != 0
++                    } else {
++                        minute and (1 shl (9 - i)) != 0
++                    }
++                    Box(
++                        modifier = Modifier
++                            .padding(4.dp)
++                            .size(12.dp)
++                            .background(
++                                if (active) color else disabledColor
+                             )
++                    )
++                    if (i == 3) {
++                        Box(Modifier.size(8.dp))
++                    }
++                }
++            }
++            if (showSeconds) {
++                Row(
++                    horizontalArrangement = Arrangement.End
++                ) {
++                    for (i in 0 until 6) {
++                        val active = second and (1 shl (5 - i)) != 0
++                        Box(
++                            modifier = Modifier
++                                .padding(4.dp)
++                                .size(12.dp)
++                                .background(
++                                    if (active) color else disabledColor
++                                )
+                         )
+-                )
+-                if (i == 3) {
+-                    Box(Modifier.size(8.dp))
++                    }
+                 }
+             }
+         }
+@@ -57,9 +104,7 @@ fun BinaryClock(
+                             .padding( 4.dp)
+                             .size(12.dp)
+                             .background(
+-                                LocalContentColor.current.copy(
+-                                    if (active) 1f else 0.45f
+-                                )
++                                if (active) color else disabledColor
+                             )
+                     )
+                 }
+@@ -72,9 +117,7 @@ fun BinaryClock(
+                             .padding(4.dp)
+                             .size(12.dp)
+                             .background(
+-                                LocalContentColor.current.copy(
+-                                    if (active) 1f else 0.45f
+-                                )
++                                if (active) color else disabledColor
+                             )
+                     )
+                 }
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock1.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock1.kt
+index 4c8efc707..c66fac362 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock1.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock1.kt
+@@ -1,11 +1,14 @@
+ package de.mm20.launcher2.ui.launcher.widgets.clock.clocks
+ 
+ import android.text.format.DateFormat
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.offset
+ import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.drawscope.Fill
+@@ -23,24 +26,48 @@ import de.mm20.launcher2.preferences.ClockWidgetStyle
+ import de.mm20.launcher2.ui.ktx.toPixels
+ import de.mm20.launcher2.ui.locals.LocalDarkTheme
+ import java.text.SimpleDateFormat
+-import java.util.*
++import java.util.Locale
+ 
+ @Composable
+ fun DigitalClock1(
+     time: Long,
+-    compact: Boolean,
+     style: ClockWidgetStyle.Digital1 = ClockWidgetStyle.Digital1(),
++    compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean,
+ ) {
+     val verticalLayout = !compact
+     val format = SimpleDateFormat(
+-        if (verticalLayout) {
+-            if (DateFormat.is24HourFormat(LocalContext.current)) "HH\nmm" else "hh\nmm"
+-        } else {
+-            if (DateFormat.is24HourFormat(LocalContext.current)) "HH mm" else "hh mm"
++        when {
++            DateFormat.is24HourFormat(LocalContext.current) && verticalLayout -> {
++                "HH\nmm"
++            }
++            DateFormat.is24HourFormat(LocalContext.current) -> {
++                "HH mm"
++            }
++            verticalLayout -> {
++                "HH\nmm"
++            }
++            else -> {
++                "hh mm"
++            }
+         },
+         Locale.getDefault()
+     )
+ 
++    val color = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
++            else MaterialTheme.colorScheme.primaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.primary
++        }
++    }
++    else {
++        LocalContentColor.current
++    }
++
+     val formattedString = format.format(time)
+ 
+     val textStyle = MaterialTheme.typography.displayLarge.copy(
+@@ -49,42 +76,51 @@ fun DigitalClock1(
+         textAlign = TextAlign.Center,
+         lineHeight = 0.8.em,
+         drawStyle = if (style.outlined) Stroke(width = 2.dp.toPixels()) else Fill,
+-        color = if (style.variant == ClockWidgetStyle.Digital1.Variant.MDY) {
+-            if (LocalContentColor.current == Color.White) {
+-                if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
+-                else MaterialTheme.colorScheme.primaryContainer
+-            } else {
+-                if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
+-                else MaterialTheme.colorScheme.primary
+-            }
+-        } else LocalContentColor.current
++        color = color
+     )
+ 
+     val modifier = Modifier.offset(0.dp, if (verticalLayout) 16.dp else 0.dp)
+ 
+-    if (style.variant == ClockWidgetStyle.Digital1.Variant.OnePlus) {
+-        val hour = formattedString.substring(0, 2)
+-        Text(
+-            modifier = modifier,
+-            text = buildAnnotatedString {
+-                hour.forEach {
+-                    if (it == '1') {
+-                        withStyle(style = SpanStyle(color = Color(0xFFC41442))) {
++    Column(
++        verticalArrangement = Arrangement.Center
++    ) {
++        if (style.variant == ClockWidgetStyle.Digital1.Variant.OnePlus) {
++            val hour = formattedString.substring(0, 2)
++            Text(
++                modifier = modifier,
++                text = buildAnnotatedString {
++                    hour.forEach {
++                        if (it == '1') {
++                            withStyle(style = SpanStyle(color = Color(0xFFC41442))) {
++                                append(it)
++                            }
++                        } else {
+                             append(it)
+                         }
+-                    } else {
+-                        append(it)
+                     }
+-                }
+-                append(formattedString.substring(2))
+-            },
+-            style = textStyle
+-        )
+-        return
++                    append(formattedString.substring(2))
++                },
++                style = textStyle
++            )
++        }
++        else {
++            Text(
++                modifier = modifier,
++                text = formattedString,
++                style = textStyle,
++            )
++        }
++
++        if (verticalLayout && showSeconds) {
++            Text(
++                modifier = Modifier.offset(0.dp, (-20).dp).align(Alignment.CenterHorizontally),
++                text = SimpleDateFormat("ss", Locale.getDefault()).format(time),
++                style = textStyle.copy(
++                    fontSize = textStyle.fontSize * 0.6,
++                    color = color,
++                    drawStyle = if (style.outlined) Stroke(width = 2.dp.toPixels()) else Fill,
++                )
++            )
++        }
+     }
+-    Text(
+-        modifier = modifier,
+-        text = formattedString,
+-        style = textStyle,
+-    )
+ }
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock2.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock2.kt
+index 2ae619ba7..dfe117e42 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock2.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/DigitalClock2.kt
+@@ -1,22 +1,69 @@
+ package de.mm20.launcher2.ui.launcher.widgets.clock.clocks
+ 
+-import android.text.format.DateUtils
++import android.text.format.DateFormat
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.LocalContentColor
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.text.font.FontWeight
+-
++import androidx.compose.ui.unit.dp
++import de.mm20.launcher2.ui.locals.LocalDarkTheme
++import java.text.SimpleDateFormat
++import java.util.Locale
+ 
+ @Composable
+ fun DigitalClock2(
+     time: Long,
+     compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean,
+ ) {
++
++    val verticalLayout = !compact
++    val color = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
++            else MaterialTheme.colorScheme.primaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.primary
++        }
++    }
++    else {
++        LocalContentColor.current
++    }
++
++    val formatString = if (verticalLayout && showSeconds) {
++        if (DateFormat.is24HourFormat(LocalContext.current)) {
++            "HH:mm:ss"
++        }
++        else {
++            "hh:mm:ss"
++        }
++    }
++    else {
++        if (DateFormat.is24HourFormat(LocalContext.current)) {
++            "HH:mm"
++        }
++        else {
++            "hh:mm"
++        }
++    }
++    val formatter = SimpleDateFormat(formatString, Locale.getDefault())
+     Text(
+-        text = DateUtils.formatDateTime(LocalContext.current, time, DateUtils.FORMAT_SHOW_TIME),
++        modifier = Modifier.padding(top = if (verticalLayout) 12.dp else 0.dp,
++            bottom = if (verticalLayout) 12.dp else 0.dp,
++            start = 0.dp,
++            end = 0.dp),
++        text = formatter.format(time),
+         style = MaterialTheme.typography.displaySmall.copy(
+-            fontWeight = FontWeight.Normal
++            fontWeight = FontWeight.Normal,
++            color = color
+         )
+     )
+ }
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/OrbitClock.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/OrbitClock.kt
+index 72fd823f3..c40a6566b 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/OrbitClock.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/OrbitClock.kt
+@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.BlendMode
+ import androidx.compose.ui.graphics.Color
+ import androidx.compose.ui.graphics.PathEffect
+ import androidx.compose.ui.graphics.drawscope.Stroke
++import androidx.compose.ui.graphics.toArgb
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.text.AnnotatedString
+ import androidx.compose.ui.text.drawText
+@@ -31,7 +32,8 @@ import androidx.compose.ui.unit.center
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.toOffset
+ import de.mm20.launcher2.ktx.TWO_PI
+-import de.mm20.launcher2.preferences.LegacySettings
++import de.mm20.launcher2.ui.locals.LocalDarkTheme
++import palettes.TonalPalette
+ import java.time.Instant
+ import java.time.ZoneId
+ import java.time.ZonedDateTime
+@@ -47,6 +49,8 @@ private val currentTime
+ fun OrbitClock(
+     _time: Long,
+     compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean
+ ) {
+     val verticalLayout = !compact
+ 
+@@ -108,7 +112,24 @@ fun OrbitClock(
+         label = "hoursAnimation"
+     )
+ 
+-    val color = LocalContentColor.current
++    val fgTone = if (LocalContentColor.current == Color.White) 10 else 90
++    val bgTone = if (LocalContentColor.current == Color.White) 90 else 30
++
++    val background = if (useThemeColor) {
++        Color(TonalPalette.fromInt(MaterialTheme.colorScheme.primaryContainer.toArgb()).tone(bgTone))
++    }
++    else {
++        LocalContentColor.current
++    }
++
++    val foreground = if (useThemeColor) {
++        Color(TonalPalette.fromInt(MaterialTheme.colorScheme.onPrimaryContainer.toArgb()).tone(fgTone))
++    }
++    else {
++        LocalContentColor.current.invert()
++    }
++
++    val contentColor = LocalContentColor.current
+ 
+     val textMeasurer = rememberTextMeasurer()
+     val minuteStyle = MaterialTheme.typography.labelMedium
+@@ -118,7 +139,8 @@ fun OrbitClock(
+ 
+     Canvas(
+         modifier = Modifier
+-            .padding(bottom = if (verticalLayout) 8.dp else 0.dp)
++            .padding(bottom = if (verticalLayout) 8.dp else 0.dp,
++                top = if (verticalLayout) 8.dp else 0.dp)
+             .size(if (verticalLayout) 192.dp else 56.dp)
+     ) {
+ 
+@@ -130,9 +152,9 @@ fun OrbitClock(
+         val mSize = size.width * 0.08f
+         val hSize = rh + sSize + rs - 2f * rm
+ 
+-        if (verticalLayout) {
++        if (verticalLayout && showSeconds) {
+             drawCircle(
+-                color = color.copy(alpha = 0.5f),
++                color = contentColor.copy(alpha = 0.5f),
+                 radius = rs,
+                 style = Stroke(
+                     width = strokeWidth.toPx(),
+@@ -141,7 +163,7 @@ fun OrbitClock(
+             )
+         }
+         drawCircle(
+-            color = color.copy(alpha = 0.5f),
++            color = contentColor.copy(alpha = 0.5f),
+             radius = rm,
+             style = Stroke(
+                 width = strokeWidth.toPx(),
+@@ -154,7 +176,7 @@ fun OrbitClock(
+             )
+         )
+         drawCircle(
+-            color = color.copy(alpha = 0.5f),
++            color = contentColor.copy(alpha = 0.5f),
+             radius = rh,
+             style = Stroke(
+                 width = strokeWidth.toPx(),
+@@ -171,7 +193,7 @@ fun OrbitClock(
+         val mPos = Offset(x = sin(animatedMins) * rm, y = -cos(animatedMins) * rm)
+         val hPos = Offset(x = sin(animatedHrs) * rh, y = -cos(animatedHrs) * rh)
+ 
+-        if (verticalLayout) {
++        if (verticalLayout && showSeconds) {
+             drawCircle(
+                 color = Color.Black,
+                 radius = sSize,
+@@ -208,34 +230,47 @@ fun OrbitClock(
+ 
+             drawText(
+                 textMResult,
+-                color = color.invert(alpha = 0.65f),
++                color = Color.Black,
++                topLeft = size.center - textMResult.size.center.toOffset() + mPos,
++                blendMode = BlendMode.DstOut
++            )
++            drawText(
++                textHResult,
++                color = Color.Black,
++                topLeft = size.center - textHResult.size.center.toOffset() + mPos,
++                blendMode = BlendMode.DstOut
++            )
++
++            drawText(
++                textMResult,
++                color = foreground,
+                 topLeft = size.center - textMResult.size.center.toOffset() + mPos,
+                 blendMode = BlendMode.Overlay
+             )
+             drawText(
+                 textHResult,
+-                color = color.invert(alpha = 0.65f),
++                color = foreground,
+                 topLeft = size.center - textHResult.size.center.toOffset() + hPos,
+                 blendMode = BlendMode.Overlay
+             )
+         }
+ 
+-        if (verticalLayout) {
++        if (verticalLayout && showSeconds) {
+             drawCircle(
+-                color = color,
++                color = background,
+                 radius = sSize,
+                 center = size.center + sPos,
+                 blendMode = BlendMode.Overlay
+             )
+         }
+         drawCircle(
+-            color = color,
++            color = background,
+             radius = mSize,
+             center = size.center + mPos,
+             blendMode = BlendMode.Overlay
+         )
+         drawCircle(
+-            color = color,
++            color = background,
+             radius = hSize,
+             center = size.center + hPos,
+             blendMode = BlendMode.Overlay
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/SegmentClock.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/SegmentClock.kt
+new file mode 100644
+index 000000000..8a4185701
+--- /dev/null
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/launcher/widgets/clock/clocks/SegmentClock.kt
+@@ -0,0 +1,282 @@
++package de.mm20.launcher2.ui.launcher.widgets.clock.clocks
++
++import android.os.Handler
++import android.os.Looper
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.material3.LocalContentColor
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.alpha
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.graphics.PathFillType
++import androidx.compose.ui.graphics.SolidColor
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.graphics.vector.path
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.repeatOnLifecycle
++import de.mm20.launcher2.ui.locals.LocalDarkTheme
++import kotlinx.coroutines.awaitCancellation
++import java.time.Instant
++import java.time.ZoneId
++
++@Composable
++fun SegmentClock(
++    time: Long,
++    compact: Boolean,
++    showSeconds: Boolean,
++    useThemeColor: Boolean
++) {
++    val parsed = Instant.ofEpochMilli(time).atZone(ZoneId.systemDefault())
++    val hour = parsed.hour
++    val minute = parsed.minute
++    val second = parsed.second
++    val flick = remember { mutableStateOf(time % 1000 <= 500) }
++
++    val enabled = if (useThemeColor) {
++        if (LocalContentColor.current == Color.White) {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.onPrimaryContainer
++            else MaterialTheme.colorScheme.primaryContainer
++        } else {
++            if (LocalDarkTheme.current) MaterialTheme.colorScheme.primaryContainer
++            else MaterialTheme.colorScheme.primary
++        }
++    }
++    else {
++        LocalContentColor.current
++    }
++    val disabled = LocalContentColor.current
++
++    val owner = LocalLifecycleOwner.current
++    LaunchedEffect(null) {
++        owner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
++            val handler = Handler(Looper.myLooper()!!)
++
++            val callback = object : Runnable {
++                override fun run() {
++                    val currentTime = System.currentTimeMillis()
++                    flick.value = currentTime % 1000 <= 500
++                    handler.postDelayed(this, (500 - (currentTime % 500)))
++                }
++            }
++
++            val currentTime = System.currentTimeMillis()
++            handler.postDelayed(callback, (500 - (currentTime % 500)))
++
++            try {
++                awaitCancellation()
++            }
++            finally {
++                handler.removeCallbacks(callback)
++            }
++        }
++    }
++
++    val allSegmentVectors = remember(compact, enabled, disabled) {
++        val vectors = mutableListOf<ImageVector>()
++
++        for (code in segmentBitsForDigits.indices) {
++            vectors.add(getVectorDigitForNumber(compact, code, enabled, disabled))
++        }
++
++        vectors.toList()
++    }
++
++    val separator = remember(compact, enabled) {
++        getVectorSeparator(compact, enabled)
++    }
++
++    Row(
++        modifier = Modifier.padding(top = if (!compact) 16.dp else 0.dp,
++            bottom = if (!compact) 16.dp else 0.dp,
++            start = 0.dp, end = 0.dp),
++        horizontalArrangement = Arrangement.Center,
++        verticalAlignment = Alignment.CenterVertically
++    ) {
++        Image(allSegmentVectors[if (hour / 10 == 0) 10 else hour / 10], null)
++        Separator(compact)
++        Image(allSegmentVectors[hour % 10], null)
++
++        Separator(compact)
++        Box(Modifier.alpha(if (flick.value) 1f else 0.05f)) { Image(separator, null) }
++        Separator(compact)
++
++        Image(allSegmentVectors[minute / 10], null)
++        Separator(compact)
++        Image(allSegmentVectors[minute % 10], null)
++
++        if (!compact && showSeconds) {
++            Separator(false)
++            Box(Modifier.alpha(if (flick.value) 1f else 0.05f)) { Image(separator, null) }
++            Separator(false)
++
++            Image(allSegmentVectors[second / 10], null)
++            Separator(false)
++            Image(allSegmentVectors[second % 10], null)
++        }
++    }
++}
++
++@Composable
++private fun Separator(compact: Boolean) {
++    Box(Modifier.size(if (compact) 3.dp else 4.dp))
++}
++
++/*
++   ┌─(A)─┐
++  (F)   (B)  // Segments on byte: 0bGFEDBCA
++   ├─(G)─┤   // (11 values counting one with all bits off at the end)
++  (E)   (C)
++   └─(D)─┘
++ */
++private val segmentBitsForDigits = arrayOf(0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f, 0x00)
++
++private fun getVectorDigitForNumber(compact: Boolean, number: Int, enabled: Color, disabled: Color) : ImageVector {
++    if (number < 0 || number > segmentBitsForDigits.size) {
++        throw IllegalArgumentException()
++    }
++
++    val segment = segmentBitsForDigits[number]
++    val solidEnabled = SolidColor(enabled)
++    val solidDisabled = SolidColor(disabled)
++
++    return ImageVector.Builder(
++        defaultWidth = if (compact) 18.dp else 30.dp,
++        defaultHeight = if (compact) 30.dp else 50.dp,
++        viewportWidth = 15.874999f,
++        viewportHeight = 26.458332f
++    ).path(
++        name = "A",
++        fill = if ((segment and 0x01) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if ((segment and 0x01) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(4.076372f, 3.6568797f)
++        horizontalLineToRelative(7.802962f)
++        lineTo(12.903025f, 0.0872854f)
++        lineTo(3.470742f, 0.04026844f)
++        curveTo(2.1788f, 0.0804f, 1.4853f, 0.7665f, 1.4853f, 0.7665f)
++        close()
++    }.path(
++        name = "B",
++        fill = if (((segment and 0x02) shr 1) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x02) shr 1) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(13.50401f, 0.22460027f)
++        lineToRelative(-1.096166f, 4.134793f)
++        lineToRelative(-0.01958f, 7.2860675f)
++        lineToRelative(2.388076f, 1.485313f)
++        lineToRelative(1.076593f, -0.56201f)
++        lineToRelative(0.05628f, -9.253104f)
++        curveToRelative(0.0046f, -0.7586f, -0.9567f, -2.6294f, -2.4052f, -3.0911f)
++        close()
++    }.path(
++        name = "C",
++        fill = if (((segment and 0x04) shr 2) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x04) shr 2) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(12.407844f, 15.358745f)
++        lineToRelative(2.27063f, -1.505385f)
++        lineToRelative(1.174464f, 0.56201f)
++        lineToRelative(0.0049f, 8.658477f)
++        curveToRelative(0.0015f, 2.733f, -2.9606f, 3.3846f, -2.9606f, 3.3846f)
++        lineToRelative(-0.469785f, -3.637352f)
++        close()
++    }.path(
++        name = "D",
++        fill = if (((segment and 0x08) shr 3) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x08) shr 3) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(4.088724f, 22.705027f)
++        lineToRelative(-2.681692f, 3.010772f)
++        curveToRelative(0.6655f, 0.7226f, 2.1287f, 0.7828f, 2.1287f, 0.7828f)
++        horizontalLineToRelative(8.861135f)
++        lineToRelative(-0.550436f, -3.793573f)
++        close()
++    }.path(
++        name = "E",
++        fill = if (((segment and 0x10) shr 4) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x10) shr 4) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(3.247025f, 15.459104f)
++        lineToRelative(-2.290205f, -1.686032f)
++        lineToRelative(-0.880847f, 0.461652f)
++        lineToRelative(-0.0367f, 8.711166f)
++        reflectiveCurveToRelative(0.04649f, 1.324739f, 0.800103f, 2.248042f)
++        lineToRelative(2.427225f, -2.461695f)
++        close()
++    }.path(
++        name = "F",
++        fill = if (((segment and 0x20) shr 5) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x20) shr 5) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(1.035118f, 1.2482624f)
++        reflectiveCurveToRelative(-0.928317f, 0.8023766f, -0.929784f, 2.1552107f)
++        lineToRelative(-0.0098f, 9.024787f)
++        lineToRelative(0.880848f, 0.521867f)
++        lineToRelative(2.290204f, -1.465242f)
++        verticalLineToRelative(-7.707575f)
++        close()
++    }.path(
++        name = "G",
++        fill = if (((segment and 0x40) shr 6) == 0x01) solidEnabled else solidDisabled,
++        fillAlpha = if (((segment and 0x40) shr 6) == 0x01) 1.0f else 0.05f,
++        pathFillType = PathFillType.NonZero
++    ) {
++        moveTo(1.603085f, 13.391707f)
++        curveToRelative(0.8352f, -0.5352f, 1.6703f, -1.0705f, 2.5055f, -1.6057f)
++        horizontalLineToRelative(7.340399f)
++        curveToRelative(0.9265f, 0.5486f, 1.853f, 1.0973f, 2.7796f, 1.6459f)
++        curveToRelative(-0.8482f, 0.5553f, -1.6964f, 1.1106f, -2.5447f, 1.666f)
++        horizontalLineTo(4.069459f)
++        curveToRelative(-0.8221f, -0.5687f, -1.6442f, -1.1374f, -2.4664f, -1.7061f)
++        close()
++    }
++
++    .build()
++}
++
++private fun getVectorSeparator(compact: Boolean, enabled: Color) : ImageVector {
++
++    return ImageVector.Builder(
++        defaultWidth = if (compact) 3.6.dp else 6.dp,
++        defaultHeight = if (compact) 30.dp else 50.dp,
++        viewportWidth = 3.175f,
++        viewportHeight = 26.458f
++    ).apply {
++        path(
++            fill = SolidColor(enabled),
++            fillAlpha = 1.0f,
++            pathFillType = PathFillType.NonZero
++        ) {
++            moveTo(3.175f, 18.5f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, -1.587f, 1.588f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, -1.588f, -1.588f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, 1.588f, -1.587f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, 1.587f, 1.587f)
++            close()
++            moveToRelative(0f, -9.634f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, -1.587f, 1.588f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, -1.588f, -1.588f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, 1.588f, -1.587f)
++            arcToRelative(1.587f, 1.587f, 0f, isMoreThanHalf = false, isPositiveArc = true, 1.587f, 1.587f)
++            close()
++        }
++    }.build()
++}
+\ No newline at end of file
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/SettingsActivity.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/SettingsActivity.kt
+index bdbebaae4..1ede778fa 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/SettingsActivity.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/SettingsActivity.kt
+@@ -24,6 +24,7 @@ import androidx.navigation.navArgument
+ import de.mm20.launcher2.licenses.AppLicense
+ import de.mm20.launcher2.licenses.OpenSourceLicenses
+ import de.mm20.launcher2.ui.base.BaseActivity
++import de.mm20.launcher2.ui.base.ProvideCurrentTime
+ import de.mm20.launcher2.ui.base.ProvideSettings
+ import de.mm20.launcher2.ui.locals.LocalDarkTheme
+ import de.mm20.launcher2.ui.locals.LocalNavController
+@@ -84,155 +85,157 @@ class SettingsActivity : BaseActivity() {
+                 LocalWallpaperColors provides wallpaperColors,
+             ) {
+                 ProvideSettings {
+-                    LauncherTheme {
+-                        val systemBarColor = MaterialTheme.colorScheme.surfaceDim
+-                        val systemBarColorAlt = MaterialTheme.colorScheme.onSurface
+-                        val isDarkTheme = LocalDarkTheme.current
+-                        LaunchedEffect(isDarkTheme, systemBarColor, systemBarColorAlt) {
+-                            enableEdgeToEdge(
+-                                if (isDarkTheme) SystemBarStyle.dark(systemBarColor.toArgb())
+-                                else SystemBarStyle.light(systemBarColor.toArgb(), systemBarColorAlt.toArgb())
+-                            )
+-                        }
+-                        OverlayHost {
+-                            NavHost(
+-                                navController = navController,
+-                                startDestination = "settings",
+-                                exitTransition = {
+-                                    fadeOut() + scaleOut(targetScale = 0.5f)
+-                                },
+-                                enterTransition = {
+-                                    slideInHorizontally { it }
+-                                },
+-                                popEnterTransition = {
+-                                    fadeIn() + scaleIn(initialScale = 0.5f)
+-                                },
+-                                popExitTransition = {
+-                                    slideOutHorizontally { it }
+-                                },
+-                            ) {
+-                                composable("settings") {
+-                                    MainSettingsScreen()
+-                                }
+-                                composable("settings/appearance") {
+-                                    AppearanceSettingsScreen()
+-                                }
+-                                composable("settings/homescreen") {
+-                                    HomescreenSettingsScreen()
+-                                }
+-                                composable("settings/icons") {
+-                                    IconsSettingsScreen()
+-                                }
+-                                composable("settings/appearance/themes") {
+-                                    ThemesSettingsScreen()
+-                                }
+-                                composable(
+-                                    "settings/appearance/themes/{id}",
+-                                    arguments = listOf(navArgument("id") {
+-                                        nullable = false
+-                                    })
+-                                ) {
+-                                    val id = it.arguments?.getString("id")?.let {
+-                                        UUID.fromString(it)
+-                                    } ?: return@composable
+-                                    ThemeSettingsScreen(id)
+-                                }
+-                                composable("settings/appearance/cards") {
+-                                    CardsSettingsScreen()
+-                                }
+-                                composable("settings/search") {
+-                                    SearchSettingsScreen()
+-                                }
+-                                composable("settings/gestures") {
+-                                    GestureSettingsScreen()
+-                                }
+-                                composable("settings/search/unitconverter") {
+-                                    UnitConverterSettingsScreen()
+-                                }
+-                                composable("settings/search/wikipedia") {
+-                                    WikipediaSettingsScreen()
+-                                }
+-                                composable("settings/search/locations") {
+-                                    LocationsSettingsScreen()
+-                                }
+-                                composable("settings/search/files") {
+-                                    FileSearchSettingsScreen()
+-                                }
+-                                composable("settings/search/searchactions") {
+-                                    SearchActionsSettingsScreen()
+-                                }
+-                                composable("settings/search/hiddenitems") {
+-                                    HiddenItemsSettingsScreen()
+-                                }
+-                                composable("settings/search/tags") {
+-                                    TagsSettingsScreen()
+-                                }
+-                                composable(ROUTE_WEATHER_INTEGRATION) {
+-                                    WeatherIntegrationSettingsScreen()
+-                                }
+-                                composable(ROUTE_MEDIA_INTEGRATION) {
+-                                    MediaIntegrationSettingsScreen()
+-                                }
+-                                composable("settings/favorites") {
+-                                    FavoritesSettingsScreen()
+-                                }
+-                                composable("settings/integrations") {
+-                                    IntegrationsSettingsScreen()
+-                                }
+-                                composable("settings/plugins") {
+-                                    PluginsSettingsScreen()
+-                                }
+-                                composable("settings/plugins/{id}") {
+-                                    PluginSettingsScreen(it.arguments?.getString("id") ?: return@composable)
+-                                }
+-                                composable("settings/about") {
+-                                    AboutSettingsScreen()
+-                                }
+-                                composable("settings/about/buildinfo") {
+-                                    BuildInfoSettingsScreen()
+-                                }
+-                                composable("settings/about/easteregg") {
+-                                    EasterEggSettingsScreen()
+-                                }
+-                                composable("settings/debug") {
+-                                    DebugSettingsScreen()
+-                                }
+-                                composable("settings/backup") {
+-                                    BackupSettingsScreen()
+-                                }
+-                                composable("settings/debug/crashreporter") {
+-                                    CrashReporterScreen()
+-                                }
+-                                composable("settings/debug/logs") {
+-                                    LogScreen()
+-                                }
+-                                composable(
+-                                    "settings/debug/crashreporter/report?fileName={fileName}",
+-                                    arguments = listOf(navArgument("fileName") {
+-                                        nullable = false
+-                                    })
+-                                ) {
+-                                    val fileName = it.arguments?.getString("fileName")
+-                                        ?.let {
+-                                            URLDecoder.decode(it, "utf8")
+-                                        }
+-                                    CrashReportScreen(fileName!!)
+-                                }
+-                                composable(
+-                                    "settings/license?library={libraryName}",
+-                                    arguments = listOf(navArgument("libraryName") {
+-                                        nullable = true
+-                                    })
++                    ProvideCurrentTime {
++                        LauncherTheme {
++                            val systemBarColor = MaterialTheme.colorScheme.surfaceDim
++                            val systemBarColorAlt = MaterialTheme.colorScheme.onSurface
++                            val isDarkTheme = LocalDarkTheme.current
++                            LaunchedEffect(isDarkTheme, systemBarColor, systemBarColorAlt) {
++                                enableEdgeToEdge(
++                                    if (isDarkTheme) SystemBarStyle.dark(systemBarColor.toArgb())
++                                    else SystemBarStyle.light(systemBarColor.toArgb(), systemBarColorAlt.toArgb())
++                                )
++                            }
++                            OverlayHost {
++                                NavHost(
++                                    navController = navController,
++                                    startDestination = "settings",
++                                    exitTransition = {
++                                        fadeOut() + scaleOut(targetScale = 0.5f)
++                                    },
++                                    enterTransition = {
++                                        slideInHorizontally { it }
++                                    },
++                                    popEnterTransition = {
++                                        fadeIn() + scaleIn(initialScale = 0.5f)
++                                    },
++                                    popExitTransition = {
++                                        slideOutHorizontally { it }
++                                    },
+                                 ) {
+-                                    val libraryName = it.arguments?.getString("libraryName")
+-                                    val library = remember(libraryName) {
+-                                        if (libraryName == null) {
+-                                            AppLicense.get(this@SettingsActivity)
+-                                        } else {
+-                                            OpenSourceLicenses.first { it.name == libraryName }
++                                    composable("settings") {
++                                        MainSettingsScreen()
++                                    }
++                                    composable("settings/appearance") {
++                                        AppearanceSettingsScreen()
++                                    }
++                                    composable("settings/homescreen") {
++                                        HomescreenSettingsScreen()
++                                    }
++                                    composable("settings/icons") {
++                                        IconsSettingsScreen()
++                                    }
++                                    composable("settings/appearance/themes") {
++                                        ThemesSettingsScreen()
++                                    }
++                                    composable(
++                                        "settings/appearance/themes/{id}",
++                                        arguments = listOf(navArgument("id") {
++                                            nullable = false
++                                        })
++                                    ) {
++                                        val id = it.arguments?.getString("id")?.let {
++                                            UUID.fromString(it)
++                                        } ?: return@composable
++                                        ThemeSettingsScreen(id)
++                                    }
++                                    composable("settings/appearance/cards") {
++                                        CardsSettingsScreen()
++                                    }
++                                    composable("settings/search") {
++                                        SearchSettingsScreen()
++                                    }
++                                    composable("settings/gestures") {
++                                        GestureSettingsScreen()
++                                    }
++                                    composable("settings/search/unitconverter") {
++                                        UnitConverterSettingsScreen()
++                                    }
++                                    composable("settings/search/wikipedia") {
++                                        WikipediaSettingsScreen()
++                                    }
++                                    composable("settings/search/locations") {
++                                        LocationsSettingsScreen()
++                                    }
++                                    composable("settings/search/files") {
++                                        FileSearchSettingsScreen()
++                                    }
++                                    composable("settings/search/searchactions") {
++                                        SearchActionsSettingsScreen()
++                                    }
++                                    composable("settings/search/hiddenitems") {
++                                        HiddenItemsSettingsScreen()
++                                    }
++                                    composable("settings/search/tags") {
++                                        TagsSettingsScreen()
++                                    }
++                                    composable(ROUTE_WEATHER_INTEGRATION) {
++                                        WeatherIntegrationSettingsScreen()
++                                    }
++                                    composable(ROUTE_MEDIA_INTEGRATION) {
++                                        MediaIntegrationSettingsScreen()
++                                    }
++                                    composable("settings/favorites") {
++                                        FavoritesSettingsScreen()
++                                    }
++                                    composable("settings/integrations") {
++                                        IntegrationsSettingsScreen()
++                                    }
++                                    composable("settings/plugins") {
++                                        PluginsSettingsScreen()
++                                    }
++                                    composable("settings/plugins/{id}") {
++                                        PluginSettingsScreen(it.arguments?.getString("id") ?: return@composable)
++                                    }
++                                    composable("settings/about") {
++                                        AboutSettingsScreen()
++                                    }
++                                    composable("settings/about/buildinfo") {
++                                        BuildInfoSettingsScreen()
++                                    }
++                                    composable("settings/about/easteregg") {
++                                        EasterEggSettingsScreen()
++                                    }
++                                    composable("settings/debug") {
++                                        DebugSettingsScreen()
++                                    }
++                                    composable("settings/backup") {
++                                        BackupSettingsScreen()
++                                    }
++                                    composable("settings/debug/crashreporter") {
++                                        CrashReporterScreen()
++                                    }
++                                    composable("settings/debug/logs") {
++                                        LogScreen()
++                                    }
++                                    composable(
++                                        "settings/debug/crashreporter/report?fileName={fileName}",
++                                        arguments = listOf(navArgument("fileName") {
++                                            nullable = false
++                                        })
++                                    ) {
++                                        val fileName = it.arguments?.getString("fileName")
++                                            ?.let {
++                                                URLDecoder.decode(it, "utf8")
++                                            }
++                                        CrashReportScreen(fileName!!)
++                                    }
++                                    composable(
++                                        "settings/license?library={libraryName}",
++                                        arguments = listOf(navArgument("libraryName") {
++                                            nullable = true
++                                        })
++                                    ) {
++                                        val libraryName = it.arguments?.getString("libraryName")
++                                        val library = remember(libraryName) {
++                                            if (libraryName == null) {
++                                                AppLicense.get(this@SettingsActivity)
++                                            } else {
++                                                OpenSourceLicenses.first { it.name == libraryName }
++                                            }
+                                         }
++                                        LicenseScreen(library)
+                                     }
+-                                    LicenseScreen(library)
+                                 }
+                             }
+                         }
+diff --git a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/clockwidget/ClockWidgetSettingsScreenVM.kt b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/clockwidget/ClockWidgetSettingsScreenVM.kt
+index 19e763f97..f74f59064 100644
+--- a/app/ui/src/main/java/de/mm20/launcher2/ui/settings/clockwidget/ClockWidgetSettingsScreenVM.kt
++++ b/app/ui/src/main/java/de/mm20/launcher2/ui/settings/clockwidget/ClockWidgetSettingsScreenVM.kt
+@@ -7,9 +7,7 @@ import de.mm20.launcher2.preferences.ClockWidgetColors
+ import de.mm20.launcher2.preferences.ClockWidgetStyle
+ import de.mm20.launcher2.preferences.ui.ClockWidgetSettings
+ import kotlinx.coroutines.flow.SharingStarted
+-import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.stateIn
+-import kotlinx.coroutines.launch
+ import org.koin.core.component.KoinComponent
+ import org.koin.core.component.inject
+ 
+@@ -34,6 +32,20 @@ class ClockWidgetSettingsScreenVM : ViewModel(), KoinComponent {
+         settings.setColor(color)
+     }
+ 
++    val showSeconds = settings.showSeconds
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), false)
++
++    fun setShowSeconds(showSeconds: Boolean) {
++        settings.setShowSeconds(showSeconds)
++    }
++
++    val useThemeColor = settings.useThemeColor
++        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), false)
++
++    fun setUseThemeColor(boolean: Boolean) {
++        settings.setUseThemeColor(boolean)
++    }
++
+     val fillHeight = settings.fillHeight
+         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
+     fun setFillHeight(fillHeight: Boolean) {
+diff --git a/core/i18n/src/main/res/values/strings.xml b/core/i18n/src/main/res/values/strings.xml
+index 192ac9455..8b8458178 100644
+--- a/core/i18n/src/main/res/values/strings.xml
++++ b/core/i18n/src/main/res/values/strings.xml
+@@ -600,6 +600,8 @@
+     <string name="preference_clockwidget_layout">Layout</string>
+     <string name="preference_clockwidget_layout_vertical">Default</string>
+     <string name="preference_clockwidget_layout_horizontal">Compact</string>
++    <string name="preference_clock_widget_show_seconds">Show seconds</string>
++    <string name="preference_clock_widget_use_theme_color">Use theme color</string>
+     <string name="preference_clock_widget_fill_height">Fill screen height</string>
+     <string name="preference_clock_widget_fill_height_summary">Insert extra space above the clock to fill the entire screen height</string>
+     <string name="preference_clock_widget_color">Color</string>
+@@ -900,4 +902,14 @@
+     <string name="unavailable_searchable">This item does not exist anymore.</string>
+     <string name="preference_search_bar_separate_work_profile">Separate work profile apps</string>
+     <string name="preference_search_bar_separate_work_profile_summary">Shows work profile apps in a separate tab</string>
++
++    <string name="clock_style_digital1">Bold</string>
++    <string name="clock_style_digital2">Simple</string>
++    <string name="clock_style_orbit">Orbit</string>
++    <string name="clock_style_binary">Binary</string>
++    <string name="clock_style_analog">Hands</string>
++    <string name="clock_style_segment">7 segment</string>
++    <string name="clock_style_empty">No clock</string>
++    <string name="clock_variant_standard">Standard</string>
++    <string name="clock_variant_outlined">Outlined</string>
+ </resources>
+\ No newline at end of file
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+index 6837c58fa..21f16f205 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/LauncherSettingsData.kt
+@@ -27,6 +27,8 @@ data class LauncherSettingsData(
+     val clockWidgetCompact: Boolean = false,
+     val clockWidgetStyle: ClockWidgetStyle = ClockWidgetStyle.Digital1(),
+     val clockWidgetColors: ClockWidgetColors = ClockWidgetColors.Auto,
++    val clockWidgetShowSeconds: Boolean = false,
++    val clockWidgetUseThemeColor: Boolean = false,
+     val clockWidgetAlarmPart: Boolean = true,
+     val clockWidgetBatteryPart: Boolean = true,
+     val clockWidgetMusicPart: Boolean = true,
+@@ -189,7 +191,6 @@ sealed interface ClockWidgetStyle {
+         @Serializable
+         enum class Variant {
+             Default,
+-            MDY,
+             OnePlus,
+         }
+     }
+@@ -210,6 +211,10 @@ sealed interface ClockWidgetStyle {
+     @SerialName("binary")
+     data object Binary : ClockWidgetStyle
+ 
++    @Serializable
++    @SerialName("segment")
++    data object Segment : ClockWidgetStyle
++
+     @Serializable
+     @SerialName("empty")
+     data object Empty : ClockWidgetStyle
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/migrations/Migration1.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/migrations/Migration1.kt
+index ca315ec7c..6b95acb57 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/migrations/Migration1.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/migrations/Migration1.kt
+@@ -76,7 +76,7 @@ class Migration1(
+                 LegacySettings.ClockWidgetSettings.ClockStyle.AnalogClock -> ClockWidgetStyle.Analog
+                 LegacySettings.ClockWidgetSettings.ClockStyle.EmptyClock -> ClockWidgetStyle.Empty
+                 LegacySettings.ClockWidgetSettings.ClockStyle.DigitalClock1_MDY -> ClockWidgetStyle.Digital1(
+-                    variant = ClockWidgetStyle.Digital1.Variant.MDY
++                    variant = ClockWidgetStyle.Digital1.Variant.Default
+                 )
+ 
+                 LegacySettings.ClockWidgetSettings.ClockStyle.DigitalClock1_Outlined -> ClockWidgetStyle.Digital1(
+diff --git a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/ClockWidgetSettings.kt b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/ClockWidgetSettings.kt
+index 34f73bca1..aba704b10 100644
+--- a/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/ClockWidgetSettings.kt
++++ b/core/preferences/src/main/java/de/mm20/launcher2/preferences/ui/ClockWidgetSettings.kt
+@@ -96,12 +96,30 @@ class ClockWidgetSettings internal constructor(
+         }
+     }
+ 
++    val color
++        get() = launcherDataStore.data.map { it.clockWidgetColors }
++
+     fun setColor(color: ClockWidgetColors) {
+         launcherDataStore.update {
+             it.copy(clockWidgetColors = color)
+         }
+     }
+ 
+-    val color
+-        get() = launcherDataStore.data.map { it.clockWidgetColors }
++    val showSeconds
++        get() = launcherDataStore.data.map { it.clockWidgetShowSeconds }
++
++    fun setShowSeconds(enabled: Boolean) {
++        launcherDataStore.update {
++            it.copy(clockWidgetShowSeconds = enabled)
++        }
++    }
++
++    val useThemeColor
++        get() = launcherDataStore.data.map { it.clockWidgetUseThemeColor }
++
++    fun setUseThemeColor(enabled: Boolean) {
++        launcherDataStore.update {
++            it.copy(clockWidgetUseThemeColor = enabled)
++        }
++    }
+ }
+\ No newline at end of file
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 8cb642024..142f3dc36 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -8,24 +8,24 @@ pluginSdk = "1.0.0"
+ gradle = "8.1.2"
+ android-gradle-plugin = "8.2.2"
+ protobuf-gradle-plugin = "0.9.4"
+-ksp-gradle-plugin = "1.9.0-1.0.13"
++ksp-gradle-plugin = "1.9.23-1.0.19"
+ 
+-kotlin = "1.9.22"
+-kotlinx-coroutines = "1.7.3"
++kotlin = "1.9.23"
++kotlinx-coroutines = "1.8.0"
+ kotlinx-immutable = "0.3.5"
+-kotlinx-serialization = "1.6.2"
++kotlinx-serialization = "1.6.3"
+ 
+-jetbrains-markdown = "0.4.1"
++jetbrains-markdown = "0.5.2"
+ 
+-androidx-compose = "1.7.0-alpha02"
+-androidx-compose-material3 = "1.2.0"
+-androidx-compose-compiler = "1.5.8"
++androidx-compose = "1.7.0-alpha05"
++androidx-compose-material3 = "1.3.0-alpha03"
++androidx-compose-compiler = "1.5.11"
+ androidx-lifecycle = "2.7.0"
+ androidx-core = "1.12.0"
+ androidx-appcompat = "1.7.0-alpha03"
+ androidx-activity = "1.8.2"
+ androidx-work = "2.9.0"
+-androidx-browser = "1.7.0"
++androidx-browser = "1.8.0"
+ androidx-palette = "1.0.0"
+ androidx-media2 = "1.3.0"
+ androidx-room = "2.6.1"
+@@ -108,7 +108,7 @@ coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coi
+ 
+ leakcanary = { group = "com.squareup.leakcanary", name = "leakcanary", version = "2.10" }
+ suncalc = { group = "org.shredzone.commons", name = "commons-suncalc", version = "3.7" }
+-jsoup = { group = "org.jsoup", name = "jsoup", version = "1.15.4" }
++jsoup = { group = "org.jsoup", name = "jsoup", version = "1.16.1" }
+ commons-text = { group = "org.apache.commons", name = "commons-text", version = "1.10.0" }
+ 
+ # 4.4.2 is the last GPL compatible version, don't update to 5.x
+@@ -147,4 +147,4 @@ protobuf = { id = "com.google.protobuf", version.ref = "protobuf-gradle-plugin"
+ ksp = { id = "com.google.devtools.ksp", version.ref = "ksp-gradle-plugin" }
+ kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+ kotlin-plugin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+-dokka = { id = "org.jetbrains.dokka", version = "1.9.10" }
++dokka = { id = "org.jetbrains.dokka", version = "1.9.20" }

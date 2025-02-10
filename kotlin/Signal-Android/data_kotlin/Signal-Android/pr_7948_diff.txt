@@ -1,0 +1,109 @@
+diff --git a/src/org/thoughtcrime/securesms/ConversationItem.java b/src/org/thoughtcrime/securesms/ConversationItem.java
+index f76958a24a5..aafa627dba5 100644
+--- a/src/org/thoughtcrime/securesms/ConversationItem.java
++++ b/src/org/thoughtcrime/securesms/ConversationItem.java
+@@ -212,7 +212,7 @@ public void bind(@NonNull MessageRecord      messageRecord,
+     this.recipient.addListener(this);
+     this.conversationRecipient.addListener(this);
+ 
+-    setMediaAttributes(messageRecord);
++    setMediaAttributes(messageRecord, conversationRecipient);
+     setInteractionState(messageRecord, pulseHighlight);
+     setBodyText(messageRecord);
+     setBubbleState(messageRecord, recipient);
+@@ -412,8 +412,8 @@ private void setBodyText(MessageRecord messageRecord) {
+     }
+   }
+ 
+-  private void setMediaAttributes(MessageRecord messageRecord) {
+-    boolean showControls = !messageRecord.isFailed();
++  private void setMediaAttributes(MessageRecord messageRecord, Recipient conversationRecipient) {
++    boolean showControls = !messageRecord.isFailed() && !Util.isOwnNumber(context, conversationRecipient.getAddress());
+ 
+     if (hasSharedContact(messageRecord)) {
+       sharedContactStub.get().setVisibility(VISIBLE);
+diff --git a/src/org/thoughtcrime/securesms/database/MmsDatabase.java b/src/org/thoughtcrime/securesms/database/MmsDatabase.java
+index 2c5a0fc44d8..68b6cc3cf36 100644
+--- a/src/org/thoughtcrime/securesms/database/MmsDatabase.java
++++ b/src/org/thoughtcrime/securesms/database/MmsDatabase.java
+@@ -67,6 +67,7 @@
+ import org.thoughtcrime.securesms.util.Util;
+ import org.whispersystems.libsignal.util.guava.Optional;
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ import java.security.NoSuchAlgorithmException;
+ import java.security.SecureRandom;
+@@ -1176,7 +1177,7 @@ public MessageRecord getCurrent() {
+     }
+   }
+ 
+-  public class Reader {
++  public class Reader implements Closeable {
+ 
+     private final Cursor cursor;
+ 
+@@ -1337,8 +1338,11 @@ private SlideDeck getSlideDeck(@NonNull List<DatabaseAttachment> attachments) {
+       }
+     }
+ 
++    @Override
+     public void close() {
+-      cursor.close();
++      if (cursor != null) {
++        cursor.close();
++      }
+     }
+   }
+ 
+diff --git a/src/org/thoughtcrime/securesms/sms/MessageSender.java b/src/org/thoughtcrime/securesms/sms/MessageSender.java
+index 8595d8b02e2..bf769fe53e0 100644
+--- a/src/org/thoughtcrime/securesms/sms/MessageSender.java
++++ b/src/org/thoughtcrime/securesms/sms/MessageSender.java
+@@ -17,17 +17,22 @@
+ package org.thoughtcrime.securesms.sms;
+ 
+ import android.content.Context;
++import android.database.Cursor;
++import android.support.annotation.NonNull;
+ import android.util.Log;
+ import android.util.Pair;
+ 
+ import org.thoughtcrime.securesms.ApplicationContext;
++import org.thoughtcrime.securesms.attachments.Attachment;
+ import org.thoughtcrime.securesms.database.Address;
++import org.thoughtcrime.securesms.database.AttachmentDatabase;
+ import org.thoughtcrime.securesms.database.DatabaseFactory;
+ import org.thoughtcrime.securesms.database.MmsDatabase;
+ import org.thoughtcrime.securesms.database.RecipientDatabase;
+ import org.thoughtcrime.securesms.database.SmsDatabase;
+ import org.thoughtcrime.securesms.database.ThreadDatabase;
+ import org.thoughtcrime.securesms.database.model.MessageRecord;
++import org.thoughtcrime.securesms.database.model.MmsMessageRecord;
+ import org.thoughtcrime.securesms.jobmanager.JobManager;
+ import org.thoughtcrime.securesms.jobs.MmsSendJob;
+ import org.thoughtcrime.securesms.jobs.PushGroupSendJob;
+@@ -180,6 +185,7 @@ private static void sendMediaSelf(Context context, long messageId, long expiresI
+ 
+     database.markAsSent(messageId, true);
+     database.copyMessageInbox(messageId);
++    markAttachmentsAsUploaded(messageId, database, DatabaseFactory.getAttachmentDatabase(context));
+ 
+     if (expiresIn > 0) {
+       database.markExpireStarted(messageId);
+@@ -277,4 +283,15 @@ private static boolean isPushDestination(Context context, Recipient destination)
+     }
+   }
+ 
++  private static void markAttachmentsAsUploaded(long mmsId, @NonNull MmsDatabase mmsDatabase, @NonNull AttachmentDatabase attachmentDatabase) {
++    try (MmsDatabase.Reader reader = mmsDatabase.readerFor(mmsDatabase.getMessage(mmsId))) {
++      MessageRecord message = reader.getNext();
++
++      if (message != null && message.isMms()) {
++        for (Attachment attachment : ((MmsMessageRecord) message).getSlideDeck().asAttachments()) {
++          attachmentDatabase.markAttachmentUploaded(mmsId, attachment);
++        }
++      }
++    }
++  }
+ }

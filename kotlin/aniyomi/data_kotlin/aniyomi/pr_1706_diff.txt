@@ -1,0 +1,488 @@
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/Preference.kt b/app/src/main/java/eu/kanade/presentation/more/settings/Preference.kt
+index 3c038591e0..6454d8b506 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/Preference.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/Preference.kt
+@@ -1,13 +1,23 @@
+ package eu.kanade.presentation.more.settings
+ 
++import android.content.Context
++import android.os.Build
++import android.os.Environment
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+ import androidx.compose.ui.graphics.vector.ImageVector
++import eu.kanade.core.preference.asState
+ import eu.kanade.tachiyomi.data.track.Tracker
+ import kotlinx.collections.immutable.ImmutableList
+ import kotlinx.collections.immutable.ImmutableMap
++import kotlinx.coroutines.CoroutineScope
++import tachiyomi.core.common.storage.openFileDescriptor
++import tachiyomi.domain.storage.service.StorageManager
+ import tachiyomi.i18n.MR
+ import tachiyomi.presentation.core.i18n.stringResource
++import uy.kohesive.injekt.Injekt
++import uy.kohesive.injekt.api.get
++import java.io.FileOutputStream
+ import tachiyomi.core.common.preference.Preference as PreferenceData
+ 
+ sealed class Preference {
+@@ -151,6 +161,44 @@ sealed class Preference {
+             val canBeBlank: Boolean = false,
+         ) : PreferenceItem<String>()
+ 
++        /**
++         * A [PreferenceItem] for editing MPV config files.
++         * If [fileName] is not null, it will update this file in the config directory.
++         */
++        data class MPVConfPreference(
++            val pref: PreferenceData<String>,
++            val scope: CoroutineScope,
++            val context: Context,
++            val fileName: String? = null,
++            override val title: String,
++            override val subtitle: String? = pref.asState(scope).value
++                .lines().take(2)
++                .joinToString(
++                    separator = "\n",
++                    postfix = if (pref.asState(scope).value.lines().size > 2) "\n..." else "",
++                ),
++            override val icon: ImageVector? = null,
++            override val enabled: Boolean = true,
++            override val onValueChanged: suspend (newValue: String) -> Boolean = { newValue ->
++                if (fileName != null) {
++                    val storageManager: StorageManager = Injekt.get()
++                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
++                        val inputFile = storageManager.getMPVConfigDirectory()
++                            ?.createFile(fileName)
++                        inputFile?.openFileDescriptor(context, "rwt")?.fileDescriptor
++                            ?.let {
++                                FileOutputStream(it).bufferedWriter().use { writer ->
++                                    writer.write(newValue)
++                                }
++                            }
++                        pref.set(newValue)
++                    }
++                }
++                true
++            },
++            val canBeBlank: Boolean = true,
++        ) : PreferenceItem<String>()
++
+         /**
+          * A [PreferenceItem] for individual tracker.
+          */
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/PreferenceItem.kt b/app/src/main/java/eu/kanade/presentation/more/settings/PreferenceItem.kt
+index 9af40d8f1d..54651d6342 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/PreferenceItem.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/PreferenceItem.kt
+@@ -169,6 +169,22 @@ internal fun PreferenceItem(
+                     canBeBlank = item.canBeBlank,
+                 )
+             }
++            is Preference.PreferenceItem.MPVConfPreference -> {
++                val values by item.pref.collectAsState()
++                EditTextPreferenceWidget(
++                    title = item.title,
++                    subtitle = item.subtitle,
++                    icon = item.icon,
++                    value = values,
++                    onConfirm = {
++                        val accepted = item.onValueChanged(it)
++                        if (accepted) item.pref.set(it)
++                        accepted
++                    },
++                    singleLine = false,
++                    canBeBlank = item.canBeBlank,
++                )
++            }
+             is Preference.PreferenceItem.TrackerPreference -> {
+                 val isLoggedIn by item.tracker.let { tracker ->
+                     tracker.isLoggedInFlow.collectAsState(tracker.isLoggedIn)
+diff --git a/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt b/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
+index 001d75fd65..7c5213c337 100644
+--- a/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
++++ b/app/src/main/java/eu/kanade/presentation/more/settings/screen/AdvancedPlayerSettingsScreen.kt
+@@ -1,6 +1,5 @@
+ package eu.kanade.presentation.more.settings.screen
+ 
+-import android.annotation.SuppressLint
+ import android.content.Intent
+ import android.net.Uri
+ import android.os.Build
+@@ -10,13 +9,11 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.platform.LocalContext
+-import eu.kanade.core.preference.asState
+ import eu.kanade.presentation.more.settings.Preference
+ import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
+ import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
+ import kotlinx.collections.immutable.toImmutableMap
+ import tachiyomi.core.common.i18n.stringResource
+-import tachiyomi.domain.storage.service.StorageManager
+ import tachiyomi.i18n.MR
+ import uy.kohesive.injekt.Injekt
+ import uy.kohesive.injekt.api.get
+@@ -25,7 +22,6 @@ object AdvancedPlayerSettingsScreen : SearchableSettings {
+     @Composable
+     override fun getTitleRes() = MR.strings.pref_category_player_advanced
+ 
+-    @SuppressLint("InlinedApi")
+     @Composable
+     override fun getPreferences(): List<Preference> {
+         val playerPreferences = remember { Injekt.get<PlayerPreferences>() }
+@@ -33,52 +29,28 @@ object AdvancedPlayerSettingsScreen : SearchableSettings {
+         val context = LocalContext.current
+         val mpvConf = playerPreferences.mpvConf()
+         val mpvInput = playerPreferences.mpvInput()
+-        val storageManager: StorageManager = Injekt.get()
++        val subSelectConf = playerPreferences.subSelectConf()
+ 
+         return listOf(
+-            Preference.PreferenceItem.MultiLineEditTextPreference(
++            Preference.PreferenceItem.MPVConfPreference(
+                 pref = mpvConf,
+                 title = context.stringResource(MR.strings.pref_mpv_conf),
+-                subtitle = mpvConf.asState(scope).value
+-                    .lines().take(2)
+-                    .joinToString(
+-                        separator = "\n",
+-                        postfix = if (mpvConf.asState(scope).value.lines().size > 2) "\n..." else "",
+-                    ),
+-                onValueChanged = {
+-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+-                        val inputFile = storageManager.getMPVConfigDirectory()
+-                            ?.createFile("mpv.conf")
+-                        inputFile?.openOutputStream()?.bufferedWriter().use { writer ->
+-                            writer?.write(it)
+-                        }
+-                        mpvConf.set(it)
+-                    }
+-                    true
+-                },
+-                canBeBlank = true,
++                fileName = "mpv.conf",
++                scope = scope,
++                context = context,
+             ),
+-            Preference.PreferenceItem.MultiLineEditTextPreference(
++            Preference.PreferenceItem.MPVConfPreference(
+                 pref = mpvInput,
+                 title = context.stringResource(MR.strings.pref_mpv_input),
+-                subtitle = mpvInput.asState(scope).value
+-                    .lines().take(2)
+-                    .joinToString(
+-                        separator = "\n",
+-                        postfix = if (mpvInput.asState(scope).value.lines().size > 2) "\n..." else "",
+-                    ),
+-                onValueChanged = {
+-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()) {
+-                        val inputFile = storageManager.getMPVConfigDirectory()
+-                            ?.createFile("input.conf")
+-                        inputFile?.openOutputStream()?.bufferedWriter().use { writer ->
+-                            writer?.write(it)
+-                        }
+-                        mpvInput.set(it)
+-                    }
+-                    true
+-                },
+-                canBeBlank = true,
++                fileName = "input.conf",
++                scope = scope,
++                context = context,
++            ),
++            Preference.PreferenceItem.MPVConfPreference(
++                pref = subSelectConf,
++                title = context.stringResource(MR.strings.pref_sub_select_conf),
++                scope = scope,
++                context = context,
+             ),
+             Preference.PreferenceItem.SwitchPreference(
+                 title = context.stringResource(MR.strings.pref_gpu_next_title),
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+index 2e437c27a3..f0428847db 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/PlayerActivity.kt
+@@ -82,6 +82,7 @@ import eu.kanade.tachiyomi.ui.player.viewer.VideoDebanding
+ import eu.kanade.tachiyomi.util.AniSkipApi
+ import eu.kanade.tachiyomi.util.SkipType
+ import eu.kanade.tachiyomi.util.Stamp
++import eu.kanade.tachiyomi.util.SubtitleSelect
+ import eu.kanade.tachiyomi.util.system.LocaleHelper
+ import eu.kanade.tachiyomi.util.system.powerManager
+ import eu.kanade.tachiyomi.util.system.toShareIntent
+@@ -1738,50 +1739,111 @@ class PlayerActivity : BaseActivity() {
+         }
+     }
+ 
++    private val subtitleSelect = SubtitleSelect(playerPreferences)
++
++    private fun selectSubtitle(subtitleTracks: List<Track>, index: Int, embedded: Boolean = false) {
++        val offset = if (embedded) 0 else 1
++        streams.subtitle.index = index + offset
++        val tracks = player.tracks.getValue("sub")
++        val selectedLoadedTrack = tracks.firstOrNull {
++            it.name == subtitleTracks[index].url ||
++                it.mpvId.toString() == subtitleTracks[index].url
++        }
++        selectedLoadedTrack?.let { player.sid = it.mpvId }
++            ?: MPVLib.command(
++                arrayOf(
++                    "sub-add",
++                    subtitleTracks[index].url,
++                    "select",
++                    subtitleTracks[index].url,
++                ),
++            )
++    }
++
+     // TODO: exception java.util.ConcurrentModificationException:
+     //  UPDATE: MAY HAVE BEEN FIXED
+     // at java.lang.Object java.util.ArrayList$Itr.next() (ArrayList.java:860)
+     // at void eu.kanade.tachiyomi.ui.player.PlayerActivity.fileLoaded() (PlayerActivity.kt:1874)
+     // at void eu.kanade.tachiyomi.ui.player.PlayerActivity.event(int) (PlayerActivity.kt:1566)
+     // at void is.xyz.mpv.MPVLib.event(int) (MPVLib.java:86)
+-    @SuppressLint("SourceLockedOrientationActivity")
+     internal suspend fun fileLoaded() {
+         setMpvMediaTitle()
+-        val localLangName = LocaleHelper.getSimpleLocaleDisplayName()
+         clearTracks()
+         player.loadTracks()
++        setupSubtitleTracks()
++        setupAudioTracks()
++
++        viewModel.viewModelScope.launchUI {
++            if (playerPreferences.adjustOrientationVideoDimensions().get()) {
++                if ((player.videoW ?: 1) / (player.videoH ?: 1) >= 1) {
++                    this@PlayerActivity.requestedOrientation =
++                        playerPreferences.defaultPlayerOrientationLandscape().get()
++
++                    switchControlsOrientation(true)
++                } else {
++                    this@PlayerActivity.requestedOrientation =
++                        playerPreferences.defaultPlayerOrientationPortrait().get()
++
++                    switchControlsOrientation(false)
++                }
++            }
++
++            viewModel.mutableState.update {
++                it.copy(isLoadingEpisode = false)
++            }
++        }
++        // aniSkip stuff
++        waitingAniSkip = playerPreferences.waitingTimeAniSkip().get()
++        runBlocking {
++            if (aniSkipEnable) {
++                aniSkipInterval = viewModel.aniSkipResponse(player.duration)
++                aniSkipInterval?.let {
++                    aniskipStamps = it
++                    updateChapters(it, player.duration)
++                }
++            }
++        }
++    }
++
++    private fun setupSubtitleTracks() {
+         streams.subtitle.tracks += player.tracks.getOrElse("sub") { emptyList() }
+             .drop(1).map { track ->
+                 Track(track.mpvId.toString(), track.name)
+             }.toTypedArray()
+-        streams.audio.tracks += player.tracks.getOrElse("audio") { emptyList() }
+-            .drop(1).map { track ->
+-                Track(track.mpvId.toString(), track.name)
+-            }.toTypedArray()
+         if (hadPreviousSubs) {
+             streams.subtitle.tracks.getOrNull(streams.subtitle.index)?.let { sub ->
+                 MPVLib.command(arrayOf("sub-add", sub.url, "select", sub.url))
+             }
+-        } else {
+-            currentVideoList?.getOrNull(streams.quality.index)
+-                ?.subtitleTracks?.let { tracks ->
+-                    val langIndex = tracks.indexOfFirst {
+-                        it.lang.contains(localLangName, true)
+-                    }
+-                    val requestedLanguage = if (langIndex == -1) 0 else langIndex
+-                    tracks.getOrNull(requestedLanguage)?.let { sub ->
+-                        hadPreviousSubs = true
+-                        streams.subtitle.index = requestedLanguage + 1
+-                        MPVLib.command(arrayOf("sub-add", sub.url, "select", sub.url))
+-                    }
+-                } ?: run {
+-                val mpvSub = player.tracks.getOrElse("sub") { emptyList() }
+-                    .firstOrNull { player.sid == it.mpvId }
+-                streams.subtitle.index = mpvSub?.let {
+-                    streams.subtitle.tracks.indexOfFirst { it.url == mpvSub.mpvId.toString() }
+-                }?.coerceAtLeast(0) ?: 0
+-            }
++            return
+         }
++        val subtitleTracks = currentVideoList?.getOrNull(streams.quality.index)
++            ?.subtitleTracks?.takeIf { it.isNotEmpty() }
++
++        subtitleTracks?.let { tracks ->
++            val preferredIndex = subtitleSelect.getPreferredSubtitleIndex(tracks) ?: 0
++            hadPreviousSubs = true
++            selectSubtitle(tracks, preferredIndex)
++        } ?: let {
++            val tracks = streams.subtitle.tracks.toList()
++            val preferredIndex = subtitleSelect.getPreferredSubtitleIndex(tracks)
++                ?: let {
++                    val mpvSub = player.tracks["sub"]?.firstOrNull { player.sid == it.mpvId }
++                    mpvSub?.let {
++                        streams.subtitle.tracks.indexOfFirst { it.url == mpvSub.mpvId.toString() }
++                    }?.coerceAtLeast(0) ?: 0
++                }
++            selectSubtitle(tracks, preferredIndex, embedded = true)
++        }
++    }
++
++    private fun setupAudioTracks() {
++        val localLangName = LocaleHelper.getSimpleLocaleDisplayName()
++
++        streams.audio.tracks += player.tracks.getOrElse("audio") { emptyList() }
++            .drop(1).map { track ->
++                Track(track.mpvId.toString(), track.name)
++            }.toTypedArray()
++
+         if (hadPreviousAudio) {
+             streams.audio.tracks.getOrNull(streams.audio.index)?.let { audio ->
+                 MPVLib.command(arrayOf("audio-add", audio.url, "select", audio.url))
+@@ -1806,37 +1868,6 @@ class PlayerActivity : BaseActivity() {
+                 }?.coerceAtLeast(0) ?: 0
+             }
+         }
+-
+-        viewModel.viewModelScope.launchUI {
+-            if (playerPreferences.adjustOrientationVideoDimensions().get()) {
+-                if ((player.videoW ?: 1) / (player.videoH ?: 1) >= 1) {
+-                    this@PlayerActivity.requestedOrientation =
+-                        playerPreferences.defaultPlayerOrientationLandscape().get()
+-
+-                    switchControlsOrientation(true)
+-                } else {
+-                    this@PlayerActivity.requestedOrientation =
+-                        playerPreferences.defaultPlayerOrientationPortrait().get()
+-
+-                    switchControlsOrientation(false)
+-                }
+-            }
+-
+-            viewModel.mutableState.update {
+-                it.copy(isLoadingEpisode = false)
+-            }
+-        }
+-        // aniSkip stuff
+-        waitingAniSkip = playerPreferences.waitingTimeAniSkip().get()
+-        runBlocking {
+-            if (aniSkipEnable) {
+-                aniSkipInterval = viewModel.aniSkipResponse(player.duration)
+-                aniSkipInterval?.let {
+-                    aniskipStamps = it
+-                    updateChapters(it, player.duration)
+-                }
+-            }
+-        }
+     }
+ 
+     private fun setMpvMediaTitle() {
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+index e8553f42fb..40711f4192 100644
+--- a/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
++++ b/app/src/main/java/eu/kanade/tachiyomi/ui/player/settings/PlayerPreferences.kt
+@@ -37,6 +37,8 @@ class PlayerPreferences(
+ 
+     fun mpvInput() = preferenceStore.getString("pref_mpv_input", "")
+ 
++    fun subSelectConf() = preferenceStore.getString("pref_sub_select_conf", "")
++
+     fun defaultPlayerOrientationType() = preferenceStore.getInt(
+         "pref_default_player_orientation_type_key",
+         10,
+diff --git a/app/src/main/java/eu/kanade/tachiyomi/util/SubtitleSelect.kt b/app/src/main/java/eu/kanade/tachiyomi/util/SubtitleSelect.kt
+new file mode 100644
+index 0000000000..67ed06dd8f
+--- /dev/null
++++ b/app/src/main/java/eu/kanade/tachiyomi/util/SubtitleSelect.kt
+@@ -0,0 +1,60 @@
++package eu.kanade.tachiyomi.util
++
++import androidx.core.os.LocaleListCompat
++import eu.kanade.tachiyomi.animesource.model.Track
++import eu.kanade.tachiyomi.ui.player.settings.PlayerPreferences
++import kotlinx.serialization.Serializable
++import kotlinx.serialization.SerializationException
++import kotlinx.serialization.json.Json
++import logcat.LogPriority
++import tachiyomi.core.common.util.system.logcat
++import uy.kohesive.injekt.injectLazy
++import java.util.Locale
++
++class SubtitleSelect(private val playerPreferences: PlayerPreferences) {
++
++    private val json: Json by injectLazy()
++
++    fun getPreferredSubtitleIndex(tracks: List<Track>): Int? {
++        val config = try {
++            json.decodeFromString<SubConfig>(playerPreferences.subSelectConf().get())
++        } catch (e: SerializationException) {
++            logcat(LogPriority.WARN, e) { "Invalid subtitle select configuration" }
++            SubConfig()
++        }
++
++        val locales = config.lang.map(::Locale).ifEmpty {
++            listOf(LocaleListCompat.getDefault()[0]!!)
++        }
++        val chosenLocale = locales.firstOrNull { locale ->
++            tracks.any { t -> containsLang(t.lang, locale) }
++        } ?: return null
++
++        val filtered = tracks.withIndex()
++            .filterNot { (_, track) ->
++                config.blacklist.any { track.lang.contains(it, true) }
++            }
++            .filter { (_, track) ->
++                containsLang(track.lang, chosenLocale)
++            }
++
++        return filtered.firstOrNull { (_, track) ->
++            config.whitelist.any { track.lang.contains(it, true) }
++        }?.index ?: filtered.getOrNull(0)?.index
++    }
++
++    private fun containsLang(title: String, locale: Locale): Boolean {
++        val localName = locale.getDisplayName(locale)
++        val englishName = locale.getDisplayName(Locale.ENGLISH).substringBefore(" (")
++        val langRegex = Regex("""\b${locale.getISO3Language()}\b""", RegexOption.IGNORE_CASE)
++
++        return title.contains(localName) || title.contains(englishName) || langRegex.find(title) != null
++    }
++
++    @Serializable
++    data class SubConfig(
++        val lang: List<String> = emptyList(),
++        val blacklist: List<String> = emptyList(),
++        val whitelist: List<String> = emptyList(),
++    )
++}
+diff --git a/i18n/src/commonMain/moko-resources/base/strings.xml b/i18n/src/commonMain/moko-resources/base/strings.xml
+index 4624b48485..ca9490f9f6 100644
+--- a/i18n/src/commonMain/moko-resources/base/strings.xml
++++ b/i18n/src/commonMain/moko-resources/base/strings.xml
+@@ -943,6 +943,7 @@
+     <string name="pref_mpv_conf">Edit MPV configuration file for further player settings</string>
+     <string name="pref_reset_mpv_conf">Reset MPV configuration file</string>
+     <string name="pref_mpv_input">Edit MPV input file for keyboard mapping configuration</string>
++    <string name="pref_sub_select_conf">Edit advanced subtitle track select configuration</string>
+     <string name="pref_category_external_player">External player</string>
+     <string name="pref_always_use_external_player">Always use external player</string>
+     <string name="pref_external_player_preference">External player preference</string>
+@@ -1117,7 +1118,7 @@
+     <string name="player_filters_contrast">Contrast</string>
+     <string name="player_filters_gamma">Gamma</string>
+     <string name="player_filters_hue">Hue</string>
+-    <string name="player_filters_warning">Some filters may not work your current video driver</string>
++    <string name="player_filters_warning">Some filters may not work with your current video driver</string>
+     <string name="player_subtitle_settings">Subtitle settings</string>
+     <string name="player_add_external_audio">Add external audio</string>
+     <string name="player_add_external_audio_intent">Select an audio file.</string>

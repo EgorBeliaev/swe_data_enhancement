@@ -1,0 +1,94 @@
+diff --git a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
+index 72cdb307d90..abfe8fbb86b 100644
+--- a/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
++++ b/plugins/sync/src/main/kotlin/app/aaps/plugins/sync/wear/wearintegration/DataHandlerMobile.kt
+@@ -93,6 +93,7 @@ import java.util.concurrent.TimeUnit
+ import javax.inject.Inject
+ import javax.inject.Singleton
+ import kotlin.math.abs
++import kotlin.math.ceil
+ import kotlin.math.min
+ 
+ @Singleton
+@@ -630,12 +631,17 @@ class DataHandlerMobile @Inject constructor(
+ 
+     private fun handleBolusPreCheck(command: EventData.ActionBolusPreCheck) {
+         val insulinAfterConstraints = constraintChecker.applyBolusConstraints(ConstraintObject(command.insulin, aapsLogger)).value()
+-        val carbsAfterConstraints = constraintChecker.applyCarbsConstraints(ConstraintObject(command.carbs, aapsLogger)).value()
++        val cob = iobCobCalculator.ads.getLastAutosensData("carbsDialog", aapsLogger, dateUtil)?.cob ?: 0.0
++        var carbsAfterConstraints = constraintChecker.applyCarbsConstraints(ConstraintObject(command.carbs, aapsLogger)).value()
+         val pump = activePlugin.activePump
+         if (insulinAfterConstraints > 0 && (!pump.isInitialized() || pump.isSuspended() || loop.isDisconnected)) {
+             sendError(rh.gs(app.aaps.core.ui.R.string.wizard_pump_not_available))
+             return
+         }
++        // Handle negative carbs constraint
++        if (carbsAfterConstraints < 0) {
++            if (carbsAfterConstraints < -cob) carbsAfterConstraints = ceil(-cob).toInt()
++        }
+         var message = ""
+         message += rh.gs(app.aaps.core.ui.R.string.bolus) + ": " + insulinAfterConstraints + rh.gs(R.string.units_short) + "\n"
+         message += rh.gs(app.aaps.core.ui.R.string.carbs) + ": " + carbsAfterConstraints + rh.gs(R.string.grams_short)
+@@ -655,14 +661,19 @@ class DataHandlerMobile @Inject constructor(
+ 
+     private fun handleECarbsPreCheck(command: EventData.ActionECarbsPreCheck) {
+         val startTimeStamp = System.currentTimeMillis() + T.mins(command.carbsTimeShift.toLong()).msecs()
+-        val carbsAfterConstraints = constraintChecker.applyCarbsConstraints(ConstraintObject(command.carbs, aapsLogger)).value()
++        val cob = iobCobCalculator.ads.getLastAutosensData("carbsDialog", aapsLogger, dateUtil)?.cob ?: 0.0
++        var carbsAfterConstraints = constraintChecker.applyCarbsConstraints(ConstraintObject(command.carbs, aapsLogger)).value()
++        // Handle negative carbs constraint
++        if (carbsAfterConstraints < 0) {
++            if (carbsAfterConstraints < -cob) carbsAfterConstraints = ceil(-cob).toInt()
++        }
+         var message = rh.gs(app.aaps.core.ui.R.string.carbs) + ": " + carbsAfterConstraints + rh.gs(R.string.grams_short) +
+             "\n" + rh.gs(app.aaps.core.ui.R.string.time) + ": " + dateUtil.timeString(startTimeStamp) +
+             "\n" + rh.gs(app.aaps.core.ui.R.string.duration) + ": " + command.duration + rh.gs(R.string.hour_short)
+-        if (carbsAfterConstraints - command.carbs != 0) {
++        if (carbsAfterConstraints != command.carbs) {
+             message += "\n" + rh.gs(app.aaps.core.ui.R.string.constraint_applied)
+         }
+-        if (carbsAfterConstraints <= 0) {
++        if (carbsAfterConstraints == 0) {
+             sendError(rh.gs(app.aaps.core.ui.R.string.carb_equal_zero_no_action))
+             return
+         }
+@@ -1389,7 +1400,7 @@ class DataHandlerMobile @Inject constructor(
+         detailedBolusInfo.carbsTimestamp = carbsTime
+         detailedBolusInfo.carbsDuration = T.hours(carbsDuration.toLong()).msecs()
+         detailedBolusInfo.notes = notes
+-        if (detailedBolusInfo.insulin > 0 || detailedBolusInfo.carbs > 0) {
++        if (detailedBolusInfo.insulin > 0 || detailedBolusInfo.carbs != 0.0) {
+ 
+             val action = when {
+                 amount == 0.0     -> Action.CARBS
+diff --git a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/CarbActivity.kt b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/CarbActivity.kt
+index 7ce269495b7..6febf9ed3c0 100644
+--- a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/CarbActivity.kt
++++ b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/CarbActivity.kt
+@@ -43,9 +43,9 @@ class CarbActivity : ViewSelectorActivity() {
+             0    -> {
+                 val viewAdapter = EditPlusMinusViewAdapter.getViewAdapter(sp, applicationContext, container, true)
+                 val view = viewAdapter.root
+-                var initValue = SafeParse.stringToDouble(editCarbs?.editText?.text.toString(), 0.0)
++                val initValue = SafeParse.stringToDouble(editCarbs?.editText?.text.toString(), 0.0)
+                 val maxCarbs = sp.getInt(getString(R.string.key_treatments_safety_max_carbs), 48).toDouble()
+-                editCarbs = PlusMinusEditText(viewAdapter, initValue, 0.0, maxCarbs, stepValues, DecimalFormat("0"), true, getString(R.string.action_carbs))
++                editCarbs = PlusMinusEditText(viewAdapter, initValue, -maxCarbs, maxCarbs, stepValues, DecimalFormat("0"), true, getString(R.string.action_carbs))
+                 container.addView(view)
+                 view.requestFocus()
+                 view
+diff --git a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/TreatmentActivity.kt b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/TreatmentActivity.kt
+index e1e424bdfae..1f83a5dac8d 100644
+--- a/wear/src/main/kotlin/app/aaps/wear/interaction/actions/TreatmentActivity.kt
++++ b/wear/src/main/kotlin/app/aaps/wear/interaction/actions/TreatmentActivity.kt
+@@ -62,8 +62,8 @@ class TreatmentActivity : ViewSelectorActivity() {
+                 val viewAdapter = EditPlusMinusViewAdapter.getViewAdapter(sp, applicationContext, container, true)
+                 val view = viewAdapter.root
+                 val maxCarbs = sp.getInt(getString(R.string.key_treatments_safety_max_carbs), 48).toDouble()
+-                var initValue = stringToDouble(editCarbs?.editText?.text.toString(), 0.0)
+-                editCarbs = PlusMinusEditText(viewAdapter, initValue, 0.0, maxCarbs, stepValuesCarbs, DecimalFormat("0"), false, getString(R.string.action_carbs))
++                val initValue = stringToDouble(editCarbs?.editText?.text.toString(), 0.0)
++                editCarbs = PlusMinusEditText(viewAdapter, initValue, -maxCarbs, maxCarbs, stepValuesCarbs, DecimalFormat("0"), false, getString(R.string.action_carbs))
+                 container.addView(view)
+                 view
+             }
