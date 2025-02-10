@@ -1,0 +1,651 @@
+diff --git a/apps/backend/src/api/routes/integrations.controller.ts b/apps/backend/src/api/routes/integrations.controller.ts
+index 6cdf7ee67..791e0ac3e 100644
+--- a/apps/backend/src/api/routes/integrations.controller.ts
++++ b/apps/backend/src/api/routes/integrations.controller.ts
+@@ -264,7 +264,8 @@ export class IntegrationsController {
+           const load = await integrationProvider[body.name](
+             getIntegration.token,
+             body.data,
+-            getIntegration.internalId
++            getIntegration.internalId,
++            getIntegration
+           );
+ 
+           return load;
+diff --git a/apps/frontend/public/icons/platforms/lemmy.png b/apps/frontend/public/icons/platforms/lemmy.png
+new file mode 100644
+index 000000000..475d5c10a
+Binary files /dev/null and b/apps/frontend/public/icons/platforms/lemmy.png differ
+diff --git a/apps/frontend/src/components/launches/providers/high.order.provider.tsx b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+index c0ff02b09..57c11780b 100644
+--- a/apps/frontend/src/components/launches/providers/high.order.provider.tsx
++++ b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+@@ -527,7 +527,7 @@ export const withProvider = function <T extends object>(
+           {(showTab === 0 || showTab === 2) && (
+             <div className={clsx('mt-[20px]', showTab !== 2 && 'hidden')}>
+               <Component values={editInPlace ? InPlaceValue : props.value} />
+-              {data?.internalPlugs?.length && (
++              {!!data?.internalPlugs?.length && (
+                 <InternalChannels plugs={data?.internalPlugs} />
+               )}
+             </div>
+diff --git a/apps/frontend/src/components/launches/providers/lemmy/lemmy.provider.tsx b/apps/frontend/src/components/launches/providers/lemmy/lemmy.provider.tsx
+new file mode 100644
+index 000000000..8bf3b9ecc
+--- /dev/null
++++ b/apps/frontend/src/components/launches/providers/lemmy/lemmy.provider.tsx
+@@ -0,0 +1,77 @@
++import { FC, useCallback } from 'react';
++import { withProvider } from '@gitroom/frontend/components/launches/providers/high.order.provider';
++import { useSettings } from '@gitroom/frontend/components/launches/helpers/use.values';
++import { useFieldArray } from 'react-hook-form';
++import { Button } from '@gitroom/react/form/button';
++import { deleteDialog } from '@gitroom/react/helpers/delete.dialog';
++import { Subreddit } from './subreddit';
++import { LemmySettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/lemmy.dto';
++
++const LemmySettings: FC = () => {
++  const { register, control } = useSettings();
++  const { fields, append, remove } = useFieldArray({
++    control, // control props comes from useForm (optional: if you are using FormContext)
++    name: 'subreddit', // unique name for your Field Array
++  });
++
++  const addField = useCallback(() => {
++    append({});
++  }, [fields, append]);
++
++  const deleteField = useCallback(
++    (index: number) => async () => {
++      if (
++        !(await deleteDialog('Are you sure you want to delete this Subreddit?'))
++      )
++        return;
++      remove(index);
++    },
++    [fields, remove]
++  );
++
++  return (
++    <>
++      <div className="flex flex-col gap-[20px] mb-[20px]">
++        {fields.map((field, index) => (
++          <div key={field.id} className="flex flex-col relative">
++            <div
++              onClick={deleteField(index)}
++              className="absolute -left-[10px] justify-center items-center flex -top-[10px] w-[20px] h-[20px] bg-red-600 rounded-full text-textColor"
++            >
++              x
++            </div>
++            <Subreddit {...register(`subreddit.${index}.value`)} />
++          </div>
++        ))}
++      </div>
++      <Button onClick={addField}>Add Subreddit</Button>
++      {fields.length === 0 && (
++        <div className="text-red-500 text-[12px] mt-[10px]">
++          Please add at least one Subreddit
++        </div>
++      )}
++    </>
++  );
++};
++
++export default withProvider(
++  LemmySettings,
++  undefined,
++  LemmySettingsDto,
++  async (items) => {
++    const [firstItems] = items;
++
++    if (
++      firstItems.length &&
++      firstItems[0].path.indexOf('png') === -1 &&
++      firstItems[0].path.indexOf('jpg') === -1 &&
++      firstItems[0].path.indexOf('jpef') === -1 &&
++      firstItems[0].path.indexOf('gif') === -1
++    ) {
++      return 'You can set only one picture for a cover';
++    }
++
++    return true;
++  },
++  10000
++);
+diff --git a/apps/frontend/src/components/launches/providers/lemmy/subreddit.tsx b/apps/frontend/src/components/launches/providers/lemmy/subreddit.tsx
+new file mode 100644
+index 000000000..014245a4e
+--- /dev/null
++++ b/apps/frontend/src/components/launches/providers/lemmy/subreddit.tsx
+@@ -0,0 +1,168 @@
++import { FC, FormEvent, useCallback, useState } from 'react';
++import { useCustomProviderFunction } from '@gitroom/frontend/components/launches/helpers/use.custom.provider.function';
++import { Input } from '@gitroom/react/form/input';
++import { useDebouncedCallback } from 'use-debounce';
++import { useWatch } from 'react-hook-form';
++import { useSettings } from '@gitroom/frontend/components/launches/helpers/use.values';
++
++export const Subreddit: FC<{
++  onChange: (event: {
++    target: {
++      name: string;
++      value: {
++        id: string;
++        subreddit: string;
++        title: string;
++        name: string;
++        url: string;
++        body: string;
++        media: any[];
++      };
++    };
++  }) => void;
++  name: string;
++}> = (props) => {
++  const { onChange, name } = props;
++
++  const state = useSettings();
++  const split = name.split('.');
++  const [loading, setLoading] = useState(false);
++  // @ts-ignore
++  const errors = state?.formState?.errors?.[split?.[0]]?.[split?.[1]]?.value;
++
++  const [results, setResults] = useState([]);
++  const func = useCustomProviderFunction();
++  const value = useWatch({ name });
++  const [searchValue, setSearchValue] = useState('');
++
++  const setResult = (result: { id: string; name: string }) => async () => {
++    setLoading(true);
++    setSearchValue('');
++
++    onChange({
++      target: {
++        name,
++        value: {
++          id: String(result.id),
++          subreddit: result.name,
++          title: '',
++          name: '',
++          url: '',
++          body: '',
++          media: [],
++        },
++      },
++    });
++
++    setLoading(false);
++  };
++
++  const setTitle = useCallback(
++    (e: any) => {
++      onChange({
++        target: {
++          name,
++          value: {
++            ...value,
++            title: e.target.value,
++          },
++        },
++      });
++    },
++    [value]
++  );
++
++  const setURL = useCallback(
++    (e: any) => {
++      onChange({
++        target: {
++          name,
++          value: {
++            ...value,
++            url: e.target.value,
++          },
++        },
++      });
++    },
++    [value]
++  );
++
++  const search = useDebouncedCallback(
++    useCallback(async (e: FormEvent<HTMLInputElement>) => {
++      // @ts-ignore
++      setResults([]);
++      // @ts-ignore
++      if (!e.target.value) {
++        return;
++      }
++      // @ts-ignore
++      const results = await func.get('subreddits', { word: e.target.value });
++      // @ts-ignore
++      setResults(results);
++    }, []),
++    500
++  );
++
++  return (
++    <div className="bg-primary p-[20px]">
++      {value?.subreddit ? (
++        <>
++          <Input
++            error={errors?.subreddit?.message}
++            disableForm={true}
++            value={value.subreddit}
++            readOnly={true}
++            label="Community"
++            name="subreddit"
++          />
++          <Input
++            error={errors?.title?.message}
++            value={value.title}
++            disableForm={true}
++            label="Title"
++            name="title"
++            onChange={setTitle}
++          />
++          <Input
++            error={errors?.url?.message}
++            value={value.url}
++            label="URL"
++            name="url"
++            disableForm={true}
++            onChange={setURL}
++          />
++        </>
++      ) : (
++        <div className="relative">
++          <Input
++            placeholder="Community"
++            name="search"
++            label="Search Community"
++            readOnly={loading}
++            value={searchValue}
++            error={errors?.message}
++            disableForm={true}
++            onInput={async (e) => {
++              // @ts-ignore
++              setSearchValue(e.target.value);
++              await search(e);
++            }}
++          />
++          {!!results.length && !loading && (
++            <div className="z-[400] w-full absolute bg-input -mt-[20px] outline-none border-fifth border cursor-pointer">
++              {results.map((r: { id: string; name: string }) => (
++                <div
++                  onClick={setResult(r)}
++                  key={r.id}
++                  className="px-[16px] py-[5px] hover:bg-secondary"
++                >
++                  {r.name}
++                </div>
++              ))}
++            </div>
++          )}
++        </div>
++      )}
++    </div>
++  );
++};
+diff --git a/apps/frontend/src/components/launches/providers/show.all.providers.tsx b/apps/frontend/src/components/launches/providers/show.all.providers.tsx
+index 3b26f62bc..2549ca365 100644
+--- a/apps/frontend/src/components/launches/providers/show.all.providers.tsx
++++ b/apps/frontend/src/components/launches/providers/show.all.providers.tsx
+@@ -17,6 +17,7 @@ import DiscordProvider from '@gitroom/frontend/components/launches/providers/dis
+ import SlackProvider from '@gitroom/frontend/components/launches/providers/slack/slack.provider';
+ import MastodonProvider from '@gitroom/frontend/components/launches/providers/mastodon/mastodon.provider';
+ import BlueskyProvider from '@gitroom/frontend/components/launches/providers/bluesky/bluesky.provider';
++import LemmyProvider from '@gitroom/frontend/components/launches/providers/lemmy/lemmy.provider';
+ 
+ export const Providers = [
+     {identifier: 'devto', component: DevtoProvider},
+@@ -37,6 +38,7 @@ export const Providers = [
+     {identifier: 'slack', component: SlackProvider},
+     {identifier: 'mastodon', component: MastodonProvider},
+     {identifier: 'bluesky', component: BlueskyProvider},
++    {identifier: 'lemmy', component: LemmyProvider},
+ ];
+ 
+ 
+diff --git a/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts b/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
+index f661a2a5d..999413090 100644
+--- a/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
++++ b/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
+@@ -14,6 +14,7 @@ import { DribbbleDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-sett
+ import { TikTokDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/tiktok.dto';
+ import { DiscordDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/discord.dto';
+ import { SlackDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/slack.dto';
++import { LemmySettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/lemmy.dto';
+ 
+ export class EmptySettings {}
+ export class Integration {
+@@ -66,6 +67,7 @@ export class Post {
+           { value: MediumSettingsDto, name: 'medium' },
+           { value: HashnodeSettingsDto, name: 'hashnode' },
+           { value: RedditSettingsDto, name: 'reddit' },
++          { value: LemmySettingsDto, name: 'lemmy' },
+           { value: YoutubeSettingsDto, name: 'youtube' },
+           { value: PinterestSettingsDto, name: 'pinterest' },
+           { value: DribbbleDto, name: 'dribbble' },
+diff --git a/libraries/nestjs-libraries/src/dtos/posts/lemmy.dto.ts b/libraries/nestjs-libraries/src/dtos/posts/lemmy.dto.ts
+new file mode 100644
+index 000000000..7fb064cfc
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/dtos/posts/lemmy.dto.ts
+@@ -0,0 +1,46 @@
++import {
++  ArrayMinSize,
++  IsDefined,
++  IsOptional,
++  IsString,
++  IsUrl,
++  MinLength,
++  ValidateIf,
++  ValidateNested,
++} from 'class-validator';
++import { Type } from 'class-transformer';
++
++export class LemmySettingsDtoInner {
++  @IsString()
++  @MinLength(2)
++  @IsDefined()
++  subreddit: string;
++
++  @IsString()
++  @IsDefined()
++  id: string;
++
++  @IsString()
++  @MinLength(2)
++  @IsDefined()
++  title: string;
++
++  @ValidateIf((o) => o.url)
++  @IsOptional()
++  @IsUrl()
++  url: string;
++}
++
++export class LemmySettingsValueDto {
++  @Type(() => LemmySettingsDtoInner)
++  @IsDefined()
++  @ValidateNested()
++  value: LemmySettingsDtoInner;
++}
++
++export class LemmySettingsDto {
++  @Type(() => LemmySettingsValueDto)
++  @ValidateNested({ each: true })
++  @ArrayMinSize(1)
++  subreddit: LemmySettingsValueDto[];
++}
+diff --git a/libraries/nestjs-libraries/src/integrations/integration.manager.ts b/libraries/nestjs-libraries/src/integrations/integration.manager.ts
+index 8382946de..bf44d5587 100644
+--- a/libraries/nestjs-libraries/src/integrations/integration.manager.ts
++++ b/libraries/nestjs-libraries/src/integrations/integration.manager.ts
+@@ -21,6 +21,7 @@ import { DiscordProvider } from '@gitroom/nestjs-libraries/integrations/social/d
+ import { SlackProvider } from '@gitroom/nestjs-libraries/integrations/social/slack.provider';
+ import { MastodonProvider } from '@gitroom/nestjs-libraries/integrations/social/mastodon.provider';
+ import { BlueskyProvider } from '@gitroom/nestjs-libraries/integrations/social/bluesky.provider';
++import { LemmyProvider } from '@gitroom/nestjs-libraries/integrations/social/lemmy.provider';
+ // import { MastodonCustomProvider } from '@gitroom/nestjs-libraries/integrations/social/mastodon.custom.provider';
+ 
+ const socialIntegrationList: SocialProvider[] = [
+@@ -39,6 +40,7 @@ const socialIntegrationList: SocialProvider[] = [
+   new SlackProvider(),
+   new MastodonProvider(),
+   new BlueskyProvider(),
++  new LemmyProvider(),
+   // new MastodonCustomProvider(),
+ ];
+ 
+diff --git a/libraries/nestjs-libraries/src/integrations/social/lemmy.provider.ts b/libraries/nestjs-libraries/src/integrations/social/lemmy.provider.ts
+new file mode 100644
+index 000000000..9e6535281
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/integrations/social/lemmy.provider.ts
+@@ -0,0 +1,245 @@
++import {
++  AuthTokenDetails,
++  PostDetails,
++  PostResponse,
++  SocialProvider,
++} from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
++import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
++import { SocialAbstract } from '@gitroom/nestjs-libraries/integrations/social.abstract';
++import dayjs from 'dayjs';
++import { Integration } from '@prisma/client';
++import { AuthService } from '@gitroom/helpers/auth/auth.service';
++import { LemmySettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/lemmy.dto';
++import { groupBy } from 'lodash';
++
++export class LemmyProvider extends SocialAbstract implements SocialProvider {
++  identifier = 'lemmy';
++  name = 'Lemmy';
++  isBetweenSteps = false;
++  scopes = [];
++
++  async customFields() {
++    return [
++      {
++        key: 'service',
++        label: 'Service',
++        defaultValue: 'https://lemmy.world',
++        validation: `/^https?:\\/\\/(www\\.)?[-a-zA-Z0-9@:%._\\+~#=]{1,256}\\.[a-zA-Z0-9()]{1,6}\\b([-a-zA-Z0-9()@:%_\\+.~#?&//=]*)$/`,
++        type: 'text' as const,
++      },
++      {
++        key: 'identifier',
++        label: 'Identifier',
++        validation: `/^.{3,}$/`,
++        type: 'text' as const,
++      },
++      {
++        key: 'password',
++        label: 'Password',
++        validation: `/^.{3,}$/`,
++        type: 'password' as const,
++      },
++    ];
++  }
++
++  async refreshToken(refreshToken: string): Promise<AuthTokenDetails> {
++    return {
++      refreshToken: '',
++      expiresIn: 0,
++      accessToken: '',
++      id: '',
++      name: '',
++      picture: '',
++      username: '',
++    };
++  }
++
++  async generateAuthUrl() {
++    const state = makeId(6);
++    return {
++      url: '',
++      codeVerifier: makeId(10),
++      state,
++    };
++  }
++
++  async authenticate(params: {
++    code: string;
++    codeVerifier: string;
++    refresh?: string;
++  }) {
++    const body = JSON.parse(Buffer.from(params.code, 'base64').toString());
++
++    const load = await fetch(body.service + '/api/v3/user/login', {
++      body: JSON.stringify({
++        username_or_email: body.identifier,
++        password: body.password,
++      }),
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++      },
++    });
++
++    if (load.status === 401) {
++      return 'Invalid credentials';
++    }
++
++    const { jwt } = await load.json();
++
++    try {
++      const user = await (
++        await fetch(body.service + `/api/v3/user?username=${body.identifier}`, {
++          headers: {
++            Authorization: `Bearer ${jwt}`,
++          },
++        })
++      ).json();
++
++      return {
++        refreshToken: jwt!,
++        expiresIn: dayjs().add(100, 'years').unix() - dayjs().unix(),
++        accessToken: jwt!,
++        id: String(user.person_view.person.id),
++        name:
++          user.person_view.person.display_name ||
++          user.person_view.person.name ||
++          '',
++        picture: user.person_view.person.avatar || '',
++        username: body.identifier || '',
++      };
++    } catch (e) {
++      console.log(e);
++      return 'Invalid credentials';
++    }
++  }
++
++  async post(
++    id: string,
++    accessToken: string,
++    postDetails: PostDetails<LemmySettingsDto>[],
++    integration: Integration
++  ): Promise<PostResponse[]> {
++    const [firstPost, ...restPosts] = postDetails;
++
++    const body = JSON.parse(
++      AuthService.fixedDecryption(integration.customInstanceDetails!)
++    );
++
++    const { jwt } = await (
++      await fetch(body.service + '/api/v3/user/login', {
++        body: JSON.stringify({
++          username_or_email: body.identifier,
++          password: body.password,
++        }),
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++        },
++      })
++    ).json();
++
++    const valueArray: PostResponse[] = [];
++
++    for (const lemmy of firstPost.settings.subreddit) {
++      const { post_view, ...all } = await (
++        await fetch(body.service + '/api/v3/post', {
++          body: JSON.stringify({
++            community_id: +lemmy.value.id,
++            name: lemmy.value.title,
++            body: firstPost.message,
++            ...(lemmy.value.url ? { url: lemmy.value.url } : {}),
++            ...(firstPost.media?.length
++              ? { custom_thumbnail: firstPost.media[0].url }
++              : {}),
++            nsfw: false,
++          }),
++          method: 'POST',
++          headers: {
++            Authorization: `Bearer ${jwt}`,
++            'Content-Type': 'application/json',
++          },
++        })
++      ).json();
++
++      valueArray.push({
++        postId: post_view.post.id,
++        releaseURL: body.service + '/post/' + post_view.post.id,
++        id: firstPost.id,
++        status: 'published',
++      });
++
++      for (const comment of restPosts) {
++        const { comment_view } = await (
++          await fetch(body.service + '/api/v3/comment', {
++            body: JSON.stringify({
++              post_id: post_view.post.id,
++              content: comment.message,
++            }),
++            method: 'POST',
++            headers: {
++              Authorization: `Bearer ${jwt}`,
++              'Content-Type': 'application/json',
++            },
++          })
++        ).json();
++
++        valueArray.push({
++          postId: comment_view.post.id,
++          releaseURL: body.service + '/comment/' + comment_view.comment.id,
++          id: comment.id,
++          status: 'published',
++        });
++      }
++    }
++
++    return Object.values(groupBy(valueArray, (p) => p.id)).map((p) => ({
++      id: p[0].id,
++      postId: p.map((p) => String(p.postId)).join(','),
++      releaseURL: p.map((p) => p.releaseURL).join(','),
++      status: 'published',
++    }));
++  }
++
++  async subreddits(
++    accessToken: string,
++    data: any,
++    id: string,
++    integration: Integration
++  ) {
++    const body = JSON.parse(
++      AuthService.fixedDecryption(integration.customInstanceDetails!)
++    );
++
++    const { jwt } = await (
++      await fetch(body.service + '/api/v3/user/login', {
++        body: JSON.stringify({
++          username_or_email: body.identifier,
++          password: body.password,
++        }),
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++        },
++      })
++    ).json();
++
++    const { communities } = await (
++      await fetch(
++        body.service +
++          `/api/v3/search?type_=Communities&sort=Active&q=${data.word}`,
++        {
++          headers: {
++            Authorization: `Bearer ${jwt}`,
++          },
++        }
++      )
++    ).json();
++
++    return communities.map((p: any) => ({
++      title: p.community.title,
++      name: p.community.title,
++      id: p.community.id,
++    }));
++  }
++}

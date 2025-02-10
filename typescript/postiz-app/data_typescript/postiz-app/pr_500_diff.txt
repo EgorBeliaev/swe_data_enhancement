@@ -1,0 +1,747 @@
+diff --git a/apps/backend/src/api/routes/integrations.controller.ts b/apps/backend/src/api/routes/integrations.controller.ts
+index abb4de6e5..332de202c 100644
+--- a/apps/backend/src/api/routes/integrations.controller.ts
++++ b/apps/backend/src/api/routes/integrations.controller.ts
+@@ -1,5 +1,13 @@
+ import {
+-  Body, Controller, Delete, Get, Param, Post, Put, Query, UseFilters
++  Body,
++  Controller,
++  Delete,
++  Get,
++  Param,
++  Post,
++  Put,
++  Query,
++  UseFilters,
+ } from '@nestjs/common';
+ import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
+ import { ConnectIntegrationDto } from '@gitroom/nestjs-libraries/dtos/integrations/connect.integration.dto';
+@@ -42,6 +50,11 @@ export class IntegrationsController {
+     return this._integrationManager.getAllIntegrations();
+   }
+ 
++  @Get('/:identifier/internal-plugs')
++  getInternalPlugs(@Param('identifier') identifier: string) {
++    return this._integrationManager.getInternalPlugs(identifier);
++  }
++
+   @Get('/customers')
+   getCustomers(@GetOrgFromRequest() org: Organization) {
+     return this._integrationService.customers(org.id);
+@@ -66,11 +79,7 @@ export class IntegrationsController {
+     @Param('id') id: string,
+     @Body() body: { name: string }
+   ) {
+-    return this._integrationService.updateOnCustomerName(
+-      org.id,
+-      id,
+-      body.name
+-    );
++    return this._integrationService.updateOnCustomerName(org.id, id, body.name);
+   }
+ 
+   @Get('/list')
+diff --git a/apps/frontend/src/components/launches/add.edit.model.tsx b/apps/frontend/src/components/launches/add.edit.model.tsx
+index 6cfcbaf5b..74308b33d 100644
+--- a/apps/frontend/src/components/launches/add.edit.model.tsx
++++ b/apps/frontend/src/components/launches/add.edit.model.tsx
+@@ -71,6 +71,7 @@ function countCharacters(text: string, type: string): number {
+ export const AddEditModal: FC<{
+   date: dayjs.Dayjs;
+   integrations: Integrations[];
++  allIntegrations?: Integrations[];
+   reopenModal: () => void;
+   mutate: () => void;
+   onlyValues?: Array<{
+@@ -538,11 +539,13 @@ export const AddEditModal: FC<{
+                     disableForm={true}
+                   >
+                     <option value="">Selected Customer</option>
+-                    {uniqBy(ints, (u) => u?.customer?.name).filter(f => f.customer?.name).map((p) => (
+-                      <option key={p.customer?.id} value={p.customer?.id}>
+-                        Customer: {p.customer?.name}
+-                      </option>
+-                    ))}
++                    {uniqBy(ints, (u) => u?.customer?.name)
++                      .filter((f) => f.customer?.name)
++                      .map((p) => (
++                        <option key={p.customer?.id} value={p.customer?.id}>
++                          Customer: {p.customer?.name}
++                        </option>
++                      ))}
+                   </Select>
+                 )}
+                 <DatePicker onChange={setDateState} date={dateState} />
+@@ -814,6 +817,7 @@ export const AddEditModal: FC<{
+           {!!selectedIntegrations.length && (
+             <div className="flex-1 flex flex-col p-[16px] pt-0">
+               <ProvidersOptions
++                allIntegrations={props.allIntegrations || []}
+                 integrations={selectedIntegrations}
+                 editorValue={value}
+                 date={dateState}
+diff --git a/apps/frontend/src/components/launches/bold.text.tsx b/apps/frontend/src/components/launches/bold.text.tsx
+index c60580a85..04f8371f1 100644
+--- a/apps/frontend/src/components/launches/bold.text.tsx
++++ b/apps/frontend/src/components/launches/bold.text.tsx
+@@ -1,5 +1,6 @@
+ import { FC, useCallback } from 'react';
+ import { Editor, Transforms } from 'slate';
++import { ReactEditor } from 'slate-react';
+ 
+ const originalMap = {
+   a: '𝗮',
+@@ -80,7 +81,9 @@ export const BoldText: FC<{ editor: any; currentValue: string }> = ({
+       .map((char) => originalMap?.[char] || char)
+       .join('');
+ 
++
+     Transforms.insertText(editor, newText);
++    ReactEditor.focus(editor);
+   };
+ 
+   return (
+diff --git a/apps/frontend/src/components/launches/calendar.tsx b/apps/frontend/src/components/launches/calendar.tsx
+index 80c9ad714..4d6f54da9 100644
+--- a/apps/frontend/src/components/launches/calendar.tsx
++++ b/apps/frontend/src/components/launches/calendar.tsx
+@@ -357,6 +357,7 @@ export const CalendarColumn: FC<{
+         children: (
+           <IntegrationContext.Provider
+             value={{
++              allIntegrations: [],
+               date: dayjs(),
+               integration,
+               value: [],
+@@ -392,6 +393,7 @@ export const CalendarColumn: FC<{
+         children: (
+           <ExistingDataContextProvider value={data}>
+             <AddEditModal
++              allIntegrations={integrations.map((p) => ({ ...p }))}
+               reopenModal={editPost(post)}
+               mutate={reloadCalendarView}
+               integrations={integrations
+@@ -419,6 +421,7 @@ export const CalendarColumn: FC<{
+       },
+       children: (
+         <AddEditModal
++          allIntegrations={integrations.map((p) => ({ ...p }))}
+           integrations={integrations.slice(0).map((p) => ({ ...p }))}
+           mutate={reloadCalendarView}
+           date={
+diff --git a/apps/frontend/src/components/launches/generator/generator.tsx b/apps/frontend/src/components/launches/generator/generator.tsx
+index 4369eb1d3..5237f0c3b 100644
+--- a/apps/frontend/src/components/launches/generator/generator.tsx
++++ b/apps/frontend/src/components/launches/generator/generator.tsx
+@@ -143,6 +143,7 @@ const FirstStep: FC = (props) => {
+         },
+         children: (
+           <AddEditModal
++            allIntegrations={integrations.map((p) => ({ ...p }))}
+             integrations={integrations.slice(0).map((p) => ({ ...p }))}
+             mutate={reloadCalendarView}
+             date={dayjs.utc(load.date).local()}
+diff --git a/apps/frontend/src/components/launches/helpers/pick.platform.component.tsx b/apps/frontend/src/components/launches/helpers/pick.platform.component.tsx
+index 394c92e35..b733bfa77 100644
+--- a/apps/frontend/src/components/launches/helpers/pick.platform.component.tsx
++++ b/apps/frontend/src/components/launches/helpers/pick.platform.component.tsx
+@@ -7,7 +7,6 @@ import Image from 'next/image';
+ import { useCopilotAction, useCopilotReadable } from '@copilotkit/react-core';
+ import { useStateCallback } from '@gitroom/react/helpers/use.state.callback';
+ import { timer } from '@gitroom/helpers/utils/timer';
+-import dayjs from 'dayjs';
+ 
+ export const PickPlatforms: FC<{
+   integrations: Integrations[];
+diff --git a/apps/frontend/src/components/launches/helpers/use.integration.ts b/apps/frontend/src/components/launches/helpers/use.integration.ts
+index 80c918143..091a4a039 100644
+--- a/apps/frontend/src/components/launches/helpers/use.integration.ts
++++ b/apps/frontend/src/components/launches/helpers/use.integration.ts
+@@ -7,11 +7,12 @@ import dayjs from 'dayjs';
+ export const IntegrationContext = createContext<{
+   date: dayjs.Dayjs;
+   integration: Integrations | undefined;
++  allIntegrations: Integrations[];
+   value: Array<{
+     content: string;
+     id?: string;
+     image?: Array<{ path: string; id: string }>;
+   }>;
+-}>({ integration: undefined, value: [], date: dayjs() });
++}>({ integration: undefined, value: [], date: dayjs(), allIntegrations: [] });
+ 
+ export const useIntegration = () => useContext(IntegrationContext);
+diff --git a/apps/frontend/src/components/launches/internal.channels.tsx b/apps/frontend/src/components/launches/internal.channels.tsx
+new file mode 100644
+index 000000000..028376316
+--- /dev/null
++++ b/apps/frontend/src/components/launches/internal.channels.tsx
+@@ -0,0 +1,165 @@
++import { FC, useEffect, useState } from 'react';
++import {
++  Integrations,
++  useCalendar,
++} from '@gitroom/frontend/components/launches/calendar.context';
++import { PickPlatforms } from '@gitroom/frontend/components/launches/helpers/pick.platform.component';
++import { useIntegration } from '@gitroom/frontend/components/launches/helpers/use.integration';
++import { Select } from '@gitroom/react/form/select';
++import { Slider } from '@gitroom/react/form/slider';
++import { useSettings } from '@gitroom/frontend/components/launches/helpers/use.values';
++import clsx from 'clsx';
++
++const delayOptions = [
++  {
++    name: 'Immediately',
++    value: 0,
++  },
++  {
++    name: '1 hour',
++    value: 3600000,
++  },
++  {
++    name: '2 hours',
++    value: 7200000,
++  },
++  {
++    name: '3 hours',
++    value: 10800000,
++  },
++  {
++    name: '8 hours',
++    value: 28800000,
++  },
++  {
++    name: '12 hours',
++    value: 43200000,
++  },
++  {
++    name: '15 hours',
++    value: 54000000,
++  },
++  {
++    name: '24 hours',
++    value: 86400000,
++  },
++];
++export const InternalChannels: FC<{
++  plugs: {
++    identifier: string;
++    title: string;
++    description: string;
++    pickIntegration: string[];
++    fields: {
++      name: string;
++      description: string;
++      type: string;
++      placeholder: string;
++      validation?: RegExp;
++    }[];
++  }[];
++}> = (props) => {
++  const { plugs } = props;
++
++  return (
++    <div>
++      {plugs.map((plug, index) => (
++        <Plug plug={plug} key={index} />
++      ))}
++    </div>
++  );
++};
++
++const Plug: FC<{
++  plug: {
++    identifier: string;
++    title: string;
++    description: string;
++    pickIntegration: string[];
++    fields: {
++      name: string;
++      description: string;
++      type: string;
++      placeholder: string;
++      validation?: RegExp;
++    }[];
++  };
++}> = ({ plug }) => {
++  const { allIntegrations, integration } = useIntegration();
++  const { watch, setValue, control, register } = useSettings();
++  const val = watch(`plug--${plug.identifier}--integrations`);
++  const active = watch(`plug--${plug.identifier}--active`);
++
++  // const selectedIntegrationsValue = watch(
++  //   `plug.${plug.identifier}.integrations`
++  // );
++  //
++  // console.log(selectedIntegrationsValue);
++  const [localValue, setLocalValue] = useState<Integrations[]>(
++    (val || []).map((p: any) => ({ ...p }))
++  );
++  useEffect(() => {
++    setValue(`plug--${plug.identifier}--integrations`, [...localValue]);
++  }, [localValue, plug, setValue]);
++
++  const [allowedIntegrations] = useState(
++    allIntegrations.filter(
++      (i) =>
++        plug.pickIntegration.includes(i.identifier) && integration?.id !== i.id
++    )
++  );
++
++  return (
++    <div
++      key={plug.title}
++      className="flex flex-col gap-[10px] border-tableBorder border p-[15px] rounded-lg"
++    >
++      <div className="flex items-center">
++        <div className="flex-1">{plug.title}</div>
++        <div>
++          <Slider
++            value={active ? 'on' : 'off'}
++            onChange={(p) =>
++              setValue(`plug--${plug.identifier}--active`, p === 'on')
++            }
++            fill={true}
++          />
++        </div>
++      </div>
++      <div className="w-full max-w-[600px] overflow-y-auto pb-[10px] text-[12px] flex flex-col gap-[10px]">
++        {!allowedIntegrations.length ? (
++          'No available accounts'
++        ) : (
++          <div
++            className={clsx(
++              'flex flex-col gap-[10px]',
++              !active && 'opacity-25 pointer-events-none'
++            )}
++          >
++            <div>{plug.description}</div>
++            <Select
++              label="Delay"
++              hideErrors={true}
++              {...register(`plug--${plug.identifier}--delay`)}
++            >
++              {delayOptions.map((p) => (
++                <option key={p.name} value={p.value}>
++                  {p.name}
++                </option>
++              ))}
++            </Select>
++            <div>Accounts that will engage:</div>
++            <PickPlatforms
++              hide={false}
++              integrations={allowedIntegrations}
++              selectedIntegrations={localValue}
++              singleSelect={false}
++              isMain={true}
++              onChange={setLocalValue}
++            />
++          </div>
++        )}
++      </div>
++    </div>
++  );
++};
+diff --git a/apps/frontend/src/components/launches/providers.options.tsx b/apps/frontend/src/components/launches/providers.options.tsx
+index 0698b1ee2..52621f897 100644
+--- a/apps/frontend/src/components/launches/providers.options.tsx
++++ b/apps/frontend/src/components/launches/providers.options.tsx
+@@ -8,6 +8,7 @@ import { useStateCallback } from '@gitroom/react/helpers/use.state.callback';
+ 
+ export const ProvidersOptions: FC<{
+   integrations: Integrations[];
++  allIntegrations: Integrations[];
+   editorValue: Array<{ id?: string; content: string }>;
+   date: dayjs.Dayjs;
+ }> = (props) => {
+@@ -32,7 +33,7 @@ export const ProvidersOptions: FC<{
+         isMain={false}
+       />
+       <IntegrationContext.Provider
+-        value={{ value: editorValue, integration: selectedIntegrations?.[0], date }}
++        value={{ value: editorValue, integration: selectedIntegrations?.[0], date, allIntegrations: props.allIntegrations }}
+       >
+         <ShowAllProviders
+           value={editorValue}
+diff --git a/apps/frontend/src/components/launches/providers/high.order.provider.tsx b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+index aae10fb2e..e681ed39a 100644
+--- a/apps/frontend/src/components/launches/providers/high.order.provider.tsx
++++ b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+@@ -42,6 +42,9 @@ import { useModals } from '@mantine/modals';
+ import { useUppyUploader } from '@gitroom/frontend/components/media/new.uploader';
+ import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
+ import { DropFiles } from '@gitroom/frontend/components/layout/drop.files';
++import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
++import useSWR from 'swr';
++import { InternalChannels } from '@gitroom/frontend/components/launches/internal.channels';
+ 
+ // Simple component to change back to settings on after changing tab
+ export const SetTab: FC<{ changeTab: () => void }> = (props) => {
+@@ -101,6 +104,7 @@ export const withProvider = function <T extends object>(
+     const { integration, date } = useIntegration();
+     const [showLinkedinPopUp, setShowLinkedinPopUp] = useState<any>(false);
+     const [uploading, setUploading] = useState(false);
++    const fetch = useFetch();
+ 
+     useCopilotReadable({
+       description:
+@@ -343,6 +347,12 @@ export const withProvider = function <T extends object>(
+       [changeImage]
+     );
+ 
++    const getInternalPlugs = useCallback(async () => {
++      return (await fetch(`/integrations/${props.identifier}/internal-plugs`)).json();
++    }, [props.identifier]);
++
++    const {data} = useSWR(`internal-${props.identifier}`, getInternalPlugs);
++
+     // this is a trick to prevent the data from being deleted, yet we don't render the elements
+     if (!props.show) {
+       return null;
+@@ -364,7 +374,7 @@ export const withProvider = function <T extends object>(
+                   Preview
+                 </Button>
+               </div>
+-              {!!SettingsComponent && (
++              {(!!SettingsComponent || !!data?.internalPlugs?.length) && (
+                 <div className="flex-1 flex">
+                   <Button
+                     className={clsx(
+@@ -516,6 +526,9 @@ export const withProvider = function <T extends object>(
+           {(showTab === 0 || showTab === 2) && (
+             <div className={clsx('mt-[20px]', showTab !== 2 && 'hidden')}>
+               <Component values={editInPlace ? InPlaceValue : props.value} />
++              {data?.internalPlugs?.length && (
++                <InternalChannels plugs={data?.internalPlugs}  />
++              )}
+             </div>
+           )}
+           {showTab === 0 && (
+diff --git a/apps/frontend/src/components/launches/u.text.tsx b/apps/frontend/src/components/launches/u.text.tsx
+index f32d06a78..143d6410f 100644
+--- a/apps/frontend/src/components/launches/u.text.tsx
++++ b/apps/frontend/src/components/launches/u.text.tsx
+@@ -1,5 +1,6 @@
+ import { FC, useCallback } from 'react';
+ import { Editor, Transforms } from 'slate';
++import { ReactEditor } from 'slate-react';
+ 
+ const underlineMap = {
+   a: 'a̲',
+@@ -80,6 +81,7 @@ export const UText: FC<{ editor: any; currentValue: string }> = ({
+       .join('');
+ 
+     Transforms.insertText(editor, newText);
++    ReactEditor.focus(editor);
+   };
+ 
+   return (
+diff --git a/apps/workers/src/app/plugs.controller.ts b/apps/workers/src/app/plugs.controller.ts
+index 36e4f7d1b..b4e3194c3 100644
+--- a/apps/workers/src/app/plugs.controller.ts
++++ b/apps/workers/src/app/plugs.controller.ts
+@@ -4,9 +4,7 @@ import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/in
+ 
+ @Controller()
+ export class PlugsController {
+-  constructor(
+-    private _integrationService: IntegrationService
+-  ) {}
++  constructor(private _integrationService: IntegrationService) {}
+ 
+   @EventPattern('plugs', Transport.REDIS)
+   async plug(data: {
+@@ -18,4 +16,17 @@ export class PlugsController {
+   }) {
+     return this._integrationService.processPlugs(data);
+   }
++
++  @EventPattern('internal-plugs', Transport.REDIS)
++  async internalPlug(data: {
++    post: string;
++    originalIntegration: string;
++    integration: string;
++    plugName: string;
++    orgId: string;
++    delay: number;
++    information: any;
++  }) {
++    return this._integrationService.processInternalPlug(data);
++  }
+ }
+diff --git a/apps/workers/src/app/posts.controller.ts b/apps/workers/src/app/posts.controller.ts
+index a8c1aa9f8..a4f33a5c8 100644
+--- a/apps/workers/src/app/posts.controller.ts
++++ b/apps/workers/src/app/posts.controller.ts
+@@ -7,7 +7,7 @@ export class PostsController {
+   constructor(private _postsService: PostsService) {}
+   @EventPattern('post', Transport.REDIS)
+   async post(data: { id: string }) {
+-    console.log('proceccsing', data);
++    console.log('processing', data);
+     return this._postsService.post(data.id);
+   }
+ 
+diff --git a/libraries/helpers/src/decorators/post.plug.ts b/libraries/helpers/src/decorators/post.plug.ts
+new file mode 100644
+index 000000000..ed5b1ee79
+--- /dev/null
++++ b/libraries/helpers/src/decorators/post.plug.ts
+@@ -0,0 +1,26 @@
++import 'reflect-metadata';
++
++export function PostPlug(params: {
++  identifier: string;
++  title: string;
++  description: string;
++  pickIntegration: string[];
++  fields: {
++    name: string;
++    description: string;
++    type: string;
++    placeholder: string;
++    validation?: RegExp;
++  }[];
++}) {
++  return function (target: Object, propertyKey: string | symbol, descriptor: any) {
++    // Retrieve existing metadata or initialize an empty array
++    const existingMetadata = Reflect.getMetadata('custom:internal_plug', target) || [];
++
++    // Add the metadata information for this method
++    existingMetadata.push({ methodName: propertyKey, ...params });
++
++    // Define metadata on the class prototype (so it can be retrieved from the class)
++    Reflect.defineMetadata('custom:internal_plug', existingMetadata, target);
++  };
++}
+diff --git a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
+index 74287a972..eb1ff5b4a 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
+@@ -416,6 +416,54 @@ export class IntegrationService {
+     );
+   }
+ 
++  async processInternalPlug(data: {
++    post: string;
++    originalIntegration: string;
++    integration: string;
++    plugName: string;
++    orgId: string;
++    delay: number;
++    information: any;
++  }) {
++    const originalIntegration = await this._integrationRepository.getIntegrationById(
++      data.orgId,
++      data.originalIntegration
++    );
++
++    const getIntegration = await this._integrationRepository.getIntegrationById(
++      data.orgId,
++      data.integration
++    );
++
++    if (!getIntegration || !originalIntegration) {
++      return;
++    }
++
++    const getAllInternalPlugs = this._integrationManager
++      .getInternalPlugs(getIntegration.providerIdentifier)
++      .internalPlugs.find((p: any) => p.identifier === data.plugName);
++
++    if (!getAllInternalPlugs) {
++      return;
++    }
++
++    const getSocialIntegration = this._integrationManager.getSocialIntegration(
++      getIntegration.providerIdentifier
++    );
++
++    try {
++      // @ts-ignore
++      await getSocialIntegration?.[getAllInternalPlugs.methodName]?.(
++        getIntegration,
++        originalIntegration,
++        data.post,
++        data.information
++      );
++    } catch (err) {
++      return;
++    }
++  }
++
+   async processPlugs(data: {
+     plugId: string;
+     postId: string;
+@@ -438,8 +486,6 @@ export class IntegrationService {
+         (p) => p.identifier === getPlugById.integration.providerIdentifier
+       )!;
+ 
+-    console.log(data.postId);
+-
+     // @ts-ignore
+     const process = await integration[getPlugById.plugFunction](
+       getPlugById.integration,
+@@ -524,7 +570,9 @@ export class IntegrationService {
+       findTimes.reduce((all: any, current: any) => {
+         return [
+           ...all,
+-          ...JSON.parse(current.postingTimes).map((p: { time: number }) => p.time),
++          ...JSON.parse(current.postingTimes).map(
++            (p: { time: number }) => p.time
++          ),
+         ];
+       }, [] as number[])
+     );
+diff --git a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+index 25a6a135a..04961a4dd 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+@@ -319,6 +319,13 @@ export class PostsService {
+         publishedPosts[0].postId
+       );
+ 
++      await this.checkInternalPlug(
++        integration,
++        integration.organizationId,
++        publishedPosts[0].postId,
++        JSON.parse(newPosts[0].settings || '{}')
++      );
++
+       return {
+         postId: publishedPosts[0].postId,
+         releaseURL: publishedPosts[0].releaseURL,
+@@ -332,6 +339,55 @@ export class PostsService {
+     }
+   }
+ 
++  private async checkInternalPlug(
++    integration: Integration,
++    orgId: string,
++    id: string,
++    settings: any
++  ) {
++    const plugs = Object.entries(settings).filter(([key]) => {
++      return key.indexOf('plug-') > -1;
++    });
++
++    if (plugs.length === 0) {
++      return;
++    }
++
++    const parsePlugs = plugs.reduce((all, [key, value]) => {
++      const [_, name, identifier] = key.split('--');
++      all[name] = all[name] || { name };
++      all[name][identifier] = value;
++      return all;
++    }, {} as any);
++
++    const list: {
++      name: string;
++      integrations: { id: string }[];
++      delay: string;
++      active: boolean;
++    }[] = Object.values(parsePlugs);
++
++    for (const trigger of list) {
++      for (const int of trigger.integrations) {
++        this._workerServiceProducer.emit('internal-plugs', {
++          id: 'plug_' + id + '_' + trigger.name + '_' + int.id,
++          options: {
++            delay: +trigger.delay,
++          },
++          payload: {
++            post: id,
++            originalIntegration: integration.id,
++            integration: int.id,
++            plugName: trigger.name,
++            orgId: orgId,
++            delay: +trigger.delay,
++            information: trigger,
++          },
++        });
++      }
++    }
++  }
++
+   private async checkPlugs(
+     orgId: string,
+     providerName: string,
+diff --git a/libraries/nestjs-libraries/src/integrations/integration.manager.ts b/libraries/nestjs-libraries/src/integrations/integration.manager.ts
+index 097565766..8382946de 100644
+--- a/libraries/nestjs-libraries/src/integrations/integration.manager.ts
++++ b/libraries/nestjs-libraries/src/integrations/integration.manager.ts
+@@ -87,6 +87,15 @@ export class IntegrationManager {
+       .filter((f) => f.plugs.length);
+   }
+ 
++  getInternalPlugs(providerName: string) {
++    const p = socialIntegrationList.find((p) => p.identifier === providerName)!;
++    return {
++      internalPlugs:
++        Reflect.getMetadata('custom:internal_plug', p.constructor.prototype) ||
++        [],
++    };
++  }
++
+   getAllowedSocialsIntegrations() {
+     return socialIntegrationList.map((p) => p.identifier);
+   }
+diff --git a/libraries/nestjs-libraries/src/integrations/social/x.provider.ts b/libraries/nestjs-libraries/src/integrations/social/x.provider.ts
+index ad9de0370..2aa6365fd 100644
+--- a/libraries/nestjs-libraries/src/integrations/social/x.provider.ts
++++ b/libraries/nestjs-libraries/src/integrations/social/x.provider.ts
+@@ -13,6 +13,7 @@ import { SocialAbstract } from '@gitroom/nestjs-libraries/integrations/social.ab
+ import { Plug } from '@gitroom/helpers/decorators/plug.decorator';
+ import { Integration } from '@prisma/client';
+ import { timer } from '@gitroom/helpers/utils/timer';
++import { PostPlug } from '@gitroom/helpers/decorators/post.plug';
+ 
+ export class XProvider extends SocialAbstract implements SocialProvider {
+   identifier = 'x';
+@@ -64,6 +65,35 @@ export class XProvider extends SocialAbstract implements SocialProvider {
+     return false;
+   }
+ 
++  @PostPlug({
++    identifier: 'x-repost-post-users',
++    title: 'Add Re-posters',
++    description: 'Add accounts to repost your post',
++    pickIntegration: ['x'],
++    fields: [],
++  })
++  async repostPostUsers(
++    integration: Integration,
++    originalIntegration: Integration,
++    postId: string,
++    information: any
++  ) {
++    const [accessTokenSplit, accessSecretSplit] = integration.token.split(':');
++    const client = new TwitterApi({
++      appKey: process.env.X_API_KEY!,
++      appSecret: process.env.X_API_SECRET!,
++      accessToken: accessTokenSplit,
++      accessSecret: accessSecretSplit,
++    });
++
++    const {data: {id}} = await client.v2.me();
++
++    try {
++      await client.v2.retweet(id, postId);
++    } catch (err) {
++    }
++  }
++
+   @Plug({
+     identifier: 'x-autoPlugPost',
+     title: 'Auto plug post',
+@@ -186,7 +216,7 @@ export class XProvider extends SocialAbstract implements SocialProvider {
+       accessSecret: oauth_token_secret,
+     });
+ 
+-    const { accessToken, client, accessSecret } = await startingClient.login(
++    const { accessToken, client, accessSecret, userId } = await startingClient.login(
+       code
+     );
+ 

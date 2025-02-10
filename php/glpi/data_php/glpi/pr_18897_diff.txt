@@ -1,0 +1,281 @@
+diff --git a/install/empty_data.php b/install/empty_data.php
+index 41937470642..09479419622 100644
+--- a/install/empty_data.php
++++ b/install/empty_data.php
+@@ -2484,6 +2484,7 @@ public function getEmptyData(): array
+                 'is_group_autoclean' => '0',
+                 'is_location_autoclean' => '0',
+                 'state_autoclean_mode' => '0',
++                'show_tickets_properties_on_helpdesk' => 0,
+             ],
+         ];
+ 
+diff --git a/install/migrations/update_10.0.x_to_11.0.0/form.php b/install/migrations/update_10.0.x_to_11.0.0/form.php
+index def61580505..07f3ebef843 100644
+--- a/install/migrations/update_10.0.x_to_11.0.0/form.php
++++ b/install/migrations/update_10.0.x_to_11.0.0/form.php
+@@ -273,6 +273,22 @@
+     );
+ }
+ 
++$field = 'show_tickets_properties_on_helpdesk';
++if (!$DB->fieldExists("glpi_entities", $field)) {
++    $migration->addField(
++        'glpi_entities',
++        $field,
++        "int NOT NULL DEFAULT '-2'"
++    );
++    $migration->addPostQuery(
++        $DB->buildUpdate(
++            'glpi_entities',
++            [$field => 0],
++            ['id' => 0]
++        )
++    );
++}
++
+ // Add rights for the forms object
+ $migration->addRight("form", ALLSTANDARDRIGHT, ['config' => UPDATE]);
+ 
+diff --git a/install/mysql/glpi-empty.sql b/install/mysql/glpi-empty.sql
+index c692a918005..b455e5f4481 100644
+--- a/install/mysql/glpi-empty.sql
++++ b/install/mysql/glpi-empty.sql
+@@ -2843,6 +2843,7 @@ CREATE TABLE `glpi_entities` (
+   `is_group_autoclean` tinyint NOT NULL DEFAULT '-2',
+   `is_location_autoclean` tinyint NOT NULL DEFAULT '-2',
+   `state_autoclean_mode` int NOT NULL DEFAULT '-2',
++  `show_tickets_properties_on_helpdesk` int NOT NULL DEFAULT '-2',
+   PRIMARY KEY (`id`),
+   UNIQUE KEY `unicity` (`entities_id`,`name`),
+   KEY `name` (`name`),
+diff --git a/phpunit/functional/TicketTest.php b/phpunit/functional/TicketTest.php
+index 87def2b8dbd..3a693630fbb 100644
+--- a/phpunit/functional/TicketTest.php
++++ b/phpunit/functional/TicketTest.php
+@@ -1589,7 +1589,8 @@ private function checkFormOutput(
+         $impact = true,
+         $category = true,
+         $requestSource = true,
+-        $location = true
++        $location = true,
++        $itil_form = true,
+     ) {
+         ob_start();
+         $ticket->showForm($ticket->getID());
+@@ -1655,6 +1656,15 @@ private function checkFormOutput(
+         $matches = iterator_to_array($crawler->filter("#itil-footer button[type=submit][name=update]:not([disabled])"));
+         $this->assertCount(($save === true ? 1 : 0), $matches, ($save === true ? 'Save button missing' : 'Save button present') . ' ' . $caller);
+ 
++        // Check that the itil form exist
++        $matches = iterator_to_array($crawler->filter("#itil-form"));
++        $this->assertCount(
++            ($itil_form === true ? 1 : 0),
++            $matches,
++            ($itil_form === true ? 'ITIL form' : 'ITIL form present') . ' ' . $caller
++        );
++
++
+         //Assign to
+         /*preg_match(
+           '|.*<select name=\'_itil_assign\[_type\]\'[^>]*>.*|',
+@@ -1705,6 +1715,7 @@ public function testFormPostOnly()
+             category: false,
+             requestSource: false,
+             location: false,
++            itil_form: false,
+         );
+ 
+         $uid = getItemByTypeName('User', TU_USER, true);
+@@ -1735,7 +1746,33 @@ public function testFormPostOnly()
+             $impact = false,
+             $category = false,
+             $requestSource = false,
+-            $location = false
++            $location = false,
++            itil_form: false,
++        );
++
++        // Display extra fields
++        $this->login('glpi', 'glpi'); // Need to be admin to update entities
++        $this->updateItem(Entity::class, 0, [
++            'show_tickets_properties_on_helpdesk' => 1,
++        ]);
++        $this->login('post-only', 'postonly');
++        $this->checkFormOutput(
++            $ticket,
++            name: false,
++            textarea: false,
++            priority: false,
++            save: false,
++            assign: false,
++            openDate: false,
++            timeOwnResolve: false,
++            type: false,
++            status: false,
++            urgency: false,
++            impact: false,
++            category: false,
++            requestSource: false,
++            location: false,
++            itil_form: true,
+         );
+     }
+ 
+diff --git a/src/Entity.php b/src/Entity.php
+index 9278091b167..77aa082019e 100644
+--- a/src/Entity.php
++++ b/src/Entity.php
+@@ -148,7 +148,7 @@ class Entity extends CommonTreeDropdown
+             'changetemplates_strategy', 'changetemplates_id',
+             'problemtemplates_strategy', 'problemtemplates_id',
+             'suppliers_as_private', 'autopurge_delay', 'anonymize_support_agents', 'display_users_initials',
+-            'contracts_strategy_default', 'contracts_id_default'
++            'contracts_strategy_default', 'contracts_id_default', 'show_tickets_properties_on_helpdesk'
+         ],
+         // Configuration
+         'config' => ['enable_custom_css', 'custom_css_code']
+diff --git a/src/Ticket.php b/src/Ticket.php
+index 9c3e5d79346..1c0388523fa 100644
+--- a/src/Ticket.php
++++ b/src/Ticket.php
+@@ -3755,6 +3755,10 @@ public function showForm($ID, array $options = [])
+             'cancreateuser'             => $cancreateuser,
+             'canreadnote'               => Session::haveRight('entity', READNOTE),
+             'has_pending_reason'        => PendingReason_Item::getForItem($this) !== false,
++            'show_tickets_properties_on_helpdesk' => Entity::getUsedConfig(
++                'show_tickets_properties_on_helpdesk',
++                Session::getActiveEntity(),
++            ),
+         ]);
+ 
+         return true;
+diff --git a/templates/components/itilobject/footer.html.twig b/templates/components/itilobject/footer.html.twig
+index b8ce5de3dd6..e0c5056014a 100644
+--- a/templates/components/itilobject/footer.html.twig
++++ b/templates/components/itilobject/footer.html.twig
+@@ -109,7 +109,7 @@
+             <div class="ms-auto"></div>
+ 
+             {% if item.canDeleteItem() %}
+-               <button class="btn btn-ghost-danger" type="submit" name="delete" form="itil-form">
++               <button class="btn btn-ghost-danger me-2" type="submit" name="delete" form="itil-form">
+                   <i class="ti ti-trash me-1"></i>
+                   <span>{{ __("Cancel ticket") }}</span>
+                </button>
+diff --git a/templates/components/itilobject/layout.html.twig b/templates/components/itilobject/layout.html.twig
+index 08a3c39b922..6ec2d80a244 100644
+--- a/templates/components/itilobject/layout.html.twig
++++ b/templates/components/itilobject/layout.html.twig
+@@ -34,6 +34,7 @@
+ {% set rand = random() %}
+ {% set main_rand = rand %}
+ {% set is_helpdesk = get_current_interface() == 'helpdesk' %}
++{% set show_extra_fields = not is_helpdesk or show_tickets_properties_on_helpdesk %}
+ 
+ {% set itil_layout = user_pref('itil_layout', true) %}
+ {% set is_collapsed = itil_layout['collapsed'] == "true" %}
+@@ -64,14 +65,14 @@
+    <div class="row d-flex flex-column alin-items-stretch itil-object">
+       {% set is_timeline_reversed = user_pref('timeline_order') == constant('CommonITILObject::TIMELINE_ORDER_REVERSE') %}
+       {% set fl_direction = (item.isNewItem() or is_timeline_reversed ? 'flex-column' : 'flex-column-reverse') %}
+-      <div class="itil-left-side col-12 {{ left_side_cls }} order-last order-lg-first pt-2 pe-2 pe-lg-4 d-flex {{ fl_direction }} border-top border-4 {{ is_helpdesk ? "w-100" : "" }}">
++      <div class="itil-left-side col-12 {{ left_side_cls }} order-last order-lg-first pt-2 pe-2 pe-lg-4 d-flex {{ fl_direction }} border-top border-4 {{ not show_extra_fields ? "w-100" : "" }}">
+          {% if item.isNewItem() %}
+             {{ include('components/itilobject/timeline/new_form.html.twig') }}
+          {% else %}
+             {{ include('components/itilobject/timeline/timeline.html.twig') }}
+          {% endif %}
+       </div>
+-      {% if not is_helpdesk %}
++      {% if show_extra_fields %}
+          <div class="itil-right-side col-12 {{ right_side_cls }} mt-0 mt-lg-n1 card-footer p-0 rounded-0">
+             {% if not item.isNewItem() %}
+                {{ include('components/itilobject/mainform_open.html.twig') }}
+diff --git a/templates/pages/admin/entity/assistance.html.twig b/templates/pages/admin/entity/assistance.html.twig
+index 7f7a0316d47..7b7a9398efd 100644
+--- a/templates/pages/admin/entity/assistance.html.twig
++++ b/templates/pages/admin/entity/assistance.html.twig
+@@ -172,4 +172,19 @@
+             });
+         </script>
+     {% endfor %}
++
++    {{ fields.smallTitle(__('Helpdesk')) }}
++    {{ fields.dropdownArrayField(
++        'show_tickets_properties_on_helpdesk',
++        item.fields['show_tickets_properties_on_helpdesk'],
++        inheritable_params.toadd + {
++            0: __('No'),
++            1: __('Yes'),
++        },
++        __('Show tickets properties on helpdesk'),
++        {
++            add_field_html: inheritance_labels['show_tickets_properties_on_helpdesk']|default(null)
++        } + inheritable_params
++    ) }}
++
+ {% endblock %}
+diff --git a/tests/cypress/e2e/entity.cy.js b/tests/cypress/e2e/entity.cy.js
+new file mode 100644
+index 00000000000..5712b570309
+--- /dev/null
++++ b/tests/cypress/e2e/entity.cy.js
+@@ -0,0 +1,57 @@
++/**
++ * ---------------------------------------------------------------------
++ *
++ * GLPI - Gestionnaire Libre de Parc Informatique
++ *
++ * http://glpi-project.org
++ *
++ * @copyright 2015-2025 Teclib' and contributors.
++ * @licence   https://www.gnu.org/licenses/gpl-3.0.html
++ *
++ * ---------------------------------------------------------------------
++ *
++ * LICENSE
++ *
++ * This file is part of GLPI.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ *
++ * ---------------------------------------------------------------------
++ */
++
++let entity_id;
++
++describe('Entity', () => {
++    beforeEach(() => {
++        const unique_id = (new Date()).getTime();
++        cy.createWithAPI("Entity", {
++            name: `Test entity ${unique_id}`,
++        }).then((id) => {
++            entity_id = id;
++            cy.login();
++        });
++    });
++
++    it('Can configure assistance properties', () => {
++        cy.visit(`/front/entity.form.php?id=${entity_id}&forcetab=Entity$5`);
++        cy.getDropdownByLabelText('Show tickets properties on helpdesk')
++            .should('have.text', 'Inheritance of the parent entity')
++            .selectDropdownValue('Yes')
++        ;
++        cy.findByRole('button', {'name': "Save"}).click();
++        cy.getDropdownByLabelText('Show tickets properties on helpdesk')
++            .should('have.text', 'Yes')
++        ;
++    });
++});

@@ -1,0 +1,1158 @@
+diff --git a/apps/backend/src/api/api.module.ts b/apps/backend/src/api/api.module.ts
+index e7f9386e2..4fb94fbf1 100644
+--- a/apps/backend/src/api/api.module.ts
++++ b/apps/backend/src/api/api.module.ts
+@@ -28,6 +28,7 @@ import { RootController } from '@gitroom/backend/api/routes/root.controller';
+ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
+ import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
+ import { Nowpayments } from '@gitroom/nestjs-libraries/crypto/nowpayments';
++import { WebhookController } from '@gitroom/backend/api/routes/webhooks.controller';
+ 
+ const authenticatedController = [
+   UsersController,
+@@ -42,6 +43,7 @@ const authenticatedController = [
+   MessagesController,
+   CopilotController,
+   AgenciesController,
++  WebhookController,
+ ];
+ @Module({
+   imports: [
+diff --git a/apps/backend/src/api/routes/webhooks.controller.ts b/apps/backend/src/api/routes/webhooks.controller.ts
+new file mode 100644
+index 000000000..19a787301
+--- /dev/null
++++ b/apps/backend/src/api/routes/webhooks.controller.ts
+@@ -0,0 +1,50 @@
++import { Body, Controller, Delete, Get, Param, Post, Put } from '@nestjs/common';
++import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
++import { Organization } from '@prisma/client';
++import { ApiTags } from '@nestjs/swagger';
++import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
++import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
++import {
++  AuthorizationActions,
++  Sections,
++} from '@gitroom/backend/services/auth/permissions/permissions.service';
++import {
++  UpdateDto,
++  WebhooksDto,
++} from '@gitroom/nestjs-libraries/dtos/webhooks/webhooks.dto';
++
++@ApiTags('Webhooks')
++@Controller('/webhooks')
++export class WebhookController {
++  constructor(private _webhooksService: WebhooksService) {}
++
++  @Get('/')
++  async getStatistics(@GetOrgFromRequest() org: Organization) {
++    return this._webhooksService.getWebhooks(org.id);
++  }
++
++  @Post('/')
++  @CheckPolicies([AuthorizationActions.Create, Sections.WEBHOOKS])
++  async createAWebhook(
++    @GetOrgFromRequest() org: Organization,
++    @Body() body: WebhooksDto
++  ) {
++    return this._webhooksService.createWebhook(org.id, body);
++  }
++
++  @Put('/')
++  async updateWebhook(
++    @GetOrgFromRequest() org: Organization,
++    @Body() body: UpdateDto
++  ) {
++    return this._webhooksService.createWebhook(org.id, body);
++  }
++
++  @Delete('/:id')
++  async deleteWebhook(
++    @GetOrgFromRequest() org: Organization,
++    @Param('id') id: string
++  ) {
++    return this._webhooksService.deleteWebhook(org.id, id);
++  }
++}
+diff --git a/apps/backend/src/services/auth/permissions/permissions.service.ts b/apps/backend/src/services/auth/permissions/permissions.service.ts
+index 7538dc9eb..8c4f87f3a 100644
+--- a/apps/backend/src/services/auth/permissions/permissions.service.ts
++++ b/apps/backend/src/services/auth/permissions/permissions.service.ts
+@@ -5,6 +5,7 @@ import { SubscriptionService } from '@gitroom/nestjs-libraries/database/prisma/s
+ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+ import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
+ import dayjs from 'dayjs';
++import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
+ 
+ export enum Sections {
+   CHANNEL = 'channel',
+@@ -15,6 +16,7 @@ export enum Sections {
+   AI = 'ai',
+   IMPORT_FROM_CHANNELS = 'import_from_channels',
+   ADMIN = 'admin',
++  WEBHOOKS = 'webhooks',
+ }
+ 
+ export enum AuthorizationActions {
+@@ -31,7 +33,8 @@ export class PermissionsService {
+   constructor(
+     private _subscriptionService: SubscriptionService,
+     private _postsService: PostsService,
+-    private _integrationService: IntegrationService
++    private _integrationService: IntegrationService,
++    private _webhooksService: WebhooksService,
+   ) {}
+   async getPackageOptions(orgId: string) {
+     const subscription =
+@@ -93,6 +96,14 @@ export class PermissionsService {
+         }
+       }
+ 
++      if (section === Sections.WEBHOOKS) {
++        const totalWebhooks = await this._webhooksService.getTotal(orgId);
++        if (totalWebhooks < options.webhooks) {
++          can(AuthorizationActions.Create, section);
++          continue;
++        }
++      }
++
+       // check for posts per month
+       if (section === Sections.POSTS_PER_MONTH) {
+         const createdAt =
+diff --git a/apps/backend/src/services/auth/permissions/subscription.exception.ts b/apps/backend/src/services/auth/permissions/subscription.exception.ts
+index 09b6cc062..3088674bc 100644
+--- a/apps/backend/src/services/auth/permissions/subscription.exception.ts
++++ b/apps/backend/src/services/auth/permissions/subscription.exception.ts
+@@ -1,11 +1,17 @@
+-import {ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus} from "@nestjs/common";
+-import {AuthorizationActions, Sections} from "@gitroom/backend/services/auth/permissions/permissions.service";
++import {
++  ArgumentsHost,
++  Catch,
++  ExceptionFilter,
++  HttpException,
++  HttpStatus,
++} from '@nestjs/common';
++import {
++  AuthorizationActions,
++  Sections,
++} from '@gitroom/backend/services/auth/permissions/permissions.service';
+ 
+ export class SubscriptionException extends HttpException {
+-  constructor(message: {
+-    section: Sections,
+-    action: AuthorizationActions
+-  }) {
++  constructor(message: { section: Sections; action: AuthorizationActions }) {
+     super(message, HttpStatus.PAYMENT_REQUIRED);
+   }
+ }
+@@ -16,19 +22,23 @@ export class SubscriptionExceptionFilter implements ExceptionFilter {
+     const ctx = host.switchToHttp();
+     const response = ctx.getResponse();
+     const status = exception.getStatus();
+-    const error: {section: Sections, action: AuthorizationActions} = exception.getResponse() as any;
++    const error: { section: Sections; action: AuthorizationActions } =
++      exception.getResponse() as any;
+ 
+     const message = getErrorMessage(error);
+ 
+     response.status(status).json({
+-        statusCode: status,
+-        message,
+-        url: process.env.FRONTEND_URL + '/billing',
++      statusCode: status,
++      message,
++      url: process.env.FRONTEND_URL + '/billing',
+     });
+   }
+ }
+ 
+-const getErrorMessage = (error: {section: Sections, action: AuthorizationActions}) => {
++const getErrorMessage = (error: {
++  section: Sections;
++  action: AuthorizationActions;
++}) => {
+   switch (error.section) {
+     case Sections.POSTS_PER_MONTH:
+       switch (error.action) {
+@@ -40,5 +50,10 @@ const getErrorMessage = (error: {section: Sections, action: AuthorizationActions
+         default:
+           return 'You have reached the maximum number of channels for your subscription. Please upgrade your subscription to add more channels.';
+       }
++    case Sections.WEBHOOKS:
++      switch (error.action) {
++        default:
++          return 'You have reached the maximum number of webhooks for your subscription. Please upgrade your subscription to add more webhooks.';
++      }
+   }
+-}
++};
+diff --git a/apps/frontend/src/app/(site)/settings/page.tsx b/apps/frontend/src/app/(site)/settings/page.tsx
+index ba9acb8e0..84b16a2c5 100644
+--- a/apps/frontend/src/app/(site)/settings/page.tsx
++++ b/apps/frontend/src/app/(site)/settings/page.tsx
+@@ -1,9 +1,7 @@
++import { SettingsPopup } from '@gitroom/frontend/components/layout/settings.component';
++
+ export const dynamic = 'force-dynamic';
+ 
+-import { SettingsComponent } from '@gitroom/frontend/components/settings/settings.component';
+-import { internalFetch } from '@gitroom/helpers/utils/internal.fetch';
+-import { redirect } from 'next/navigation';
+-import { RedirectType } from 'next/dist/client/components/redirect';
+ import { Metadata } from 'next';
+ import { isGeneralServerSide } from '@gitroom/helpers/utils/is.general.server.side';
+ 
+@@ -16,14 +14,5 @@ export default async function Index({
+ }: {
+   searchParams: { code: string };
+ }) {
+-  if (searchParams.code) {
+-    await internalFetch('/settings/github', {
+-      method: 'POST',
+-      body: JSON.stringify({ code: searchParams.code }),
+-    });
+-
+-    return redirect('/settings', RedirectType.replace);
+-  }
+-
+-  return <SettingsComponent />;
++  return <SettingsPopup />;
+ }
+diff --git a/apps/frontend/src/components/launches/menu/menu.tsx b/apps/frontend/src/components/launches/menu/menu.tsx
+index 2b287e5cd..6398e10db 100644
+--- a/apps/frontend/src/components/launches/menu/menu.tsx
++++ b/apps/frontend/src/components/launches/menu/menu.tsx
+@@ -17,7 +17,6 @@ import { BotPicture } from '@gitroom/frontend/components/launches/bot.picture';
+ import { CustomerModal } from '@gitroom/frontend/components/launches/customer.modal';
+ import { Integration } from '@prisma/client';
+ import { SettingsModal } from '@gitroom/frontend/components/launches/settings.modal';
+-import { string } from 'yup';
+ import { CustomVariables } from '@gitroom/frontend/components/launches/add.provider.component';
+ import { useRouter } from 'next/navigation';
+ 
+diff --git a/apps/frontend/src/components/layout/impersonate.tsx b/apps/frontend/src/components/layout/impersonate.tsx
+index d6ae692ba..2e94f20cc 100644
+--- a/apps/frontend/src/components/layout/impersonate.tsx
++++ b/apps/frontend/src/components/layout/impersonate.tsx
+@@ -114,7 +114,7 @@ export const Impersonate = () => {
+   }, [data]);
+ 
+   return (
+-    <div className="md:px-[23px]">
++    <div>
+       <div className="bg-forth h-[52px] flex justify-center items-center border-input border rounded-[8px]">
+         <div className="relative flex flex-col w-[600px]">
+           <div className="relative z-[999]">
+diff --git a/apps/frontend/src/components/layout/settings.component.tsx b/apps/frontend/src/components/layout/settings.component.tsx
+index 6eeddc5dd..8a6edf980 100644
+--- a/apps/frontend/src/components/layout/settings.component.tsx
++++ b/apps/frontend/src/components/layout/settings.component.tsx
+@@ -19,9 +19,11 @@ import { LogoutComponent } from '@gitroom/frontend/components/layout/logout.comp
+ import { useSearchParams } from 'next/navigation';
+ import { useVariables } from '@gitroom/react/helpers/variable.context';
+ import { PublicComponent } from '@gitroom/frontend/components/public-api/public.component';
++import Link from 'next/link';
++import { Webhooks } from '@gitroom/frontend/components/webhooks/webhooks';
+ 
+ export const SettingsPopup: FC<{ getRef?: Ref<any> }> = (props) => {
+-  const {isGeneral} = useVariables();
++  const { isGeneral } = useVariables();
+   const { getRef } = props;
+   const fetch = useFetch();
+   const toast = useToaster();
+@@ -39,7 +41,7 @@ export const SettingsPopup: FC<{ getRef?: Ref<any> }> = (props) => {
+   }, []);
+ 
+   const url = useSearchParams();
+-  const showLogout = !url.get('onboarding') || user?.tier?.current === "FREE";
++  const showLogout = !url.get('onboarding') || user?.tier?.current === 'FREE';
+ 
+   const loadProfile = useCallback(async () => {
+     const personal = await (await fetch('/user/personal')).json();
+@@ -85,8 +87,8 @@ export const SettingsPopup: FC<{ getRef?: Ref<any> }> = (props) => {
+         )}
+         <div
+           className={clsx(
+-            'w-full max-w-[920px] mx-auto bg-sixth gap-[24px] flex flex-col relative',
+-            !getRef && 'p-[32px] rounded-[4px] border border-customColor6'
++            'w-full mx-auto gap-[24px] flex flex-col relative',
++            !getRef && 'rounded-[4px]'
+           )}
+         >
+           {/*{!getRef && (*/}
+@@ -196,7 +198,10 @@ export const SettingsPopup: FC<{ getRef?: Ref<any> }> = (props) => {
+           {/*  </div>*/}
+           {/*)}*/}
+           {!!user?.tier?.team_members && isGeneral && <TeamsComponent />}
+-          {!!user?.tier?.public_api && isGeneral && showLogout && <PublicComponent />}
++          {!!user?.tier?.webhooks && <Webhooks />}
++          {!!user?.tier?.public_api && isGeneral && showLogout && (
++            <PublicComponent />
++          )}
+           {showLogout && <LogoutComponent />}
+         </div>
+       </form>
+@@ -205,32 +210,21 @@ export const SettingsPopup: FC<{ getRef?: Ref<any> }> = (props) => {
+ };
+ 
+ export const SettingsComponent = () => {
+-  const settings = useModals();
+-  const openModal = useCallback(() => {
+-    settings.openModal({
+-      children: <SettingsPopup />,
+-      classNames: {
+-        modal: 'bg-transparent text-textColor',
+-      },
+-      withCloseButton: false,
+-      size: '100%',
+-    });
+-  }, []);
+-
+   return (
+-    <svg
+-      width="40"
+-      height="40"
+-      viewBox="0 0 40 40"
+-      fill="none"
+-      xmlns="http://www.w3.org/2000/svg"
+-      className="cursor-pointer relative z-[200]"
+-      onClick={openModal}
+-    >
+-      <path
+-        d="M19.9987 15.5C19.1087 15.5 18.2387 15.7639 17.4986 16.2584C16.7586 16.7528 16.1818 17.4556 15.8413 18.2779C15.5007 19.1002 15.4115 20.005 15.5852 20.8779C15.7588 21.7508 16.1874 22.5526 16.8167 23.182C17.4461 23.8113 18.2479 24.2399 19.1208 24.4135C19.9937 24.5871 20.8985 24.498 21.7208 24.1574C22.5431 23.8168 23.2459 23.2401 23.7403 22.5C24.2348 21.76 24.4987 20.89 24.4987 20C24.4975 18.8069 24.023 17.663 23.1793 16.8194C22.3357 15.9757 21.1918 15.5012 19.9987 15.5ZM19.9987 23C19.4054 23 18.8254 22.824 18.332 22.4944C17.8387 22.1647 17.4541 21.6962 17.2271 21.148C17 20.5999 16.9406 19.9967 17.0564 19.4147C17.1721 18.8328 17.4578 18.2982 17.8774 17.8787C18.297 17.4591 18.8315 17.1734 19.4134 17.0576C19.9954 16.9419 20.5986 17.0013 21.1468 17.2283C21.6949 17.4554 22.1635 17.8399 22.4931 18.3333C22.8228 18.8266 22.9987 19.4066 22.9987 20C22.9987 20.7956 22.6826 21.5587 22.12 22.1213C21.5574 22.6839 20.7944 23 19.9987 23ZM30.3056 18.0509C30.2847 17.9453 30.2413 17.8454 30.1784 17.7581C30.1155 17.6707 30.0345 17.5979 29.9409 17.5447L27.1443 15.9509L27.1331 12.799C27.1327 12.6905 27.1089 12.5833 27.063 12.4849C27.0172 12.3865 26.9506 12.2992 26.8678 12.229C25.8533 11.3709 24.6851 10.7134 23.4253 10.2912C23.3261 10.2577 23.2209 10.2452 23.1166 10.2547C23.0123 10.2643 22.9111 10.2955 22.8197 10.3465L19.9987 11.9234L17.175 10.3437C17.0834 10.2924 16.9821 10.2609 16.8776 10.2513C16.7732 10.2416 16.6678 10.2539 16.5684 10.2875C15.3095 10.7127 14.1426 11.3728 13.1297 12.2328C13.0469 12.3028 12.9804 12.39 12.9346 12.4882C12.8888 12.5865 12.8648 12.6935 12.8643 12.8019L12.8503 15.9565L10.0537 17.5503C9.96015 17.6036 9.87916 17.6763 9.81623 17.7637C9.7533 17.8511 9.70992 17.9509 9.68903 18.0565C9.43309 19.3427 9.43309 20.6667 9.68903 21.9528C9.70992 22.0584 9.7533 22.1583 9.81623 22.2456C9.87916 22.333 9.96015 22.4058 10.0537 22.459L12.8503 24.0528L12.8615 27.2047C12.8619 27.3132 12.8858 27.4204 12.9316 27.5188C12.9774 27.6172 13.044 27.7045 13.1268 27.7747C14.1413 28.6328 15.3095 29.2904 16.5693 29.7125C16.6686 29.7461 16.7737 29.7585 16.878 29.749C16.9823 29.7394 17.0835 29.7082 17.175 29.6572L19.9987 28.0765L22.8225 29.6562C22.9342 29.7185 23.0602 29.7508 23.1881 29.75C23.27 29.75 23.3514 29.7367 23.429 29.7106C24.6878 29.286 25.8547 28.6265 26.8678 27.7672C26.9505 27.6971 27.017 27.61 27.0628 27.5117C27.1087 27.4135 27.1326 27.3065 27.1331 27.1981L27.1472 24.0434L29.9437 22.4497C30.0373 22.3964 30.1183 22.3236 30.1812 22.2363C30.2441 22.1489 30.2875 22.049 30.3084 21.9434C30.5629 20.6583 30.562 19.3357 30.3056 18.0509ZM28.8993 21.3237L26.2209 22.8472C26.1035 22.9139 26.0064 23.0111 25.9397 23.1284C25.8853 23.2222 25.8281 23.3215 25.77 23.4153C25.6956 23.5335 25.6559 23.6703 25.6556 23.81L25.6415 26.8334C24.9216 27.3988 24.1195 27.8509 23.2631 28.174L20.5612 26.6684C20.449 26.6064 20.3228 26.5741 20.1947 26.5747H20.1768C20.0634 26.5747 19.949 26.5747 19.8356 26.5747C19.7014 26.5713 19.5688 26.6037 19.4512 26.6684L16.7475 28.1778C15.8892 27.8571 15.0849 27.4072 14.3625 26.8437L14.3522 23.825C14.3517 23.685 14.3121 23.548 14.2378 23.4294C14.1797 23.3356 14.1225 23.2419 14.069 23.1425C14.0028 23.0233 13.9056 22.9242 13.7878 22.8556L11.1065 21.3284C10.9678 20.4507 10.9678 19.5567 11.1065 18.679L13.7803 17.1528C13.8976 17.0861 13.9948 16.9889 14.0615 16.8715C14.1159 16.7778 14.1731 16.6784 14.2312 16.5847C14.3056 16.4664 14.3453 16.3297 14.3456 16.19L14.3597 13.1665C15.0796 12.6012 15.8816 12.1491 16.7381 11.8259L19.4362 13.3315C19.5536 13.3966 19.6864 13.429 19.8206 13.4253C19.934 13.4253 20.0484 13.4253 20.1618 13.4253C20.296 13.4286 20.4287 13.3963 20.5462 13.3315L23.25 11.8222C24.1082 12.1429 24.9125 12.5927 25.635 13.1562L25.6453 16.175C25.6457 16.3149 25.6854 16.452 25.7597 16.5706C25.8178 16.6644 25.875 16.7581 25.9284 16.8575C25.9947 16.9767 26.0918 17.0758 26.2097 17.1444L28.8909 18.6715C29.0315 19.5499 29.0331 20.4449 28.8956 21.3237H28.8993Z"
+-        fill="currentColor"
+-      />
+-    </svg>
++    <Link href="/settings">
++      <svg
++        width="40"
++        height="40"
++        viewBox="0 0 40 40"
++        fill="none"
++        xmlns="http://www.w3.org/2000/svg"
++        className="cursor-pointer relative z-[200]"
++      >
++        <path
++          d="M19.9987 15.5C19.1087 15.5 18.2387 15.7639 17.4986 16.2584C16.7586 16.7528 16.1818 17.4556 15.8413 18.2779C15.5007 19.1002 15.4115 20.005 15.5852 20.8779C15.7588 21.7508 16.1874 22.5526 16.8167 23.182C17.4461 23.8113 18.2479 24.2399 19.1208 24.4135C19.9937 24.5871 20.8985 24.498 21.7208 24.1574C22.5431 23.8168 23.2459 23.2401 23.7403 22.5C24.2348 21.76 24.4987 20.89 24.4987 20C24.4975 18.8069 24.023 17.663 23.1793 16.8194C22.3357 15.9757 21.1918 15.5012 19.9987 15.5ZM19.9987 23C19.4054 23 18.8254 22.824 18.332 22.4944C17.8387 22.1647 17.4541 21.6962 17.2271 21.148C17 20.5999 16.9406 19.9967 17.0564 19.4147C17.1721 18.8328 17.4578 18.2982 17.8774 17.8787C18.297 17.4591 18.8315 17.1734 19.4134 17.0576C19.9954 16.9419 20.5986 17.0013 21.1468 17.2283C21.6949 17.4554 22.1635 17.8399 22.4931 18.3333C22.8228 18.8266 22.9987 19.4066 22.9987 20C22.9987 20.7956 22.6826 21.5587 22.12 22.1213C21.5574 22.6839 20.7944 23 19.9987 23ZM30.3056 18.0509C30.2847 17.9453 30.2413 17.8454 30.1784 17.7581C30.1155 17.6707 30.0345 17.5979 29.9409 17.5447L27.1443 15.9509L27.1331 12.799C27.1327 12.6905 27.1089 12.5833 27.063 12.4849C27.0172 12.3865 26.9506 12.2992 26.8678 12.229C25.8533 11.3709 24.6851 10.7134 23.4253 10.2912C23.3261 10.2577 23.2209 10.2452 23.1166 10.2547C23.0123 10.2643 22.9111 10.2955 22.8197 10.3465L19.9987 11.9234L17.175 10.3437C17.0834 10.2924 16.9821 10.2609 16.8776 10.2513C16.7732 10.2416 16.6678 10.2539 16.5684 10.2875C15.3095 10.7127 14.1426 11.3728 13.1297 12.2328C13.0469 12.3028 12.9804 12.39 12.9346 12.4882C12.8888 12.5865 12.8648 12.6935 12.8643 12.8019L12.8503 15.9565L10.0537 17.5503C9.96015 17.6036 9.87916 17.6763 9.81623 17.7637C9.7533 17.8511 9.70992 17.9509 9.68903 18.0565C9.43309 19.3427 9.43309 20.6667 9.68903 21.9528C9.70992 22.0584 9.7533 22.1583 9.81623 22.2456C9.87916 22.333 9.96015 22.4058 10.0537 22.459L12.8503 24.0528L12.8615 27.2047C12.8619 27.3132 12.8858 27.4204 12.9316 27.5188C12.9774 27.6172 13.044 27.7045 13.1268 27.7747C14.1413 28.6328 15.3095 29.2904 16.5693 29.7125C16.6686 29.7461 16.7737 29.7585 16.878 29.749C16.9823 29.7394 17.0835 29.7082 17.175 29.6572L19.9987 28.0765L22.8225 29.6562C22.9342 29.7185 23.0602 29.7508 23.1881 29.75C23.27 29.75 23.3514 29.7367 23.429 29.7106C24.6878 29.286 25.8547 28.6265 26.8678 27.7672C26.9505 27.6971 27.017 27.61 27.0628 27.5117C27.1087 27.4135 27.1326 27.3065 27.1331 27.1981L27.1472 24.0434L29.9437 22.4497C30.0373 22.3964 30.1183 22.3236 30.1812 22.2363C30.2441 22.1489 30.2875 22.049 30.3084 21.9434C30.5629 20.6583 30.562 19.3357 30.3056 18.0509ZM28.8993 21.3237L26.2209 22.8472C26.1035 22.9139 26.0064 23.0111 25.9397 23.1284C25.8853 23.2222 25.8281 23.3215 25.77 23.4153C25.6956 23.5335 25.6559 23.6703 25.6556 23.81L25.6415 26.8334C24.9216 27.3988 24.1195 27.8509 23.2631 28.174L20.5612 26.6684C20.449 26.6064 20.3228 26.5741 20.1947 26.5747H20.1768C20.0634 26.5747 19.949 26.5747 19.8356 26.5747C19.7014 26.5713 19.5688 26.6037 19.4512 26.6684L16.7475 28.1778C15.8892 27.8571 15.0849 27.4072 14.3625 26.8437L14.3522 23.825C14.3517 23.685 14.3121 23.548 14.2378 23.4294C14.1797 23.3356 14.1225 23.2419 14.069 23.1425C14.0028 23.0233 13.9056 22.9242 13.7878 22.8556L11.1065 21.3284C10.9678 20.4507 10.9678 19.5567 11.1065 18.679L13.7803 17.1528C13.8976 17.0861 13.9948 16.9889 14.0615 16.8715C14.1159 16.7778 14.1731 16.6784 14.2312 16.5847C14.3056 16.4664 14.3453 16.3297 14.3456 16.19L14.3597 13.1665C15.0796 12.6012 15.8816 12.1491 16.7381 11.8259L19.4362 13.3315C19.5536 13.3966 19.6864 13.429 19.8206 13.4253C19.934 13.4253 20.0484 13.4253 20.1618 13.4253C20.296 13.4286 20.4287 13.3963 20.5462 13.3315L23.25 11.8222C24.1082 12.1429 24.9125 12.5927 25.635 13.1562L25.6453 16.175C25.6457 16.3149 25.6854 16.452 25.7597 16.5706C25.8178 16.6644 25.875 16.7581 25.9284 16.8575C25.9947 16.9767 26.0918 17.0758 26.2097 17.1444L28.8909 18.6715C29.0315 19.5499 29.0331 20.4449 28.8956 21.3237H28.8993Z"
++          fill="currentColor"
++        />
++      </svg>
++    </Link>
+   );
+ };
+diff --git a/apps/frontend/src/components/layout/top.menu.tsx b/apps/frontend/src/components/layout/top.menu.tsx
+index c84ba34ea..f4bc2f373 100644
+--- a/apps/frontend/src/components/layout/top.menu.tsx
++++ b/apps/frontend/src/components/layout/top.menu.tsx
+@@ -55,6 +55,13 @@ export const useMenuItems = () => {
+       role: ['ADMIN', 'SUPERADMIN'],
+       requireBilling: true,
+     },
++    {
++      name: 'Settings',
++      icon: 'settings',
++      path: '/settings',
++      role: ['ADMIN', 'SUPERADMIN'],
++      hide: true,
++    },
+     {
+       name: 'Affiliate',
+       icon: 'affiliate',
+@@ -76,6 +83,9 @@ export const TopMenu: FC = () => {
+       <ul className="gap-0 md:gap-5 flex flex-1 items-center text-[18px]">
+         {menuItems
+           .filter((f) => {
++            if (f.hide) {
++              return false;
++            }
+             if (f.requireBilling && !billingEnabled) {
+               return false;
+             }
+@@ -97,6 +107,9 @@ export const TopMenu: FC = () => {
+                   'flex gap-2 items-center box px-[6px] md:px-[24px] py-[8px]',
+                   menuItems
+                     .filter((f) => {
++                      if (f.hide) {
++                        return false;
++                      }
+                       if (f.role) {
+                         return f.role.includes(user?.role!);
+                       }
+diff --git a/apps/frontend/src/components/public-api/public.component.tsx b/apps/frontend/src/components/public-api/public.component.tsx
+index 1f211c3ab..93c7038cf 100644
+--- a/apps/frontend/src/components/public-api/public.component.tsx
++++ b/apps/frontend/src/components/public-api/public.component.tsx
+@@ -22,7 +22,7 @@ export const PublicComponent = () => {
+ 
+   return (
+     <div className="flex flex-col">
+-      <h2 className="text-[24px]">Public API</h2>
++      <h3 className="text-[20px]">Public API</h3>
+       <div className="text-customColor18 mt-[4px]">
+         Use Postiz API to integrate with your tools.
+         <br />
+diff --git a/apps/frontend/src/components/settings/teams.component.tsx b/apps/frontend/src/components/settings/teams.component.tsx
+index 5ff001581..b834a431f 100644
+--- a/apps/frontend/src/components/settings/teams.component.tsx
++++ b/apps/frontend/src/components/settings/teams.component.tsx
+@@ -186,8 +186,7 @@ export const TeamsComponent = () => {
+ 
+   return (
+     <div className="flex flex-col">
+-      <h2 className="text-[24px] mb-[24px]">Team Members</h2>
+-      <h3 className="text-[20px]">Account Managers</h3>
++      <h3 className="text-[20px]">Team Members</h3>
+       <div className="text-customColor18 mt-[4px]">
+         Invite your assistant or team member to manage your account
+       </div>
+@@ -238,7 +237,7 @@ export const TeamsComponent = () => {
+           ))}
+         </div>
+         <div>
+-          <Button className="rounded-[4px]" onClick={addMember}>
++          <Button onClick={addMember}>
+             Add another member
+           </Button>
+         </div>
+diff --git a/apps/frontend/src/components/webhooks/webhooks.tsx b/apps/frontend/src/components/webhooks/webhooks.tsx
+new file mode 100644
+index 000000000..6d964d99a
+--- /dev/null
++++ b/apps/frontend/src/components/webhooks/webhooks.tsx
+@@ -0,0 +1,245 @@
++import React, { FC, Fragment, useCallback, useMemo, useState } from 'react';
++import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
++import useSWR from 'swr';
++import { useUser } from '@gitroom/frontend/components/layout/user.context';
++import { Button } from '@gitroom/react/form/button';
++import { useModals } from '@mantine/modals';
++import { TopTitle } from '@gitroom/frontend/components/launches/helpers/top.title.component';
++import { Input } from '@gitroom/react/form/input';
++import { FormProvider, useForm } from 'react-hook-form';
++import { array, object, string } from 'yup';
++import { yupResolver } from '@hookform/resolvers/yup';
++import { Select } from '@gitroom/react/form/select';
++import { PickPlatforms } from '@gitroom/frontend/components/launches/helpers/pick.platform.component';
++import { useToaster } from '@gitroom/react/toaster/toaster';
++import clsx from 'clsx';
++import { deleteDialog } from '@gitroom/react/helpers/delete.dialog';
++
++export const Webhooks: FC = () => {
++  const fetch = useFetch();
++  const user = useUser();
++  const modal = useModals();
++  const toaster = useToaster();
++
++  const list = useCallback(async () => {
++    return (await fetch('/webhooks')).json();
++  }, []);
++
++  const { data, mutate } = useSWR('webhooks', list);
++
++  const addWebhook = useCallback(
++    (data?: any) => () => {
++      modal.openModal({
++        title: '',
++        withCloseButton: false,
++        classNames: {
++          modal: 'bg-transparent text-textColor',
++        },
++        children: <AddOrEditWebhook data={data} reload={mutate} />,
++      });
++    },
++    []
++  );
++
++  const deleteHook = useCallback(
++    (data: any) => async () => {
++      if (await deleteDialog(`Are you sure you want to delete ${data.name}?`)) {
++        await fetch(`/webhooks/${data.id}`, { method: 'DELETE' });
++        mutate();
++        toaster.show('Webhook deleted successfully', 'success');
++      }
++    },
++    []
++  );
++
++  return (
++    <div className="flex flex-col">
++      <h3 className="text-[20px]">
++        Webhooks ({data?.length || 0}/{user?.tier?.webhooks})
++      </h3>
++      <div className="text-customColor18 mt-[4px]">
++        Webhooks are a way to get notified when something happens in Postiz via
++        an HTTP request.
++      </div>
++      <div className="my-[16px] mt-[16px] bg-sixth border-fifth items-center border rounded-[4px] p-[24px] flex gap-[24px]">
++        <div className="flex flex-col w-full">
++          {!!data?.length && (
++            <div className="grid grid-cols-[1fr,1fr,1fr,1fr] w-full gap-y-[10px]">
++              <div>Name</div>
++              <div>URL</div>
++              <div>Edit</div>
++              <div>Delete</div>
++              {data?.map((p: any) => (
++                <Fragment key={p.id}>
++                  <div className="flex flex-col justify-center">{p.name}</div>
++                  <div className="flex flex-col justify-center">{p.url}</div>
++                  <div className="flex flex-col justify-center">
++                    <div>
++                      <Button onClick={addWebhook(p)}>Edit</Button>
++                    </div>
++                  </div>
++                  <div className="flex flex-col justify-center">
++                    <div>
++                      <Button onClick={deleteHook(p)}>Delete</Button>
++                    </div>
++                  </div>
++                </Fragment>
++              ))}
++            </div>
++          )}
++          <div>
++            <Button
++              onClick={addWebhook()}
++              className={clsx((data?.length || 0) > 0 && 'my-[16px]')}
++            >
++              Add a webhook
++            </Button>
++          </div>
++        </div>
++      </div>
++    </div>
++  );
++};
++
++const details = object().shape({
++  name: string().required(),
++  url: string().url().required(),
++  integrations: array(),
++});
++
++const options = [
++  { label: 'All integrations', value: 'all' },
++  { label: 'Specific integrations', value: 'specific' },
++];
++
++export const AddOrEditWebhook: FC<{ data?: any; reload: () => void }> = (
++  props
++) => {
++  const { data, reload } = props;
++  const fetch = useFetch();
++  const [allIntegrations, setAllIntegrations] = useState(
++    (data?.integrations?.length || 0) > 0 ? options[1] : options[0]
++  );
++  const modal = useModals();
++  const toast = useToaster();
++  const form = useForm({
++    resolver: yupResolver(details),
++    values: {
++      name: data?.name || '',
++      url: data?.url || '',
++      integrations: data?.integrations?.map((p: any) => p.integration) || [],
++    },
++  });
++
++  const integrations = form.watch('integrations');
++
++  const integration = useCallback(async () => {
++    return (await fetch('/integrations/list')).json();
++  }, []);
++
++  const changeIntegration = useCallback(
++    (e: React.ChangeEvent<HTMLSelectElement>) => {
++      const findValue = options.find(
++        (option) => option.value === e.target.value
++      )!;
++      setAllIntegrations(findValue);
++      if (findValue.value === 'all') {
++        form.setValue('integrations', []);
++      }
++    },
++    []
++  );
++
++  const { data: dataList, isLoading } = useSWR('integrations', integration);
++
++  const callBack = useCallback(
++    async (values: any) => {
++      await fetch('/webhooks', {
++        method: data?.id ? 'PUT' : 'POST',
++        body: JSON.stringify({
++          ...(data?.id ? { id: data.id } : {}),
++          ...values,
++        }),
++      });
++
++      toast.show(
++        data?.id
++          ? 'Webhook updated successfully'
++          : 'Webhook added successfully',
++        'success'
++      );
++
++      modal.closeAll();
++      reload();
++    },
++    [data, integrations]
++  );
++
++  return (
++    <FormProvider {...form}>
++      <form onSubmit={form.handleSubmit(callBack)}>
++        <div className="relative flex gap-[20px] flex-col flex-1 rounded-[4px] border border-customColor6 bg-sixth p-[16px] pt-0 w-[500px]">
++          <TopTitle title={data ? 'Edit webhook' : 'Add webhook'} />
++          <button
++            className="outline-none absolute right-[20px] top-[15px] mantine-UnstyledButton-root mantine-ActionIcon-root hover:bg-tableBorder cursor-pointer mantine-Modal-close mantine-1dcetaa"
++            type="button"
++            onClick={modal.closeAll}
++          >
++            <svg
++              viewBox="0 0 15 15"
++              fill="none"
++              xmlns="http://www.w3.org/2000/svg"
++              width="16"
++              height="16"
++            >
++              <path
++                d="M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z"
++                fill="currentColor"
++                fillRule="evenodd"
++                clipRule="evenodd"
++              ></path>
++            </svg>
++          </button>
++
++          <div>
++            <Input label="Name" {...form.register('name')} />
++            <Input label="URL" {...form.register('url')} />
++            <Select
++              value={allIntegrations.value}
++              name="integrations"
++              label="Integrations"
++              disableForm={true}
++              onChange={changeIntegration}
++            >
++              {options.map((option) => (
++                <option key={option.value} value={option.value}>
++                  {option.label}
++                </option>
++              ))}
++            </Select>
++            {allIntegrations.value === 'specific' && dataList && !isLoading && (
++              <PickPlatforms
++                integrations={dataList.integrations}
++                selectedIntegrations={integrations as any[]}
++                onChange={(e) => form.setValue('integrations', e)}
++                singleSelect={false}
++                toolTip={true}
++                isMain={true}
++              />
++            )}
++            <Button
++              type="submit"
++              className="mt-[24px]"
++              disabled={
++                !form.formState.isValid ||
++                (allIntegrations.value === 'specific' && !integrations?.length)
++              }
++            >
++              Save
++            </Button>
++          </div>
++        </div>
++      </form>
++    </FormProvider>
++  );
++};
+diff --git a/apps/workers/src/app/posts.controller.ts b/apps/workers/src/app/posts.controller.ts
+index f644dc32c..90ef07b03 100644
+--- a/apps/workers/src/app/posts.controller.ts
++++ b/apps/workers/src/app/posts.controller.ts
+@@ -1,10 +1,15 @@
+ import { Controller } from '@nestjs/common';
+ import { EventPattern, Transport } from '@nestjs/microservices';
+ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
++import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
+ 
+ @Controller()
+ export class PostsController {
+-  constructor(private _postsService: PostsService) {}
++  constructor(
++    private _postsService: PostsService,
++    private _webhooksService: WebhooksService
++  ) {}
++
+   @EventPattern('post', Transport.REDIS)
+   async post(data: { id: string }) {
+     console.log('processing', data);
+@@ -17,7 +22,19 @@ export class PostsController {
+   }
+ 
+   @EventPattern('sendDigestEmail', Transport.REDIS)
+-  async sendDigestEmail(data: { subject: string, org: string; since: string }) {
+-    return this._postsService.sendDigestEmail(data.subject, data.org, data.since);
++  async sendDigestEmail(data: { subject: string; org: string; since: string }) {
++    return this._postsService.sendDigestEmail(
++      data.subject,
++      data.org,
++      data.since
++    );
++  }
++
++  @EventPattern('webhooks', Transport.REDIS)
++  async webhooks(data: { org: string; since: string }) {
++    return this._webhooksService.fireWebhooks(
++      data.org,
++      data.since
++    );
+   }
+ }
+diff --git a/libraries/nestjs-libraries/src/database/prisma/database.module.ts b/libraries/nestjs-libraries/src/database/prisma/database.module.ts
+index 9345983e9..610eb7dbc 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/database.module.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/database.module.ts
+@@ -29,6 +29,8 @@ import { AgenciesService } from '@gitroom/nestjs-libraries/database/prisma/agenc
+ import { AgenciesRepository } from '@gitroom/nestjs-libraries/database/prisma/agencies/agencies.repository';
+ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
+ import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
++import { WebhooksRepository } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.repository';
++import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
+ 
+ @Global()
+ @Module({
+@@ -47,6 +49,8 @@ import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.
+     SubscriptionRepository,
+     NotificationService,
+     NotificationsRepository,
++    WebhooksRepository,
++    WebhooksService,
+     IntegrationService,
+     IntegrationRepository,
+     PostsService,
+diff --git a/libraries/nestjs-libraries/src/database/prisma/posts/posts.repository.ts b/libraries/nestjs-libraries/src/database/prisma/posts/posts.repository.ts
+index 3b0d25ed7..825deb8e9 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/posts/posts.repository.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/posts/posts.repository.ts
+@@ -515,4 +515,33 @@ export class PostsRepository {
+       },
+     });
+   }
++
++  async getPostsSince(orgId: string, since: string) {
++    return this._post.model.post.findMany({
++      where: {
++        organizationId: orgId,
++        publishDate: {
++          gte: new Date(since),
++        },
++        deletedAt: null,
++        parentPostId: null,
++      },
++      select: {
++        id: true,
++        content: true,
++        publishDate: true,
++        releaseURL: true,
++        state: true,
++        integration: {
++          select: {
++            id: true,
++            name: true,
++            providerIdentifier: true,
++            picture: true,
++            type: true,
++          },
++        },
++      },
++    });
++  }
+ }
+diff --git a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+index 89d7390f1..a30414823 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+@@ -22,6 +22,7 @@ import { AuthTokenDetails } from '@gitroom/nestjs-libraries/integrations/social/
+ import utc from 'dayjs/plugin/utc';
+ import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
+ import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
++import { WebhooksService } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.service';
+ dayjs.extend(utc);
+ 
+ type PostWithConditionals = Post & {
+@@ -40,7 +41,8 @@ export class PostsService {
+     private _stripeService: StripeService,
+     private _integrationService: IntegrationService,
+     private _mediaService: MediaService,
+-    private _shortLinkService: ShortLinkService
++    private _shortLinkService: ShortLinkService,
++    private _webhookService: WebhooksService
+   ) {}
+ 
+   async getStatistics(orgId: string, id: string) {
+@@ -372,6 +374,11 @@ export class PostsService {
+         true
+       );
+ 
++      await this._webhookService.digestWebhooks(
++        integration.organizationId,
++        dayjs(newPosts[0].publishDate).format('YYYY-MM-DDTHH:mm:00')
++      );
++
+       await this.checkPlugs(
+         integration.organizationId,
+         getIntegration.identifier,
+diff --git a/libraries/nestjs-libraries/src/database/prisma/schema.prisma b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+index ef4dbf0b6..4cbd162d6 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/schema.prisma
++++ b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+@@ -33,6 +33,7 @@ model Organization {
+   credits           Credits[]
+   plugs             Plugs[]
+   customers         Customer[]
++  webhooks          Webhooks[]
+ }
+ 
+ model User {
+@@ -290,6 +291,7 @@ model Integration {
+   exisingPlugData       ExisingPlugData[]
+   rootInternalId        String?
+   additionalSettings    String?        @default("[]")
++  webhooks              IntegrationsWebhooks[]
+ 
+   @@index([rootInternalId])
+   @@index([updatedAt])
+@@ -501,6 +503,33 @@ model PopularPosts {
+   updatedAt  DateTime @updatedAt
+ }
+ 
++model IntegrationsWebhooks {
++  integrationId String
++  integration   Integration @relation(fields: [integrationId], references: [id])
++  webhookId     String
++  webhook       Webhooks   @relation(fields: [webhookId], references: [id])
++
++  @@unique([integrationId, webhookId])
++  @@id([integrationId, webhookId])
++  @@index([integrationId])
++  @@index([webhookId])
++}
++
++model Webhooks {
++  id         String   @id @default(uuid())
++  name       String
++  organizationId String
++  organization Organization @relation(fields: [organizationId], references: [id])
++  integrations IntegrationsWebhooks[]
++  url        String
++  deletedAt  DateTime?
++  createdAt  DateTime @default(now())
++  updatedAt  DateTime @updatedAt
++
++  @@index([organizationId])
++  @@index([deletedAt])
++}
++
+ enum OrderStatus {
+   PENDING
+   ACCEPTED
+diff --git a/libraries/nestjs-libraries/src/database/prisma/subscriptions/pricing.ts b/libraries/nestjs-libraries/src/database/prisma/subscriptions/pricing.ts
+index 7fb692f55..e1752c88d 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/subscriptions/pricing.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/subscriptions/pricing.ts
+@@ -12,6 +12,7 @@ export interface PricingInnerInterface {
+   image_generator?: boolean;
+   image_generation_count: number;
+   public_api: boolean;
++  webhooks: number;
+ }
+ export interface PricingInterface {
+   [key: string]: PricingInnerInterface;
+@@ -31,6 +32,7 @@ export const pricing: PricingInterface = {
+     import_from_channels: false,
+     image_generator: false,
+     public_api: false,
++    webhooks: 0,
+   },
+   STANDARD: {
+     current: 'STANDARD',
+@@ -46,6 +48,7 @@ export const pricing: PricingInterface = {
+     import_from_channels: true,
+     image_generator: false,
+     public_api: true,
++    webhooks: 2,
+   },
+   TEAM: {
+     current: 'TEAM',
+@@ -61,6 +64,7 @@ export const pricing: PricingInterface = {
+     import_from_channels: true,
+     image_generator: true,
+     public_api: true,
++    webhooks: 10,
+   },
+   PRO: {
+     current: 'PRO',
+@@ -76,6 +80,7 @@ export const pricing: PricingInterface = {
+     import_from_channels: true,
+     image_generator: true,
+     public_api: true,
++    webhooks: 30,
+   },
+   ULTIMATE: {
+     current: 'ULTIMATE',
+@@ -91,5 +96,6 @@ export const pricing: PricingInterface = {
+     import_from_channels: true,
+     image_generator: true,
+     public_api: true,
++    webhooks: 10000,
+   },
+ };
+diff --git a/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.repository.ts b/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.repository.ts
+new file mode 100644
+index 000000000..cc1b025c7
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.repository.ts
+@@ -0,0 +1,87 @@
++import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
++import { Injectable } from '@nestjs/common';
++import { WebhooksDto } from '@gitroom/nestjs-libraries/dtos/webhooks/webhooks.dto';
++import { v4 as uuidv4 } from 'uuid';
++
++@Injectable()
++export class WebhooksRepository {
++  constructor(private _webhooks: PrismaRepository<'webhooks'>) {}
++
++  getTotal(orgId: string) {
++    return this._webhooks.model.webhooks.count({
++      where: {
++        organizationId: orgId,
++        deletedAt: null,
++      },
++    });
++  }
++
++  getWebhooks(orgId: string) {
++    return this._webhooks.model.webhooks.findMany({
++      where: {
++        organizationId: orgId,
++        deletedAt: null,
++      },
++      include: {
++        integrations: {
++          select: {
++            integration: {
++              select: {
++                id: true,
++                picture: true,
++                name: true,
++              },
++            },
++          },
++        },
++      },
++    });
++  }
++
++  deleteWebhook(orgId: string, id: string) {
++    return this._webhooks.model.webhooks.update({
++      where: {
++        id,
++        organizationId: orgId,
++      },
++      data: {
++        deletedAt: new Date(),
++      },
++    });
++  }
++
++  async createWebhook(orgId: string, body: WebhooksDto) {
++    const { id } = await this._webhooks.model.webhooks.upsert({
++      where: {
++        id: body.id || uuidv4(),
++        organizationId: orgId,
++      },
++      create: {
++        organizationId: orgId,
++        url: body.url,
++        name: body.name,
++      },
++      update: {
++        url: body.url,
++        name: body.name,
++      },
++    });
++
++    await this._webhooks.model.webhooks.update({
++      where: {
++        id,
++        organizationId: orgId,
++      },
++      data: {
++        integrations: {
++          deleteMany: {},
++          create: body.integrations.map((integration) => ({
++            integrationId: integration.id,
++          })),
++        },
++      },
++    });
++
++    return { id };
++  }
++}
+diff --git a/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.service.ts b/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.service.ts
+new file mode 100644
+index 000000000..d23bed29a
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/database/prisma/webhooks/webhooks.service.ts
+@@ -0,0 +1,98 @@
++import { Injectable } from '@nestjs/common';
++import { WebhooksRepository } from '@gitroom/nestjs-libraries/database/prisma/webhooks/webhooks.repository';
++import { WebhooksDto } from '@gitroom/nestjs-libraries/dtos/webhooks/webhooks.dto';
++import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
++import { BullMqClient } from '@gitroom/nestjs-libraries/bull-mq-transport-new/client';
++import { PostsRepository } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.repository';
++
++@Injectable()
++export class WebhooksService {
++  constructor(
++    private _webhooksRepository: WebhooksRepository,
++    private _postsRepository: PostsRepository,
++    private _workerServiceProducer: BullMqClient
++  ) {}
++
++  getTotal(orgId: string) {
++    return this._webhooksRepository.getTotal(orgId);
++  }
++
++  getWebhooks(orgId: string) {
++    return this._webhooksRepository.getWebhooks(orgId);
++  }
++
++  createWebhook(orgId: string, body: WebhooksDto) {
++    return this._webhooksRepository.createWebhook(orgId, body);
++  }
++
++  deleteWebhook(orgId: string, id: string) {
++    return this._webhooksRepository.deleteWebhook(orgId, id);
++  }
++
++  async digestWebhooks(orgId: string, since: string) {
++    const date = new Date().toISOString();
++    await ioRedis.watch('webhook_' + orgId);
++    const value = await ioRedis.get('webhook_' + orgId);
++    if (value) {
++      return;
++    }
++
++    await ioRedis
++      .multi()
++      .set('webhook_' + orgId, date)
++      .expire('webhook_' + orgId, 60)
++      .exec();
++
++    this._workerServiceProducer.emit('webhooks', {
++      id: 'digest_' + orgId,
++      options: {
++        delay: 60000,
++      },
++      payload: {
++        org: orgId,
++        since,
++      },
++    });
++  }
++
++  async fireWebhooks(orgId: string, since: string) {
++    const list = await this._postsRepository.getPostsSince(orgId, since);
++    const webhooks = await this._webhooksRepository.getWebhooks(orgId);
++    const sendList = [];
++    for (const webhook of webhooks) {
++      const toSend = [];
++      if (webhook.integrations.length === 0) {
++        toSend.push(...list);
++      } else {
++        toSend.push(
++          ...list.filter((post) =>
++            webhook.integrations.some(
++              (i) => i.integration.id === post.integration.id
++            )
++          )
++        );
++      }
++
++      sendList.push({
++        url: webhook.url,
++        data: toSend,
++      });
++    }
++
++    return Promise.all(
++      sendList.map(async (s) => {
++        try {
++          await fetch(s.url, {
++            method: 'POST',
++            headers: {
++              'Content-Type': 'application/json',
++            },
++            body: JSON.stringify(s.data),
++          });
++        } catch (e) {
++          /**empty**/
++        }
++      })
++    );
++  }
++}
+diff --git a/libraries/nestjs-libraries/src/dtos/webhooks/webhooks.dto.ts b/libraries/nestjs-libraries/src/dtos/webhooks/webhooks.dto.ts
+new file mode 100644
+index 000000000..d05db43b1
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/dtos/webhooks/webhooks.dto.ts
+@@ -0,0 +1,44 @@
++import { IsDefined, IsOptional, IsString, IsUrl } from 'class-validator';
++import { Type } from 'class-transformer';
++
++export class WebhooksIntegrationDto {
++  @IsString()
++  @IsDefined()
++  id: string;
++}
++
++export class WebhooksDto {
++  id: string;
++
++  @IsString()
++  @IsDefined()
++  name: string;
++
++  @IsString()
++  @IsUrl()
++  @IsDefined()
++  url: string;
++
++  @Type(() => WebhooksIntegrationDto)
++  @IsDefined()
++  integrations: WebhooksIntegrationDto[];
++}
++
++export class UpdateDto {
++  @IsString()
++  @IsDefined()
++  id: string;
++
++  @IsString()
++  @IsDefined()
++  name: string;
++
++  @IsString()
++  @IsUrl()
++  @IsDefined()
++  url: string;
++
++  @Type(() => WebhooksIntegrationDto)
++  @IsDefined()
++  integrations: WebhooksIntegrationDto[];
++}

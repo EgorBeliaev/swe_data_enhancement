@@ -212,7 +212,7 @@ def process_repo(repo_url, repo_name, prefix=""):
                 print(f"Error for PR {pr_number}\n\n")
 
 # Explore subfolders in the "java" directory
-lang = 'cpp'
+lang = 'php'
 java_directory = f'../{lang}'
 subfolders = [name for name in os.listdir(java_directory) if os.path.isdir(os.path.join(java_directory, name))]
 

@@ -1,0 +1,422 @@
+diff --git a/apps/backend/src/services/auth/providers/farcaster.provider.ts b/apps/backend/src/services/auth/providers/farcaster.provider.ts
+new file mode 100644
+index 000000000..55d6f877d
+--- /dev/null
++++ b/apps/backend/src/services/auth/providers/farcaster.provider.ts
+@@ -0,0 +1,43 @@
++import { ProvidersInterface } from '@gitroom/backend/services/auth/providers.interface';
++import { NeynarAPIClient } from '@neynar/nodejs-sdk';
++
++const client = new NeynarAPIClient({
++  apiKey: process.env.NEYNAR_SECRET_KEY || '00000000-000-0000-000-000000000000',
++});
++
++export class FarcasterProvider implements ProvidersInterface {
++  generateLink() {
++    return '';
++  }
++
++  async getToken(code: string) {
++    const data = JSON.parse(Buffer.from(code, 'base64').toString());
++    const status = await client.lookupSigner({signerUuid: data.signer_uuid});
++    if (status.status === 'approved') {
++      return data.signer_uuid;
++    }
++
++    return '';
++  }
++
++  async getUser(providerToken: string) {
++    const status = await client.lookupSigner({signerUuid: providerToken});
++    if (status.status !== 'approved') {
++      return {
++        id: '',
++        email: '',
++      };
++    }
++
++
++    // const { client, oauth2 } = clientAndYoutube();
++    // client.setCredentials({ access_token: providerToken });
++    // const user = oauth2(client);
++    // const { data } = await user.userinfo.get();
++
++    return {
++      id: String('farcaster_' + status.fid),
++      email: String('farcaster_' + status.fid),
++    };
++  }
++}
+diff --git a/apps/backend/src/services/auth/providers/providers.factory.ts b/apps/backend/src/services/auth/providers/providers.factory.ts
+index 61048d508..0864e722e 100644
+--- a/apps/backend/src/services/auth/providers/providers.factory.ts
++++ b/apps/backend/src/services/auth/providers/providers.factory.ts
+@@ -2,6 +2,7 @@ import { Provider } from '@prisma/client';
+ import { GithubProvider } from '@gitroom/backend/services/auth/providers/github.provider';
+ import { ProvidersInterface } from '@gitroom/backend/services/auth/providers.interface';
+ import { GoogleProvider } from '@gitroom/backend/services/auth/providers/google.provider';
++import { FarcasterProvider } from '@gitroom/backend/services/auth/providers/farcaster.provider';
+ 
+ export class ProvidersFactory {
+   static loadProvider(provider: Provider): ProvidersInterface {
+@@ -10,6 +11,8 @@ export class ProvidersFactory {
+         return new GithubProvider();
+       case Provider.GOOGLE:
+         return new GoogleProvider();
++      case Provider.FARCASTER:
++        return new FarcasterProvider();
+     }
+   }
+ }
+diff --git a/apps/frontend/src/app/auth/layout.tsx b/apps/frontend/src/app/auth/layout.tsx
+index 140822865..9b5392d72 100644
+--- a/apps/frontend/src/app/auth/layout.tsx
++++ b/apps/frontend/src/app/auth/layout.tsx
+@@ -68,7 +68,7 @@ export default async function AuthLayout({
+               <div className="absolute top-0 bg-gradient-to-t from-customColor9 w-[1px] translate-x-[22px] h-full" />
+             </div>
+             <div>
+-              <div className="absolute right-0 bg-gradient-to-l from-customColor9 h-[1px] translate-y-[22px] w-full" />
++              <div className="absolute right-0 bg-gradient-to-l from-customColor9 h-[1px] translate-y-[60px] w-full" />
+             </div>
+           </div>
+           <div className="absolute top-0 bg-gradient-to-t from-customColor9 w-[1px] -translate-x-[22px] h-full" />
+diff --git a/apps/frontend/src/app/layout.tsx b/apps/frontend/src/app/layout.tsx
+index 28fc79463..ce355481f 100644
+--- a/apps/frontend/src/app/layout.tsx
++++ b/apps/frontend/src/app/layout.tsx
+@@ -42,6 +42,7 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
+           uploadDirectory={process.env.NEXT_PUBLIC_UPLOAD_STATIC_DIRECTORY!}
+           tolt={process.env.NEXT_PUBLIC_TOLT!}
+           facebookPixel={process.env.NEXT_PUBLIC_FACEBOOK_PIXEL!}
++          neynarClientId={process.env.NEYNAR_CLIENT_ID!}
+         >
+           <ToltScript />
+           <FacebookComponent />
+diff --git a/apps/frontend/src/components/auth/login.tsx b/apps/frontend/src/components/auth/login.tsx
+index 13a458ec7..a0279e91d 100644
+--- a/apps/frontend/src/components/auth/login.tsx
++++ b/apps/frontend/src/components/auth/login.tsx
+@@ -12,6 +12,7 @@ import { GithubProvider } from '@gitroom/frontend/components/auth/providers/gith
+ import interClass from '@gitroom/react/helpers/inter.font';
+ import { GoogleProvider } from '@gitroom/frontend/components/auth/providers/google.provider';
+ import { useVariables } from '@gitroom/react/helpers/variable.context';
++import { FarcasterProvider } from '@gitroom/frontend/components/auth/providers/farcaster.provider';
+ 
+ type Inputs = {
+   email: string;
+@@ -22,7 +23,7 @@ type Inputs = {
+ 
+ export function Login() {
+   const [loading, setLoading] = useState(false);
+-  const {isGeneral} = useVariables();
++  const { isGeneral, neynarClientId } = useVariables();
+   const resolver = useMemo(() => {
+     return classValidatorResolver(LoginUserDto);
+   }, []);
+@@ -62,7 +63,14 @@ export function Login() {
+           </h1>
+         </div>
+ 
+-        {!isGeneral ? <GithubProvider /> : <GoogleProvider />}
++        {!isGeneral ? (
++          <GithubProvider />
++        ) : (
++          <div className="gap-[5px] flex flex-col">
++            <GoogleProvider />
++            {!!neynarClientId && <FarcasterProvider />}
++          </div>
++        )}
+         <div className="h-[20px] mb-[24px] mt-[24px] relative">
+           <div className="absolute w-full h-[1px] bg-fifth top-[50%] -translate-y-[50%]" />
+           <div
+@@ -89,7 +97,11 @@ export function Login() {
+         </div>
+         <div className="text-center mt-6">
+           <div className="w-full flex">
+-            <Button type="submit" className="flex-1 rounded-[4px]" loading={loading}>
++            <Button
++              type="submit"
++              className="flex-1 rounded-[4px]"
++              loading={loading}
++            >
+               Sign in
+             </Button>
+           </div>
+diff --git a/apps/frontend/src/components/auth/nayner.auth.button.tsx b/apps/frontend/src/components/auth/nayner.auth.button.tsx
+new file mode 100644
+index 000000000..ac659f791
+--- /dev/null
++++ b/apps/frontend/src/components/auth/nayner.auth.button.tsx
+@@ -0,0 +1,100 @@
++'use client';
++
++import React, {
++  useCallback,
++  useEffect,
++  useState,
++  useRef,
++  FC,
++  ReactNode,
++} from 'react';
++import { useNeynarContext } from '@neynar/react';
++
++export const NeynarAuthButton: FC<{
++  children: ReactNode;
++  onLogin: (code: string) => void;
++}> = (props) => {
++  const { children, onLogin } = props;
++  const { client_id } = useNeynarContext();
++
++  const [showModal, setShowModal] = useState(false);
++
++  const authWindowRef = useRef<Window | null>(null);
++  const neynarLoginUrl = `${
++    process.env.NEYNAR_LOGIN_URL ?? 'https://app.neynar.com/login'
++  }?client_id=${client_id}`;
++  const authOrigin = new URL(neynarLoginUrl).origin;
++
++  const modalRef = useRef<HTMLDivElement>(null);
++
++  const handleMessage = useCallback(
++    async (event: MessageEvent) => {
++      if (
++        event.origin === authOrigin &&
++        event.data &&
++        event.data.is_authenticated
++      ) {
++        authWindowRef.current?.close();
++        window.removeEventListener('message', handleMessage); // Remove listener here
++        const _user = {
++          signer_uuid: event.data.signer_uuid,
++          ...event.data.user,
++        };
++
++        onLogin(Buffer.from(JSON.stringify(_user)).toString('base64'));
++      }
++    },
++    [client_id, onLogin]
++  );
++
++  const handleSignIn = useCallback(() => {
++    const width = 600,
++      height = 700;
++    const left = window.screen.width / 2 - width / 2;
++    const top = window.screen.height / 2 - height / 2;
++    const windowFeatures = `width=${width},height=${height},top=${top},left=${left}`;
++
++    authWindowRef.current = window.open(
++      neynarLoginUrl,
++      '_blank',
++      windowFeatures
++    );
++
++    if (!authWindowRef.current) {
++      console.error(
++        'Failed to open the authentication window. Please check your pop-up blocker settings.'
++      );
++      return;
++    }
++
++    window.addEventListener('message', handleMessage, false);
++  }, [client_id, handleMessage]);
++
++  const closeModal = () => setShowModal(false);
++
++  useEffect(() => {
++    return () => {
++      window.removeEventListener('message', handleMessage); // Cleanup function to remove listener
++    };
++  }, [handleMessage]);
++
++  const handleOutsideClick = useCallback((event: any) => {
++    if (modalRef.current && !modalRef.current.contains(event.target)) {
++      closeModal();
++    }
++  }, []);
++
++  useEffect(() => {
++    if (showModal) {
++      document.addEventListener('mousedown', handleOutsideClick);
++    } else {
++      document.removeEventListener('mousedown', handleOutsideClick);
++    }
++
++    return () => {
++      document.removeEventListener('mousedown', handleOutsideClick);
++    };
++  }, [showModal, handleOutsideClick]);
++
++  return <div onClick={handleSignIn}>{children}</div>;
++};
+diff --git a/apps/frontend/src/components/auth/providers/farcaster.provider.tsx b/apps/frontend/src/components/auth/providers/farcaster.provider.tsx
+new file mode 100644
+index 000000000..fbba54668
+--- /dev/null
++++ b/apps/frontend/src/components/auth/providers/farcaster.provider.tsx
+@@ -0,0 +1,51 @@
++import { useCallback } from 'react';
++import interClass from '@gitroom/react/helpers/inter.font';
++import { useVariables } from '@gitroom/react/helpers/variable.context';
++import { NeynarContextProvider, Theme, useNeynarContext } from '@neynar/react';
++import { NeynarAuthButton } from '@gitroom/frontend/components/auth/nayner.auth.button';
++import { useRouter } from 'next/navigation';
++
++export const FarcasterProvider = () => {
++  const { neynarClientId } = useVariables();
++
++  const gotoLogin = useCallback(async (code: string) => {
++    window.location.href = `/auth?provider=FARCASTER&code=${code}`;
++  }, []);
++
++  return (
++    <NeynarContextProvider
++      settings={{
++        clientId: neynarClientId,
++        defaultTheme: Theme.Dark,
++      }}
++    >
++      <NeynarAuthButton onLogin={gotoLogin}>
++        <div
++          className={`cursor-pointer bg-[#855ECD] h-[44px] rounded-[4px] flex justify-center items-center text-white ${interClass} gap-[4px]`}
++        >
++          <svg
++            width="21px"
++            height="21px"
++            viewBox="0 0 1000 1000"
++            fill="none"
++            xmlns="http://www.w3.org/2000/svg"
++          >
++            <path
++              d="M257.778 155.556H742.222V844.445H671.111V528.889H670.414C662.554 441.677 589.258 373.333 500 373.333C410.742 373.333 337.446 441.677 329.586 528.889H328.889V844.445H257.778V155.556Z"
++              fill="white"
++            />
++            <path
++              d="M128.889 253.333L157.778 351.111H182.222V746.667C169.949 746.667 160 756.616 160 768.889V795.556H155.556C143.283 795.556 133.333 805.505 133.333 817.778V844.445H382.222V817.778C382.222 805.505 372.273 795.556 360 795.556H355.556V768.889C355.556 756.616 345.606 746.667 333.333 746.667H306.667V253.333H128.889Z"
++              fill="white"
++            />
++            <path
++              d="M675.556 746.667C663.282 746.667 653.333 756.616 653.333 768.889V795.556H648.889C636.616 795.556 626.667 805.505 626.667 817.778V844.445H875.556V817.778C875.556 805.505 865.606 795.556 853.333 795.556H848.889V768.889C848.889 756.616 838.94 746.667 826.667 746.667V351.111H851.111L880 253.333H702.222V746.667H675.556Z"
++              fill="white"
++            />
++          </svg>
++          <div>Continue with Farcaster</div>
++        </div>
++      </NeynarAuthButton>
++    </NeynarContextProvider>
++  );
++};
+diff --git a/apps/frontend/src/components/auth/providers/google.provider.tsx b/apps/frontend/src/components/auth/providers/google.provider.tsx
+index 64424a3ac..a3d9b3370 100644
+--- a/apps/frontend/src/components/auth/providers/google.provider.tsx
++++ b/apps/frontend/src/components/auth/providers/google.provider.tsx
+@@ -39,7 +39,7 @@ export const GoogleProvider = () => {
+           />
+         </svg>
+       </div>
+-      <div>Sign in with Google</div>
++      <div>Continue with Google</div>
+     </div>
+   );
+ };
+diff --git a/apps/frontend/src/components/auth/register.tsx b/apps/frontend/src/components/auth/register.tsx
+index 1db5175b5..ec23af0a1 100644
+--- a/apps/frontend/src/components/auth/register.tsx
++++ b/apps/frontend/src/components/auth/register.tsx
+@@ -18,6 +18,7 @@ import { useFireEvents } from '@gitroom/helpers/utils/use.fire.events';
+ import { useVariables } from '@gitroom/react/helpers/variable.context';
+ import { useTrack } from '@gitroom/react/helpers/use.track';
+ import { TrackEnum } from '@gitroom/nestjs-libraries/user/track.enum';
++import { FarcasterProvider } from '@gitroom/frontend/components/auth/providers/farcaster.provider';
+ 
+ type Inputs = {
+   email: string;
+@@ -85,7 +86,7 @@ export function RegisterAfter({
+   token: string;
+   provider: string;
+ }) {
+-  const { isGeneral } = useVariables();
++  const { isGeneral, neynarClientId } = useVariables();
+   const [loading, setLoading] = useState(false);
+   const router = useRouter();
+   const fireEvents = useFireEvents();
+@@ -153,7 +154,14 @@ export function RegisterAfter({
+           </h1>
+         </div>
+         {!isAfterProvider &&
+-          (!isGeneral ? <GithubProvider /> : <GoogleProvider />)}
++          (!isGeneral ? (
++            <GithubProvider />
++          ) : (
++            <div className="gap-[5px] flex flex-col">
++              <GoogleProvider />
++              {!!neynarClientId && <FarcasterProvider />}
++            </div>
++          ))}
+         {!isAfterProvider && (
+           <div className="h-[20px] mb-[24px] mt-[24px] relative">
+             <div className="absolute w-full h-[1px] bg-fifth top-[50%] -translate-y-[50%]" />
+diff --git a/libraries/nestjs-libraries/src/database/prisma/schema.prisma b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+index 796645ad3..ef4dbf0b6 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/schema.prisma
++++ b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+@@ -536,6 +536,7 @@ enum Provider {
+   LOCAL
+   GITHUB
+   GOOGLE
++  FARCASTER
+ }
+ 
+ enum Role {
+diff --git a/libraries/nestjs-libraries/src/services/email.service.ts b/libraries/nestjs-libraries/src/services/email.service.ts
+index 135dceb75..e17607662 100644
+--- a/libraries/nestjs-libraries/src/services/email.service.ts
++++ b/libraries/nestjs-libraries/src/services/email.service.ts
+@@ -33,6 +33,10 @@ export class EmailService {
+   }
+ 
+   async sendEmail(to: string, subject: string, html: string, replyTo?: string) {
++    if (to.indexOf('@') === -1) {
++      return ;
++    }
++
+     if (!process.env.EMAIL_FROM_ADDRESS || !process.env.EMAIL_FROM_NAME) {
+       console.log(
+         'Email sender information not found in environment variables'
+diff --git a/libraries/nestjs-libraries/src/services/newsletter.service.ts b/libraries/nestjs-libraries/src/services/newsletter.service.ts
+index f3d5cea95..db2c7939f 100644
+--- a/libraries/nestjs-libraries/src/services/newsletter.service.ts
++++ b/libraries/nestjs-libraries/src/services/newsletter.service.ts
+@@ -1,6 +1,11 @@
+ export class NewsletterService {
+   static async register(email: string) {
+-    if (!process.env.BEEHIIVE_API_KEY || !process.env.BEEHIIVE_PUBLICATION_ID || process.env.NODE_ENV === 'development') {
++    if (
++      !process.env.BEEHIIVE_API_KEY ||
++      !process.env.BEEHIIVE_PUBLICATION_ID ||
++      process.env.NODE_ENV === 'development' ||
++      email.indexOf('@') === -1
++    ) {
+       return;
+     }
+     const body = {
+diff --git a/libraries/react-shared-libraries/src/helpers/variable.context.tsx b/libraries/react-shared-libraries/src/helpers/variable.context.tsx
+index 66c91f47f..95decf76f 100644
+--- a/libraries/react-shared-libraries/src/helpers/variable.context.tsx
++++ b/libraries/react-shared-libraries/src/helpers/variable.context.tsx
+@@ -12,6 +12,7 @@ interface VariableContextInterface {
+   discordUrl: string;
+   uploadDirectory: string;
+   facebookPixel: string;
++  neynarClientId: string;
+   tolt: string;
+ }
+ const VariableContext = createContext({
+@@ -24,6 +25,7 @@ const VariableContext = createContext({
+   discordUrl: '',
+   uploadDirectory: '',
+   facebookPixel: '',
++  neynarClientId: '',
+   tolt: '',
+ } as VariableContextInterface);
+ 

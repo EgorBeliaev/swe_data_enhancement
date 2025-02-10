@@ -1,0 +1,92 @@
+diff --git a/web/src/__tests__/async/daily-metrics-api.servertest.ts b/web/src/__tests__/async/daily-metrics-api.servertest.ts
+index dca7098fbc41..8521ac5d5855 100644
+--- a/web/src/__tests__/async/daily-metrics-api.servertest.ts
++++ b/web/src/__tests__/async/daily-metrics-api.servertest.ts
+@@ -23,11 +23,9 @@ describe("/api/public/metrics/daily API Endpoint", () => {
+       createObservation({
+         trace_id: createdTrace.id,
+         project_id: createdTrace.project_id,
+-        name: "observation-name",
++        name: "observation-name-1",
+         end_time: new Date().getTime(),
+         start_time: new Date().getTime() - 1000,
+-        input: "input",
+-        output: "output",
+         provided_model_name: "model-1",
+       }),
+       createObservation({
+@@ -35,9 +33,23 @@ describe("/api/public/metrics/daily API Endpoint", () => {
+         project_id: createdTrace.project_id,
+         name: "observation-name-2",
+         end_time: new Date().getTime(),
++        start_time: new Date().getTime() - 1000,
++        provided_model_name: "model-1",
++      }),
++      createObservation({
++        trace_id: createdTrace.id,
++        project_id: createdTrace.project_id,
++        name: "observation-name-3",
++        end_time: new Date().getTime(),
++        start_time: new Date().getTime() - 100000,
++        provided_model_name: "model-2",
++      }),
++      createObservation({
++        trace_id: createdTrace.id,
++        project_id: createdTrace.project_id,
++        name: "observation-name-4",
++        end_time: new Date().getTime(),
+         start_time: new Date().getTime() - 100000,
+-        input: "input-2",
+-        output: "output-2",
+         provided_model_name: "model-2",
+       }),
+     ];
+@@ -56,17 +68,17 @@ describe("/api/public/metrics/daily API Endpoint", () => {
+ 
+     const metric = metrics.body.data[0];
+     expect(metric.countTraces).toBe(1);
+-    expect(metric.countObservations).toBe(2);
++    expect(metric.countObservations).toBe(4);
+     expect(metric.usage).toHaveLength(2);
+-    expect(metric.totalCost).toBe(600);
++    expect(metric.totalCost).toBe(1200);
+     for (const usage of metric.usage) {
+       expect(usage.model).toMatch(/model-\d/g);
+-      expect(usage.inputUsage).toBe(1234);
+-      expect(usage.outputUsage).toBe(5678);
+-      expect(usage.totalUsage).toBe(6912);
+-      expect(usage.countObservations).toBe(1);
++      expect(usage.inputUsage).toBe(1234 * 2);
++      expect(usage.outputUsage).toBe(5678 * 2);
++      expect(usage.totalUsage).toBe(6912 * 2);
++      expect(usage.countObservations).toBe(2);
+       expect(usage.countTraces).toBe(1);
+-      expect(usage.totalCost).toBe(300);
++      expect(usage.totalCost).toBe(600);
+     }
+   });
+ });
+diff --git a/web/src/features/public-api/server/dailyMetrics.ts b/web/src/features/public-api/server/dailyMetrics.ts
+index 008bb0ee1c61..60df0fcc3c8d 100644
+--- a/web/src/features/public-api/server/dailyMetrics.ts
++++ b/web/src/features/public-api/server/dailyMetrics.ts
+@@ -38,8 +38,8 @@ export const generateDailyMetrics = async (props: QueryType) => {
+         o.provided_model_name as model,
+         count(o.id) as countObservations,
+         count(distinct t.id) as countTraces,
+-        arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, o.usage_details))) as inputUsage,
+-        arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, o.usage_details))) as outputUsage,
++        sum(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, o.usage_details)))) as inputUsage,
++        sum(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, o.usage_details)))) as outputUsage,
+         sumMap(o.usage_details)['total'] as totalUsage,
+         sum(coalesce(o.total_cost, 0)) as totalCost
+       FROM traces t FINAL
+@@ -48,7 +48,7 @@ export const generateDailyMetrics = async (props: QueryType) => {
+       AND t.project_id = {projectId: String}
+       ${filter.length() > 0 ? `AND ${appliedFilter.query}` : ""}
+       ${timeFilter ? `AND start_time >= {cteTimeFilter: DateTime64(3)} - ${TRACE_TO_OBSERVATIONS_INTERVAL}` : ""}
+-      GROUP BY date, model, usage_details
++      GROUP BY date, model
+     ), daily_model_usage AS (
+       SELECT
+         "date",

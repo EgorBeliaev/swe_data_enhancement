@@ -1,0 +1,1878 @@
+diff --git a/app/Controllers/entryController.php b/app/Controllers/entryController.php
+index 8e5dbaa80a3..be553267b24 100644
+--- a/app/Controllers/entryController.php
++++ b/app/Controllers/entryController.php
+@@ -46,7 +46,7 @@ public function firstAction(): void {
+ 	public function readAction(): void {
+ 		$get = Minz_Request::paramString('get');
+ 		$next_get = Minz_Request::paramString('nextGet') ?: $get;
+-		$id_max = Minz_Request::paramString('idMax') ?: '0';
++		$id_max = Minz_Request::paramString('idMax');
+ 		if (!ctype_digit($id_max)) {
+ 			$id_max = '0';
+ 		}
+diff --git a/app/Controllers/feedController.php b/app/Controllers/feedController.php
+index bf20f074745..cc321aa49c0 100755
+--- a/app/Controllers/feedController.php
++++ b/app/Controllers/feedController.php
+@@ -1104,7 +1104,7 @@ public function reloadAction(): void {
+ 
+ 		//Extract all feed entries from database, load complete content and store them back in database.
+ 		$entryDAO = FreshRSS_Factory::createEntryDao();
+-		$entries = $entryDAO->listWhere('f', $feed_id, FreshRSS_Entry::STATE_ALL, 'DESC', $limit);
++		$entries = $entryDAO->listWhere('f', $feed_id, FreshRSS_Entry::STATE_ALL, order: 'DESC', limit: $limit);
+ 
+ 		//We need another DB connection in parallel for unbuffered streaming
+ 		Minz_ModelPdo::$usesSharedPdo = false;
+diff --git a/app/Controllers/indexController.php b/app/Controllers/indexController.php
+index 3737f2dfda6..e2d48560e5b 100644
+--- a/app/Controllers/indexController.php
++++ b/app/Controllers/indexController.php
+@@ -62,7 +62,9 @@ public function normalAction(): void {
+ 		}
+ 		FreshRSS_View::prependTitle($title . ' · ');
+ 
+-		FreshRSS_Context::$id_max = time() . '000000';
++		if (FreshRSS_Context::$id_max === '0') {
++			FreshRSS_Context::$id_max = time() . '000000';
++		}
+ 
+ 		$this->view->callbackBeforeFeeds = static function (FreshRSS_View $view) {
+ 			$view->tags = FreshRSS_Context::labels(true);
+@@ -84,10 +86,10 @@ public function normalAction(): void {
+ 		};
+ 
+ 		$this->view->callbackBeforePagination = static function (?FreshRSS_View $view, int $nbEntries, FreshRSS_Entry $lastEntry) {
+-			if ($nbEntries >= FreshRSS_Context::$number) {
++			if ($nbEntries > FreshRSS_Context::$number) {
+ 				//We have enough entries: we discard the last one to use it for the next articles' page
+ 				ob_clean();
+-				FreshRSS_Context::$next_id = $lastEntry->id();
++				FreshRSS_Context::$continuation_id = $lastEntry->id();
+ 			}
+ 			ob_end_flush();
+ 		};
+@@ -264,16 +266,30 @@ public static function listEntriesByContext(?int $postsPerPage = null): Traversa
+ 			$id = 0;
+ 		}
+ 
+-		$date_min = 0;
++		$id_min = '0';
+ 		if (FreshRSS_Context::$sinceHours > 0) {
+-			$date_min = time() - (FreshRSS_Context::$sinceHours * 3600);
++			$id_min = (time() - (FreshRSS_Context::$sinceHours * 3600)) . '000000';
++		}
++
++		$continuation_value = 0;
++		if (FreshRSS_Context::$continuation_id !== '0') {
++			if (in_array(FreshRSS_Context::$sort, ['date', 'link', 'title'], true)) {
++				$pagingEntry = $entryDAO->searchById(FreshRSS_Context::$continuation_id);
++				$continuation_value = $pagingEntry === null ? 0 : match (FreshRSS_Context::$sort) {
++					'date' => $pagingEntry->date(true),
++					'link' => $pagingEntry->link(true),
++					'title' => $pagingEntry->title(),
++				};
++			} elseif (FreshRSS_Context::$sort === 'rand') {
++				FreshRSS_Context::$continuation_id = '0';
++			}
+ 		}
+ 
+ 		foreach ($entryDAO->listWhere(
+-					$type, $id, FreshRSS_Context::$state, FreshRSS_Context::$order,
+-					$postsPerPage ?? FreshRSS_Context::$number, FreshRSS_Context::$offset, FreshRSS_Context::$first_id,
+-					FreshRSS_Context::$search, $date_min
+-				) as $entry) {
++					$type, $id, FreshRSS_Context::$state, FreshRSS_Context::$search,
++					id_min: $id_min, id_max: FreshRSS_Context::$id_max, sort: FreshRSS_Context::$sort, order: FreshRSS_Context::$order,
++					continuation_id: FreshRSS_Context::$continuation_id, continuation_value: $continuation_value,
++					limit: $postsPerPage ?? FreshRSS_Context::$number, offset: FreshRSS_Context::$offset) as $entry) {
+ 			yield $entry;
+ 		}
+ 	}
+diff --git a/app/Models/Context.php b/app/Models/Context.php
+index 6634482d33a..0c8161c8b01 100644
+--- a/app/Models/Context.php
++++ b/app/Models/Context.php
+@@ -40,16 +40,17 @@ final class FreshRSS_Context {
+ 
+ 	public static string $next_get = 'a';
+ 	public static int $state = 0;
+-	/**
+-	 * @phpstan-var 'ASC'|'DESC'
+-	 */
++	/** @var 'ASC'|'DESC' */
+ 	public static string $order = 'DESC';
++	/** @var 'id'|'date'|'link'|'title'|'rand' */
++	public static string $sort = 'id';
+ 	public static int $number = 0;
+ 	public static int $offset = 0;
+ 	public static FreshRSS_BooleanSearch $search;
+-	public static string $first_id = '';
+-	public static string $next_id = '';
+-	public static string $id_max = '';
++	/** @var numeric-string */
++	public static string $continuation_id = '0';
++	/** @var numeric-string */
++	public static string $id_max = '0';
+ 	public static int $sinceHours = 0;
+ 	public static bool $isCli = false;
+ 
+@@ -221,7 +222,7 @@ public static function updateUsingRequest(bool $computeStatistics): void {
+ 		self::_get(Minz_Request::paramString('get') ?: 'a');
+ 
+ 		self::$state = Minz_Request::paramInt('state') ?: FreshRSS_Context::userConf()->default_state;
+-		$state_forced_by_user = Minz_Request::paramString('state') !== '';
++		$state_forced_by_user = Minz_Request::paramString('state', true) !== '';
+ 		if (!$state_forced_by_user) {
+ 			if (FreshRSS_Context::userConf()->show_fav_unread && (self::isCurrentGet('s') || self::isCurrentGet('T') || self::isTag())) {
+ 				self::$state = FreshRSS_Entry::STATE_NOT_READ | FreshRSS_Entry::STATE_READ;
+@@ -235,8 +236,10 @@ public static function updateUsingRequest(bool $computeStatistics): void {
+ 		}
+ 
+ 		self::$search = new FreshRSS_BooleanSearch(Minz_Request::paramString('search'));
+-		$order = Minz_Request::paramString('order') ?: FreshRSS_Context::userConf()->sort_order;
++		$order = Minz_Request::paramString('order', true) ?: FreshRSS_Context::userConf()->sort_order;
+ 		self::$order = in_array($order, ['ASC', 'DESC'], true) ? $order : 'DESC';
++		$sort = Minz_Request::paramString('sort', true) ?: FreshRSS_Context::userConf()->sort;
++		self::$sort = in_array($sort, ['id', 'date', 'link', 'title', 'rand'], true) ? $sort : 'id';
+ 		self::$number = Minz_Request::paramInt('nb') ?: FreshRSS_Context::userConf()->posts_per_page;
+ 		if (self::$number > FreshRSS_Context::userConf()->max_posts_per_rss) {
+ 			self::$number = max(
+@@ -244,7 +247,10 @@ public static function updateUsingRequest(bool $computeStatistics): void {
+ 				FreshRSS_Context::userConf()->posts_per_page);
+ 		}
+ 		self::$offset = Minz_Request::paramInt('offset');
+-		self::$first_id = Minz_Request::paramString('next');
++		$id_max = Minz_Request::paramString('idMax', true);
++		self::$id_max = ctype_digit($id_max) ? $id_max : '0';
++		$continuation_id = Minz_Request::paramString('cid', true);
++		self::$continuation_id = ctype_digit($continuation_id) ? $continuation_id : '0';
+ 		self::$sinceHours = Minz_Request::paramInt('hours');
+ 	}
+ 
+diff --git a/app/Models/EntryDAO.php b/app/Models/EntryDAO.php
+index 4e7f532ac1c..6075b0759f7 100644
+--- a/app/Models/EntryDAO.php
++++ b/app/Models/EntryDAO.php
+@@ -27,6 +27,10 @@ public static function sqlIgnoreConflict(string $sql): string {
+ 		return str_replace('INSERT INTO ', 'INSERT IGNORE INTO ', $sql);
+ 	}
+ 
++	public static function sqlRandom(): string {
++		return 'RAND()';
++	}
++
+ 	/** @return array{pattern?:string,matchType?:string} */
+ 	protected static function regexToSql(string $regex): array {
+ 		if (preg_match('#^/(?P<pattern>.*)/(?P<matchType>[im]*)$#', $regex, $matches)) {
+@@ -511,7 +515,7 @@ public function markReadEntries(string $idMax = '0', bool $onlyFavorites = false
+ 			$sql .= ')';
+ 		}
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('', $filters, $state);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: '', state: $state, filters: $filters);
+ 
+ 		$stm = $this->pdo->prepare($sql . $search);
+ 		if ($stm === false || !$stm->execute(array_merge($values, $searchValues))) {
+@@ -552,7 +556,7 @@ public function markReadCat(int $id, string $idMax = '0', ?FreshRSS_BooleanSearc
+ SQL;
+ 		$values = [$is_read ? 1 : 0, $is_read ? 1 : 0, $idMax, $id];
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('', $filters, $state);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: '', state: $state, filters: $filters);
+ 
+ 		$stm = $this->pdo->prepare($sql . $search);
+ 		if ($stm === false || !$stm->execute(array_merge($values, $searchValues))) {
+@@ -594,7 +598,7 @@ public function markReadFeed(int $id_feed, string $idMax = '0', ?FreshRSS_Boolea
+ 			 . 'WHERE id_feed=? AND is_read <> ? AND id <= ?';
+ 		$values = [$is_read ? 1 : 0, $id_feed, $is_read ? 1 : 0, $idMax];
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('', $filters, $state);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: '', state: $state, filters: $filters);
+ 
+ 		$stm = $this->pdo->prepare($sql . $search);
+ 		if ($stm === false || !$stm->execute(array_merge($values, $searchValues))) {
+@@ -652,7 +656,7 @@ public function markReadTag(int $id = 0, string $idMax = '0', ?FreshRSS_BooleanS
+ 		$values[] = $is_read ? 1 : 0;
+ 		$values[] = $idMax;
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('e.', $filters, $state);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: 'e.', state: $state, filters: $filters);
+ 
+ 		$stm = $this->pdo->prepare($sql . $search);
+ 		if ($stm === false || !$stm->execute(array_merge($values, $searchValues))) {
+@@ -1107,13 +1111,15 @@ public static function sqlBooleanSearch(string $alias, FreshRSS_BooleanSearch $f
+ 	}
+ 
+ 	/**
++	 * @param numeric-string $id_min
++	 * @param numeric-string $id_max
++	 * @param 'id'|'date'|'link'|'title'|'rand' $sort
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return array{0:list<int|string>,1:string}
+-	 * @throws FreshRSS_EntriesGetter_Exception
+ 	 */
+-	protected function sqlListEntriesWhere(string $alias = '', ?FreshRSS_BooleanSearch $filters = null,
+-			int $state = FreshRSS_Entry::STATE_ALL,
+-			string $order = 'DESC', string $firstId = '', int $date_min = 0): array {
++	protected function sqlListEntriesWhere(string $alias = '', int $state = FreshRSS_Entry::STATE_ALL, ?FreshRSS_BooleanSearch $filters = null,
++		string $id_min = '0', string $id_max = '0', string $sort = 'id', string $order = 'DESC',
++		string $continuation_id = '0', string|int $continuation_value = 0): array {
+ 		$search = ' ';
+ 		$values = [];
+ 		if ($state & FreshRSS_Entry::STATE_ANDS) {
+@@ -1146,21 +1152,42 @@ protected function sqlListEntriesWhere(string $alias = '', ?FreshRSS_BooleanSear
+ 			}
+ 		}
+ 
+-		switch ($order) {
+-			case 'DESC':
+-			case 'ASC':
+-				break;
+-			default:
+-				throw new FreshRSS_EntriesGetter_Exception('Bad order in Entry->listByType: [' . $order . ']!');
++		if (!ctype_digit($id_min)) {
++			$id_min = '0';
++		}
++		if (!ctype_digit($id_max)) {
++			$id_max = '0';
++		}
++		if (!ctype_digit($continuation_id)) {
++			$continuation_id = '0';
++		}
++
++		if ($continuation_id !== '0' && $sort === 'id') {
++			if ($order === 'ASC') {
++				$id_min = $id_min === '0' ? $continuation_id : max($id_min, $continuation_id);
++			} else {
++				$id_max = $id_max === '0' ? $continuation_id : min($id_max, $continuation_id);
++			}
+ 		}
+-		if ($firstId !== '') {
+-			$search .= 'AND ' . $alias . 'id ' . ($order === 'DESC' ? '<=' : '>=') . ' ? ';
+-			$values[] = $firstId;
++
++		if ($id_max !== '0') {
++			$search .= 'AND ' . $alias . 'id <= ? ';
++			$values[] = $id_max;
+ 		}
+-		if ($date_min > 0) {
++		if ($id_min !== '0') {
+ 			$search .= 'AND ' . $alias . 'id >= ? ';
+-			$values[] = $date_min . '000000';
++			$values[] = $id_min;
++		}
++
++		if ($continuation_id !== '0' && in_array($sort, ['date', 'link', 'title'], true)) {
++			$sign = $order === 'ASC' ? '>' : '<';
++			// Keyset pagination (Compatibility syntax due to poor performance of tuple syntax in MySQL https://bugs.mysql.com/bug.php?id=104128)
++			$search .= "AND ({$alias}{$sort} {$sign} ? OR ({$alias}{$sort} = ? AND {$alias}id {$sign}= ?)) ";
++			$values[] = $continuation_value;
++			$values[] = $continuation_value;
++			$values[] = $continuation_id;
+ 		}
++
+ 		if ($filters !== null && count($filters->searches()) > 0) {
+ 			[$filterValues, $filterSearch] = self::sqlBooleanSearch($alias, $filters);
+ 			$filterSearch = trim($filterSearch);
+@@ -1174,15 +1201,19 @@ protected function sqlListEntriesWhere(string $alias = '', ?FreshRSS_BooleanSear
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'i'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
++	 * @param 'a'|'A'|'i'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
++	 * @param numeric-string $id_min
++	 * @param numeric-string $id_max
++	 * @param 'id'|'date'|'link'|'title'|'rand' $sort
+ 	 * @param 'ASC'|'DESC' $order
++	 * @param numeric-string $continuation_id
+ 	 * @return array{0:list<int|string>,1:string}
+ 	 * @throws FreshRSS_EntriesGetter_Exception
+ 	 */
+-	private function sqlListWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL,
+-			string $order = 'DESC', int $limit = 1, int $offset = 0, string $firstId = '', ?FreshRSS_BooleanSearch $filters = null,
+-			int $date_min = 0): array {
++	private function sqlListWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL, ?FreshRSS_BooleanSearch $filters = null,
++			string $id_min = '0', string $id_max = '0', string $sort = 'id', string $order = 'DESC',
++			string $continuation_id = '0', string|int $continuation_value = 0, int $limit = 1, int $offset = 0): array {
+ 		if (!$state) {
+ 			$state = FreshRSS_Entry::STATE_ALL;
+ 		}
+@@ -1231,7 +1262,11 @@ private function sqlListWhere(string $type = 'a', int $id = 0, int $state = Fres
+ 				throw new FreshRSS_EntriesGetter_Exception('Bad type in Entry->listByType: [' . $type . ']!');
+ 		}
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('e.', $filters, $state, $order, $firstId, $date_min);
++		$order = in_array($order, ['ASC', 'DESC'], true) ? $order : 'DESC';
++		$sort = in_array($sort, ['id', 'date', 'link', 'title', 'rand'], true) ? $sort : 'id';
++		$orderBy = ($sort === 'rand' ? static::sqlRandom() : 'e.' . $sort);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: 'e.', state: $state, filters: $filters, id_min: $id_min, id_max: $id_max,
++			sort: $sort, order: $order, continuation_id: $continuation_id, continuation_value: $continuation_value);
+ 
+ 		return [array_merge($values, $searchValues), 'SELECT '
+ 			. ($type === 'T' ? 'DISTINCT ' : '')
+@@ -1240,34 +1275,45 @@ private function sqlListWhere(string $type = 'a', int $id = 0, int $state = Fres
+ 			. ($type === 't' || $type === 'T' ? 'INNER JOIN `_entrytag` et ON et.id_entry = e.id ' : '')
+ 			. 'WHERE ' . $where
+ 			. $search
+-			. 'ORDER BY e.id ' . $order
++			. 'ORDER BY ' . $orderBy . ' ' . $order
++			. ($sort === 'id' ? '' : ', e.id ' . $order)	// For keyset pagination
+ 			. ($limit > 0 ? ' LIMIT ' . $limit : '')	// http://explainextended.com/2009/10/23/mysql-order-by-limit-performance-late-row-lookups/
+ 			. ($offset > 0 ? ' OFFSET ' . $offset : '')
+ 		];
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+-	 * @param 'ASC'|'DESC' $order
++	 * @param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
++	 * @param numeric-string $id_min
++	 * @param numeric-string $id_max
++	 * @param 'id'|'date'|'link'|'title'|'rand' $sort
++	 * @param 'ASC'|'DESC' $order
++	 * @param numeric-string $continuation_id
+ 	 * @throws FreshRSS_EntriesGetter_Exception
+ 	 */
+-	private function listWhereRaw(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL,
+-			string $order = 'DESC', int $limit = 1, int $offset = 0, string $firstId = '', ?FreshRSS_BooleanSearch $filters = null,
+-			int $date_min = 0): PDOStatement|false {
+-		[$values, $sql] = $this->sqlListWhere($type, $id, $state, $order, $limit, $offset, $firstId, $filters, $date_min);
++	private function listWhereRaw(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL, ?FreshRSS_BooleanSearch $filters = null,
++		string $id_min = '0', string $id_max = '0', string $sort = 'id', string $order = 'DESC',
++		string $continuation_id = '0', string|int $continuation_value = 0, int $limit = 1, int $offset = 0): PDOStatement|false {
++		$order = in_array($order, ['ASC', 'DESC'], true) ? $order : 'DESC';
++		$sort = in_array($sort, ['id', 'date', 'link', 'title', 'rand'], true) ? $sort : 'id';
+ 
+-		if ($order !== 'DESC' && $order !== 'ASC') {
+-			$order = 'DESC';
+-		}
++		[$values, $sql] = $this->sqlListWhere($type, $id, $state, $filters, id_min: $id_min, id_max: $id_max, sort: $sort, order: $order,
++			continuation_id: $continuation_id, continuation_value: $continuation_value, limit: $limit, offset: $offset);
++
++		$orderBy = ($sort === 'rand' ? static::sqlRandom() : 'e0.' . $sort);
+ 		$content = static::isCompressed() ? 'UNCOMPRESS(e0.content_bin) AS content' : 'e0.content';
+ 		$hash = static::sqlHexEncode('e0.hash');
+ 		$sql = <<<SQL
+ SELECT e0.id, e0.guid, e0.title, e0.author, {$content}, e0.link, e0.date, {$hash} AS hash, e0.is_read, e0.is_favorite, e0.id_feed, e0.tags, e0.attributes
+ FROM `_entry` e0
+ INNER JOIN ({$sql}) e2 ON e2.id=e0.id
+-ORDER BY e0.id {$order}
++ORDER BY {$orderBy} {$order}
+ SQL;
++		if ($sort !== 'id') {
++			// For keyset pagination
++			$sql .= ', e0.id ' . $order;
++		}
+ 		$stm = $this->pdo->prepare($sql);
+ 		if ($stm !== false && $stm->execute($values)) {
+ 			return $stm;
+@@ -1275,7 +1321,8 @@ private function listWhereRaw(string $type = 'a', int $id = 0, int $state = Fres
+ 			$info = $stm === false ? $this->pdo->errorInfo() : $stm->errorInfo();
+ 			/** @var array{0:string,1:int,2:string} $info */
+ 			if ($this->autoUpdateDb($info)) {
+-				return $this->listWhereRaw($type, $id, $state, $order, $limit, $offset, $firstId, $filters, $date_min);
++				return $this->listWhereRaw($type, $id, $state, $filters, id_min: $id_min, id_max: $id_max, sort: $sort, order: $order,
++					continuation_id: $continuation_id, continuation_value: $continuation_value, limit: $limit, offset: $offset);
+ 			}
+ 			Minz_Log::error('SQL error ' . __METHOD__ . json_encode($info));
+ 			return false;
+@@ -1283,16 +1330,21 @@ private function listWhereRaw(string $type = 'a', int $id = 0, int $state = Fres
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
++	 * @param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
++	 * @param numeric-string $id_min
++	 * @param numeric-string $id_max
++	 * @param 'id'|'date'|'link'|'title'|'rand' $sort
+ 	 * @param 'ASC'|'DESC' $order
++	 * @param numeric-string $continuation_id
+ 	 * @return Traversable<FreshRSS_Entry>
+ 	 * @throws FreshRSS_EntriesGetter_Exception
+ 	 */
+-	public function listWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL,
+-			string $order = 'DESC', int $limit = 1, int $offset = 0, string $firstId = '',
+-			?FreshRSS_BooleanSearch $filters = null, int $date_min = 0): Traversable {
+-		$stm = $this->listWhereRaw($type, $id, $state, $order, $limit, $offset, $firstId, $filters, $date_min);
++	public function listWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL, ?FreshRSS_BooleanSearch $filters = null,
++			string $id_min = '0', string $id_max = '0', string $sort = 'id', string $order = 'DESC',
++			string $continuation_id = '0', string|int $continuation_value = 0, int $limit = 1, int $offset = 0): Traversable {
++		$stm = $this->listWhereRaw($type, $id, $state, $filters, id_min: $id_min, id_max: $id_max, sort: $sort, order: $order,
++			continuation_id: $continuation_id, continuation_value: $continuation_value, limit: $limit, offset: $offset);
+ 		if ($stm !== false) {
+ 			while ($row = $stm->fetch(PDO::FETCH_ASSOC)) {
+ 				if (is_array($row)) {
+@@ -1305,6 +1357,7 @@ public function listWhere(string $type = 'a', int $id = 0, int $state = FreshRSS
+ 	}
+ 
+ 	/**
++	 * For API.
+ 	 * @param array<numeric-string> $ids
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return Traversable<FreshRSS_Entry>
+@@ -1317,15 +1370,13 @@ public function listByIds(array $ids, string $order = 'DESC'): Traversable {
+ 			// Split a query with too many variables parameters
+ 			$idsChunks = array_chunk($ids, FreshRSS_DatabaseDAO::MAX_VARIABLE_NUMBER);
+ 			foreach ($idsChunks as $idsChunk) {
+-				foreach ($this->listByIds($idsChunk, $order) as $entry) {
++				foreach ($this->listByIds($idsChunk, order: $order) as $entry) {
+ 					yield $entry;
+ 				}
+ 			}
+ 			return;
+ 		}
+-		if ($order !== 'DESC' && $order !== 'ASC') {
+-			$order = 'DESC';
+-		}
++		$order = in_array($order, ['ASC', 'DESC'], true) ? $order : 'DESC';
+ 		$content = static::isCompressed() ? 'UNCOMPRESS(content_bin) AS content' : 'content';
+ 		$hash = static::sqlHexEncode('hash');
+ 		$repeats = str_repeat('?,', count($ids) - 1) . '?';
+@@ -1349,16 +1400,20 @@ public function listByIds(array $ids, string $order = 'DESC'): Traversable {
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
++	 * @param 'a'|'A'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
++	 * @param numeric-string $id_min
++	 * @param numeric-string $id_max
++	 * @param numeric-string $continuation_id
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return list<numeric-string>|null
+ 	 * @throws FreshRSS_EntriesGetter_Exception
+ 	 */
+-	public function listIdsWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL,
+-		string $order = 'DESC', int $limit = 1, int $offset = 0, string $firstId = '', ?FreshRSS_BooleanSearch $filters = null): ?array {
+-
+-		[$values, $sql] = $this->sqlListWhere($type, $id, $state, $order, $limit, $offset, $firstId, $filters);
++	public function listIdsWhere(string $type = 'a', int $id = 0, int $state = FreshRSS_Entry::STATE_ALL, ?FreshRSS_BooleanSearch $filters = null,
++		string $id_min = '0', string $id_max = '0', string $order = 'DESC',
++		string $continuation_id = '0', string|int $continuation_value = 0, int $limit = 1, int $offset = 0): ?array {
++		[$values, $sql] = $this->sqlListWhere($type, $id, $state, $filters, id_min: $id_min, id_max: $id_max, order: $order,
++			continuation_id: $continuation_id, continuation_value: $continuation_value, limit: $limit, offset: $offset);
+ 		$stm = $this->pdo->prepare($sql);
+ 		if ($stm !== false && $stm->execute($values) && ($res = $stm->fetchAll(PDO::FETCH_COLUMN, 0)) !== false) {
+ 			$res = array_map('strval', $res);
+diff --git a/app/Models/EntryDAOPGSQL.php b/app/Models/EntryDAOPGSQL.php
+index 1a5266bbd3b..c42c2cec186 100644
+--- a/app/Models/EntryDAOPGSQL.php
++++ b/app/Models/EntryDAOPGSQL.php
+@@ -23,6 +23,11 @@ public static function sqlIgnoreConflict(string $sql): string {
+ 		return rtrim($sql, ' ;') . ' ON CONFLICT DO NOTHING';
+ 	}
+ 
++	#[\Override]
++	public static function sqlRandom(): string {
++		return 'RANDOM()';
++	}
++
+ 	#[\Override]
+ 	protected static function sqlRegex(string $expression, string $regex, array &$values): string {
+ 		$matches = static::regexToSql($regex);
+diff --git a/app/Models/EntryDAOSQLite.php b/app/Models/EntryDAOSQLite.php
+index 5734ec3b30d..6951afb2798 100644
+--- a/app/Models/EntryDAOSQLite.php
++++ b/app/Models/EntryDAOSQLite.php
+@@ -28,6 +28,11 @@ public static function sqlIgnoreConflict(string $sql): string {
+ 		return str_replace('INSERT INTO ', 'INSERT OR IGNORE INTO ', $sql);
+ 	}
+ 
++	#[\Override]
++	public static function sqlRandom(): string {
++		return 'RANDOM()';
++	}
++
+ 	#[\Override]
+ 	protected static function sqlRegex(string $expression, string $regex, array &$values): string {
+ 		$values[] = $regex;
+@@ -164,7 +169,7 @@ public function markReadTag($id = 0, string $idMax = '0', ?FreshRSS_BooleanSearc
+ 			$values[] = $id;
+ 		}
+ 
+-		[$searchValues, $search] = $this->sqlListEntriesWhere('e.', $filters, $state);
++		[$searchValues, $search] = $this->sqlListEntriesWhere(alias: 'e.', state: $state, filters: $filters);
+ 
+ 		$stm = $this->pdo->prepare($sql . $search);
+ 		if ($stm === false || !$stm->execute(array_merge($values, $searchValues))) {
+diff --git a/app/Models/UserConfiguration.php b/app/Models/UserConfiguration.php
+index 4d465bf670a..ce6f0149de5 100644
+--- a/app/Models/UserConfiguration.php
++++ b/app/Models/UserConfiguration.php
+@@ -51,6 +51,7 @@
+  * @property int $simplify_over_n_feeds
+  * @property bool $show_nav_buttons
+  * @property 'ASC'|'DESC' $sort_order
++ * @property 'id'|'date'|'link'|'title'|'rand' $sort
+  * @property array<string,array<string,string>> $sharing
+  * @property array<string,string> $shortcuts
+  * @property bool $sides_close_article
+diff --git a/app/Services/ExportService.php b/app/Services/ExportService.php
+index 07652462538..e9acda61420 100644
+--- a/app/Services/ExportService.php
++++ b/app/Services/ExportService.php
+@@ -69,11 +69,11 @@ public function generateStarredEntries(string $type): array {
+ 
+ 		$view->list_title = _t('sub.import_export.starred_list');
+ 		$view->type = 'starred';
+-		$entriesId = $this->entry_dao->listIdsWhere($type, 0, FreshRSS_Entry::STATE_ALL, 'ASC', -1) ?? [];
++		$entriesId = $this->entry_dao->listIdsWhere($type, 0, FreshRSS_Entry::STATE_ALL, order: 'ASC', limit: -1) ?? [];
+ 		$view->entryIdsTagNames = $this->tag_dao->getEntryIdsTagNames($entriesId);
+ 		// The following is a streamable query, i.e. must be last
+ 		$view->entries = $this->entry_dao->listWhere(
+-			$type, 0, FreshRSS_Entry::STATE_ALL, 'ASC', -1
++			$type, 0, FreshRSS_Entry::STATE_ALL, order: 'ASC', limit: -1
+ 		);
+ 
+ 		return [
+@@ -103,12 +103,12 @@ public function generateFeedEntries(int $feed_id, int $max_number_entries): ?arr
+ 		$view->list_title = _t('sub.import_export.feed_list', $feed->name());
+ 		$view->type = 'feed/' . $feed->id();
+ 		$entriesId = $this->entry_dao->listIdsWhere(
+-			'f', $feed->id(), FreshRSS_Entry::STATE_ALL, 'ASC', $max_number_entries
++			'f', $feed->id(), FreshRSS_Entry::STATE_ALL, order: 'ASC', limit: $max_number_entries
+ 		) ?? [];
+ 		$view->entryIdsTagNames = $this->tag_dao->getEntryIdsTagNames($entriesId);
+ 		// The following is a streamable query, i.e. must be last
+ 		$view->entries = $this->entry_dao->listWhere(
+-			'f', $feed->id(), FreshRSS_Entry::STATE_ALL, 'ASC', $max_number_entries
++			'f', $feed->id(), FreshRSS_Entry::STATE_ALL, order: 'ASC', limit: $max_number_entries
+ 		);
+ 
+ 		return [
+diff --git a/app/i18n/cs/index.php b/app/i18n/cs/index.php
+index 9a1f279e3eb..f6055421888 100644
+--- a/app/i18n/cs/index.php
++++ b/app/i18n/cs/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Nejsou žádné články k zobrazení.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'Kanál RSS %s',
+ 		'title' => 'Hlavní kanál',
+ 		'title_fav' => 'Oblíbené',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Zobrazení pro čtení',
+ 		'rss_view' => 'Kanál RSS',
+ 		'search_short' => 'Hledat',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Zobrazit oblíbené',
+ 		'stats' => 'Statistika',
+ 		'subscription' => 'Správa odběrů',
+diff --git a/app/i18n/de/index.php b/app/i18n/de/index.php
+index 27d7508b4bf..3adb4065edb 100644
+--- a/app/i18n/de/index.php
++++ b/app/i18n/de/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Es gibt keinen Artikel zum Anzeigen.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS-Feed von %s',
+ 		'title' => 'Haupt-Feeds',
+ 		'title_fav' => 'Favoriten',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Lese-Ansicht',
+ 		'rss_view' => 'RSS-Feed',
+ 		'search_short' => 'Suchen',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Nur Favoriten zeigen',
+ 		'stats' => 'Statistiken',
+ 		'subscription' => 'Abonnementverwaltung',
+diff --git a/app/i18n/el/index.php b/app/i18n/el/index.php
+index d8b12a8d089..82f325cf7f7 100644
+--- a/app/i18n/el/index.php
++++ b/app/i18n/el/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'There are no articles to show.',	// TODO
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS feed of %s',	// TODO
+ 		'title' => 'Main stream',	// TODO
+ 		'title_fav' => 'Favourites',	// TODO
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Reading view',	// TODO
+ 		'rss_view' => 'RSS feed',	// TODO
+ 		'search_short' => 'Search',	// TODO
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Show favourites',	// TODO
+ 		'stats' => 'Statistics',	// TODO
+ 		'subscription' => 'Subscription management',	// TODO
+diff --git a/app/i18n/en-us/index.php b/app/i18n/en-us/index.php
+index 15f37ecba7d..9d0c9ec77df 100644
+--- a/app/i18n/en-us/index.php
++++ b/app/i18n/en-us/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'There are no articles to show.',	// IGNORE
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// IGNORE
++			'today' => 'Received today',	// IGNORE
++			'yesterday' => 'Received yesterday',	// IGNORE
++		),
+ 		'rss_of' => 'RSS feed of %s',	// IGNORE
+ 		'title' => 'Main stream',	// IGNORE
+ 		'title_fav' => 'Favorites',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Reading view',	// IGNORE
+ 		'rss_view' => 'RSS feed',	// IGNORE
+ 		'search_short' => 'Search',	// IGNORE
++		'sort' => array(
++			'_' => 'Sorting criteria',	// IGNORE
++			'date_asc' => 'Publication date 1→9',	// IGNORE
++			'date_desc' => 'Publication date 9→1',	// IGNORE
++			'id_asc' => 'Freshly received last',	// IGNORE
++			'id_desc' => 'Freshly received first',	// IGNORE
++			'link_asc' => 'Link A→Z',	// IGNORE
++			'link_desc' => 'Link Z→A',	// IGNORE
++			'rand' => 'Random order',	// IGNORE
++			'title_asc' => 'Title A→Z',	// IGNORE
++			'title_desc' => 'Title Z→A',	// IGNORE
++		),
+ 		'starred' => 'Show favorites',
+ 		'stats' => 'Statistics',	// IGNORE
+ 		'subscription' => 'Subscription management',	// IGNORE
+diff --git a/app/i18n/en/index.php b/app/i18n/en/index.php
+index 5c49064694c..cbb10545663 100644
+--- a/app/i18n/en/index.php
++++ b/app/i18n/en/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'There are no articles to show.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',
++			'today' => 'Received today',
++			'yesterday' => 'Received yesterday',
++		),
+ 		'rss_of' => 'RSS feed of %s',
+ 		'title' => 'Main stream',
+ 		'title_fav' => 'Favourites',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Reading view',
+ 		'rss_view' => 'RSS feed',
+ 		'search_short' => 'Search',
++		'sort' => array(
++			'_' => 'Sorting criteria',
++			'date_asc' => 'Publication date 1→9',
++			'date_desc' => 'Publication date 9→1',
++			'id_asc' => 'Freshly received last',
++			'id_desc' => 'Freshly received first',
++			'link_asc' => 'Link A→Z',
++			'link_desc' => 'Link Z→A',
++			'rand' => 'Random order',
++			'title_asc' => 'Title A→Z',
++			'title_desc' => 'Title Z→A',
++		),
+ 		'starred' => 'Show favourites',
+ 		'stats' => 'Statistics',
+ 		'subscription' => 'Subscription management',
+diff --git a/app/i18n/es/index.php b/app/i18n/es/index.php
+index 3401347bd20..88209906d46 100644
+--- a/app/i18n/es/index.php
++++ b/app/i18n/es/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'No hay artículos a mostrar.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'Fuente RSS de %s',
+ 		'title' => 'Salida Principal',
+ 		'title_fav' => 'Favoritos',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Vista de lectura',
+ 		'rss_view' => 'Fuente RSS',
+ 		'search_short' => 'Buscar',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Mostrar solo los favoritos',
+ 		'stats' => 'Estadísticas',
+ 		'subscription' => 'Administración de suscripciones',
+diff --git a/app/i18n/fa/index.php b/app/i18n/fa/index.php
+index 2dba7fbb228..b389a9541a3 100644
+--- a/app/i18n/fa/index.php
++++ b/app/i18n/fa/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => ' هیچ مقاله ای برای نمایش وجود ندارد.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => ' فید RSS %s',
+ 		'title' => ' جریان اصلی',
+ 		'title_fav' => ' موارد دلخواه',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => ' مشاهده خواندن',
+ 		'rss_view' => ' خوراک RSS',
+ 		'search_short' => ' جستجو',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => ' نمایش موارد دلخواه',
+ 		'stats' => ' آمار',
+ 		'subscription' => ' مدیریت اشتراک',
+diff --git a/app/i18n/fi/index.php b/app/i18n/fi/index.php
+index 63007001b14..c7193549edf 100644
+--- a/app/i18n/fi/index.php
++++ b/app/i18n/fi/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Näytettäviä artikkeleita ei ole.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'Sivuston %s RSS-syöte',
+ 		'title' => 'Pääsyötevirta',
+ 		'title_fav' => 'Suosikit',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Lukunäkymä',
+ 		'rss_view' => 'RSS-syöte',
+ 		'search_short' => 'Haku',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Näytä suosikit',
+ 		'stats' => 'Tilastot',
+ 		'subscription' => 'Tilausten hallinta',
+diff --git a/app/i18n/fr/index.php b/app/i18n/fr/index.php
+index 2369b7225c2..2fd1bc4b87b 100644
+--- a/app/i18n/fr/index.php
++++ b/app/i18n/fr/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Il n’y a aucun article à afficher.',
++		'received' => array(
++			'before_yesterday' => 'Reçu avant avant-hier',
++			'today' => 'Reçu aujourd’hui',
++			'yesterday' => 'Reçu hier',
++		),
+ 		'rss_of' => 'Flux RSS de %s',
+ 		'title' => 'Flux principal',
+ 		'title_fav' => 'Favoris',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Vue lecture',
+ 		'rss_view' => 'Flux RSS',
+ 		'search_short' => 'Rechercher',
++		'sort' => array(
++			'_' => 'Critère de tri',
++			'date_asc' => 'Date de publication 1→9',
++			'date_desc' => 'Date de publication 9→1',
++			'id_asc' => 'Reçus récemment en dernier',
++			'id_desc' => 'Reçus récemment en premier',
++			'link_asc' => 'Lien A→Z',
++			'link_desc' => 'Lien Z→A',
++			'rand' => 'Ordre aléatoire',
++			'title_asc' => 'Titre A→Z',
++			'title_desc' => 'Titre Z→A',
++		),
+ 		'starred' => 'Afficher les favoris',
+ 		'stats' => 'Statistiques',
+ 		'subscription' => 'Gestion des abonnements',
+diff --git a/app/i18n/he/index.php b/app/i18n/he/index.php
+index 78ee180f1e1..f603acea53e 100644
+--- a/app/i18n/he/index.php
++++ b/app/i18n/he/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'אין מאמר להצגה.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'הזנת RSS של %s',
+ 		'title' => 'הזנה ראשית',
+ 		'title_fav' => 'מועדפים',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'תצוגת קריאה',
+ 		'rss_view' => 'הזנת RSS',
+ 		'search_short' => 'חיפוש',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'הצגת מועדפים בלבד',
+ 		'stats' => 'סטטיסטיקות',
+ 		'subscription' => 'ניהול הרשמות',
+diff --git a/app/i18n/hu/index.php b/app/i18n/hu/index.php
+index 03fe4c46263..863ed38b945 100644
+--- a/app/i18n/hu/index.php
++++ b/app/i18n/hu/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Nincs megjeleníthető cikk.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS hírforrás %s',
+ 		'title' => 'Minden cikk',
+ 		'title_fav' => 'Kedvencek',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Olvasó nézet',
+ 		'rss_view' => 'RSS hírforrás',
+ 		'search_short' => 'Keresés',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Kedvencek megjelenítése',
+ 		'stats' => 'Statisztika',
+ 		'subscription' => 'Hírforrások kezelése',
+diff --git a/app/i18n/id/index.php b/app/i18n/id/index.php
+index 390673ddcb6..0f0ec25434c 100644
+--- a/app/i18n/id/index.php
++++ b/app/i18n/id/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'There are no articles to show.',	// TODO
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS feed of %s',	// TODO
+ 		'title' => 'Main stream',	// TODO
+ 		'title_fav' => 'Favorites',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Reading view',	// TODO
+ 		'rss_view' => 'RSS feed',	// TODO
+ 		'search_short' => 'Search',	// TODO
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Show favorites',
+ 		'stats' => 'Statistics',	// TODO
+ 		'subscription' => 'Subscription management',	// TODO
+diff --git a/app/i18n/it/index.php b/app/i18n/it/index.php
+index 14fcd25faec..316e7824264 100644
+--- a/app/i18n/it/index.php
++++ b/app/i18n/it/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Non ci sono articoli da mostrare.',
++		'received' => array(
++			'before_yesterday' => 'Ricevuto prima di ieri',
++			'today' => 'Ricevuto oggi',
++			'yesterday' => 'Ricevuto ieri',
++		),
+ 		'rss_of' => 'RSS feed di %s',
+ 		'title' => 'Flusso principale',
+ 		'title_fav' => 'Preferiti',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Modalità di lettura',
+ 		'rss_view' => 'Feed RSS',
+ 		'search_short' => 'Cerca',
++		'sort' => array(
++			'_' => 'Ordina per',
++			'date_asc' => 'Data di pubblicazione 1→9',
++			'date_desc' => 'Data di pubblicazione 9→1',
++			'id_asc' => 'Dal meno recente',
++			'id_desc' => 'Dal più recente',
++			'link_asc' => 'Link A→Z',	// IGNORE
++			'link_desc' => 'Link Z→A',	// IGNORE
++			'rand' => 'Ordine casuale',
++			'title_asc' => 'Titolo A→Z',
++			'title_desc' => 'Titolo Z→A',
++		),
+ 		'starred' => 'Mostra solo preferiti',
+ 		'stats' => 'Statistiche',
+ 		'subscription' => 'Gestione sottoscrizioni',
+diff --git a/app/i18n/ja/index.php b/app/i18n/ja/index.php
+index 35671a6e748..cf4c906082d 100644
+--- a/app/i18n/ja/index.php
++++ b/app/i18n/ja/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => '表示できる記事がありません',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => '%s のRSSフィード',
+ 		'title' => 'メイン',
+ 		'title_fav' => 'お気に入り',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'リーディングビュー',
+ 		'rss_view' => 'RSSフィード',
+ 		'search_short' => '検索',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'お気に入りを表示する',
+ 		'stats' => '統計',
+ 		'subscription' => '購読フィードの管理',
+diff --git a/app/i18n/ko/index.php b/app/i18n/ko/index.php
+index 095f9ad08b0..388ae106338 100644
+--- a/app/i18n/ko/index.php
++++ b/app/i18n/ko/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => '글이 없습니다.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => '%s의 피드',
+ 		'title' => '메인 스트림',
+ 		'title_fav' => '즐겨찾기',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => '읽기 모드',
+ 		'rss_view' => 'RSS 피드',
+ 		'search_short' => '검색',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => '즐겨찾기만 표시',
+ 		'stats' => '통계',
+ 		'subscription' => '구독 관리',
+diff --git a/app/i18n/lv/index.php b/app/i18n/lv/index.php
+index 7e786c32a01..96dc104b343 100644
+--- a/app/i18n/lv/index.php
++++ b/app/i18n/lv/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Nav neviena raksta, ko parādīt.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS plūsma %s',
+ 		'title' => 'Galvenā plūsma',
+ 		'title_fav' => 'Mīļākie',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Lasīšanas skats',
+ 		'rss_view' => 'RSS barotne',
+ 		'search_short' => 'Meklēt',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Rādīt mīļākos',
+ 		'stats' => 'Statistika',
+ 		'subscription' => 'Abonementa pārvalde',
+diff --git a/app/i18n/nl/index.php b/app/i18n/nl/index.php
+index e7f3a1f29ee..24350d4ec93 100644
+--- a/app/i18n/nl/index.php
++++ b/app/i18n/nl/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Er is geen artikel om te laten zien.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS-feed van %s',
+ 		'title' => 'Overzicht',
+ 		'title_fav' => 'Favorieten',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Lees modus',
+ 		'rss_view' => 'RSS-feed',
+ 		'search_short' => 'Zoeken',
++		'sort' => array(
++			'_' => 'Sorteercriteria',
++			'date_asc' => 'Publicatiedatum 1→9',
++			'date_desc' => 'Publicatiedatum 9→1',
++			'id_asc' => 'Nieuw ontvangen laatst',
++			'id_desc' => 'Nieuw ontvangen eerst',
++			'link_asc' => 'Link A→Z',	// IGNORE
++			'link_desc' => 'Link Z→A',	// IGNORE
++			'rand' => 'Willekeurige volgorde',
++			'title_asc' => 'Titel A→Z',
++			'title_desc' => 'Titel Z→A',
++		),
+ 		'starred' => 'Laat alleen favorieten zien',
+ 		'stats' => 'Statistieken',
+ 		'subscription' => 'Abonnementen beheer',
+diff --git a/app/i18n/oc/index.php b/app/i18n/oc/index.php
+index 2d3a0554e38..f1c4b44c151 100644
+--- a/app/i18n/oc/index.php
++++ b/app/i18n/oc/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'I a pas cap de flux de mostrar.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'Flux RSS de %s',
+ 		'title' => 'Flux màger',
+ 		'title_fav' => 'Favorits',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Vista lectura',
+ 		'rss_view' => 'Flux RSS',
+ 		'search_short' => 'Recercar',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Mostrar los favorits',
+ 		'stats' => 'Estatisticas',
+ 		'subscription' => 'Gestion dels abonaments',
+diff --git a/app/i18n/pl/index.php b/app/i18n/pl/index.php
+index a9f120ef852..32990de681c 100644
+--- a/app/i18n/pl/index.php
++++ b/app/i18n/pl/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Brak wiadomości do wyświetlenia.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'Kanał RSS: %s',
+ 		'title' => 'Kanał główny',
+ 		'title_fav' => 'Ulubione',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Widok czytania',
+ 		'rss_view' => 'Kanał RSS',
+ 		'search_short' => 'Szukaj',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Pokaż ulubione',
+ 		'stats' => 'Statystyki',
+ 		'subscription' => 'Zarządzanie subskrypcjami',
+diff --git a/app/i18n/pt-br/index.php b/app/i18n/pt-br/index.php
+index be420fa2949..375b94f819b 100644
+--- a/app/i18n/pt-br/index.php
++++ b/app/i18n/pt-br/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Não há nenhum artigo para mostrar.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS feed do %s',
+ 		'title' => 'Stream principal',
+ 		'title_fav' => 'Favoritos',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Visualização de leitura',
+ 		'rss_view' => 'Feed RSS',
+ 		'search_short' => 'Buscar',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Mostrar apenas os favoritos',
+ 		'stats' => 'Estatísticas',
+ 		'subscription' => 'Gerenciamento de inscrições',
+diff --git a/app/i18n/ru/index.php b/app/i18n/ru/index.php
+index b12d1c8cb67..9eab768c38c 100644
+--- a/app/i18n/ru/index.php
++++ b/app/i18n/ru/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Нет статей для отображения.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS-лента %s',
+ 		'title' => 'Основной поток',
+ 		'title_fav' => 'Избранное',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Вид для чтения',
+ 		'rss_view' => 'RSS-лента',
+ 		'search_short' => 'Поиск',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Показать избранное',
+ 		'stats' => 'Статистика',
+ 		'subscription' => 'Управление подписками',
+diff --git a/app/i18n/sk/index.php b/app/i18n/sk/index.php
+index 0f566ea7e96..2e375daa98b 100644
+--- a/app/i18n/sk/index.php
++++ b/app/i18n/sk/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Žiadne články.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => 'RSS kanál pre %s',
+ 		'title' => 'Všetky kanály',
+ 		'title_fav' => 'Obľúbené',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Zobrazenie na čítanie',
+ 		'rss_view' => 'RSS kanál',
+ 		'search_short' => 'Hľadať',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Zobraziť obľúbené',
+ 		'stats' => 'Štatistiky',
+ 		'subscription' => 'Správca odberov',
+diff --git a/app/i18n/tr/index.php b/app/i18n/tr/index.php
+index 34171b183c8..d3099cc4c57 100644
+--- a/app/i18n/tr/index.php
++++ b/app/i18n/tr/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => 'Gösterilecek makale yok.',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => '%s kaynağına ait RSS akışı',
+ 		'title' => 'Ana akış',
+ 		'title_fav' => 'Favoriler',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => 'Okuma görünümü',
+ 		'rss_view' => 'RSS akışı',
+ 		'search_short' => 'Ara',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => 'Favorileri göster',
+ 		'stats' => 'İstatistikler',
+ 		'subscription' => 'Abonelik yönetimi',
+diff --git a/app/i18n/zh-cn/index.php b/app/i18n/zh-cn/index.php
+index 3ee6d82e60f..50694a74181 100644
+--- a/app/i18n/zh-cn/index.php
++++ b/app/i18n/zh-cn/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => '没有文章可以显示。',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => '%s 的订阅源',
+ 		'title' => '首页',
+ 		'title_fav' => '收藏',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => '阅读视图',
+ 		'rss_view' => '订阅源',
+ 		'search_short' => '搜索',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => '显示收藏',
+ 		'stats' => '统计',
+ 		'subscription' => '订阅管理',
+diff --git a/app/i18n/zh-tw/index.php b/app/i18n/zh-tw/index.php
+index a0bf58886fe..893b23c6800 100644
+--- a/app/i18n/zh-tw/index.php
++++ b/app/i18n/zh-tw/index.php
+@@ -27,6 +27,11 @@
+ 	),
+ 	'feed' => array(
+ 		'empty' => '暫時沒有文章可顯示。',
++		'received' => array(
++			'before_yesterday' => 'Received before yesterday',	// TODO
++			'today' => 'Received today',	// TODO
++			'yesterday' => 'Received yesterday',	// TODO
++		),
+ 		'rss_of' => '%s 的訂閱源',
+ 		'title' => '首頁',
+ 		'title_fav' => '收藏',
+@@ -60,6 +65,18 @@
+ 		'reader_view' => '閱讀視圖',
+ 		'rss_view' => '訂閱源',
+ 		'search_short' => '搜尋',
++		'sort' => array(
++			'_' => 'Sorting criteria',	// TODO
++			'date_asc' => 'Publication date 1→9',	// TODO
++			'date_desc' => 'Publication date 9→1',	// TODO
++			'id_asc' => 'Freshly received last',	// TODO
++			'id_desc' => 'Freshly received first',	// TODO
++			'link_asc' => 'Link A→Z',	// TODO
++			'link_desc' => 'Link Z→A',	// TODO
++			'rand' => 'Random order',	// TODO
++			'title_asc' => 'Title A→Z',	// TODO
++			'title_desc' => 'Title Z→A',	// TODO
++		),
+ 		'starred' => '顯示收藏',
+ 		'stats' => '統計',
+ 		'subscription' => '訂閱管理',
+diff --git a/app/layout/header.phtml b/app/layout/header.phtml
+index ad0a5e8e2cb..b152ed78a2e 100644
+--- a/app/layout/header.phtml
++++ b/app/layout/header.phtml
+@@ -31,6 +31,8 @@
+ 			<input type="hidden" name="user" value="<?= Minz_User::name() ?>" />
+ 			<?php } if (ctype_alnum(Minz_Request::paramString('t'))) { ?>
+ 			<input type="hidden" name="t" value="<?= Minz_Request::paramString('t') ?>" />
++			<?php } if (ctype_lower(Minz_Request::paramString('sort'))) { ?>
++			<input type="hidden" name="sort" value="<?= FreshRSS_Context::$sort ?>" />
+ 			<?php } if (ctype_upper(Minz_Request::paramString('order'))) { ?>
+ 			<input type="hidden" name="order" value="<?= FreshRSS_Context::$order ?>" />
+ 			<?php } if (ctype_lower(Minz_Request::paramString('f'))) { ?>
+diff --git a/app/layout/nav_menu.phtml b/app/layout/nav_menu.phtml
+index c45c5e70a65..944008f049d 100644
+--- a/app/layout/nav_menu.phtml
++++ b/app/layout/nav_menu.phtml
+@@ -150,6 +150,7 @@
+ 						type="submit"><?= $string_mark ?></button>
+ 				</li>
+ <?php
++	$mark_read_enabled = FreshRSS_Context::$sort === 'id';
+ 	$today = @strtotime('today');
+ 	$mark_before_today = $mark_read_url;
+ 	$mark_before_today['params']['idMax'] = $today . '000000';
+@@ -159,13 +160,13 @@
+ 		(!FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_NOT_READ) && !FreshRSS_Context::isStateEnabled(FreshRSS_Entry::STATE_OR_NOT_READ));
+ ?>
+ 				<li class="item separator">
+-					<button class="as-link <?= $confirm ?>"
++					<button class="as-link <?= $mark_read_enabled ? $confirm : '" disabled="disabled' ?>"
+ 						form="mark-read-menu"
+ 						formaction="<?= Minz_Url::display($mark_before_today) ?>"
+ 						type="submit"><?= _t('index.menu.before_one_day') ?></button>
+ 				</li>
+ 				<li class="item">
+-					<button class="as-link <?= $confirm ?>"
++					<button class="as-link <?= $mark_read_enabled ? $confirm : '" disabled="disabled' ?>"
+ 						form="mark-read-menu"
+ 						formaction="<?= Minz_Url::display($mark_before_one_week) ?>"
+ 						type="submit"><?= _t('index.menu.before_one_week') ?></button>
+@@ -212,22 +213,41 @@
+ 	<?php } ?>
+ 
+ 	<?php
+-		if (FreshRSS_Context::$order === 'DESC') {
+-			$order = 'ASC';
++		if (FreshRSS_Context::$order === 'ASC') {
+ 			$icon = 'sort-up';
+ 			$title = _t('index.menu.older_first');
+ 		} else {
+-			$order = 'DESC';
+ 			$icon = 'sort-down';
+ 			$title = _t('index.menu.newer_first');
+ 		}
+ 		$url_order = Minz_Request::currentRequest();
+-		$url_order['params']['order'] = $order;
+ 	?>
+ 	<div class="group">
+-		<a id="toggle-order" class="btn" href="<?= Minz_Url::display($url_order) ?>" title="<?= $title ?>">
+-			<?= _i($icon) ?>
+-		</a>
++		<div class="dropdown">
++			<div id="dropdown-sort" class="dropdown-target"></div>
++			<a id="toggle-order" class="dropdown-toggle btn" href="#dropdown-sort" title="<?= _t('index.menu.sort') ?>"><?= _i($icon) ?></a>
++			<ul class="dropdown-menu" role="radiogroup">
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'DESC' && FreshRSS_Context::$sort === 'id' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'id', 'order' => 'DESC']]) ?>"><?= _t('index.menu.sort.id_desc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'DESC' && FreshRSS_Context::$sort === 'date' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'date', 'order' => 'DESC']]) ?>"><?= _t('index.menu.sort.date_desc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'DESC' && FreshRSS_Context::$sort === 'link' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'link', 'order' => 'DESC']]) ?>"><?= _t('index.menu.sort.link_desc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'DESC' && FreshRSS_Context::$sort === 'title' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'title', 'order' => 'DESC']]) ?>"><?= _t('index.menu.sort.title_desc') ?></a></li>
++				<li class="item separator" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'ASC' && FreshRSS_Context::$sort === 'id' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'id', 'order' => 'ASC']]) ?>"><?= _t('index.menu.sort.id_asc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'ASC' && FreshRSS_Context::$sort === 'date' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'date', 'order' => 'ASC']]) ?>"><?= _t('index.menu.sort.date_asc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'ASC' && FreshRSS_Context::$sort === 'link' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'link', 'order' => 'ASC']]) ?>"><?= _t('index.menu.sort.link_asc') ?></a></li>
++				<li class="item" role="radio" aria-checked="<?= FreshRSS_Context::$order === 'ASC' && FreshRSS_Context::$sort === 'title' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'title', 'order' => 'ASC']]) ?>"><?= _t('index.menu.sort.title_asc') ?></a></li>
++				<li class="item separator" role="radio" aria-checked="<?= FreshRSS_Context::$sort === 'rand' ? 'true' : 'false' ?>">
++					<a href="<?= Minz_Url::display($url_order, amend: ['params' => ['sort' => 'rand', 'order' => null]]) ?>"><?= _t('index.menu.sort.rand') ?></a></li>
++			</ul>
++			<a class="dropdown-close" href="#close">❌</a>
++		</div>
+ 	</div>
+ 
+ 	<?php if (FreshRSS_Auth::hasAccess() || FreshRSS_Context::systemConf()->allow_anonymous_refresh) { ?>
+diff --git a/app/views/helpers/export/articles.phtml b/app/views/helpers/export/articles.phtml
+index 20001fb5932..75ff5db84ed 100644
+--- a/app/views/helpers/export/articles.phtml
++++ b/app/views/helpers/export/articles.phtml
+@@ -21,10 +21,10 @@ if (empty($this->entryIdsTagNames)) {
+ 
+ foreach ($this->entries as $entry) {
+ 	if (!$this->internal_rendering) {
+-		/** @var FreshRSS_Entry */
++		/** @var FreshRSS_Entry|null $entry */
+ 		$entry = Minz_ExtensionManager::callHook('entry_before_display', $entry);
+ 	}
+-	if ($entry == null) {
++	if ($entry === null) {
+ 		continue;
+ 	}
+ 
+diff --git a/app/views/helpers/javascript_vars.phtml b/app/views/helpers/javascript_vars.phtml
+index db6e8cf3b21..14af408a661 100644
+--- a/app/views/helpers/javascript_vars.phtml
++++ b/app/views/helpers/javascript_vars.phtml
+@@ -10,12 +10,13 @@ echo htmlspecialchars(json_encode([
+ 		'auto_remove_article' => !!FreshRSS_Context::isAutoRemoveAvailable(),
+ 		'hide_posts' => !(FreshRSS_Context::userConf()->display_posts || Minz_Request::actionName() === 'reader'),
+ 		'display_order' => Minz_Request::paramString('order') ?: FreshRSS_Context::userConf()->sort_order,
++		'sort' => FreshRSS_Context::$sort,
+ 		'display_categories' => FreshRSS_Context::userConf()->display_categories,
+ 		'auto_mark_article' => !!$mark['article'],
+ 		'auto_mark_site' => !!$mark['site'],
+ 		'auto_mark_scroll' => !!$mark['scroll'],
+ 		'auto_mark_focus' => !!$mark['focus'],
+-		'auto_load_more' => !!FreshRSS_Context::userConf()->auto_load_more,
++		'auto_load_more' => FreshRSS_Context::userConf()->auto_load_more && FreshRSS_Context::$sort !== 'rand',
+ 		'auto_actualize_feeds' => Minz_Session::paramBoolean('actualize_feeds'),
+ 		'nb_parallel_refresh' => max(1, FreshRSS_Context::systemConf()->nb_parallel_refresh),
+ 		'does_lazyload' => !!FreshRSS_Context::userConf()->lazyload ,
+diff --git a/app/views/helpers/stream-footer.phtml b/app/views/helpers/stream-footer.phtml
+index bd6a8a88047..3394eed7658 100644
+--- a/app/views/helpers/stream-footer.phtml
++++ b/app/views/helpers/stream-footer.phtml
+@@ -2,7 +2,12 @@
+ 	declare(strict_types=1);
+ 	/** @var FreshRSS_View $this */
+ 	$url_next = Minz_Request::currentRequest();
+-	$url_next['params']['next'] = FreshRSS_Context::$next_id;
++	if (FreshRSS_Context::$continuation_id !== '0') {
++		$url_next['params']['cid'] = FreshRSS_Context::$continuation_id;
++	}
++	if (FreshRSS_Context::$sort !== 'id') {
++		$url_next['params']['idMax'] = FreshRSS_Context::$id_max;
++	}
+ 	$url_next['params']['state'] = (string)FreshRSS_Context::$state;
+ 	$url_next['params']['ajax'] = '1';
+ 
+@@ -27,7 +32,7 @@
+ <div id="stream-footer">
+ <?php }?>
+ 	<div class="stream-footer-inner">
+-	<?php if (FreshRSS_Context::$next_id !== '') { ?>
++	<?php if (FreshRSS_Context::$continuation_id !== '0') { ?>
+ 		<button id="load_more" type="submit" class="btn" formaction="<?= Minz_Url::display($url_next) ?>"><?= _t('gen.stream.load_more') ?></button>
+ 	<?php } elseif ($hasAccess) { ?>
+ 		<?= _t('gen.stream.nothing_to_load') ?><br />
+diff --git a/app/views/index/normal.phtml b/app/views/index/normal.phtml
+index 38ce3027698..aca3b8f0a88 100644
+--- a/app/views/index/normal.phtml
++++ b/app/views/index/normal.phtml
+@@ -8,9 +8,9 @@ if (!Minz_Request::paramBoolean('ajax')) {
+ 
+ call_user_func($this->callbackBeforeEntries, $this);
+ 
+-$display_today = true;
+-$display_yesterday = true;
+-$display_others = true;
++$display_today = FreshRSS_Context::$sort === 'id';
++$display_yesterday = $display_today;
++$display_others = $display_today;
+ $useKeepUnreadImportant = !FreshRSS_Context::isImportant() && !FreshRSS_Context::isFeed();
+ 
+ $today = @strtotime('today');
+@@ -46,15 +46,15 @@ $today = @strtotime('today');
+ 	$lastEntry = null;
+ 	$nbEntries = 0;
+ 	foreach ($this->entries as $item):
+-		$lastEntry = $item;
+-		$nbEntries++;
+-		ob_flush();
+-		/** @var FreshRSS_Entry */
++		/** @var FreshRSS_Entry|null $item */
+ 		$item = Minz_ExtensionManager::callHook('entry_before_display', $item);
+-		if ($item == null) {
++		if ($item === null) {
+ 			continue;
+ 		}
++		ob_flush();
+ 		$this->entry = $item;
++		$lastEntry = $item;
++		$nbEntries++;
+ 
+ 		// We most likely already have the feed object in cache, otherwise make a request
+ 		$this->feed = FreshRSS_Category::findFeed($this->categories, $this->entry->feedId()) ??
+@@ -62,7 +62,7 @@ $today = @strtotime('today');
+ 
+ 		if ($display_today && $this->entry->isDay(FreshRSS_Days::TODAY, $today)) {
+ 			?><div class="day" id="day_today"><?php
+-				echo _t('gen.date.today');
++				echo _t('index.feed.received.today');
+ 				?><span class="date"> — <?= timestamptodate(time(), false) ?></span><?php
+ 				?><span class="name"><?= FreshRSS_Context::$name ?></span><?php
+ 			?></div><?php
+@@ -70,7 +70,7 @@ $today = @strtotime('today');
+ 		}
+ 		if ($display_yesterday && $this->entry->isDay(FreshRSS_Days::YESTERDAY, $today)) {
+ 			?><div class="day" id="day_yesterday"><?php
+-				echo _t('gen.date.yesterday');
++				echo _t('index.feed.received.yesterday');
+ 				?><span class="date"> — <?= timestamptodate(time() - 86400, false) ?></span><?php
+ 				?><span class="name"><?= FreshRSS_Context::$name ?></span><?php
+ 			?></div><?php
+@@ -78,7 +78,7 @@ $today = @strtotime('today');
+ 		}
+ 		if ($display_others && $this->entry->isDay(FreshRSS_Days::BEFORE_YESTERDAY, $today)) {
+ 			?><div class="day" id="day_before_yesterday"><?php
+-				echo _t('gen.date.before_yesterday');
++				echo _t('index.feed.received.before_yesterday');
+ 				?><span class="name"><?= FreshRSS_Context::$name ?></span><?php
+ 			?></div><?php
+ 			$display_others = false;
+diff --git a/app/views/index/reader.phtml b/app/views/index/reader.phtml
+index ae576c2e58a..adcb7890841 100644
+--- a/app/views/index/reader.phtml
++++ b/app/views/index/reader.phtml
+@@ -18,15 +18,15 @@ $lazyload = FreshRSS_Context::userConf()->lazyload;
+ 	$lastEntry = null;
+ 	$nbEntries = 0;
+ 	foreach ($this->entries as $entry):
+-		$lastEntry = $entry;
+-		$nbEntries++;
+-		ob_flush();
+-		/** @var FreshRSS_Entry */
++		/** @var FreshRSS_Entry|null $entry */
+ 		$entry = Minz_ExtensionManager::callHook('entry_before_display', $entry);
+-		if ($entry == null) {
++		if ($entry === null) {
+ 			continue;
+ 		}
++		ob_flush();
+ 		$this->entry = $entry;
++		$lastEntry = $entry;
++		$nbEntries++;
+ 
+ 		//We most likely already have the feed object in cache, otherwise make a request
+ 		$this->feed = FreshRSS_Category::findFeed($this->categories, $entry->feedId()) ?? $entry->feed() ?? FreshRSS_Feed::default();
+diff --git a/app/views/index/rss.phtml b/app/views/index/rss.phtml
+index 9b87f0a771d..36d00345332 100644
+--- a/app/views/index/rss.phtml
++++ b/app/views/index/rss.phtml
+@@ -23,9 +23,9 @@
+ <?php
+ foreach ($this->entries as $item) {
+ 	if (!$this->internal_rendering) {
+-		/** @var FreshRSS_Entry */
++		/** @var FreshRSS_Entry|null $item */
+ 		$item = Minz_ExtensionManager::callHook('entry_before_display', $item);
+-		if ($item == null) {
++		if ($item === null) {
+ 			continue;
+ 		}
+ 	}
+diff --git a/config-user.default.php b/config-user.default.php
+index 15b5fb8fb04..b742c369388 100644
+--- a/config-user.default.php
++++ b/config-user.default.php
+@@ -53,6 +53,7 @@
+ 	#	Set to `true` to mark it unread, or `false` to leave it as-is.
+ 	'mark_updated_article_unread' => false, //TODO: -1 => ignore, 0 => update, 1 => update and mark as unread
+ 
++	'sort' => 'id',
+ 	'sort_order' => 'DESC',
+ 	'anon_access' => false,
+ 	'mark_when' => array (
+diff --git a/lib/Minz/Url.php b/lib/Minz/Url.php
+index 811f0fff7de..f388054fcff 100644
+--- a/lib/Minz/Url.php
++++ b/lib/Minz/Url.php
+@@ -13,13 +13,18 @@ class Minz_Url {
+ 	 *                    $url['params'] = array of additional parameters
+ 	 *             or as a string
+ 	 * @param string $encoding how to encode & (& ou &amp; pour html)
++	 * @param array{c?:string,a?:string,params?:array<string,mixed>} $amend Parameters to add or replace in the URL in its array form
+ 	 * @return string Formatted URL
+ 	 * @throws Minz_ConfigurationException
+ 	 */
+-	public static function display($url = [], string $encoding = 'html', bool|string $absolute = false): string {
++	public static function display(string|array $url = [], string $encoding = 'html', bool|string $absolute = false, array $amend = []): string {
+ 		$isArray = is_array($url);
+ 
+ 		if ($isArray) {
++			if (!empty($amend)) {
++				/** @var array{c?:string,a?:string,params?:array<string,mixed>} $url */
++				$url = array_replace_recursive($url, $amend);
++			}
+ 			$url = self::checkControllerUrl($url);
+ 		}
+ 
+diff --git a/p/api/fever.php b/p/api/fever.php
+index 92523db06a0..b3a2a074c64 100644
+--- a/p/api/fever.php
++++ b/p/api/fever.php
+@@ -417,12 +417,12 @@ private function entriesToIdList(array $ids = []): string {
+ 	}
+ 
+ 	private function getUnreadItemIds(): string {
+-		$entries = $this->entryDAO->listIdsWhere('a', 0, FreshRSS_Entry::STATE_NOT_READ, 'ASC', 0) ?? [];
++		$entries = $this->entryDAO->listIdsWhere('a', 0, FreshRSS_Entry::STATE_NOT_READ, order: 'ASC', limit: 0) ?? [];
+ 		return $this->entriesToIdList($entries);
+ 	}
+ 
+ 	private function getSavedItemIds(): string {
+-		$entries = $this->entryDAO->listIdsWhere('a', 0, FreshRSS_Entry::STATE_FAVORITE, 'ASC', 0) ?? [];
++		$entries = $this->entryDAO->listIdsWhere('a', 0, FreshRSS_Entry::STATE_FAVORITE, order: 'ASC', limit: 0) ?? [];
+ 		return $this->entriesToIdList($entries);
+ 	}
+ 
+@@ -504,9 +504,9 @@ private function getItems(): array {
+ 		Minz_ExtensionManager::init();
+ 
+ 		foreach ($entries as $item) {
+-			/** @var FreshRSS_Entry $entry */
++			/** @var FreshRSS_Entry|null $entry */
+ 			$entry = Minz_ExtensionManager::callHook('entry_before_display', $item);
+-			if ($entry == null) {
++			if ($entry === null) {
+ 				continue;
+ 			}
+ 			$items[] = [
+diff --git a/p/api/greader.php b/p/api/greader.php
+index 9769f66cb81..bbe533c86bb 100644
+--- a/p/api/greader.php
++++ b/p/api/greader.php
+@@ -557,9 +557,9 @@ private static function entriesToArray(array $entries): array {
+ 
+ 		$items = [];
+ 		foreach ($entries as $item) {
+-			/** @var FreshRSS_Entry $entry */
++			/** @var FreshRSS_Entry|null $entry */
+ 			$entry = Minz_ExtensionManager::callHook('entry_before_display', $item);
+-			if ($entry == null) {
++			if ($entry === null) {
+ 				continue;
+ 			}
+ 
+@@ -643,6 +643,9 @@ private static function streamContentsFilters(string $type, int|string $streamId
+ 		return [$type, $streamId, $state, $searches];
+ 	}
+ 
++	/**
++	 * @param numeric-string $continuation
++	 */
+ 	private static function streamContents(string $path, string $include_target, int $start_time, int $stop_time, int $count,
+ 		string $order, string $filter_target, string $exclude_target, string $continuation): never {
+ 		// https://code.google.com/archive/p/pyrfeed/wikis/GoogleReaderAPI.wiki
+@@ -660,17 +663,20 @@ private static function streamContents(string $path, string $include_target, int
+ 		[$type, $include_target, $state, $searches] =
+ 			self::streamContentsFilters($type, $include_target, $filter_target, $exclude_target, $start_time, $stop_time);
+ 
+-		if ($continuation != '') {
++		if ($continuation !== '0') {
+ 			$count++;	//Shift by one element
+ 		}
+ 
+ 		$entryDAO = FreshRSS_Factory::createEntryDao();
+-		$entries = $entryDAO->listWhere($type, $include_target, $state, $order === 'o' ? 'ASC' : 'DESC', $count, 0, $continuation, $searches);
++		$entries = $entryDAO->listWhere($type, $include_target, $state, $searches,
++			order: $order === 'o' ? 'ASC' : 'DESC',
++			continuation_id: $continuation,
++			limit: $count);
+ 		$entries = array_values(iterator_to_array($entries));	//TODO: Improve
+ 
+ 		$items = self::entriesToArray($entries);
+ 
+-		if ($continuation != '') {
++		if ($continuation !== '0') {
+ 			array_shift($items);	//Discard first element that was already sent in the previous response
+ 			$count--;
+ 		}
+@@ -692,6 +698,9 @@ private static function streamContents(string $path, string $include_target, int
+ 		exit();
+ 	}
+ 
++	/**
++	 * @param numeric-string $continuation
++	 */
+ 	private static function streamContentsItemsIds(string $streamId, int $start_time, int $stop_time, int $count,
+ 		string $order, string $filter_target, string $exclude_target, string $continuation): never {
+ 		// https://github.com/mihaip/google-reader-api/blob/master/wiki/ApiStreamItemsIds.wiki
+@@ -712,17 +721,20 @@ private static function streamContentsItemsIds(string $streamId, int $start_time
+ 
+ 		[$type, $id, $state, $searches] = self::streamContentsFilters($type, $streamId, $filter_target, $exclude_target, $start_time, $stop_time);
+ 
+-		if ($continuation != '') {
++		if ($continuation !== '0') {
+ 			$count++;	//Shift by one element
+ 		}
+ 
+ 		$entryDAO = FreshRSS_Factory::createEntryDao();
+-		$ids = $entryDAO->listIdsWhere($type, $id, $state, $order === 'o' ? 'ASC' : 'DESC', $count, 0, $continuation, $searches);
++		$ids = $entryDAO->listIdsWhere($type, $id, $state, $searches,
++			order: $order === 'o' ? 'ASC' : 'DESC',
++			continuation_id: $continuation,
++			limit: $count);
+ 		if ($ids === null) {
+ 			self::internalServerError();
+ 		}
+ 
+-		if ($continuation != '') {
++		if ($continuation !== '0') {
+ 			array_shift($ids);	//Discard first element that was already sent in the previous response
+ 			$count--;
+ 		}
+@@ -766,7 +778,7 @@ private static function streamContentsItems(array $e_ids, string $order): never
+ 		/** @var list<numeric-string> $e_ids */
+ 
+ 		$entryDAO = FreshRSS_Factory::createEntryDao();
+-		$entries = $entryDAO->listByIds($e_ids, $order === 'o' ? 'ASC' : 'DESC');
++		$entries = $entryDAO->listByIds($e_ids, order: $order === 'o' ? 'ASC' : 'DESC');
+ 		$entries = array_values(iterator_to_array($entries));	//TODO: Improve
+ 
+ 		$items = self::entriesToArray($entries);
+@@ -1050,7 +1062,7 @@ public static function parse(): never {
+ 					 */
+ 					$continuation = is_string($_GET['c'] ?? null) ? trim($_GET['c']) : '';
+ 					if (!ctype_digit($continuation)) {
+-						$continuation = '';
++						$continuation = '0';
+ 					}
+ 					if (isset($pathInfos[5]) && $pathInfos[5] === 'contents') {
+ 						if (!isset($pathInfos[6]) && is_string($_GET['s'] ?? null)) {
+diff --git a/p/scripts/main.js b/p/scripts/main.js
+index a1cf5d8aed0..1dce5f9fcf1 100644
+--- a/p/scripts/main.js
++++ b/p/scripts/main.js
+@@ -1857,6 +1857,12 @@ let url_load_more = '';
+ let load_more = false;
+ let box_load_more = null;
+ 
++function remove_existing_posts() {
++	document.querySelectorAll('.flux, .day').forEach(function (div) {
++		div.remove();
++	});
++}
++
+ function load_more_posts() {
+ 	if (load_more || !url_load_more || !box_load_more) {
+ 		return;
+@@ -1868,6 +1874,11 @@ function load_more_posts() {
+ 	req.open('GET', url_load_more, true);
+ 	req.responseType = 'document';
+ 	req.onload = function (e) {
++		if (context.sort === 'rand') {
++			document.scrollingElement.scrollTop = 0;
++			remove_existing_posts();
++		}
++
+ 		const html = this.response;
+ 		const streamFooter = document.getElementById('stream-footer');
+ 

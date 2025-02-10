@@ -1,0 +1,752 @@
+diff --git a/apps/backend/src/api/api.module.ts b/apps/backend/src/api/api.module.ts
+index 133758d09..c2101d58c 100644
+--- a/apps/backend/src/api/api.module.ts
++++ b/apps/backend/src/api/api.module.ts
+@@ -26,6 +26,7 @@ import { AgenciesController } from '@gitroom/backend/api/routes/agencies.control
+ import { PublicController } from '@gitroom/backend/api/routes/public.controller';
+ import { RootController } from '@gitroom/backend/api/routes/root.controller';
+ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
++import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
+ 
+ const authenticatedController = [
+   UsersController,
+@@ -63,6 +64,7 @@ const authenticatedController = [
+     CodesService,
+     IntegrationManager,
+     TrackService,
++    ShortLinkService,
+   ],
+   get exports() {
+     return [...this.imports, ...this.providers];
+diff --git a/apps/backend/src/api/routes/posts.controller.ts b/apps/backend/src/api/routes/posts.controller.ts
+index 314ad5c69..81307e607 100644
+--- a/apps/backend/src/api/routes/posts.controller.ts
++++ b/apps/backend/src/api/routes/posts.controller.ts
+@@ -27,6 +27,7 @@ import { CreateGeneratedPostsDto } from '@gitroom/nestjs-libraries/dtos/generato
+ import { AgentGraphService } from '@gitroom/nestjs-libraries/agent/agent.graph.service';
+ import { Response } from 'express';
+ import { GetUserFromRequest } from '@gitroom/nestjs-libraries/user/user.from.request';
++import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
+ 
+ @ApiTags('Posts')
+ @Controller('/posts')
+@@ -35,9 +36,23 @@ export class PostsController {
+     private _postsService: PostsService,
+     private _starsService: StarsService,
+     private _messagesService: MessagesService,
+-    private _agentGraphService: AgentGraphService
++    private _agentGraphService: AgentGraphService,
++    private _shortLinkService: ShortLinkService
+   ) {}
+ 
++  @Get('/:id/statistics')
++  async getStatistics(
++    @GetOrgFromRequest() org: Organization,
++    @Param('id') id: string
++  ) {
++    return this._postsService.getStatistics(org.id, id);
++  }
++
++  @Post('/should-shortlink')
++  async shouldShortlink(@Body() body: { messages: string[] }) {
++    return { ask: this._shortLinkService.askShortLinkedin(body.messages) };
++  }
++
+   @Get('/marketplace/:id?')
+   async getMarketplacePosts(
+     @GetOrgFromRequest() org: Organization,
+@@ -61,26 +76,16 @@ export class PostsController {
+     @GetOrgFromRequest() org: Organization,
+     @Query() query: GetPostsDto
+   ) {
+-    const [posts] = await Promise.all([
+-      this._postsService.getPosts(org.id, query),
+-      // this._commentsService.getAllCommentsByWeekYear(
+-      //   org.id,
+-      //   query.year,
+-      //   query.week
+-      // ),
+-    ]);
++    const posts = await this._postsService.getPosts(org.id, query);
+ 
+     return {
+       posts,
+-      // comments,
+     };
+   }
+ 
+   @Get('/find-slot')
+-  async findSlot(
+-    @GetOrgFromRequest() org: Organization,
+-  ) {
+-    return {date: await this._postsService.findFreeDateTime(org.id)}
++  async findSlot(@GetOrgFromRequest() org: Organization) {
++    return { date: await this._postsService.findFreeDateTime(org.id) };
+   }
+ 
+   @Get('/predict-trending')
+@@ -128,10 +133,7 @@ export class PostsController {
+     @Res({ passthrough: false }) res: Response
+   ) {
+     res.setHeader('Content-Type', 'application/json; charset=utf-8');
+-    for await (const event of this._agentGraphService.start(
+-      org.id,
+-      body,
+-    )) {
++    for await (const event of this._agentGraphService.start(org.id, body)) {
+       res.write(JSON.stringify(event) + '\n');
+     }
+ 
+diff --git a/apps/frontend/src/components/launches/add.edit.model.tsx b/apps/frontend/src/components/launches/add.edit.model.tsx
+index 124a32227..d3ca5897a 100644
+--- a/apps/frontend/src/components/launches/add.edit.model.tsx
++++ b/apps/frontend/src/components/launches/add.edit.model.tsx
+@@ -1,14 +1,12 @@
+ 'use client';
+ 
+ import React, {
+-  ClipboardEventHandler,
+   FC,
+   Fragment,
+   MouseEventHandler,
+   useCallback,
+   useEffect,
+   useMemo,
+-  useRef,
+   ClipboardEvent,
+   useState,
+   memo,
+@@ -363,12 +361,33 @@ export const AddEditModal: FC<{
+         }
+       }
+ 
++      const shortLinkUrl = await (
++        await fetch('/posts/should-shortlink', {
++          method: 'POST',
++          body: JSON.stringify({
++            messages: allKeys.flatMap((p) =>
++              p.value.flatMap((a) =>
++                a.content.slice(0, p.maximumCharacters || 1000000)
++              )
++            ),
++          }),
++        })
++      ).json();
++
++      const shortLink = !shortLinkUrl.ask
++        ? false
++        : await deleteDialog(
++            'Do you want to shortlink the URLs? it will let you get statistics over clicks',
++            'Yes, shortlink it!'
++          );
++
+       setLoading(true);
+       await fetch('/posts', {
+         method: 'POST',
+         body: JSON.stringify({
+           ...(postFor ? { order: postFor.id } : {}),
+           type,
++          shortLink,
+           date: dateState.utc().format('YYYY-MM-DDTHH:mm:ss'),
+           posts: allKeys.map((p) => ({
+             ...p,
+diff --git a/apps/frontend/src/components/launches/calendar.tsx b/apps/frontend/src/components/launches/calendar.tsx
+index 66232dbb1..2ba71d420 100644
+--- a/apps/frontend/src/components/launches/calendar.tsx
++++ b/apps/frontend/src/components/launches/calendar.tsx
+@@ -35,6 +35,7 @@ import { extend } from 'dayjs';
+ import { isUSCitizen } from './helpers/isuscitizen.utils';
+ import removeMd from 'remove-markdown';
+ import { useInterval } from '@mantine/hooks';
++import { StatisticsModal } from '@gitroom/frontend/components/launches/statistics';
+ extend(isSameOrAfter);
+ extend(isSameOrBefore);
+ 
+@@ -508,6 +509,23 @@ export const CalendarColumn: FC<{
+     });
+   }, [integrations, getDate]);
+ 
++  const openStatistics = useCallback(
++    (id: string) => () => {
++      modal.openModal({
++        closeOnClickOutside: true,
++        closeOnEscape: true,
++        withCloseButton: false,
++        classNames: {
++          modal: 'w-[100%] max-w-[1400px] bg-transparent text-textColor',
++        },
++        children: <StatisticsModal postId={id} />,
++        size: '80%',
++        // title: `Adding posts for ${getDate.format('DD/MM/YYYY HH:mm')}`,
++      });
++    },
++    []
++  );
++
+   const addProvider = useAddProvider();
+ 
+   return (
+@@ -551,6 +569,7 @@ export const CalendarColumn: FC<{
+                   isBeforeNow={isBeforeNow}
+                   date={getDate}
+                   state={post.state}
++                  statistics={openStatistics(post.id)}
+                   editPost={editPost(post, false)}
+                   duplicatePost={editPost(post, true)}
+                   post={post}
+@@ -654,13 +673,22 @@ const CalendarItem: FC<{
+   isBeforeNow: boolean;
+   editPost: () => void;
+   duplicatePost: () => void;
++  statistics: () => void;
+   integrations: Integrations[];
+   state: State;
+   display: 'day' | 'week' | 'month';
+   post: Post & { integration: Integration };
+ }> = memo((props) => {
+-  const { editPost, duplicatePost, post, date, isBeforeNow, state, display } =
+-    props;
++  const {
++    editPost,
++    statistics,
++    duplicatePost,
++    post,
++    date,
++    isBeforeNow,
++    state,
++    display,
++  } = props;
+ 
+   const preview = useCallback(() => {
+     window.open(`/p/` + post.id + '?share=true', '_blank');
+@@ -683,18 +711,24 @@ const CalendarItem: FC<{
+       className={clsx('w-full flex h-full flex-1 flex-col group', 'relative')}
+       style={{ opacity }}
+     >
+-      <div className="text-primary bg-forth text-[11px] h-[15px] w-full rounded-tr-[10px] rounded-tl-[10px] flex justify-center gap-[10px] px-[5px]">
++      <div className="text-white bg-forth text-[11px] h-[15px] w-full rounded-tr-[10px] rounded-tl-[10px] flex justify-center gap-[10px] px-[5px]">
+         <div
+           className="hidden group-hover:block hover:underline cursor-pointer"
+           onClick={duplicatePost}
+         >
+-          Duplicate
++          <Duplicate />
+         </div>
+         <div
+           className="hidden group-hover:block hover:underline cursor-pointer"
+           onClick={preview}
+         >
+-          Preview
++          <Preview />
++        </div>{' '}
++        <div
++          className="hidden group-hover:block hover:underline cursor-pointer"
++          onClick={statistics}
++        >
++          <Statistics />
+         </div>
+       </div>
+       <div
+@@ -730,3 +764,60 @@ const CalendarItem: FC<{
+     </div>
+   );
+ });
++
++const Duplicate = () => {
++  return (
++    <svg
++      xmlns="http://www.w3.org/2000/svg"
++      width="15"
++      height="15"
++      viewBox="0 0 32 32"
++      fill="none"
++      data-tooltip-id="tooltip"
++      data-tooltip-content="Duplicate Post"
++    >
++      <path
++        d="M27 5H9C8.46957 5 7.96086 5.21071 7.58579 5.58579C7.21071 5.96086 7 6.46957 7 7V9H5C4.46957 9 3.96086 9.21071 3.58579 9.58579C3.21071 9.96086 3 10.4696 3 11V25C3 25.5304 3.21071 26.0391 3.58579 26.4142C3.96086 26.7893 4.46957 27 5 27H23C23.5304 27 24.0391 26.7893 24.4142 26.4142C24.7893 26.0391 25 25.5304 25 25V23H27C27.5304 23 28.0391 22.7893 28.4142 22.4142C28.7893 22.0391 29 21.5304 29 21V7C29 6.46957 28.7893 5.96086 28.4142 5.58579C28.0391 5.21071 27.5304 5 27 5ZM23 11V13H5V11H23ZM23 25H5V15H23V25ZM27 21H25V11C25 10.4696 24.7893 9.96086 24.4142 9.58579C24.0391 9.21071 23.5304 9 23 9H9V7H27V21Z"
++        fill="white"
++      />
++    </svg>
++  );
++};
++
++const Preview = () => {
++  return (
++    <svg
++      xmlns="http://www.w3.org/2000/svg"
++      width="15"
++      height="15"
++      viewBox="0 0 32 32"
++      fill="none"
++      data-tooltip-id="tooltip"
++      data-tooltip-content="Preview Post"
++    >
++      <path
++        d="M30.9137 15.595C30.87 15.4963 29.8112 13.1475 27.4575 10.7937C24.3212 7.6575 20.36 6 16 6C11.64 6 7.67874 7.6575 4.54249 10.7937C2.18874 13.1475 1.12499 15.5 1.08624 15.595C1.02938 15.7229 1 15.8613 1 16.0012C1 16.1412 1.02938 16.2796 1.08624 16.4075C1.12999 16.5062 2.18874 18.8538 4.54249 21.2075C7.67874 24.3425 11.64 26 16 26C20.36 26 24.3212 24.3425 27.4575 21.2075C29.8112 18.8538 30.87 16.5062 30.9137 16.4075C30.9706 16.2796 31 16.1412 31 16.0012C31 15.8613 30.9706 15.7229 30.9137 15.595ZM16 24C12.1525 24 8.79124 22.6012 6.00874 19.8438C4.86704 18.7084 3.89572 17.4137 3.12499 16C3.89551 14.5862 4.86686 13.2915 6.00874 12.1562C8.79124 9.39875 12.1525 8 16 8C19.8475 8 23.2087 9.39875 25.9912 12.1562C27.1352 13.2912 28.1086 14.5859 28.8812 16C27.98 17.6825 24.0537 24 16 24ZM16 10C14.8133 10 13.6533 10.3519 12.6666 11.0112C11.6799 11.6705 10.9108 12.6075 10.4567 13.7039C10.0026 14.8003 9.88377 16.0067 10.1153 17.1705C10.3468 18.3344 10.9182 19.4035 11.7573 20.2426C12.5965 21.0818 13.6656 21.6532 14.8294 21.8847C15.9933 22.1162 17.1997 21.9974 18.2961 21.5433C19.3924 21.0892 20.3295 20.3201 20.9888 19.3334C21.6481 18.3467 22 17.1867 22 16C21.9983 14.4092 21.3657 12.884 20.2408 11.7592C19.1159 10.6343 17.5908 10.0017 16 10ZM16 20C15.2089 20 14.4355 19.7654 13.7777 19.3259C13.1199 18.8864 12.6072 18.2616 12.3045 17.5307C12.0017 16.7998 11.9225 15.9956 12.0768 15.2196C12.2312 14.4437 12.6122 13.731 13.1716 13.1716C13.731 12.6122 14.4437 12.2312 15.2196 12.0769C15.9956 11.9225 16.7998 12.0017 17.5307 12.3045C18.2616 12.6072 18.8863 13.1199 19.3259 13.7777C19.7654 14.4355 20 15.2089 20 16C20 17.0609 19.5786 18.0783 18.8284 18.8284C18.0783 19.5786 17.0609 20 16 20Z"
++        fill="white"
++      />
++    </svg>
++  );
++};
++
++export const Statistics = () => {
++  return (
++    <svg
++      xmlns="http://www.w3.org/2000/svg"
++      width="15"
++      height="15"
++      viewBox="0 0 32 32"
++      fill="none"
++      data-tooltip-id="tooltip"
++      data-tooltip-content="Post Statistics"
++    >
++      <path
++        d="M28 25H27V5C27 4.73478 26.8946 4.48043 26.7071 4.29289C26.5196 4.10536 26.2652 4 26 4H19C18.7348 4 18.4804 4.10536 18.2929 4.29289C18.1054 4.48043 18 4.73478 18 5V10H12C11.7348 10 11.4804 10.1054 11.2929 10.2929C11.1054 10.4804 11 10.7348 11 11V16H6C5.73478 16 5.48043 16.1054 5.29289 16.2929C5.10536 16.4804 5 16.7348 5 17V25H4C3.73478 25 3.48043 25.1054 3.29289 25.2929C3.10536 25.4804 3 25.7348 3 26C3 26.2652 3.10536 26.5196 3.29289 26.7071C3.48043 26.8946 3.73478 27 4 27H28C28.2652 27 28.5196 26.8946 28.7071 26.7071C28.8946 26.5196 29 26.2652 29 26C29 25.7348 28.8946 25.4804 28.7071 25.2929C28.5196 25.1054 28.2652 25 28 25ZM20 6H25V25H20V6ZM13 12H18V25H13V12ZM7 18H11V25H7V18Z"
++        fill="white"
++      />
++    </svg>
++  );
++};
+diff --git a/apps/frontend/src/components/launches/statistics.tsx b/apps/frontend/src/components/launches/statistics.tsx
+new file mode 100644
+index 000000000..90e050d1f
+--- /dev/null
++++ b/apps/frontend/src/components/launches/statistics.tsx
+@@ -0,0 +1,73 @@
++import React, { FC, Fragment, useCallback } from 'react';
++import { useModals } from '@mantine/modals';
++import useSWR from 'swr';
++import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
++
++export const StatisticsModal: FC<{ postId: string }> = (props) => {
++  const { postId } = props;
++  const modals = useModals();
++  const fetch = useFetch();
++
++  const loadStatistics = useCallback(async () => {
++    return (await fetch(`/posts/${postId}/statistics`)).json();
++  }, [postId]);
++
++  const closeAll = useCallback(() => {
++    modals.closeAll();
++  }, []);
++
++  const { data, isLoading } = useSWR(
++    `/posts/${postId}/statistics`,
++    loadStatistics
++  );
++
++  return (
++    <div className="bg-sixth p-[32px] w-full max-w-[920px] mx-auto flex flex-col rounded-[4px] border border-customColor6 relative">
++      <button
++        onClick={closeAll}
++        className="outline-none absolute right-[20px] top-[15px] mantine-UnstyledButton-root mantine-ActionIcon-root hover:bg-tableBorder cursor-pointer mantine-Modal-close mantine-1dcetaa"
++        type="button"
++      >
++        <svg
++          viewBox="0 0 15 15"
++          fill="none"
++          xmlns="http://www.w3.org/2000/svg"
++          width="16"
++          height="16"
++        >
++          <path
++            d="M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z"
++            fill="currentColor"
++            fillRule="evenodd"
++            clipRule="evenodd"
++          />
++        </svg>
++      </button>
++      <h1 className="text-[24px]">Statistics</h1>
++      {isLoading ? (
++        <div>Loading</div>
++      ) : (
++        <>
++          {data.clicks.length === 0 ? (
++            'No Results'
++          ) : (
++            <>
++              <div className="grid grid-cols-3 mt-[20px]">
++                <div className="bg-forth p-[4px] rounded-tl-lg">Short Link</div>
++                <div className="bg-forth p-[4px]">Original Link</div>
++                <div className="bg-forth p-[4px] rounded-tr-lg">Clicks</div>
++                {data.clicks.map((p: any) => (
++                  <Fragment key={p.short}>
++                    <div className="p-[4px] py-[10px] bg-customColor6">{p.short}</div>
++                    <div className="p-[4px] py-[10px] bg-customColor6">{p.original}</div>
++                    <div className="p-[4px] py-[10px] bg-customColor6">{p.clicks}</div>
++                  </Fragment>
++                ))}
++              </div>
++            </>
++          )}
++        </>
++      )}
++    </div>
++  );
++};
+diff --git a/libraries/nestjs-libraries/src/database/prisma/database.module.ts b/libraries/nestjs-libraries/src/database/prisma/database.module.ts
+index 7b5652030..9345983e9 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/database.module.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/database.module.ts
+@@ -28,6 +28,7 @@ import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
+ import { AgenciesService } from '@gitroom/nestjs-libraries/database/prisma/agencies/agencies.service';
+ import { AgenciesRepository } from '@gitroom/nestjs-libraries/database/prisma/agencies/agencies.repository';
+ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
++import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
+ 
+ @Global()
+ @Module({
+@@ -64,6 +65,7 @@ import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
+     OpenaiService,
+     EmailService,
+     TrackService,
++    ShortLinkService,
+   ],
+   get exports() {
+     return this.providers;
+diff --git a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+index d4320b6e8..30c588027 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+@@ -21,6 +21,7 @@ import { timer } from '@gitroom/helpers/utils/timer';
+ import { AuthTokenDetails } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+ import utc from 'dayjs/plugin/utc';
+ import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
++import { ShortLinkService } from '@gitroom/nestjs-libraries/short-linking/short.link.service';
+ dayjs.extend(utc);
+ 
+ type PostWithConditionals = Post & {
+@@ -38,9 +39,20 @@ export class PostsService {
+     private _messagesService: MessagesService,
+     private _stripeService: StripeService,
+     private _integrationService: IntegrationService,
+-    private _mediaService: MediaService
++    private _mediaService: MediaService,
++    private _shortLinkService: ShortLinkService
+   ) {}
+ 
++  async getStatistics(orgId: string, id: string) {
++    const getPost = await this.getPostsRecursively(id, true, orgId, true);
++    const content = getPost.map((p) => p.content);
++    const shortLinksTracking = await this._shortLinkService.getStatistics(content);
++
++    return {
++      clicks: shortLinksTracking
++    }
++  }
++
+   async getPostsRecursively(
+     id: string,
+     includeIntegration = false,
+@@ -554,6 +566,14 @@ export class PostsService {
+   async createPost(orgId: string, body: CreatePostDto) {
+     const postList = [];
+     for (const post of body.posts) {
++      const messages = post.value.map(p => p.content);
++      const updateContent = !body.shortLink ? messages : await this._shortLinkService.convertTextToShortLinks(orgId, messages);
++
++      post.value = post.value.map((p, i) => ({
++        ...p,
++        content: updateContent[i],
++      }));
++
+       const { previousPost, posts } =
+         await this._postRepository.createOrUpdatePost(
+           body.type,
+@@ -757,6 +777,7 @@ export class PostsService {
+           type: 'draft',
+           date: randomDate,
+           order: '',
++          shortLink: false,
+           posts: [
+             {
+               group,
+diff --git a/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts b/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
+index 20bcd2481..3965f7103 100644
+--- a/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
++++ b/libraries/nestjs-libraries/src/dtos/posts/create.post.dto.ts
+@@ -1,5 +1,5 @@
+ import {
+-  ArrayMinSize, IsArray, IsDateString, IsDefined, IsIn, IsOptional, IsString, MinLength, ValidateIf, ValidateNested
++  ArrayMinSize, IsArray, IsBoolean, IsDateString, IsDefined, IsIn, IsOptional, IsString, MinLength, ValidateIf, ValidateNested
+ } from 'class-validator';
+ import { Type } from 'class-transformer';
+ import { DevToSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/dev.to.settings.dto';
+@@ -89,6 +89,10 @@ export class CreatePostDto {
+   @IsString()
+   order: string;
+ 
++  @IsDefined()
++  @IsBoolean()
++  shortLink: boolean;
++
+   @IsDefined()
+   @IsDateString()
+   date: string;
+diff --git a/libraries/nestjs-libraries/src/short-linking/providers/dub.ts b/libraries/nestjs-libraries/src/short-linking/providers/dub.ts
+new file mode 100644
+index 000000000..cc61a1503
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/short-linking/providers/dub.ts
+@@ -0,0 +1,80 @@
++import { ShortLinking } from '@gitroom/nestjs-libraries/short-linking/short-linking.interface';
++
++const options = {
++  headers: {
++    Authorization: `Bearer ${process.env.DUB_TOKEN}`,
++    'Content-Type': 'application/json',
++  },
++};
++
++export class Dub implements ShortLinking {
++  shortLinkDomain = 'dub.sh';
++
++  async linksStatistics(links: string[]) {
++    return Promise.all(
++      links.map(async (link) => {
++        const response = await (
++          await fetch(`https://api.dub.co/links/info?domain=${this.shortLinkDomain}&key=${link.split('/').pop()}`, options)
++        ).json();
++
++        return {
++          short: link,
++          original: response.url,
++          clicks: response.clicks,
++        };
++      })
++    );
++  }
++
++  async convertLinkToShortLink(id: string, link: string) {
++    return (
++      await (
++        await fetch(`https://api.dub.co/links`, {
++          ...options,
++          method: 'POST',
++          body: JSON.stringify({
++            url: link,
++            tenantId: id,
++            domain: this.shortLinkDomain,
++          }),
++        })
++      ).json()
++    ).shortLink;
++  }
++
++  async convertShortLinkToLink(shortLink: string) {
++    return await (
++      await (
++        await fetch(
++          `https://api.dub.co/links/info?domain=${shortLink}`,
++          options
++        )
++      ).json()
++    ).url;
++  }
++
++  // recursive functions that gets maximum 100 links per request if there are less than 100 links stop the recursion
++  async getAllLinksStatistics(
++    id: string,
++    page = 1
++  ): Promise<{ short: string; original: string; clicks: string }[]> {
++    const response = await (
++      await fetch(
++        `https://api.dub.co/links?tenantId=${id}&page=${page}&pageSize=100`,
++        options
++      )
++    ).json();
++
++    const mapLinks = response.links.map((link: any) => ({
++      short: link,
++      original: response.url,
++      clicks: response.clicks,
++    }));
++
++    if (mapLinks.length < 100) {
++      return mapLinks;
++    }
++
++    return [...mapLinks, ...(await this.getAllLinksStatistics(id, page + 1))];
++  }
++}
+diff --git a/libraries/nestjs-libraries/src/short-linking/providers/empty.ts b/libraries/nestjs-libraries/src/short-linking/providers/empty.ts
+new file mode 100644
+index 000000000..53d6bf5af
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/short-linking/providers/empty.ts
+@@ -0,0 +1,21 @@
++import { ShortLinking } from '@gitroom/nestjs-libraries/short-linking/short-linking.interface';
++
++export class Empty implements ShortLinking {
++  shortLinkDomain = 'empty';
++
++  async linksStatistics(links: string[]) {
++    return [];
++  }
++
++  async convertLinkToShortLink(link: string) {
++    return '';
++  }
++
++  async convertShortLinkToLink(shortLink: string) {
++    return '';
++  }
++
++  getAllLinksStatistics(id: string, page: number): Promise<{ short: string; original: string; clicks: string }[]> {
++    return Promise.resolve([]);
++  }
++}
+diff --git a/libraries/nestjs-libraries/src/short-linking/short-linking.interface.ts b/libraries/nestjs-libraries/src/short-linking/short-linking.interface.ts
+new file mode 100644
+index 000000000..74e2360aa
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/short-linking/short-linking.interface.ts
+@@ -0,0 +1,7 @@
++export interface ShortLinking {
++  shortLinkDomain: string;
++  linksStatistics(links: string[]): Promise<{short: string; original: string, clicks: string}[]>;
++  convertLinkToShortLink(id: string, link: string): Promise<string>;
++  convertShortLinkToLink(shortLink: string): Promise<string>;
++  getAllLinksStatistics(id: string, page: number): Promise<{short: string; original: string, clicks: string}[]>;
++}
+\ No newline at end of file
+diff --git a/libraries/nestjs-libraries/src/short-linking/short.link.service.ts b/libraries/nestjs-libraries/src/short-linking/short.link.service.ts
+new file mode 100644
+index 000000000..cdff93ce0
+--- /dev/null
++++ b/libraries/nestjs-libraries/src/short-linking/short.link.service.ts
+@@ -0,0 +1,131 @@
++import { Dub } from '@gitroom/nestjs-libraries/short-linking/providers/dub';
++import { Empty } from '@gitroom/nestjs-libraries/short-linking/providers/empty';
++import { ShortLinking } from '@gitroom/nestjs-libraries/short-linking/short-linking.interface';
++import { Injectable } from '@nestjs/common';
++
++const getProvider = (): ShortLinking => {
++  if (process.env.DUB_TOKEN) {
++    return new Dub();
++  }
++
++  return new Empty();
++};
++
++@Injectable()
++export class ShortLinkService {
++  static provider = getProvider();
++
++  askShortLinkedin(messages: string[]): boolean {
++    if (ShortLinkService.provider.shortLinkDomain === 'empty') {
++      return false;
++    }
++
++    const mergeMessages = messages.join(' ');
++    const urlRegex = /https?:\/\/[^\s/$.?#].[^\s]*/g;
++    const urls = mergeMessages.match(urlRegex);
++    if (!urls) {
++      // No URLs found, return the original text
++      return false;
++    }
++
++    return urls.some((url) => url.indexOf(ShortLinkService.provider.shortLinkDomain) === -1);
++  }
++
++  async convertTextToShortLinks(id: string, messages: string[]) {
++    if (ShortLinkService.provider.shortLinkDomain === 'empty') {
++      return messages;
++    }
++
++    const urlRegex = /https?:\/\/[^\s/$.?#].[^\s]*/g;
++    return Promise.all(
++      messages.map(async (text) => {
++        const urls = text.match(urlRegex);
++        if (!urls) {
++          // No URLs found, return the original text
++          return text;
++        }
++
++        const replacementMap: Record<string, string> = {};
++
++        // Process each URL asynchronously
++        await Promise.all(
++          urls.map(async (url) => {
++            if (url.indexOf(ShortLinkService.provider.shortLinkDomain) === -1) {
++              replacementMap[url] =
++                await ShortLinkService.provider.convertLinkToShortLink(id, url);
++            } else {
++              replacementMap[url] = url; // Keep the original URL if it matches the prefix
++            }
++          })
++        );
++
++        // Replace the URLs in the text with their replacements
++        return text.replace(urlRegex, (url) => replacementMap[url]);
++      })
++    );
++  }
++
++  async convertShortLinksToLinks(messages: string[]) {
++    if (ShortLinkService.provider.shortLinkDomain === 'empty') {
++      return messages;
++    }
++
++    const urlRegex = /https?:\/\/[^\s/$.?#].[^\s]*/g;
++    return Promise.all(
++      messages.map(async (text) => {
++        const urls = text.match(urlRegex);
++        if (!urls) {
++          // No URLs found, return the original text
++          return text;
++        }
++
++        const replacementMap: Record<string, string> = {};
++
++        // Process each URL asynchronously
++        await Promise.all(
++          urls.map(async (url) => {
++            if (url.indexOf(ShortLinkService.provider.shortLinkDomain) > -1) {
++              replacementMap[url] =
++                await ShortLinkService.provider.convertShortLinkToLink(url);
++            } else {
++              replacementMap[url] = url; // Keep the original URL if it matches the prefix
++            }
++          })
++        );
++
++        // Replace the URLs in the text with their replacements
++        return text.replace(urlRegex, (url) => replacementMap[url]);
++      })
++    );
++  }
++
++  async getStatistics(messages: string[]) {
++    if (ShortLinkService.provider.shortLinkDomain === 'empty') {
++      return [];
++    }
++
++    const mergeMessages = messages.join(' ');
++    const regex = new RegExp(
++      `https?://${ShortLinkService.provider.shortLinkDomain.replace(
++        '.',
++        '\\.'
++      )}/[^\\s]*`,
++      'g'
++    );
++    const urls = mergeMessages.match(regex);
++    if (!urls) {
++      // No URLs found, return the original text
++      return [];
++    }
++
++    return ShortLinkService.provider.linksStatistics(urls);
++  }
++
++  async getAllLinks(id: string) {
++    if (ShortLinkService.provider.shortLinkDomain === 'empty') {
++      return [];
++    }
++
++    return ShortLinkService.provider.getAllLinksStatistics(id, 1);
++  }
++}

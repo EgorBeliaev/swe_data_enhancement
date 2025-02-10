@@ -1,0 +1,125 @@
+diff --git a/apps/backend/src/api/routes/auth.controller.ts b/apps/backend/src/api/routes/auth.controller.ts
+index 0bc68ec79..a509855bc 100644
+--- a/apps/backend/src/api/routes/auth.controller.ts
++++ b/apps/backend/src/api/routes/auth.controller.ts
+@@ -28,6 +28,12 @@ export class AuthController {
+     private _authService: AuthService,
+     private _emailService: EmailService
+   ) {}
++
++  @Get('/can-register')
++  async canRegister() {
++    return {register: await this._authService.canRegister()};
++  }
++
+   @Post('/register')
+   async register(
+     @Req() req: Request,
+diff --git a/apps/backend/src/services/auth/auth.service.ts b/apps/backend/src/services/auth/auth.service.ts
+index be8e4296c..788ca1f91 100644
+--- a/apps/backend/src/services/auth/auth.service.ts
++++ b/apps/backend/src/services/auth/auth.service.ts
+@@ -20,6 +20,14 @@ export class AuthService {
+     private _notificationService: NotificationService,
+     private _emailService: EmailService
+   ) {}
++  async canRegister() {
++    if (!process.env.DISABLE_REGISTRATION) {
++      return true;
++    }
++
++    return (await this._organizationService.getCount()) === 0;
++  }
++
+   async routeAuth(
+     provider: Provider,
+     body: CreateOrgUserDto | LoginUserDto,
+@@ -34,6 +42,10 @@ export class AuthService {
+           throw new Error('User already exists');
+         }
+ 
++        if (!(await this.canRegister())) {
++          throw new Error('Registration is disabled');
++        }
++
+         const create = await this._organizationService.createOrgAndUser(
+           body,
+           ip,
+@@ -132,6 +144,10 @@ export class AuthService {
+       return user;
+     }
+ 
++    if (!(await this.canRegister())) {
++      throw new Error('Registration is disabled');
++    }
++
+     const create = await this._organizationService.createOrgAndUser(
+       {
+         company: body.company,
+diff --git a/apps/frontend/src/app/auth/page.tsx b/apps/frontend/src/app/auth/page.tsx
+index 9240145c9..7713cb496 100644
+--- a/apps/frontend/src/app/auth/page.tsx
++++ b/apps/frontend/src/app/auth/page.tsx
+@@ -1,9 +1,11 @@
++import { internalFetch } from '@gitroom/helpers/utils/internal.fetch';
+ 
+ export const dynamic = 'force-dynamic';
+ 
+ import { Register } from '@gitroom/frontend/components/auth/register';
+ import { Metadata } from 'next';
+ import { isGeneralServerSide } from '@gitroom/helpers/utils/is.general.server.side';
++import Link from 'next/link';
+ 
+ export const metadata: Metadata = {
+   title: `${isGeneralServerSide() ? 'Postiz' : 'Gitroom'} Register`,
+@@ -11,5 +13,20 @@ export const metadata: Metadata = {
+ };
+ 
+ export default async function Auth() {
++  if (process.env.DISABLE_REGISTRATION) {
++    const canRegister = (
++      await (await internalFetch('/auth/can-register')).json()
++    ).register;
++    if (!canRegister) {
++      return (
++        <div className="text-center">
++          Registration is disabled
++          <br />
++          <Link className="underline hover:font-bold" href="/auth/login">Login instead</Link>
++        </div>
++      );
++    }
++  }
++
+   return <Register />;
+ }
+diff --git a/libraries/nestjs-libraries/src/database/prisma/organizations/organization.repository.ts b/libraries/nestjs-libraries/src/database/prisma/organizations/organization.repository.ts
+index ed5c5f074..1991387ea 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/organizations/organization.repository.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/organizations/organization.repository.ts
+@@ -30,6 +30,10 @@ export class OrganizationRepository {
+     });
+   }
+ 
++  getCount() {
++    return this._organization.model.organization.count();
++  }
++
+   getUserOrg(id: string) {
+     return this._userOrg.model.userOrganization.findFirst({
+       where: {
+diff --git a/libraries/nestjs-libraries/src/database/prisma/organizations/organization.service.ts b/libraries/nestjs-libraries/src/database/prisma/organizations/organization.service.ts
+index 48dec4769..a478555de 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/organizations/organization.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/organizations/organization.service.ts
+@@ -27,6 +27,10 @@ export class OrganizationService {
+     );
+   }
+ 
++  async getCount() {
++    return this._organizationRepository.getCount();
++  }
++
+   addUserToOrg(
+     userId: string,
+     id: string,

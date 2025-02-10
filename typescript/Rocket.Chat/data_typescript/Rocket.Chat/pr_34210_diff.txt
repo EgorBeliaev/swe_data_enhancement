@@ -1,0 +1,322 @@
+diff --git a/.changeset/popular-cameras-grin.md b/.changeset/popular-cameras-grin.md
+new file mode 100644
+index 000000000000..4ad9f6239f33
+--- /dev/null
++++ b/.changeset/popular-cameras-grin.md
+@@ -0,0 +1,6 @@
++---
++"@rocket.chat/meteor": patch
++"@rocket.chat/model-typings": patch
++---
++
++Fixes livechat conversations not being assigned to the contact manager even when the "Assign new conversations to the contact manager" setting is enabled
+diff --git a/apps/meteor/app/livechat/server/lib/LivechatTyped.ts b/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
+index b94b070537ea..6b3a1370c7b9 100644
+--- a/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
++++ b/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
+@@ -357,7 +357,12 @@ class LivechatClass {
+ 			throw new Error('error-contact-channel-blocked');
+ 		}
+ 
+-		const defaultAgent = await callbacks.run('livechat.checkDefaultAgentOnNewRoom', agent, visitor);
++		const defaultAgent =
++			agent ??
++			(await callbacks.run('livechat.checkDefaultAgentOnNewRoom', agent, {
++				visitorId: visitor._id,
++				source: roomInfo.source,
++			}));
+ 		// if no department selected verify if there is at least one active and pick the first
+ 		if (!defaultAgent && !visitor.department) {
+ 			const department = await getRequiredDepartment();
+diff --git a/apps/meteor/ee/app/livechat-enterprise/server/hooks/handleNextAgentPreferredEvents.ts b/apps/meteor/ee/app/livechat-enterprise/server/hooks/handleNextAgentPreferredEvents.ts
+index 7146b8df4e4c..5dc13cfce1e0 100644
+--- a/apps/meteor/ee/app/livechat-enterprise/server/hooks/handleNextAgentPreferredEvents.ts
++++ b/apps/meteor/ee/app/livechat-enterprise/server/hooks/handleNextAgentPreferredEvents.ts
+@@ -1,29 +1,33 @@
+ import type { IUser, SelectedAgent } from '@rocket.chat/core-typings';
+-import { LivechatVisitors, LivechatInquiry, LivechatRooms, Users } from '@rocket.chat/models';
++import { LivechatVisitors, LivechatContacts, LivechatInquiry, LivechatRooms, Users } from '@rocket.chat/models';
+ 
+ import { notifyOnLivechatInquiryChanged } from '../../../../../app/lib/server/lib/notifyListener';
+ import { RoutingManager } from '../../../../../app/livechat/server/lib/RoutingManager';
++import { migrateVisitorIfMissingContact } from '../../../../../app/livechat/server/lib/contacts/migrateVisitorIfMissingContact';
+ import { settings } from '../../../../../app/settings/server';
+ import { callbacks } from '../../../../../lib/callbacks';
+ 
+ let contactManagerPreferred = false;
+ let lastChattedAgentPreferred = false;
+ 
+-const normalizeDefaultAgent = (agent?: Pick<IUser, '_id' | 'username'> | null): SelectedAgent | null => {
++const normalizeDefaultAgent = (agent?: Pick<IUser, '_id' | 'username'> | null): SelectedAgent | undefined => {
+ 	if (!agent) {
+-		return null;
++		return undefined;
+ 	}
+ 
+ 	const { _id: agentId, username } = agent;
+ 	return { agentId, username };
+ };
+ 
+-const getDefaultAgent = async (username?: string): Promise<SelectedAgent | null> => {
+-	if (!username) {
+-		return null;
++const getDefaultAgent = async ({ username, id }: { username?: string; id?: string }): Promise<SelectedAgent | undefined> => {
++	if (!username && !id) {
++		return undefined;
+ 	}
+ 
+-	return normalizeDefaultAgent(await Users.findOneOnlineAgentByUserList(username, { projection: { _id: 1, username: 1 } }));
++	if (id) {
++		return normalizeDefaultAgent(await Users.findOneOnlineAgentById(id, undefined, { projection: { _id: 1, username: 1 } }));
++	}
++	return normalizeDefaultAgent(await Users.findOneOnlineAgentByUserList(username || [], { projection: { _id: 1, username: 1 } }));
+ };
+ 
+ settings.watch<boolean>('Livechat_last_chatted_agent_routing', (value) => {
+@@ -88,30 +92,32 @@ settings.watch<boolean>('Omnichannel_contact_manager_routing', (value) => {
+ 
+ callbacks.add(
+ 	'livechat.checkDefaultAgentOnNewRoom',
+-	async (defaultAgent, defaultGuest) => {
+-		if (defaultAgent || !defaultGuest) {
++	async (defaultAgent, { visitorId, source } = {}) => {
++		if (defaultAgent || !visitorId || !source) {
+ 			return defaultAgent;
+ 		}
+ 
+-		const { _id: guestId } = defaultGuest;
+-		const guest = await LivechatVisitors.findOneEnabledById(guestId, {
++		const guest = await LivechatVisitors.findOneEnabledById(visitorId, {
+ 			projection: { lastAgent: 1, token: 1, contactManager: 1 },
+ 		});
+ 		if (!guest) {
+-			return defaultAgent;
++			return undefined;
+ 		}
+ 
+-		const { lastAgent, token, contactManager } = guest;
+-		const guestManager = contactManager?.username && contactManagerPreferred && getDefaultAgent(contactManager?.username);
++		const contactId = await migrateVisitorIfMissingContact(visitorId, source);
++		const contact = contactId ? await LivechatContacts.findOneById(contactId, { projection: { contactManager: 1 } }) : undefined;
++
++		const guestManager = contactManagerPreferred && (await getDefaultAgent({ id: contact?.contactManager }));
+ 		if (guestManager) {
+ 			return guestManager;
+ 		}
+ 
+ 		if (!lastChattedAgentPreferred) {
+-			return defaultAgent;
++			return undefined;
+ 		}
+ 
+-		const guestAgent = lastAgent?.username && getDefaultAgent(lastAgent?.username);
++		const { lastAgent, token } = guest;
++		const guestAgent = await getDefaultAgent({ username: lastAgent?.username });
+ 		if (guestAgent) {
+ 			return guestAgent;
+ 		}
+@@ -120,19 +126,19 @@ callbacks.add(
+ 			projection: { servedBy: 1 },
+ 		});
+ 		if (!room?.servedBy) {
+-			return defaultAgent;
++			return undefined;
+ 		}
+ 
+ 		const {
+ 			servedBy: { username: usernameByRoom },
+ 		} = room;
+ 		if (!usernameByRoom) {
+-			return defaultAgent;
++			return undefined;
+ 		}
+ 		const lastRoomAgent = normalizeDefaultAgent(
+ 			await Users.findOneOnlineAgentByUserList(usernameByRoom, { projection: { _id: 1, username: 1 } }),
+ 		);
+-		return lastRoomAgent ?? defaultAgent;
++		return lastRoomAgent;
+ 	},
+ 	callbacks.priority.MEDIUM,
+ 	'livechat-check-default-agent-new-room',
+diff --git a/apps/meteor/lib/callbacks.ts b/apps/meteor/lib/callbacks.ts
+index 901c8101e034..746c56401b91 100644
+--- a/apps/meteor/lib/callbacks.ts
++++ b/apps/meteor/lib/callbacks.ts
+@@ -24,6 +24,7 @@ import type {
+ 	IOmnichannelRoomInfo,
+ 	IOmnichannelInquiryExtraData,
+ 	IOmnichannelRoomExtraData,
++	IOmnichannelSource,
+ } from '@rocket.chat/core-typings';
+ import type { Updater } from '@rocket.chat/models';
+ import type { FilterOperators } from 'mongodb';
+@@ -118,7 +119,10 @@ type ChainedCallbackSignatures = {
+ 	) => Promise<T>;
+ 
+ 	'livechat.beforeRouteChat': (inquiry: ILivechatInquiryRecord, agent?: { agentId: string; username: string }) => ILivechatInquiryRecord;
+-	'livechat.checkDefaultAgentOnNewRoom': (agent: SelectedAgent, visitor?: ILivechatVisitor) => SelectedAgent | null;
++	'livechat.checkDefaultAgentOnNewRoom': (
++		defaultAgent?: SelectedAgent,
++		params?: { visitorId?: string; source?: IOmnichannelSource },
++	) => SelectedAgent | undefined;
+ 
+ 	'livechat.onLoadForwardDepartmentRestrictions': (params: { departmentId: string }) => Record<string, unknown>;
+ 
+diff --git a/apps/meteor/server/models/raw/Users.js b/apps/meteor/server/models/raw/Users.js
+index 04df04af5939..aa8d481c86e0 100644
+--- a/apps/meteor/server/models/raw/Users.js
++++ b/apps/meteor/server/models/raw/Users.js
+@@ -1657,11 +1657,11 @@ export class UsersRaw extends BaseRaw {
+ 		return this.findOne(query);
+ 	}
+ 
+-	findOneOnlineAgentById(_id, isLivechatEnabledWhenAgentIdle) {
++	findOneOnlineAgentById(_id, isLivechatEnabledWhenAgentIdle, options) {
+ 		// TODO: Create class Agent
+ 		const query = queryStatusAgentOnline({ _id }, isLivechatEnabledWhenAgentIdle);
+ 
+-		return this.findOne(query);
++		return this.findOne(query, options);
+ 	}
+ 
+ 	findAgents() {
+diff --git a/apps/meteor/tests/end-to-end/api/livechat/24-routing.ts b/apps/meteor/tests/end-to-end/api/livechat/24-routing.ts
+index fb1301341069..582d9c096b77 100644
+--- a/apps/meteor/tests/end-to-end/api/livechat/24-routing.ts
++++ b/apps/meteor/tests/end-to-end/api/livechat/24-routing.ts
+@@ -1,9 +1,11 @@
++import { faker } from '@faker-js/faker';
+ import type { Credentials } from '@rocket.chat/api-client';
+-import { UserStatus, type ILivechatDepartment, type IUser } from '@rocket.chat/core-typings';
++import { UserStatus } from '@rocket.chat/core-typings';
++import type { ILivechatDepartment, IUser } from '@rocket.chat/core-typings';
+ import { expect } from 'chai';
+ import { after, before, describe, it } from 'mocha';
+ 
+-import { getCredentials, request, api } from '../../../data/api-data';
++import { getCredentials, request, api, credentials } from '../../../data/api-data';
+ import {
+ 	createAgent,
+ 	makeAgentAvailable,
+@@ -33,7 +35,9 @@ import { IS_EE } from '../../../e2e/config/constants';
+ 
+ 		let testUser: { user: IUser; credentials: Credentials };
+ 		let testUser2: { user: IUser; credentials: Credentials };
++		let testUser3: { user: IUser; credentials: Credentials };
+ 		let testDepartment: ILivechatDepartment;
++		let visitorEmail: string;
+ 
+ 		before(async () => {
+ 			const user = await createUser();
+@@ -60,14 +64,43 @@ import { IS_EE } from '../../../e2e/config/constants';
+ 		});
+ 
+ 		before(async () => {
+-			testDepartment = await createDepartment([{ agentId: testUser.user._id }]);
++			const user = await createUser();
++			await createAgent(user.username);
++			const credentials3 = await login(user.username, password);
++			await makeAgentAvailable(credentials3);
++
++			testUser3 = {
++				user,
++				credentials: credentials3,
++			};
+ 		});
+ 
+-		after(async () => {
+-			await deleteUser(testUser.user);
+-			await deleteUser(testUser2.user);
++		before(async () => {
++			testDepartment = await createDepartment([{ agentId: testUser.user._id }, { agentId: testUser3.user._id }]);
++			await updateSetting('Livechat_assign_new_conversation_to_bot', true);
++
++			const visitorName = faker.person.fullName();
++			visitorEmail = faker.internet.email().toLowerCase();
++			await request
++				.post(api('omnichannel/contacts'))
++				.set(credentials)
++				.send({
++					name: visitorName,
++					emails: [visitorEmail],
++					phones: [],
++					contactManager: testUser3.user._id,
++				});
+ 		});
+ 
++		after(async () =>
++			Promise.all([
++				deleteUser(testUser.user),
++				deleteUser(testUser2.user),
++				deleteUser(testUser3.user),
++				updateSetting('Livechat_assign_new_conversation_to_bot', false),
++			]),
++		);
++
+ 		it('should route a room to an available agent', async () => {
+ 			const visitor = await createVisitor(testDepartment._id);
+ 			const room = await createLivechatRoom(visitor.token);
+@@ -91,9 +124,24 @@ import { IS_EE } from '../../../e2e/config/constants';
+ 			expect(roomInfo.servedBy).to.be.an('object');
+ 			expect(roomInfo.servedBy?._id).to.not.be.equal(testUser2.user._id);
+ 		});
++		(IS_EE ? it : it.skip)(
++			'should route to contact manager if it is online and Livechat_assign_new_conversation_to_bot is enabled',
++			async () => {
++				const visitor = await createVisitor(testDepartment._id, faker.person.fullName(), visitorEmail);
++				const room = await createLivechatRoom(visitor.token);
++
++				await sleep(5000);
++
++				const roomInfo = await getLivechatRoomInfo(room._id);
++
++				expect(roomInfo.servedBy).to.be.an('object');
++				expect(roomInfo.servedBy?._id).to.be.equal(testUser3.user._id);
++			},
++		);
+ 		it('should fail to start a conversation if there is noone available and Livechat_accept_chats_with_no_agents is false', async () => {
+ 			await updateSetting('Livechat_accept_chats_with_no_agents', false);
+ 			await makeAgentUnavailable(testUser.credentials);
++			await makeAgentUnavailable(testUser3.credentials);
+ 
+ 			const visitor = await createVisitor(testDepartment._id);
+ 			const { body } = await request.get(api('livechat/room')).query({ token: visitor.token }).expect(400);
+@@ -147,6 +195,21 @@ import { IS_EE } from '../../../e2e/config/constants';
+ 			const roomInfo = await getLivechatRoomInfo(room._id);
+ 			expect(roomInfo.servedBy).to.be.undefined;
+ 		});
++		(IS_EE ? it : it.skip)(
++			'should route to another available agent if contact manager is unavailable and Livechat_assign_new_conversation_to_bot is enabled',
++			async () => {
++				await makeAgentAvailable(testUser.credentials);
++				const visitor = await createVisitor(testDepartment._id, faker.person.fullName(), visitorEmail);
++				const room = await createLivechatRoom(visitor.token);
++
++				await sleep(5000);
++
++				const roomInfo = await getLivechatRoomInfo(room._id);
++
++				expect(roomInfo.servedBy).to.be.an('object');
++				expect(roomInfo.servedBy?._id).to.be.equal(testUser.user._id);
++			},
++		);
+ 	});
+ 	describe('Load Balancing', () => {
+ 		before(async () => {
+diff --git a/packages/model-typings/src/models/IUsersModel.ts b/packages/model-typings/src/models/IUsersModel.ts
+index 407006596ba6..e7a6acd94180 100644
+--- a/packages/model-typings/src/models/IUsersModel.ts
++++ b/packages/model-typings/src/models/IUsersModel.ts
+@@ -263,7 +263,11 @@ export interface IUsersModel extends IBaseModel<IUser> {
+ 	findOnlineAgents(agentId?: string): FindCursor<ILivechatAgent>;
+ 	countOnlineAgents(agentId: string): Promise<number>;
+ 	findOneBotAgent(): Promise<ILivechatAgent | null>;
+-	findOneOnlineAgentById(agentId: string, isLivechatEnabledWhenAgentIdle?: boolean): Promise<ILivechatAgent | null>;
++	findOneOnlineAgentById(
++		agentId: string,
++		isLivechatEnabledWhenAgentIdle?: boolean,
++		options?: FindOptions<IUser>,
++	): Promise<ILivechatAgent | null>;
+ 	findAgents(): FindCursor<ILivechatAgent>;
+ 	countAgents(): Promise<number>;
+ 	getNextAgent(ignoreAgentId?: string, extraQuery?: Filter<IUser>): Promise<{ agentId: string; username: string } | null>;

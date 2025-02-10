@@ -1,0 +1,688 @@
+diff --git a/app/Controllers/entryController.php b/app/Controllers/entryController.php
+index 2cbd256bc7e..5637bd101fb 100644
+--- a/app/Controllers/entryController.php
++++ b/app/Controllers/entryController.php
+@@ -96,6 +96,14 @@ public function readAction(): void {
+ 						$entryDAO->markReadEntries($id_max, false, FreshRSS_Feed::PRIORITY_MAIN_STREAM, FreshRSS_Feed::PRIORITY_IMPORTANT,
+ 							FreshRSS_Context::$search, FreshRSS_Context::$state, $is_read);
+ 						break;
++					case 'A':
++						$entryDAO->markReadEntries($id_max, false, FreshRSS_Feed::PRIORITY_CATEGORY, FreshRSS_Feed::PRIORITY_IMPORTANT,
++							FreshRSS_Context::$search, FreshRSS_Context::$state, $is_read);
++						break;
++					case 'Z':
++						$entryDAO->markReadEntries($id_max, false, FreshRSS_Feed::PRIORITY_ARCHIVED, FreshRSS_Feed::PRIORITY_IMPORTANT,
++							FreshRSS_Context::$search, FreshRSS_Context::$state, $is_read);
++						break;
+ 					case 'i':
+ 						$entryDAO->markReadEntries($id_max, false, FreshRSS_Feed::PRIORITY_IMPORTANT, null,
+ 							FreshRSS_Context::$search, FreshRSS_Context::$state, $is_read);
+diff --git a/app/Controllers/indexController.php b/app/Controllers/indexController.php
+index a977386a337..70bb25a7765 100644
+--- a/app/Controllers/indexController.php
++++ b/app/Controllers/indexController.php
+@@ -205,7 +205,9 @@ public function opmlAction(): void {
+ 		$this->view->excludeMutedFeeds = $type !== 'f';	// Exclude muted feeds except when we focus on a feed
+ 
+ 		switch ($type) {
+-			case 'a':
++			case 'a':	// All PRIORITY_MAIN_STREAM
++			case 'A':	// All except PRIORITY_ARCHIVED
++			case 'Z':	// All including PRIORITY_ARCHIVED
+ 				$this->view->categories = FreshRSS_Context::categories();
+ 				break;
+ 			case 'c':
+diff --git a/app/Models/Context.php b/app/Models/Context.php
+index eeb16f414f8..6cdda909c3d 100644
+--- a/app/Models/Context.php
++++ b/app/Models/Context.php
+@@ -20,7 +20,7 @@ final class FreshRSS_Context {
+ 	public static int $total_unread = 0;
+ 	public static int $total_important_unread = 0;
+ 
+-	/** @var array{'all':int,'read':int,'unread':int} */
++	/** @var array{all:int,read:int,unread:int} */
+ 	public static array $total_starred = [
+ 		'all' => 0,
+ 		'read' => 0,
+@@ -29,15 +29,17 @@ final class FreshRSS_Context {
+ 
+ 	public static int $get_unread = 0;
+ 
+-	/** @var array{'all':bool,'starred':bool,'important':bool,'feed':int|false,'category':int|false,'tag':int|false,'tags':bool} */
++	/** @var array{all:bool,A:bool,starred:bool,important:bool,feed:int|false,category:int|false,tag:int|false,tags:bool,Z:bool} */
+ 	public static array $current_get = [
+ 		'all' => false,
++		'A' => false,
+ 		'starred' => false,
+ 		'important' => false,
+ 		'feed' => false,
+ 		'category' => false,
+ 		'tag' => false,
+ 		'tags' => false,
++		'Z' => false,
+ 	];
+ 
+ 	public static string $next_get = 'a';
+@@ -271,12 +273,14 @@ public static function getRevertState(int $state): int {
+ 	 * Return the current get as a string or an array.
+ 	 *
+ 	 * If $array is true, the first item of the returned value is 'f' or 'c' or 't' and the second is the id.
+-	 * @phpstan-return ($asArray is true ? array{'a'|'c'|'f'|'i'|'s'|'t'|'T',bool|int} : string)
++	 * @phpstan-return ($asArray is true ? array{'a'|'A'|'c'|'f'|'i'|'s'|'t'|'T'|'Z',bool|int} : string)
+ 	 * @return string|array{string,bool|int}
+ 	 */
+ 	public static function currentGet(bool $asArray = false): string|array {
+ 		if (self::$current_get['all']) {
+ 			return $asArray ? ['a', true] : 'a';
++		} elseif (self::$current_get['A']) {
++			return $asArray ? ['A', true] : 'A';
+ 		} elseif (self::$current_get['important']) {
+ 			return $asArray ? ['i', true] : 'i';
+ 		} elseif (self::$current_get['starred']) {
+@@ -301,6 +305,8 @@ public static function currentGet(bool $asArray = false): string|array {
+ 			}
+ 		} elseif (self::$current_get['tags']) {
+ 			return $asArray ? ['T', true] : 'T';
++		} elseif (self::$current_get['Z']) {
++			return $asArray ? ['Z', true] : 'Z';
+ 		}
+ 		return '';
+ 	}
+@@ -312,6 +318,14 @@ public static function isAll(): bool {
+ 		return self::$current_get['all'] != false;
+ 	}
+ 
++	public static function isAllAndCategories(): bool {
++		return self::$current_get['A'] != false;
++	}
++
++	public static function isAllAndArchived(): bool {
++		return self::$current_get['Z'] != false;
++	}
++
+ 	/**
+ 	 * @return bool true if the current request targets important feeds, false otherwise.
+ 	 */
+@@ -349,12 +363,14 @@ public static function isCurrentGet(string $get): bool {
+ 
+ 		return match ($type) {
+ 			'a' => self::$current_get['all'],
++			'A' => self::$current_get['A'],
+ 			'i' => self::$current_get['important'],
+ 			's' => self::$current_get['starred'],
+ 			'f' => self::$current_get['feed'] == $id,
+ 			'c' => self::$current_get['category'] == $id,
+ 			't' => self::$current_get['tag'] == $id,
+ 			'T' => self::$current_get['tags'] || self::$current_get['tag'],
++			'Z' => self::$current_get['Z'],
+ 			default => false,
+ 		};
+ 	}
+@@ -386,13 +402,23 @@ public static function _get(string $get): void {
+ 		}
+ 
+ 		switch ($type) {
+-			case 'a':
++			case 'a':	// All PRIORITY_MAIN_STREAM
+ 				self::$current_get['all'] = true;
++				self::$description = FreshRSS_Context::systemConf()->meta_description;
++				self::$get_unread = self::$total_unread;
++				break;
++			case 'A':	// All except PRIORITY_ARCHIVED
++				self::$current_get['A'] = true;
++				self::$description = FreshRSS_Context::systemConf()->meta_description;
++				self::$get_unread = self::$total_unread;
++				break;
++			case 'Z':	// All including PRIORITY_ARCHIVED
++				self::$current_get['Z'] = true;
+ 				self::$name = _t('index.feed.title');
+ 				self::$description = FreshRSS_Context::systemConf()->meta_description;
+ 				self::$get_unread = self::$total_unread;
+ 				break;
+-			case 'i':
++			case 'i':	// Priority important feeds
+ 				self::$current_get['important'] = true;
+ 				self::$name = _t('index.menu.important');
+ 				self::$description = FreshRSS_Context::systemConf()->meta_description;
+diff --git a/app/Models/EntryDAO.php b/app/Models/EntryDAO.php
+index f9bf5722046..525687c90a1 100644
+--- a/app/Models/EntryDAO.php
++++ b/app/Models/EntryDAO.php
+@@ -1170,7 +1170,7 @@ protected function sqlListEntriesWhere(string $alias = '', ?FreshRSS_BooleanSear
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'i'|'s'|'S'|'c'|'f'|'t'|'T'|'ST' $type
++	 * @phpstan-param 'a'|'A'|'i'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return array{0:array<int|string>,1:string}
+@@ -1185,13 +1185,16 @@ private function sqlListWhere(string $type = 'a', int $id = 0, int $state = Fres
+ 		$where = '';
+ 		$values = [];
+ 		switch ($type) {
+-			case 'a':	//All PRIORITY_MAIN_STREAM
++			case 'a':	// All PRIORITY_MAIN_STREAM
+ 				$where .= 'f.priority >= ' . FreshRSS_Feed::PRIORITY_MAIN_STREAM . ' ';
+ 				break;
+-			case 'A':	//All except PRIORITY_ARCHIVED
+-				$where .= 'f.priority > ' . FreshRSS_Feed::PRIORITY_ARCHIVED . ' ';
++			case 'A':	// All except PRIORITY_ARCHIVED
++				$where .= 'f.priority >= ' . FreshRSS_Feed::PRIORITY_CATEGORY . ' ';
++				break;
++			case 'Z':	// All including PRIORITY_ARCHIVED
++				$where .= 'f.priority >= ' . FreshRSS_Feed::PRIORITY_ARCHIVED . ' ';
+ 				break;
+-			case 'i':	//Priority important feeds
++			case 'i':	// Priority important feeds
+ 				$where .= 'f.priority >= ' . FreshRSS_Feed::PRIORITY_IMPORTANT . ' ';
+ 				break;
+ 			case 's':	//Starred. Deprecated: use $state instead
+@@ -1240,7 +1243,7 @@ private function sqlListWhere(string $type = 'a', int $id = 0, int $state = Fres
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST' $type
++	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @param int $id category/feed/tag ID
+ 	 * @throws FreshRSS_EntriesGetter_Exception
+@@ -1275,7 +1278,7 @@ private function listWhereRaw(string $type = 'a', int $id = 0, int $state = Fres
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST' $type
++	 * @phpstan-param 'a'|'A'|'s'|'S'|'i'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return Traversable<FreshRSS_Entry>
+@@ -1341,7 +1344,7 @@ public function listByIds(array $ids, string $order = 'DESC'): Traversable {
+ 	}
+ 
+ 	/**
+-	 * @phpstan-param 'a'|'A'|'s'|'S'|'c'|'f'|'t'|'T'|'ST' $type
++	 * @phpstan-param 'a'|'A'|'s'|'S'|'c'|'f'|'t'|'T'|'ST'|'Z' $type
+ 	 * @param int $id category/feed/tag ID
+ 	 * @param 'ASC'|'DESC' $order
+ 	 * @return array<numeric-string>|null
+diff --git a/app/Models/UserQuery.php b/app/Models/UserQuery.php
+index d3a56bb6a44..6933deb1fde 100644
+--- a/app/Models/UserQuery.php
++++ b/app/Models/UserQuery.php
+@@ -126,12 +126,18 @@ private function parseGet(string $get): void {
+ 		$this->get = $get;
+ 		if ($this->get === '') {
+ 			$this->get_type = 'all';
+-		} elseif (preg_match('/(?P<type>[acfistT])(_(?P<id>\d+))?/', $get, $matches)) {
++		} elseif (preg_match('/(?P<type>[aAcfistTZ])(_(?P<id>\d+))?/', $get, $matches)) {
+ 			$id = intval($matches['id'] ?? '0');
+ 			switch ($matches['type']) {
+-				case 'a':
++				case 'a':	// All PRIORITY_MAIN_STREAM
+ 					$this->get_type = 'all';
+ 					break;
++				case 'A':	// All except PRIORITY_ARCHIVED
++					$this->get_type = 'A';
++					break;
++				case 'Z':	// All including PRIORITY_ARCHIVED
++					$this->get_type = 'Z';
++					break;
+ 				case 'c':
+ 					$this->get_type = 'category';
+ 					$c = $this->categories[$id] ?? null;
+diff --git a/app/i18n/cs/conf.php b/app/i18n/cs/conf.php
+index ea87356bdab..b4cef925bf0 100644
+--- a/app/i18n/cs/conf.php
++++ b/app/i18n/cs/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Zobrazit podle štítku',
+ 			'type' => 'Typ',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Zobrazit všechny články',
+ 		'get_all_labels' => 'Zobrazit články s libovolným štítkem',
+ 		'get_category' => 'Zobrazit kategorii „%s“',
+diff --git a/app/i18n/de/conf.php b/app/i18n/de/conf.php
+index 71ed1438e27..22d2a3938b9 100644
+--- a/app/i18n/de/conf.php
++++ b/app/i18n/de/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Nach Labels filtern',
+ 			'type' => 'Filter-Typ',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Alle Artikel anzeigen',
+ 		'get_all_labels' => 'Alle Artikle mit beliebigem Label anzeigen',
+ 		'get_category' => 'Kategorie „%s“ anzeigen',
+diff --git a/app/i18n/el/conf.php b/app/i18n/el/conf.php
+index dfd8e92f46a..86477370e75 100644
+--- a/app/i18n/el/conf.php
++++ b/app/i18n/el/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Display by label',	// TODO
+ 			'type' => 'Type',	// TODO
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Display all articles',	// TODO
+ 		'get_all_labels' => 'Display articles with any label',	// TODO
+ 		'get_category' => 'Display “%s” category',	// TODO
+diff --git a/app/i18n/el/sub.php b/app/i18n/el/sub.php
+index 42d2607eb7f..79e64bbb5be 100644
+--- a/app/i18n/el/sub.php
++++ b/app/i18n/el/sub.php
+@@ -217,7 +217,7 @@
+ 			'show_rendered' => 'Show content',	// TODO
+ 		),
+ 		'show' => array(
+-			'all' => 'Show all feeds',	// TODO
++			'all' => 'All feeds',	// TODO
+ 			'error' => 'Show only feeds with errors',	// TODO
+ 		),
+ 		'showing' => array(
+diff --git a/app/i18n/en-us/conf.php b/app/i18n/en-us/conf.php
+index 6527a2ed6c9..0288bc0d9ae 100644
+--- a/app/i18n/en-us/conf.php
++++ b/app/i18n/en-us/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Display by label',	// IGNORE
+ 			'type' => 'Type',	// IGNORE
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// IGNORE
++		'get_Z' => 'Show all feeds, also archived ones',	// IGNORE
+ 		'get_all' => 'Display all articles',	// IGNORE
+ 		'get_all_labels' => 'Display articles with any label',	// IGNORE
+ 		'get_category' => 'Display “%s” category',	// IGNORE
+diff --git a/app/i18n/en-us/sub.php b/app/i18n/en-us/sub.php
+index c885e5861f2..a6afee93941 100644
+--- a/app/i18n/en-us/sub.php
++++ b/app/i18n/en-us/sub.php
+@@ -217,7 +217,7 @@
+ 			'show_rendered' => 'Show content',	// IGNORE
+ 		),
+ 		'show' => array(
+-			'all' => 'Show all feeds',	// IGNORE
++			'all' => 'All feeds',	// IGNORE
+ 			'error' => 'Show only feeds with errors',	// IGNORE
+ 		),
+ 		'showing' => array(
+diff --git a/app/i18n/en/conf.php b/app/i18n/en/conf.php
+index b0114f7d4ba..da0230a3093 100644
+--- a/app/i18n/en/conf.php
++++ b/app/i18n/en/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Display by label',
+ 			'type' => 'Type',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Display all articles',
+ 		'get_all_labels' => 'Display articles with any label',
+ 		'get_category' => 'Display “%s” category',
+diff --git a/app/i18n/en/sub.php b/app/i18n/en/sub.php
+index 640e5bfdac6..c6e2c24d9ee 100644
+--- a/app/i18n/en/sub.php
++++ b/app/i18n/en/sub.php
+@@ -217,7 +217,7 @@
+ 			'show_rendered' => 'Show content',
+ 		),
+ 		'show' => array(
+-			'all' => 'Show all feeds',
++			'all' => 'All feeds',
+ 			'error' => 'Show only feeds with errors',
+ 		),
+ 		'showing' => array(
+diff --git a/app/i18n/es/conf.php b/app/i18n/es/conf.php
+index 40d982557fb..610c7333c98 100644
+--- a/app/i18n/es/conf.php
++++ b/app/i18n/es/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Mostrar por etiqueta',
+ 			'type' => 'Tipo',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Mostrar todos los artículos',
+ 		'get_all_labels' => 'Mostrar artículos con cualquier etiqueta',
+ 		'get_category' => 'Mostrar la categoría “%s”',
+diff --git a/app/i18n/fa/conf.php b/app/i18n/fa/conf.php
+index afae6e3df2c..9a1890c0a71 100644
+--- a/app/i18n/fa/conf.php
++++ b/app/i18n/fa/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => ' نمایش بر اساس برچسب',
+ 			'type' => ' نوع',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => ' نمایش همه مقالات',
+ 		'get_all_labels' => 'Display articles with any label',	// TODO
+ 		'get_category' => ' دسته «%s» را نمایش دهید',
+diff --git a/app/i18n/fi/conf.php b/app/i18n/fi/conf.php
+index 441526f1ad1..3a9a12b8812 100644
+--- a/app/i18n/fi/conf.php
++++ b/app/i18n/fi/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Näytä merkinnän mukaan',
+ 			'type' => 'Laji',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Näytä kaikki artikkelit',
+ 		'get_all_labels' => 'Näytä artikkelit, joissa on mikä tahansa merkintä',
+ 		'get_category' => 'Näytä luokka “%s”',
+diff --git a/app/i18n/fr/conf.php b/app/i18n/fr/conf.php
+index 79e31dd23e5..bbf7fd6d15c 100644
+--- a/app/i18n/fr/conf.php
++++ b/app/i18n/fr/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Afficher par étiquette',
+ 			'type' => 'Type',	// IGNORE
+ 		),
++		'get_A' => 'Tous les flux, y compris ceux limités à leur catégorie',
++		'get_Z' => 'Tous les flux, y compris les archivés',
+ 		'get_all' => 'Afficher tous les articles',
+ 		'get_all_labels' => 'Afficher les articles avec une étiquette',
+ 		'get_category' => 'Afficher la catégorie <em>%s<em>',
+diff --git a/app/i18n/he/conf.php b/app/i18n/he/conf.php
+index bd63c2d0153..704459b97ff 100644
+--- a/app/i18n/he/conf.php
++++ b/app/i18n/he/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Display by label',	// TODO
+ 			'type' => 'Type',	// TODO
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'הצגת כל המאמרים',
+ 		'get_all_labels' => 'Display articles with any label',	// TODO
+ 		'get_category' => 'הצגת קטגוריה “%s”',
+diff --git a/app/i18n/he/sub.php b/app/i18n/he/sub.php
+index 049d63729b2..64d5f5bbe31 100644
+--- a/app/i18n/he/sub.php
++++ b/app/i18n/he/sub.php
+@@ -217,7 +217,7 @@
+ 			'show_rendered' => 'Show content',	// TODO
+ 		),
+ 		'show' => array(
+-			'all' => 'Show all feeds',	// TODO
++			'all' => 'All feeds',	// TODO
+ 			'error' => 'Show only feeds with errors',	// TODO
+ 		),
+ 		'showing' => array(
+diff --git a/app/i18n/hu/conf.php b/app/i18n/hu/conf.php
+index bdf15aecb14..9a9e896a194 100644
+--- a/app/i18n/hu/conf.php
++++ b/app/i18n/hu/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Rendezés címke szerint',
+ 			'type' => 'Típus',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Minden cikk megjelenítése',
+ 		'get_all_labels' => 'Cikkek megjelenítése bármilyen címkével',
+ 		'get_category' => '„%s” kategória megjelenítése',
+diff --git a/app/i18n/id/conf.php b/app/i18n/id/conf.php
+index ba95372d5e4..f9e7e39d8a2 100644
+--- a/app/i18n/id/conf.php
++++ b/app/i18n/id/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Tampilkan berdasarkan label',
+ 			'type' => 'Tipe',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Tampilkan semua artikel',
+ 		'get_all_labels' => 'Tampilkan artikel dengan setiap label',
+ 		'get_category' => 'Tampilkan kategori "%s"',
+diff --git a/app/i18n/id/sub.php b/app/i18n/id/sub.php
+index c0194397abe..bcc6a86ab14 100644
+--- a/app/i18n/id/sub.php
++++ b/app/i18n/id/sub.php
+@@ -217,7 +217,7 @@
+ 			'show_rendered' => 'Show content',	// TODO
+ 		),
+ 		'show' => array(
+-			'all' => 'Show all feeds',	// TODO
++			'all' => 'All feeds',	// TODO
+ 			'error' => 'Show only feeds with errors',	// TODO
+ 		),
+ 		'showing' => array(
+diff --git a/app/i18n/it/conf.php b/app/i18n/it/conf.php
+index 1fa9b51c5ea..dbb6a696e34 100644
+--- a/app/i18n/it/conf.php
++++ b/app/i18n/it/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Tag',
+ 			'type' => 'Tipo',
+ 		),
++		'get_A' => 'Mostra tutti i feed, anche quelli mostrati nella loro categoria',
++		'get_Z' => 'Mostra tutti i feed, anche quelli archiviati',
+ 		'get_all' => 'Mostra tutti gli articoli',
+ 		'get_all_labels' => 'Mostra gli articoli con qualsiasi etichetta',
+ 		'get_category' => 'Mostra la categoria “%s” ',
+diff --git a/app/i18n/ja/conf.php b/app/i18n/ja/conf.php
+index 9d043f58d91..1421b8c19c2 100644
+--- a/app/i18n/ja/conf.php
++++ b/app/i18n/ja/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'タグごとに表示する',
+ 			'type' => 'タイプ',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'すべての記事を表示する',
+ 		'get_all_labels' => '任意のラベルで記事を表示する',
+ 		'get_category' => 'カテゴリ“%s”を表示する',
+diff --git a/app/i18n/ko/conf.php b/app/i18n/ko/conf.php
+index a51faf5222c..e26171384f8 100644
+--- a/app/i18n/ko/conf.php
++++ b/app/i18n/ko/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => '태그별로 표시',
+ 			'type' => '유형',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => '모든 글 표시',
+ 		'get_all_labels' => '라벨이 있는 글 표시',
+ 		'get_category' => '“%s” 카테고리 표시',
+diff --git a/app/i18n/lv/conf.php b/app/i18n/lv/conf.php
+index 7e370db5dbd..d921d76940b 100644
+--- a/app/i18n/lv/conf.php
++++ b/app/i18n/lv/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Rādīt pēc birkas',
+ 			'type' => 'Veids',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Rādīt visus rakstus',
+ 		'get_all_labels' => 'Display articles with any label',	// TODO
+ 		'get_category' => 'Rādīt kategoriju “%s”',
+diff --git a/app/i18n/nl/conf.php b/app/i18n/nl/conf.php
+index 5013d08f1a6..ab680930c4f 100644
+--- a/app/i18n/nl/conf.php
++++ b/app/i18n/nl/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Weergeven op label',
+ 			'type' => 'Type',	// IGNORE
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Toon alle artikelen',
+ 		'get_all_labels' => 'Artikelen met elk label tonen',
+ 		'get_category' => 'Toon „%s” categorie',
+diff --git a/app/i18n/oc/conf.php b/app/i18n/oc/conf.php
+index 23663142cbd..7cc11693de2 100644
+--- a/app/i18n/oc/conf.php
++++ b/app/i18n/oc/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Afichatge per etiqueta',
+ 			'type' => 'Tipe',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Mostrar totes los articles',
+ 		'get_all_labels' => 'Display articles with any label',	// TODO
+ 		'get_category' => 'Mostrar la categoria « %s »',
+diff --git a/app/i18n/pl/conf.php b/app/i18n/pl/conf.php
+index fe08d0c65cb..34d9fa773f0 100644
+--- a/app/i18n/pl/conf.php
++++ b/app/i18n/pl/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Według tagu',
+ 			'type' => 'Rodzaj',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Wyświetlenie wszystkich wiadomości',
+ 		'get_all_labels' => 'Wyświetl wiadomości z dowolnymi etykietami',
+ 		'get_category' => 'Wyświetlenie kategorii “%s”',
+diff --git a/app/i18n/pt-br/conf.php b/app/i18n/pt-br/conf.php
+index b9c5b7e4590..ec4c24d9e86 100644
+--- a/app/i18n/pt-br/conf.php
++++ b/app/i18n/pt-br/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Exibir por tag',
+ 			'type' => 'Tipo',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Mostrar todos os artigos',
+ 		'get_all_labels' => 'Exibir artigos com qualquer rótulo',
+ 		'get_category' => 'Visualizar “%s” categoria',
+diff --git a/app/i18n/ru/conf.php b/app/i18n/ru/conf.php
+index 80ce407c75f..c52f20ac98a 100644
+--- a/app/i18n/ru/conf.php
++++ b/app/i18n/ru/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Отображение по метке',
+ 			'type' => 'Тип',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Показать все статьи',
+ 		'get_all_labels' => 'Показать все статьи с любыми метками',
+ 		'get_category' => 'Показать категорию “%s”',
+diff --git a/app/i18n/sk/conf.php b/app/i18n/sk/conf.php
+index c605c3dab2c..000a943a197 100644
+--- a/app/i18n/sk/conf.php
++++ b/app/i18n/sk/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Zobraziť podľa štítku',
+ 			'type' => 'Typ',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Zobraziť všetky články',
+ 		'get_all_labels' => 'Zobraziť články so všetkými štítkami',
+ 		'get_category' => 'Zobraziť kategóriu “%s”',
+diff --git a/app/i18n/tr/conf.php b/app/i18n/tr/conf.php
+index 7c1d7cf5137..68fa16819db 100644
+--- a/app/i18n/tr/conf.php
++++ b/app/i18n/tr/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => 'Etikete göre göster',
+ 			'type' => 'Tür',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => 'Tüm makaleleri göster',
+ 		'get_all_labels' => 'Herhangi etikete sahip makaleleri göster ',
+ 		'get_category' => '“%s” kategorisini göster',
+diff --git a/app/i18n/zh-cn/conf.php b/app/i18n/zh-cn/conf.php
+index 8795dacb3eb..e80136b1052 100644
+--- a/app/i18n/zh-cn/conf.php
++++ b/app/i18n/zh-cn/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => '按标签显示',
+ 			'type' => '类型',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => '显示所有文章',
+ 		'get_all_labels' => '显示所有打了标签的文章',
+ 		'get_category' => '显示分类“%s”',
+diff --git a/app/i18n/zh-tw/conf.php b/app/i18n/zh-tw/conf.php
+index 61bf61d7a51..4b1a6f4af75 100644
+--- a/app/i18n/zh-tw/conf.php
++++ b/app/i18n/zh-tw/conf.php
+@@ -138,6 +138,8 @@
+ 			'tags' => '按標籤顯示',
+ 			'type' => '類型',
+ 		),
++		'get_A' => 'Show all feeds, also those shown in their category',	// TODO
++		'get_Z' => 'Show all feeds, also archived ones',	// TODO
+ 		'get_all' => '顯示所有文章',
+ 		'get_all_labels' => '顯示任何標籤的文章',
+ 		'get_category' => '顯示分類 “%s”',
+diff --git a/app/layout/aside_feed.phtml b/app/layout/aside_feed.phtml
+index 18a1a993905..166d3954d6a 100644
+--- a/app/layout/aside_feed.phtml
++++ b/app/layout/aside_feed.phtml
+@@ -29,7 +29,7 @@
+ 	<form id="mark-read-aside" method="post">
+ 	<input type="hidden" name="_csrf" value="<?= FreshRSS_Auth::csrfToken() ?>" />
+ 	<ul id="sidebar" class="tree scrollbar-thin">
+-		<li class="tree-folder category all<?= FreshRSS_Context::isCurrentGet('a') ? ' active' : '' ?>">
++		<li class="tree-folder category all<?= FreshRSS_Context::isCurrentGet('a') || FreshRSS_Context::isCurrentGet('A') || FreshRSS_Context::isCurrentGet('Z') ? ' active' : '' ?>">
+ 			<a class="tree-folder-title" data-unread="<?= format_number(FreshRSS_Context::$total_unread) ?>" href="<?= _url('index', $actual_view) . $state_filter_manual ?>">
+ 				<?= _i('all') ?><span class="title" data-unread="<?= format_number(FreshRSS_Context::$total_unread) ?>"><?= _t('index.menu.main_stream') ?></span>
+ 			</a>
+diff --git a/app/layout/layout.phtml b/app/layout/layout.phtml
+index 685d2d48f65..217239f015d 100644
+--- a/app/layout/layout.phtml
++++ b/app/layout/layout.phtml
+@@ -49,7 +49,7 @@
+ 		}
+ ?>
+ 		<link rel="alternate" type="application/rss+xml" title="<?= $this->rss_title ?>" href="<?= Minz_Url::display($url_rss) ?>" />
+-<?php } if (FreshRSS_Context::isAll() || FreshRSS_Context::isCategory() || FreshRSS_Context::isFeed()) {
++<?php } if (FreshRSS_Context::isAll() || FreshRSS_Context::isAllAndCategories() || FreshRSS_Context::isAllAndArchived() || FreshRSS_Context::isCategory() || FreshRSS_Context::isFeed()) {
+ 		$opml_rss = $url_base;
+ 		$opml_rss['a'] = 'opml';
+ 		$opml_rss['params']['user'] = Minz_User::name() ?? '';
+diff --git a/app/views/helpers/configure/query.phtml b/app/views/helpers/configure/query.phtml
+index 97ef0c4805a..f0f339276fb 100644
+--- a/app/views/helpers/configure/query.phtml
++++ b/app/views/helpers/configure/query.phtml
+@@ -121,6 +121,8 @@
+ 				<label class="group-name" for="query_get"><?= _t('conf.query.filter.type') ?></label>
+ 				<div class="group-controls">
+ 					<select name="query[get]" class="w100" id="query_get" size="10">
++						<option value="Z" <?= 'Z' === $this->query->getGet() ? 'selected="selected"' : '' ?>><?= _t('conf.query.get_Z') ?></option>
++						<option value="A" <?= 'A' === $this->query->getGet() ? 'selected="selected"' : '' ?>><?= _t('conf.query.get_A') ?></option>
+ 						<option value="a" <?= in_array($this->query->getGet(), ['', 'a'], true) ? 'selected="selected"' : '' ?>><?= _t('index.feed.title') ?></option>
+ 						<option value="i" <?= 'i' === $this->query->getGet() ? 'selected="selected"' : '' ?>><?= _t('index.menu.important') ?></option>
+ 						<option value="s" <?= 's' === $this->query->getGet() ? 'selected="selected"' : '' ?>><?= _t('index.feed.title_fav') ?></option>
+diff --git a/p/themes/base-theme/frss.css b/p/themes/base-theme/frss.css
+index a39d393c6ae..fe988986db3 100644
+--- a/p/themes/base-theme/frss.css
++++ b/p/themes/base-theme/frss.css
+@@ -937,7 +937,7 @@ input[type="checkbox"]:focus-visible {
+ 	margin: 20px 20px 20px 0;
+ 	display: inline-block;
+ 	max-width: 95%;
+-	width: 20rem;
++	width: 30rem;
+ 	vertical-align: top;
+ }
+ 
+diff --git a/p/themes/base-theme/frss.rtl.css b/p/themes/base-theme/frss.rtl.css
+index 4e4e2597971..d3d76f6a934 100644
+--- a/p/themes/base-theme/frss.rtl.css
++++ b/p/themes/base-theme/frss.rtl.css
+@@ -937,7 +937,7 @@ input[type="checkbox"]:focus-visible {
+ 	margin: 20px 0 20px 20px;
+ 	display: inline-block;
+ 	max-width: 95%;
+-	width: 20rem;
++	width: 30rem;
+ 	vertical-align: top;
+ }
+ 

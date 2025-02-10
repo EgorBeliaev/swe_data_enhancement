@@ -1,0 +1,146 @@
+diff --git a/core/DataTable/Renderer/Csv.php b/core/DataTable/Renderer/Csv.php
+index 464777fe120..ec7a559161c 100644
+--- a/core/DataTable/Renderer/Csv.php
++++ b/core/DataTable/Renderer/Csv.php
+@@ -13,6 +13,7 @@
+ use Piwik\DataTable\Renderer;
+ use Piwik\DataTable\Simple;
+ use Piwik\DataTable;
++use Piwik\Filesystem;
+ use Piwik\Period;
+ use Piwik\Period\Range;
+ use Piwik\Piwik;
+@@ -319,6 +320,8 @@ protected function renderHeader()
+                 . ' _ ' . $prettyDate . '.csv';
+         }
+ 
++        $fileName = Filesystem::sanitizeFilename($fileName);
++
+         // silent fail otherwise unit tests fail
+         Common::sendHeader("Content-Disposition: attachment; filename*=UTF-8''" . rawurlencode($fileName), true);
+         ProxyHttp::overrideCacheControlHeaders();
+diff --git a/core/Filesystem.php b/core/Filesystem.php
+index 7ed4f5224a2..3ceeef415fb 100644
+--- a/core/Filesystem.php
++++ b/core/Filesystem.php
+@@ -584,6 +584,33 @@ public static function isFileSystemCaseInsensitive(): bool
+         return false;
+     }
+ 
++    /**
++     * Removes characters from filenames that could cause problems.
++     *
++     * This is not intended as a security measure per se, but to avoid
++     * some known problems, e.g. Excel not allowing to open an export
++     * file if some special whitespace/dash characters are present.
++     */
++    public static function sanitizeFilename(string $filename): string
++    {
++        $filename = trim($filename);
++
++        // replace reserved characters
++        // https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
++        $filename = preg_replace('~[<>:"/\\\\|?*]~', '', $filename);
++
++        // replace special characters
++        // https://www.php.net/manual/it/regexp.reference.unicode.php
++        // - Cc: Control characters
++        // - Zs: Space separators
++        // - Pd: Dash punctuation
++        $filename = preg_replace('~\p{Cc}~u', '', $filename);
++        $filename = preg_replace('~\p{Zs}~u', ' ', $filename);
++        $filename = preg_replace('~\p{Pd}~u', '-', $filename);
++
++        return trim($filename);
++    }
++
+     /**
+      * in tmp/ (sub-)folder(s) we create empty index.htm|php files
+      *
+diff --git a/plugins/ScheduledReports/ReportEmailGenerator/AttachedFileReportEmailGenerator.php b/plugins/ScheduledReports/ReportEmailGenerator/AttachedFileReportEmailGenerator.php
+index b962cd1fd7a..953c01a55f1 100644
+--- a/plugins/ScheduledReports/ReportEmailGenerator/AttachedFileReportEmailGenerator.php
++++ b/plugins/ScheduledReports/ReportEmailGenerator/AttachedFileReportEmailGenerator.php
+@@ -9,6 +9,7 @@
+ 
+ namespace Piwik\Plugins\ScheduledReports\ReportEmailGenerator;
+ 
++use Piwik\Filesystem;
+ use Piwik\Mail;
+ use Piwik\Plugins\ScheduledReports\API;
+ use Piwik\Plugins\ScheduledReports\GeneratedReport;
+@@ -46,10 +47,12 @@ protected function configureEmail(Mail $mail, GeneratedReport $report)
+         $message = $this->getMessageBody($report);
+         $mail->setBodyHtml($message);
+ 
++        $reportFilename = Filesystem::sanitizeFilename($report->getReportDescription());
++
+         $mail->addAttachment(
+             $report->getContents(),
+             $this->attachedFileMimeType,
+-            $report->getReportDescription() . $this->attachedFileExtension
++            $reportFilename . $this->attachedFileExtension
+         );
+     }
+ 
+diff --git a/tests/PHPUnit/Unit/FilesystemTest.php b/tests/PHPUnit/Unit/FilesystemTest.php
+index 47a5ba620e1..4900c6a1c0d 100644
+--- a/tests/PHPUnit/Unit/FilesystemTest.php
++++ b/tests/PHPUnit/Unit/FilesystemTest.php
+@@ -424,4 +424,56 @@ public function testGetFileSizeShouldReturnNullIfFileDoesNotExists()
+ 
+         $this->assertNull($size);
+     }
++
++    /**
++     * @dataProvider getSanitizeFilenameTestData
++     */
++    public function testSanitizeFilename(string $filename, string $expected): void
++    {
++        $this->assertSame(
++            $expected,
++            Filesystem::sanitizeFilename($filename)
++        );
++    }
++
++    public function getSanitizeFilenameTestData(): array
++    {
++        return [
++            ['reserved<>:"/\\|?*characters', 'reservedcharacters'],
++            ["control\x00\x09\x0A\x7Fcharacters", 'controlcharacters'],
++            ['  spaces are trimmed  ', 'spaces are trimmed'],
++            ['unicode    spaces', 'unicode    spaces'],
++            ['unicode‒–—dashes', 'unicode---dashes'],
++            [
++                // english (en) export for date range, replaced "thsp" + "endash"
++                'Export _ Main metrics _ December 31, 2024 – January 1, 2025.csv',
++                'Export _ Main metrics _ December 31, 2024 - January 1, 2025.csv',
++            ],
++            [
++                // bulgarian (bg) export for date range, replaced "nnbsp" + "endash"
++                'Запазване _ Главни метрики _ 31 декември 2024 г. – 1 януари 2025 г..csv',
++                'Запазване _ Главни метрики _ 31 декември 2024 г. - 1 януари 2025 г..csv',
++            ],
++            [
++                // basque (eu) export for date range, replaced "endash"
++                'Esportatu _ Metrika nagusiak _ 2025(e)ko urtarrila 1–2.csv',
++                'Esportatu _ Metrika nagusiak _ 2025(e)ko urtarrila 1-2.csv',
++            ],
++            [
++                // kurdish (ku) export for date range, replaced "thsp" + "endash"
++                'Export _ Main metrics _ 31ê berfanbara 2024an – 1ê rêbendana 2025an.csv',
++                'Export _ Main metrics _ 31ê berfanbara 2024an - 1ê rêbendana 2025an.csv',
++            ],
++            [
++                // japanese (ja) export for date range, unchanged
++                'エクスポート _ メインメトリクス _ 2024年12月31日～2025年01月1日.csv',
++                'エクスポート _ メインメトリクス _ 2024年12月31日～2025年01月1日.csv',
++            ],
++            [
++                // simplified chinese (zh-cn) export for date range, unchanged
++                '导出 _ 主要指标 _ 2025年01月1日至2日.csv',
++                '导出 _ 主要指标 _ 2025年01月1日至2日.csv',
++            ],
++        ];
++    }
+ }

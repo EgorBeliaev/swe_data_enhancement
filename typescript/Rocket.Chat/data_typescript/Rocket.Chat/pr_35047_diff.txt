@@ -1,0 +1,460 @@
+diff --git a/apps/meteor/client/providers/VideoConfProvider.tsx b/apps/meteor/client/providers/VideoConfProvider.tsx
+index 81cc1bb4f780f..be6385a4a68fa 100644
+--- a/apps/meteor/client/providers/VideoConfProvider.tsx
++++ b/apps/meteor/client/providers/VideoConfProvider.tsx
+@@ -1,6 +1,5 @@
+-import type { CallPreferences, DirectCallData, IRoom, ProviderCapabilities } from '@rocket.chat/core-typings';
+ import { useToastMessageDispatch, useSetting } from '@rocket.chat/ui-contexts';
+-import type { VideoConfPopupPayload } from '@rocket.chat/ui-video-conf';
++import type { VideoConfPopupPayload, VideoConfContextValue } from '@rocket.chat/ui-video-conf';
+ import { VideoConfContext } from '@rocket.chat/ui-video-conf';
+ import type { ReactElement, ReactNode } from 'react';
+ import { useState, useMemo, useEffect } from 'react';
+@@ -41,40 +40,23 @@ const VideoConfContextProvider = ({ children }: { children: ReactNode }): ReactE
+ 		VideoConfManager.on('calling/ended', () => setOutgoing(undefined));
+ 	}, []);
+ 
+-	const contextValue = useMemo(
++	const contextValue = useMemo<VideoConfContextValue>(
+ 		() => ({
+-			dispatchOutgoing: (option: Omit<VideoConfPopupPayload, 'id'>): void => setOutgoing({ ...option, id: option.rid }),
+-			dismissOutgoing: (): void => setOutgoing(undefined),
+-			startCall: (rid: IRoom['_id'], confTitle?: string): Promise<void> => VideoConfManager.startCall(rid, confTitle),
+-			acceptCall: (callId: string): void => VideoConfManager.acceptIncomingCall(callId),
+-			joinCall: (callId: string): Promise<void> => VideoConfManager.joinCall(callId),
+-			dismissCall: (callId: string): void => {
+-				VideoConfManager.dismissIncomingCall(callId);
+-			},
+-			rejectIncomingCall: (callId: string): void => VideoConfManager.rejectIncomingCall(callId),
+-			abortCall: (): void => VideoConfManager.abortCall(),
+-			setPreferences: (prefs: Partial<(typeof VideoConfManager)['preferences']>): void => VideoConfManager.setPreferences(prefs),
++			dispatchOutgoing: (option) => setOutgoing({ ...option, id: option.rid }),
++			dismissOutgoing: () => setOutgoing(undefined),
++			startCall: (rid, confTitle) => VideoConfManager.startCall(rid, confTitle),
++			acceptCall: (callId) => VideoConfManager.acceptIncomingCall(callId),
++			joinCall: (callId) => VideoConfManager.joinCall(callId),
++			dismissCall: (callId) => VideoConfManager.dismissIncomingCall(callId),
++			rejectIncomingCall: (callId) => VideoConfManager.rejectIncomingCall(callId),
++			abortCall: () => VideoConfManager.abortCall(),
++			setPreferences: (prefs) => VideoConfManager.setPreferences(prefs),
+ 			loadCapabilities: VideoConfManager.loadCapabilities,
+-			queryIncomingCalls: {
+-				getSnapshot: (): DirectCallData[] => VideoConfManager.getIncomingDirectCalls(),
+-				subscribe: (cb: () => void) => VideoConfManager.on('incoming/changed', cb),
+-			},
+-			queryRinging: {
+-				getSnapshot: (): boolean => VideoConfManager.isRinging(),
+-				subscribe: (cb: () => void) => VideoConfManager.on('ringing/changed', cb),
+-			},
+-			queryCalling: {
+-				getSnapshot: (): boolean => VideoConfManager.isCalling(),
+-				subscribe: (cb: () => void) => VideoConfManager.on('calling/changed', cb),
+-			},
+-			queryCapabilities: {
+-				getSnapshot: (): ProviderCapabilities => VideoConfManager.capabilities,
+-				subscribe: (cb: () => void) => VideoConfManager.on('capabilities/changed', cb),
+-			},
+-			queryPreferences: {
+-				getSnapshot: (): CallPreferences => VideoConfManager.preferences,
+-				subscribe: (cb: () => void) => VideoConfManager.on('preference/changed', cb),
+-			},
++			queryIncomingCalls: () => [(cb) => VideoConfManager.on('incoming/changed', cb), () => VideoConfManager.getIncomingDirectCalls()],
++			queryRinging: () => [(cb) => VideoConfManager.on('ringing/changed', cb), () => VideoConfManager.isRinging()],
++			queryCalling: () => [(cb) => VideoConfManager.on('calling/changed', cb), () => VideoConfManager.isCalling()],
++			queryCapabilities: () => [(cb) => VideoConfManager.on('capabilities/changed', cb), () => VideoConfManager.capabilities],
++			queryPreferences: () => [(cb) => VideoConfManager.on('preference/changed', cb), () => VideoConfManager.preferences],
+ 		}),
+ 		[],
+ 	);
+diff --git a/apps/meteor/client/sidebarv2/hooks/useRoomList.spec.tsx b/apps/meteor/client/sidebarv2/hooks/useRoomList.spec.tsx
+index 91692db1ecc59..4472104644e2b 100644
+--- a/apps/meteor/client/sidebarv2/hooks/useRoomList.spec.tsx
++++ b/apps/meteor/client/sidebarv2/hooks/useRoomList.spec.tsx
+@@ -80,12 +80,7 @@ const getWrapperSettings = ({
+ 			<VideoConfContext.Provider
+ 				value={
+ 					{
+-						queryIncomingCalls: {
+-							subscribe: () => () => undefined,
+-							getSnapshot: () => {
+-								return emptyArr;
+-							},
+-						},
++						queryIncomingCalls: () => [() => () => undefined, () => emptyArr],
+ 					} as any
+ 				}
+ 				children={children}
+diff --git a/apps/meteor/client/views/room/contextualBar/VideoConference/VideoConfPopups/VideoConfPopups.spec.tsx b/apps/meteor/client/views/room/contextualBar/VideoConference/VideoConfPopups/VideoConfPopups.spec.tsx
+new file mode 100644
+index 0000000000000..b320eaea07b85
+--- /dev/null
++++ b/apps/meteor/client/views/room/contextualBar/VideoConference/VideoConfPopups/VideoConfPopups.spec.tsx
+@@ -0,0 +1,22 @@
++import { mockAppRoot } from '@rocket.chat/mock-providers';
++import { render, screen } from '@testing-library/react';
++
++import VideoConfPopups from './VideoConfPopups';
++import { createFakeRoom } from '../../../../../../tests/mocks/data';
++import { createFakeVideoConfCall, createFakeIncomingCall } from '../../../../../../tests/mocks/utils/video-conference';
++
++const fakeRoom = createFakeRoom({ t: 'd' });
++const fakeDirectVideoConfCall = createFakeVideoConfCall({ type: 'direct', rid: fakeRoom._id });
++const fakeIncomingCall = createFakeIncomingCall({ rid: fakeRoom._id });
++
++test('should render video conference incoming popup', async () => {
++	render(<VideoConfPopups />, {
++		wrapper: mockAppRoot()
++			.withRoom(fakeRoom)
++			.withEndpoint('GET', '/v1/video-conference.info', () => fakeDirectVideoConfCall as any)
++			.withIncomingCalls([fakeIncomingCall])
++			.build(),
++	});
++
++	expect(await screen.findByRole('dialog')).toBeInTheDocument();
++});
+diff --git a/apps/meteor/tests/mocks/utils/video-conference.ts b/apps/meteor/tests/mocks/utils/video-conference.ts
+new file mode 100644
+index 0000000000000..b93b201fd373f
+--- /dev/null
++++ b/apps/meteor/tests/mocks/utils/video-conference.ts
+@@ -0,0 +1,31 @@
++import { faker } from '@faker-js/faker';
++import type { IRoom, VideoConferenceType } from '@rocket.chat/core-typings';
++
++const callId = faker.database.mongodbObjectId();
++const uid = faker.database.mongodbObjectId();
++
++export function createFakeVideoConfCall({ type, rid }: { type: VideoConferenceType; rid: IRoom['_id'] }) {
++	return {
++		type,
++		rid,
++		_id: callId,
++		status: 0,
++		createdBy: {
++			_id: uid,
++			username: faker.internet.userName(),
++			name: faker.person.fullName(),
++		},
++		_updatedAt: faker.date.recent(),
++		createdAt: faker.date.recent(),
++		providerName: faker.company.name(),
++	};
++}
++
++export function createFakeIncomingCall({ rid }: { rid: IRoom['_id'] }) {
++	return {
++		rid,
++		uid,
++		callId,
++		dismissed: faker.helpers.arrayElement([true, false]),
++	};
++}
+diff --git a/packages/mock-providers/package.json b/packages/mock-providers/package.json
+index 076f7ff7aafd0..9dc790a687779 100644
+--- a/packages/mock-providers/package.json
++++ b/packages/mock-providers/package.json
+@@ -12,6 +12,7 @@
+ 	"devDependencies": {
+ 		"@rocket.chat/ddp-client": "workspace:~",
+ 		"@rocket.chat/ui-contexts": "workspace:*",
++		"@rocket.chat/ui-video-conf": "workspace:*",
+ 		"@tanstack/react-query": "~5.65.1",
+ 		"eslint": "~8.45.0",
+ 		"react": "~18.3.1",
+diff --git a/packages/mock-providers/src/MockedAppRootBuilder.tsx b/packages/mock-providers/src/MockedAppRootBuilder.tsx
+index f87895c4fc7ee..c7c1ca597c405 100644
+--- a/packages/mock-providers/src/MockedAppRootBuilder.tsx
++++ b/packages/mock-providers/src/MockedAppRootBuilder.tsx
+@@ -1,4 +1,13 @@
+-import type { ISetting, IUser, Serialized, SettingValue } from '@rocket.chat/core-typings';
++import type {
++	CallPreferences,
++	DirectCallData,
++	IRoom,
++	ISetting,
++	IUser,
++	ProviderCapabilities,
++	Serialized,
++	SettingValue,
++} from '@rocket.chat/core-typings';
+ import type { ServerMethodName, ServerMethodParameters, ServerMethodReturn } from '@rocket.chat/ddp-client';
+ import { Emitter } from '@rocket.chat/emitter';
+ import languages from '@rocket.chat/i18n/dist/languages';
+@@ -15,6 +24,8 @@ import {
+ 	ActionManagerContext,
+ 	ModalContext,
+ } from '@rocket.chat/ui-contexts';
++import type { VideoConfPopupPayload } from '@rocket.chat/ui-video-conf';
++import { VideoConfContext } from '@rocket.chat/ui-video-conf';
+ import type { Decorator } from '@storybook/react';
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+ import { createInstance } from 'i18next';
+@@ -89,13 +100,57 @@ export class MockedAppRootBuilder {
+ 	private user: ContextType<typeof UserContext> = {
+ 		logout: () => Promise.reject(new Error('not implemented')),
+ 		queryPreference: () => [() => () => undefined, () => undefined],
+-		queryRoom: () => [() => () => undefined, () => undefined],
++		queryRoom: () => [() => () => undefined, () => this.room],
+ 		querySubscription: () => [() => () => undefined, () => undefined],
+ 		querySubscriptions: () => [() => () => undefined, () => this.subscriptions], // apply query and option
+ 		user: null,
+ 		userId: null,
+ 	};
+ 
++	private videoConf: ContextType<typeof VideoConfContext> = {
++		queryIncomingCalls: () => [() => () => undefined, () => []],
++		queryRinging: () => [() => () => undefined, () => false],
++		queryCalling: () => [() => () => undefined, () => false],
++		dispatchOutgoing(_options: Omit<VideoConfPopupPayload, 'id'>): void {
++			throw new Error('Function not implemented.');
++		},
++		dismissOutgoing(): void {
++			throw new Error('Function not implemented.');
++		},
++		startCall(_rid: IRoom['_id'], _title?: string): void {
++			throw new Error('Function not implemented.');
++		},
++		acceptCall(_callId: string): void {
++			throw new Error('Function not implemented.');
++		},
++		joinCall(_callId: string): void {
++			throw new Error('Function not implemented.');
++		},
++		dismissCall(_callId: string): void {
++			throw new Error('Function not implemented.');
++		},
++		rejectIncomingCall(_callId: string): void {
++			throw new Error('Function not implemented.');
++		},
++		abortCall(): void {
++			throw new Error('Function not implemented.');
++		},
++		setPreferences(_prefs: { mic?: boolean; cam?: boolean }): void {
++			throw new Error('Function not implemented.');
++		},
++		loadCapabilities(): Promise<void> {
++			throw new Error('Function not implemented.');
++		},
++		queryCapabilities(): [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => ProviderCapabilities] {
++			throw new Error('Function not implemented.');
++		},
++		queryPreferences(): [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => CallPreferences] {
++			throw new Error('Function not implemented.');
++		},
++	};
++
++	private room: IRoom | undefined = undefined;
++
+ 	private subscriptions: SubscriptionWithRoom[] = [];
+ 
+ 	private modal: ModalContextValue = {
+@@ -278,6 +333,12 @@ export class MockedAppRootBuilder {
+ 		return this;
+ 	}
+ 
++	withRoom(room: IRoom): this {
++		this.room = room;
++
++		return this;
++	}
++
+ 	withRole(role: string): this {
+ 		if (!this.user.user) {
+ 			throw new Error('user is not defined');
+@@ -346,6 +407,26 @@ export class MockedAppRootBuilder {
+ 		return this;
+ 	}
+ 
++	withIncomingCalls(calls: DirectCallData[]): this {
++		if (!this.videoConf) {
++			throw Error('videoConf is not defined');
++		}
++
++		const innerFn = this.videoConf.queryIncomingCalls;
++
++		const outerFn = (): [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => DirectCallData[]] => {
++			if (calls.length) {
++				return [() => () => undefined, () => calls];
++			}
++
++			return innerFn();
++		};
++
++		this.videoConf.queryIncomingCalls = outerFn;
++
++		return this;
++	}
++
+ 	withOpenModal(modal: ReactNode) {
+ 		this.modal.currentModal = { component: modal };
+ 
+@@ -401,7 +482,19 @@ export class MockedAppRootBuilder {
+ 			},
+ 		});
+ 
+-		const { connectionStatus, server, router, settings, user, i18n, authorization, wrappers, audioInputDevices, audioOutputDevices } = this;
++		const {
++			connectionStatus,
++			server,
++			router,
++			settings,
++			user,
++			videoConf,
++			i18n,
++			authorization,
++			wrappers,
++			audioInputDevices,
++			audioOutputDevices,
++		} = this;
+ 
+ 		const reduceTranslation = (translation?: ContextType<typeof TranslationContext>): ContextType<typeof TranslationContext> => {
+ 			return {
+@@ -499,19 +592,19 @@ export class MockedAppRootBuilder {
+ 																	notifyIdle: () => undefined,
+ 																}}
+ 															>
+-																{/* <VideoConfProvider>
+-																	<CallProvider>
++																<VideoConfContext.Provider value={videoConf}>
++																	{/* <CallProvider>
+ 																		<OmnichannelProvider> */}
+-																{wrappers.reduce<ReactNode>(
+-																	(children, wrapper) => wrapper(children),
+-																	<>
+-																		{children}
+-																		{modal.currentModal.component}
+-																	</>,
+-																)}
+-																{/* 		</OmnichannelProvider>
+-																	</CallProvider>
+-																</VideoConfProvider>*/}
++																	{wrappers.reduce<ReactNode>(
++																		(children, wrapper) => wrapper(children),
++																		<>
++																			{children}
++																			{modal.currentModal.component}
++																		</>,
++																	)}
++																	{/* </OmnichannelProvider>
++																	</CallProvider> */}
++																</VideoConfContext.Provider>
+ 															</ActionManagerContext.Provider>
+ 															{/* 		</UserPresenceProvider>
+ 																</OmnichannelRoomIconProvider>
+diff --git a/packages/ui-video-conf/src/VideoConfContext.ts b/packages/ui-video-conf/src/VideoConfContext.ts
+index d9c0a7c3ac22b..6e68dedb3a60a 100644
+--- a/packages/ui-video-conf/src/VideoConfContext.ts
++++ b/packages/ui-video-conf/src/VideoConfContext.ts
+@@ -7,7 +7,7 @@ export type VideoConfPopupPayload = {
+ 	isReceiving?: boolean;
+ };
+ 
+-type VideoConfContextValue = {
++export type VideoConfContextValue = {
+ 	dispatchOutgoing: (options: Omit<VideoConfPopupPayload, 'id'>) => void;
+ 	dismissOutgoing: () => void;
+ 	startCall: (rid: IRoom['_id'], title?: string) => void;
+@@ -18,26 +18,11 @@ type VideoConfContextValue = {
+ 	abortCall: () => void;
+ 	setPreferences: (prefs: { mic?: boolean; cam?: boolean }) => void;
+ 	loadCapabilities: () => Promise<void>;
+-	queryIncomingCalls: {
+-		subscribe: (cb: () => void) => () => void;
+-		getSnapshot: () => DirectCallData[];
+-	};
+-	queryRinging: {
+-		subscribe: (cb: () => void) => () => void;
+-		getSnapshot: () => boolean;
+-	};
+-	queryCalling: {
+-		subscribe: (cb: () => void) => () => void;
+-		getSnapshot: () => boolean;
+-	};
+-	queryCapabilities: {
+-		subscribe: (cb: () => void) => () => void;
+-		getSnapshot: () => ProviderCapabilities;
+-	};
+-	queryPreferences: {
+-		subscribe: (cb: () => void) => () => void;
+-		getSnapshot: () => CallPreferences;
+-	};
++	queryIncomingCalls: () => [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => DirectCallData[]];
++	queryRinging: () => [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => boolean];
++	queryCalling: () => [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => boolean];
++	queryCapabilities: () => [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => ProviderCapabilities];
++	queryPreferences: () => [subscribe: (onStoreChange: () => void) => () => void, getSnapshot: () => CallPreferences];
+ };
+ 
+ export const VideoConfContext = createContext<VideoConfContextValue | undefined>(undefined);
+diff --git a/packages/ui-video-conf/src/hooks/useVideoConfContext.ts b/packages/ui-video-conf/src/hooks/useVideoConfContext.ts
+index 4d71310634134..6179d86dce093 100644
+--- a/packages/ui-video-conf/src/hooks/useVideoConfContext.ts
++++ b/packages/ui-video-conf/src/hooks/useVideoConfContext.ts
+@@ -1,4 +1,4 @@
+-import { useContext, useSyncExternalStore } from 'react';
++import { useContext, useMemo, useSyncExternalStore } from 'react';
+ 
+ import { VideoConfContext } from '../VideoConfContext';
+ 
+@@ -24,25 +24,35 @@ export const useVideoConfLoadCapabilities = () => useVideoConfContext().loadCapa
+ 
+ export const useVideoConfIncomingCalls = () => {
+ 	const { queryIncomingCalls } = useVideoConfContext();
+-	return useSyncExternalStore(queryIncomingCalls.subscribe, queryIncomingCalls.getSnapshot);
++
++	const [subscribe, getSnapshot] = useMemo(() => queryIncomingCalls(), [queryIncomingCalls]);
++	return useSyncExternalStore(subscribe, getSnapshot);
+ };
+ 
+ export const useVideoConfIsRinging = () => {
+ 	const { queryRinging } = useVideoConfContext();
+-	return useSyncExternalStore(queryRinging.subscribe, queryRinging.getSnapshot);
++
++	const [subscribe, getSnapshot] = useMemo(() => queryRinging(), [queryRinging]);
++	return useSyncExternalStore(subscribe, getSnapshot);
+ };
+ 
+ export const useVideoConfIsCalling = () => {
+ 	const { queryCalling } = useVideoConfContext();
+-	return useSyncExternalStore(queryCalling.subscribe, queryCalling.getSnapshot);
++
++	const [subscribe, getSnapshot] = useMemo(() => queryCalling(), [queryCalling]);
++	return useSyncExternalStore(subscribe, getSnapshot);
+ };
+ 
+ export const useVideoConfCapabilities = () => {
+ 	const { queryCapabilities } = useVideoConfContext();
+-	return useSyncExternalStore(queryCapabilities.subscribe, queryCapabilities.getSnapshot);
++
++	const [subscribe, getSnapshot] = useMemo(() => queryCapabilities(), [queryCapabilities]);
++	return useSyncExternalStore(subscribe, getSnapshot);
+ };
+ 
+ export const useVideoConfPreferences = () => {
+ 	const { queryPreferences } = useVideoConfContext();
+-	return useSyncExternalStore(queryPreferences.subscribe, queryPreferences.getSnapshot);
++
++	const [subscribe, getSnapshot] = useMemo(() => queryPreferences(), [queryPreferences]);
++	return useSyncExternalStore(subscribe, getSnapshot);
+ };
+diff --git a/yarn.lock b/yarn.lock
+index 6737d1f31de86..8b86b3bfd9a20 100644
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -8571,6 +8571,7 @@ __metadata:
+     "@rocket.chat/emitter": "npm:~0.31.25"
+     "@rocket.chat/i18n": "workspace:~"
+     "@rocket.chat/ui-contexts": "workspace:*"
++    "@rocket.chat/ui-video-conf": "workspace:*"
+     "@storybook/react": "npm:^8.5.3"
+     "@tanstack/react-query": "npm:~5.65.1"
+     eslint: "npm:~8.45.0"
+@@ -9320,7 +9321,7 @@ __metadata:
+   languageName: unknown
+   linkType: soft
+ 
+-"@rocket.chat/ui-video-conf@workspace:^, @rocket.chat/ui-video-conf@workspace:packages/ui-video-conf":
++"@rocket.chat/ui-video-conf@workspace:*, @rocket.chat/ui-video-conf@workspace:^, @rocket.chat/ui-video-conf@workspace:packages/ui-video-conf":
+   version: 0.0.0-use.local
+   resolution: "@rocket.chat/ui-video-conf@workspace:packages/ui-video-conf"
+   dependencies:

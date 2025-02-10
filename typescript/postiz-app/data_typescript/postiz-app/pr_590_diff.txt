@@ -1,0 +1,223 @@
+diff --git a/apps/workers/src/app/posts.controller.ts b/apps/workers/src/app/posts.controller.ts
+index a4f33a5c8..f644dc32c 100644
+--- a/apps/workers/src/app/posts.controller.ts
++++ b/apps/workers/src/app/posts.controller.ts
+@@ -15,4 +15,9 @@ export class PostsController {
+   async payout(data: { id: string; releaseURL: string }) {
+     return this._postsService.payout(data.id, data.releaseURL);
+   }
++
++  @EventPattern('sendDigestEmail', Transport.REDIS)
++  async sendDigestEmail(data: { subject: string, org: string; since: string }) {
++    return this._postsService.sendDigestEmail(data.subject, data.org, data.since);
++  }
+ }
+diff --git a/libraries/nestjs-libraries/src/database/prisma/notifications/notification.service.ts b/libraries/nestjs-libraries/src/database/prisma/notifications/notification.service.ts
+index af007660d..c100e8321 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/notifications/notification.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/notifications/notification.service.ts
+@@ -2,13 +2,17 @@ import { Injectable } from '@nestjs/common';
+ import { NotificationsRepository } from '@gitroom/nestjs-libraries/database/prisma/notifications/notifications.repository';
+ import { EmailService } from '@gitroom/nestjs-libraries/services/email.service';
+ import { OrganizationRepository } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.repository';
++import { BullMqClient } from '@gitroom/nestjs-libraries/bull-mq-transport-new/client';
++import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
++import dayjs from 'dayjs';
+ 
+ @Injectable()
+ export class NotificationService {
+   constructor(
+     private _notificationRepository: NotificationsRepository,
+     private _emailService: EmailService,
+-    private _organizationRepository: OrganizationRepository
++    private _organizationRepository: OrganizationRepository,
++    private _workerServiceProducer: BullMqClient
+   ) {}
+ 
+   getMainPageCount(organizationId: string, userId: string) {
+@@ -25,12 +29,58 @@ export class NotificationService {
+     );
+   }
+ 
+-  async inAppNotification(orgId: string, subject: string, message: string, sendEmail = false) {
++  getNotificationsSince(organizationId: string, since: string) {
++    return this._notificationRepository.getNotificationsSince(
++      organizationId,
++      since
++    );
++  }
++
++  async inAppNotification(
++    orgId: string,
++    subject: string,
++    message: string,
++    sendEmail = false,
++    digest = false
++  ) {
++    const date = new Date().toISOString();
+     await this._notificationRepository.createNotification(orgId, message);
+     if (!sendEmail) {
+       return;
+     }
+ 
++    if (digest) {
++      await ioRedis.watch('digest_' + orgId);
++      const value = await ioRedis.get('digest_' + orgId);
++      if (value) {
++        return;
++      }
++
++      await ioRedis
++        .multi()
++        .set('digest_' + orgId, date)
++        .expire('digest_' + orgId, 60)
++        .exec();
++
++      this._workerServiceProducer.emit('sendDigestEmail', {
++        id: 'digest_' + orgId,
++        options: {
++          delay: 60000,
++        },
++        payload: {
++          subject,
++          org: orgId,
++          since: date,
++        },
++      });
++
++      return;
++    }
++
++    await this.sendEmailsToOrg(orgId, subject, message);
++  }
++
++  async sendEmailsToOrg(orgId: string, subject: string, message: string) {
+     const userOrg = await this._organizationRepository.getAllUsersOrgs(orgId);
+     for (const user of userOrg?.users || []) {
+       await this.sendEmail(user.user.email, subject, message);
+diff --git a/libraries/nestjs-libraries/src/database/prisma/notifications/notifications.repository.ts b/libraries/nestjs-libraries/src/database/prisma/notifications/notifications.repository.ts
+index 2ac87cc50..86cb37ceb 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/notifications/notifications.repository.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/notifications/notifications.repository.ts
+@@ -45,6 +45,17 @@ export class NotificationsRepository {
+     });
+   }
+ 
++  async getNotificationsSince(organizationId: string, since: string) {
++    return this._notifications.model.notifications.findMany({
++      where: {
++        organizationId,
++        createdAt: {
++          gte: new Date(since),
++        },
++      },
++    });
++  }
++
+   async getNotifications(organizationId: string, userId: string) {
+     const { lastReadNotifications } = (await this.getLastReadNotification(
+       userId
+diff --git a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+index 30c588027..89d7390f1 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/posts/posts.service.ts
+@@ -46,11 +46,13 @@ export class PostsService {
+   async getStatistics(orgId: string, id: string) {
+     const getPost = await this.getPostsRecursively(id, true, orgId, true);
+     const content = getPost.map((p) => p.content);
+-    const shortLinksTracking = await this._shortLinkService.getStatistics(content);
++    const shortLinksTracking = await this._shortLinkService.getStatistics(
++      content
++    );
+ 
+     return {
+-      clicks: shortLinksTracking
+-    }
++      clicks: shortLinksTracking,
++    };
+   }
+ 
+   async getPostsRecursively(
+@@ -363,7 +365,10 @@ export class PostsService {
+         `Your post has been published on ${capitalize(
+           integration.providerIdentifier
+         )}`,
+-        `Your post has been published at ${publishedPosts[0].releaseURL}`,
++        `Your post has been published on ${capitalize(
++          integration.providerIdentifier
++        )} at ${publishedPosts[0].releaseURL}`,
++        true,
+         true
+       );
+ 
+@@ -517,10 +522,10 @@ export class PostsService {
+     const post = await this._postRepository.deletePost(orgId, group);
+     if (post?.id) {
+       await this._workerServiceProducer.delete('post', post.id);
+-      return {id: post.id};
++      return { id: post.id };
+     }
+ 
+-    return {error: true};
++    return { error: true };
+   }
+ 
+   async countPostsFromDay(orgId: string, date: Date) {
+@@ -566,8 +571,10 @@ export class PostsService {
+   async createPost(orgId: string, body: CreatePostDto) {
+     const postList = [];
+     for (const post of body.posts) {
+-      const messages = post.value.map(p => p.content);
+-      const updateContent = !body.shortLink ? messages : await this._shortLinkService.convertTextToShortLinks(orgId, messages);
++      const messages = post.value.map((p) => p.content);
++      const updateContent = !body.shortLink
++        ? messages
++        : await this._shortLinkService.convertTextToShortLinks(orgId, messages);
+ 
+       post.value = post.value.map((p, i) => ({
+         ...p,
+@@ -624,7 +631,7 @@ export class PostsService {
+       postList.push({
+         postId: posts[0].id,
+         integration: post.integration.id,
+-      })
++      });
+     }
+ 
+     return postList;
+@@ -878,4 +885,23 @@ export class PostsService {
+   ) {
+     return this._postRepository.createComment(orgId, userId, postId, comment);
+   }
++
++  async sendDigestEmail(subject: string, orgId: string, since: string) {
++    const getNotificationsForOrgSince =
++      await this._notificationService.getNotificationsSince(orgId, since);
++    if (getNotificationsForOrgSince.length === 0) {
++      return;
++    }
++
++    const message = getNotificationsForOrgSince
++      .map((p) => p.content)
++      .join('<br />');
++    await this._notificationService.sendEmailsToOrg(
++      orgId,
++      getNotificationsForOrgSince.length === 1
++        ? subject
++        : '[Postiz] Your latest notifications',
++      message
++    );
++  }
+ }
+diff --git a/libraries/nestjs-libraries/src/integrations/social/bluesky.provider.ts b/libraries/nestjs-libraries/src/integrations/social/bluesky.provider.ts
+index 246b2a1e0..f2d01a743 100644
+--- a/libraries/nestjs-libraries/src/integrations/social/bluesky.provider.ts
++++ b/libraries/nestjs-libraries/src/integrations/social/bluesky.provider.ts
+@@ -6,7 +6,6 @@ import {
+ } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
+ import {
+-  NotEnoughScopes,
+   RefreshToken,
+   SocialAbstract,
+ } from '@gitroom/nestjs-libraries/integrations/social.abstract';

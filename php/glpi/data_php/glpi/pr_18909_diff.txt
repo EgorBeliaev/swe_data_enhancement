@@ -1,0 +1,505 @@
+diff --git a/phpunit/functional/Glpi/Error/ErrorUtilsTest.php b/phpunit/functional/Glpi/Error/ErrorUtilsTest.php
+new file mode 100644
+index 00000000000..0dc0ddf639d
+--- /dev/null
++++ b/phpunit/functional/Glpi/Error/ErrorUtilsTest.php
+@@ -0,0 +1,75 @@
++<?php
++
++/**
++ * ---------------------------------------------------------------------
++ *
++ * GLPI - Gestionnaire Libre de Parc Informatique
++ *
++ * http://glpi-project.org
++ *
++ * @copyright 2015-2025 Teclib' and contributors.
++ * @licence   https://www.gnu.org/licenses/gpl-3.0.html
++ *
++ * ---------------------------------------------------------------------
++ *
++ * LICENSE
++ *
++ * This file is part of GLPI.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ *
++ * ---------------------------------------------------------------------
++ */
++
++namespace Glpi\Error;
++
++use PHPUnit\Framework\Attributes\DataProvider;
++
++class ErrorUtilsTest extends \DbTestCase
++{
++    #[DataProvider('safeContentsProvider')]
++    public function testcleanPathsOnSafeContent($input)
++    {
++        assert(is_string(\GLPI_ROOT) && strlen(\GLPI_ROOT) > 0);
++        $this->assertEquals($input, ErrorUtils::cleanPaths($input));
++    }
++
++    #[DataProvider('unsafeContentsProvider')]
++    public function testcleanPathsOnUnsafeContentsRemovesGLPI_ROOT($input, $expected)
++    {
++        assert(is_string(\GLPI_ROOT) && strlen(\GLPI_ROOT) > 0);
++
++        $this->assertSame($expected, ErrorUtils::cleanPaths($input));
++    }
++
++    public static function unsafeContentsProvider(): array
++    {
++        return [
++            ['input' => \GLPI_ROOT . '/files/ is not writtable.', 'expected' => './files/ is not writtable.'],
++            ['input' => 'Base dir is writtable, fix rights in ' . \GLPI_ROOT, 'expected' => 'Base dir is writtable, fix rights in .'],
++            ['input' => \GLPI_ROOT, 'expected' => '.'],
++            ['input' => 'error in ' . \GLPI_ROOT . '/path : content not readable', 'expected' => 'error in ./path : content not readable'],
++        ];
++    }
++
++    public static function safeContentsProvider(): array
++    {
++        return [
++            [ '/tmp/files/ is not writtable.'],
++            [ 'Base dir is writtable, fix rights in assets/images/'],
++            [ '/not/in/root/'],
++            [ 'file /path/file.php not found'],
++        ];
++    }
++}
+diff --git a/phpunit/functional/Glpi/Log/ErrorLogHandlerTest.php b/phpunit/functional/Glpi/Log/ErrorLogHandlerTest.php
+new file mode 100644
+index 00000000000..8a4bc5fdb40
+--- /dev/null
++++ b/phpunit/functional/Glpi/Log/ErrorLogHandlerTest.php
+@@ -0,0 +1,90 @@
++<?php
++
++/**
++ * ---------------------------------------------------------------------
++ *
++ * GLPI - Gestionnaire Libre de Parc Informatique
++ *
++ * http://glpi-project.org
++ *
++ * @copyright 2015-2025 Teclib' and contributors.
++ * @licence   https://www.gnu.org/licenses/gpl-3.0.html
++ *
++ * ---------------------------------------------------------------------
++ *
++ * LICENSE
++ *
++ * This file is part of GLPI.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ *
++ * ---------------------------------------------------------------------
++ */
++
++namespace tests\units\Glpi\Log;
++
++use Glpi\Log\ErrorLogHandler;
++use Monolog\Logger;
++use PHPUnit\Framework\TestCase;
++
++class ErrorLogHandlerTest extends TestCase
++{
++    private Logger $logger;
++
++    protected function setUp(): void
++    {
++        $this->logger = new Logger('glpi_test');
++        $this->logger->pushHandler(new ErrorLogHandler());
++
++        assert(!file_exists($this->getDefaultFilePath()) || unlink($this->getDefaultFilePath()));
++
++        parent::setUp();
++    }
++
++
++    public function test_Log_LogsAreWrittenInLogFile(): void
++    {
++        $this->logger->error('This is an error message');
++
++        $this->assertFileExists($this->getDefaultFilePath());
++    }
++
++    public function test_Log_SeeExpectedContentsInLogFile(): void
++    {
++        $message = 'This is a test error';
++        $this->logger->error($message);
++
++        $this->assertStringContainsString($message, file_get_contents($this->getDefaultFilePath()));
++    }
++
++    public function test_Log_FilterRootPathInLogFile(): void
++    {
++        $PHPLOGGER = new Logger('glpi_test');
++        $PHPLOGGER->pushHandler(new ErrorLogHandler());
++
++        $message = 'This is a test error at ' . GLPI_ROOT;
++        $contextInfo = 'some path ' . GLPI_ROOT;
++        $this->logger->error($message, ['context' => $contextInfo]);
++
++        $this->assertStringNotContainsString(GLPI_ROOT, file_get_contents($this->getDefaultFilePath()));
++    }
++
++    /**
++     * value hardcoded in \Glpi\Log\ErrorLogHandler::__construct()
++     */
++    private function getDefaultFilePath(): string
++    {
++        return GLPI_LOG_DIR . "/php-errors.log";
++    }
++}
+diff --git a/phpunit/functional/ToolboxTest.php b/phpunit/functional/ToolboxTest.php
+index fc4355537f6..113d7d945cf 100644
+--- a/phpunit/functional/ToolboxTest.php
++++ b/phpunit/functional/ToolboxTest.php
+@@ -52,6 +52,8 @@
+ 
+ class ToolboxTest extends DbTestCase
+ {
++    private const TEST_CUSTOM_LOG_FILE_NAME = 'test_log_file';
++
+     public function testGetRandomString()
+     {
+         for ($len = 20; $len < 50; $len += 5) {
+@@ -1637,4 +1639,37 @@ public function testComputeRedirect(string $interface, string $where, ?string $r
+ 
+         $this->assertSame($result, $instance->computeRedirect($where));
+     }
++
++    public function test_LogInFile_SeeExpectedContentsInLogFile(): void
++    {
++        // Arrange
++        assert(!file_exists($this->getCustomLogFilePath()) || unlink($this->getCustomLogFilePath()));
++
++        $message = 'The logged message';
++
++        // Act
++        assert(\Toolbox::logInFile(self::TEST_CUSTOM_LOG_FILE_NAME, $message), 'log failed');
++
++        // Assert
++        $this->assertFileExists($this->getCustomLogFilePath());
++        $this->assertStringContainsString($message, file_get_contents($this->getCustomLogFilePath()));
++    }
++
++    public function test_LogInFile_FilterRootPathInLogFile(): void
++    {
++        // Arrange
++        assert(!file_exists($this->getCustomLogFilePath()) || unlink($this->getCustomLogFilePath()));
++        $messageWithPath = 'Error somewhere in the path ' . GLPI_ROOT . ' triggered';
++
++        // Act
++        assert(\Toolbox::logInFile(self::TEST_CUSTOM_LOG_FILE_NAME, $messageWithPath), 'log failed');
++
++        // Assert
++        $this->assertStringNotContainsString(\GLPI_ROOT, file_get_contents($this->getCustomLogFilePath()));
++    }
++
++    private function getCustomLogFilePath(): string
++    {
++        return GLPI_LOG_DIR . "/" . self::TEST_CUSTOM_LOG_FILE_NAME . ".log";
++    }
+ }
+diff --git a/src/Glpi/Api/HL/RoutePath.php b/src/Glpi/Api/HL/RoutePath.php
+index 1d71d4e889d..1dd453d2276 100644
+--- a/src/Glpi/Api/HL/RoutePath.php
++++ b/src/Glpi/Api/HL/RoutePath.php
+@@ -147,6 +147,9 @@ private function hydrate(): void
+         if (!$is_hydrated) {
+             [$controller, $method] = explode('::', $this->key);
+             try {
++                if (!\is_a($controller, AbstractController::class, true)) {
++                    throw new \Exception('Invalid controller');
++                }
+                 $this->controller = new ReflectionClass($controller);
+                 $this->method = $this->controller->getMethod($method);
+                 if (!$this->method->isPublic()) {
+diff --git a/src/Glpi/Console/CommandLoader.php b/src/Glpi/Console/CommandLoader.php
+index 0089c9878b3..70f5a46767e 100644
+--- a/src/Glpi/Console/CommandLoader.php
++++ b/src/Glpi/Console/CommandLoader.php
+@@ -446,9 +446,13 @@ private function getCommandFromFile(SplFileInfo $file, $basedir, array $prefixes
+                // Needed as a file located in root source dir of Glpi can be either namespaced either not.
+                 continue;
+             }
++            if (!is_a($classname_to_check, Command::class, true)) {
++                // Not a console command.
++                continue;
++            }
+ 
+             $reflectionClass = new ReflectionClass($classname_to_check);
+-            if ($reflectionClass->isInstantiable() && $reflectionClass->isSubclassOf(Command::class)) {
++            if ($reflectionClass->isInstantiable()) {
+                 return new $classname_to_check();
+             }
+         }
+diff --git a/src/Glpi/Controller/ErrorController.php b/src/Glpi/Controller/ErrorController.php
+index 4db51936672..48b5383e9e1 100644
+--- a/src/Glpi/Controller/ErrorController.php
++++ b/src/Glpi/Controller/ErrorController.php
+@@ -36,6 +36,7 @@
+ 
+ use Config;
+ use DBConnection;
++use Glpi\Error\ErrorUtils;
+ use Html;
+ use Session;
+ use Symfony\Component\ErrorHandler\Error\OutOfMemoryError;
+@@ -105,14 +106,14 @@ public function __invoke(Request $request, ?\Throwable $exception = null): Respo
+         ) {
+             $trace = sprintf(
+                 "%s\nIn %s(%s)",
+-                $exception->getMessage() ?: $exception::class,
+-                $exception->getFile(),
++                $this->cleanPaths($exception->getMessage() ?: $exception::class),
++                $this->cleanPaths($exception->getFile()),
+                 $exception->getLine()
+             );
+ 
+             if (!($exception instanceof OutOfMemoryError)) {
+                 // Note: OutOfMemoryError has no stack trace, we can only get filename and line.
+-                $trace .= "\n" . $exception->getTraceAsString();
++                $trace .= "\n" . $this->cleanPaths($exception->getTraceAsString());
+             }
+ 
+             $current = $exception;
+@@ -120,11 +121,11 @@ public function __invoke(Request $request, ?\Throwable $exception = null): Respo
+             while ($depth < 10 && $previous = $current->getPrevious()) {
+                 $trace .= sprintf(
+                     "\n\nPrevious: %s\nIn %s(%s)",
+-                    $previous->getMessage() ?: $previous::class,
+-                    $previous->getFile(),
++                    $this->cleanPaths($previous->getMessage() ?: $previous::class),
++                    $this->cleanPaths($previous->getFile()),
+                     $previous->getLine()
+                 );
+-                $trace .= "\n" . $previous->getTraceAsString();
++                $trace .= "\n" . $this->cleanPaths($previous->getTraceAsString());
+ 
+                 $current = $previous;
+                 $depth++;
+@@ -182,4 +183,9 @@ public function __invoke(Request $request, ?\Throwable $exception = null): Respo
+             new Response(status: $status_code)
+         );
+     }
++
++    private function cleanPaths(string $message): string
++    {
++        return ErrorUtils::cleanPaths($message);
++    }
+ }
+diff --git a/src/Glpi/Error/ErrorHandler.php b/src/Glpi/Error/ErrorHandler.php
+index 894e780ca35..f5b347931c2 100644
+--- a/src/Glpi/Error/ErrorHandler.php
++++ b/src/Glpi/Error/ErrorHandler.php
+@@ -161,7 +161,7 @@ public function handleError(int $type, string $message, string $file, int $line)
+ 
+         self::displayErrorMessage(
+             \sprintf('PHP %s (%s)', $error_type, $type),
+-            \sprintf('%s in %s at line %s', $message, $file, $line),
++            \sprintf('%s in %s at line %s', $this->cleanPaths($message), $this->cleanPaths($file), $line),
+             self::ERROR_LEVEL_MAP[$type],
+         );
+ 
+@@ -212,7 +212,7 @@ public static function displayCaughtExceptionMessage(\Throwable $exception): voi
+     {
+         self::displayErrorMessage(
+             \sprintf('Caught %s', $exception::class),
+-            \sprintf('%s in %s at line %s', $exception->getMessage(), $exception->getFile(), $exception->getLine()),
++            \sprintf('%s in %s at line %s', self::cleanPaths($exception->getMessage()), self::cleanPaths($exception->getFile()), $exception->getLine()),
+             LogLevel::ERROR,
+         );
+     }
+@@ -259,4 +259,9 @@ private function disableNativeErrorDisplaying(): void
+     {
+         \ini_set('display_errors', 'Off');
+     }
++
++    private static function cleanPaths(string $message): string
++    {
++        return ErrorUtils::cleanPaths($message);
++    }
+ }
+diff --git a/src/Glpi/Error/ErrorUtils.php b/src/Glpi/Error/ErrorUtils.php
+new file mode 100644
+index 00000000000..8c04baf985b
+--- /dev/null
++++ b/src/Glpi/Error/ErrorUtils.php
+@@ -0,0 +1,49 @@
++<?php
++
++/**
++ * ---------------------------------------------------------------------
++ *
++ * GLPI - Gestionnaire Libre de Parc Informatique
++ *
++ * http://glpi-project.org
++ *
++ * @copyright 2015-2025 Teclib' and contributors.
++ * @licence   https://www.gnu.org/licenses/gpl-3.0.html
++ *
++ * ---------------------------------------------------------------------
++ *
++ * LICENSE
++ *
++ * This file is part of GLPI.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ *
++ * ---------------------------------------------------------------------
++ */
++
++namespace Glpi\Error;
++
++class ErrorUtils
++{
++    /**
++     * Rewrite file paths to not expose their full filesystem path, as it can be considered as a sensitive information.
++     *
++     * @param string $message
++     * @return string
++     */
++    public static function cleanPaths(string $message): string
++    {
++        return str_replace(GLPI_ROOT, ".", $message);
++    }
++}
+diff --git a/src/Glpi/Log/AbstractLogLineFormatter.php b/src/Glpi/Log/AbstractLogLineFormatter.php
+index 2361cdca1be..81102e919d1 100644
+--- a/src/Glpi/Log/AbstractLogLineFormatter.php
++++ b/src/Glpi/Log/AbstractLogLineFormatter.php
+@@ -34,6 +34,7 @@
+ 
+ namespace Glpi\Log;
+ 
++use Glpi\Error\ErrorUtils;
+ use Monolog\Formatter\LineFormatter;
+ 
+ abstract class AbstractLogLineFormatter extends LineFormatter
+@@ -63,6 +64,11 @@ protected function normalizeException(\Throwable $e, int $depth = 0): string
+         return $message;
+     }
+ 
++    public function stringify($value): string
++    {
++        return $this->cleanPath(parent::stringify($value));
++    }
++
+     private function getTraceAsString(array $trace): string
+     {
+         if (empty($trace)) {
+@@ -92,15 +98,8 @@ private function getTraceAsString(array $trace): string
+         return $message;
+     }
+ 
+-    /**
+-     * Remove the GLPI root directory from file paths.
+-     */
+     private function cleanPath(string $path): string
+     {
+-        if (\str_starts_with($path, \GLPI_ROOT)) {
+-            $path = \substr($path, \strlen(\GLPI_ROOT) + 1);
+-        }
+-
+-        return $path;
++        return ErrorUtils::cleanPaths($path);
+     }
+ }
+diff --git a/src/Toolbox.php b/src/Toolbox.php
+index f0250ba4ae6..81f27b2fd09 100644
+--- a/src/Toolbox.php
++++ b/src/Toolbox.php
+@@ -35,6 +35,7 @@
+ 
+ use Glpi\Console\Application;
+ use Glpi\DBAL\QueryParam;
++use Glpi\Error\ErrorUtils;
+ use Glpi\Event;
+ use Glpi\Exception\Http\AccessDeniedHttpException;
+ use Glpi\Exception\Http\NotFoundHttpException;
+@@ -311,9 +312,12 @@ private static function log($level = LogLevel::WARNING, $args = null)
+         $tps = microtime(true);
+ 
+         try {
++            $msg = self::cleanPaths($msg);
+             $PHPLOGGER->log($level, $msg, $extra);
+         } catch (\Throwable $e) {
+-           //something went wrong, make sure logging does not cause fatal
++            //something went wrong
++            // make sure logging does not cause fatal
++            // and error still logged (without glpi root path removed)
+             error_log($e);
+         }
+     }
+@@ -415,9 +419,9 @@ public static function deprecated($message = "Called method is deprecated", $str
+     /**
+      * Log a message in log file
+      *
+-     * @param string  $name   name of the log file
+-     * @param string  $text   text to log
+-     * @param boolean $force  force log in file not seeing use_log_in_files config
++     * @param string $name name of the log file, relative to GLPI_LOG_DIR, without '.log' extension
++     * @param string $text text to log
++     * @param boolean $force force log in file not seeing use_log_in_files config
+      *
+      * @return boolean
+      **/
+@@ -425,6 +429,7 @@ public static function logInFile($name, $text, $force = false)
+     {
+         /** @var array $CFG_GLPI */
+         global $CFG_GLPI;
++        $text = self::cleanPaths($text);
+ 
+         $user = '';
+         if (method_exists('Session', 'getLoginUserID')) {
+@@ -3309,4 +3314,13 @@ final public static function getNormalizedItemtype(string $itemtype)
+     {
+         return strtolower(str_replace('\\', '', $itemtype));
+     }
++
++    /**
++     * @param string $message
++     * @return string
++     */
++    public static function cleanPaths(string $message): string
++    {
++        return ErrorUtils::cleanPaths($message);
++    }
+ }

@@ -1,0 +1,196 @@
+diff --git a/packages/support/src/Services/RelationshipJoiner.php b/packages/support/src/Services/RelationshipJoiner.php
+index 6f6fade8b0f..441d53562b6 100644
+--- a/packages/support/src/Services/RelationshipJoiner.php
++++ b/packages/support/src/Services/RelationshipJoiner.php
+@@ -5,6 +5,7 @@
+ use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+ use Illuminate\Database\Eloquent\Relations\Relation;
++use Illuminate\Database\Query\Expression;
+ use Illuminate\Database\Query\JoinClause;
+ use Illuminate\Support\Arr;
+ use Illuminate\Support\Str;
+@@ -91,15 +92,32 @@ function (array $where) use ($relationship): bool {
+ 
+             /** @phpstan-ignore-next-line */
+             foreach (($relationshipQuery->getQuery()->orders ?? []) as $order) {
+-                if (! array_key_exists('column', $order)) {
++                // Regular orders: { column: string, direction: 'asc' | 'desc' }
++                // Sub-query orders: { column: Illuminate\Database\Query\Expression, direction: 'asc' | 'desc' }
++                // Raw orders: { type: 'Raw', sql: string }
++                if (! array_key_exists('column', $order) && ! array_key_exists('sql', $order)) {
+                     continue;
+                 }
+ 
+-                if (str($order['column'])->startsWith("{$relationshipQuery->getModel()->getTable()}.")) {
++                $columnValue = $order['column'] ?? new Expression($order['sql']);
++
++                if (
++                    $columnValue instanceof Expression
++                    && str($columnValue->getValue($relationship->getGrammar()))->contains('?')
++                ) {
++                    // Heuristic to determine if the expression contains (a) binding(s), if so, as of
++                    // yet we cannot reliably determine (which) bindings are used in the expression.
++                    continue;
++                }
++
++                if (
++                    str($columnValue instanceof Expression ? $columnValue->getValue($relationship->getGrammar()) : $columnValue)
++                        ->startsWith("{$relationshipQuery->getModel()->getTable()}.")
++                ) {
+                     continue;
+                 }
+ 
+-                $relationshipQuery->addSelect($order['column']);
++                $relationshipQuery->addSelect($columnValue);
+             }
+         }
+ 
+diff --git a/tests/database/migrations/create_team_user_table.php b/tests/database/migrations/create_team_user_table.php
+new file mode 100644
+index 00000000000..9565ec19e0c
+--- /dev/null
++++ b/tests/database/migrations/create_team_user_table.php
+@@ -0,0 +1,24 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    public function up(): void
++    {
++        Schema::create('team_user', function (Blueprint $table): void {
++            $table->id();
++            $table->foreignId('team_id')->constrained();
++            $table->foreignId('user_id')->constrained();
++            $table->string('role')->nullable();
++            $table->timestamps();
++        });
++    }
++
++    public function down(): void
++    {
++        Schema::dropIfExists('team_user');
++    }
++};
+diff --git a/tests/src/Models/User.php b/tests/src/Models/User.php
+index 82e98a060ba..184f85e3752 100644
+--- a/tests/src/Models/User.php
++++ b/tests/src/Models/User.php
+@@ -9,6 +9,7 @@
+ use Illuminate\Contracts\Auth\MustVerifyEmail;
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+ use Illuminate\Database\Eloquent\Relations\HasMany;
+ use Illuminate\Foundation\Auth\User as Authenticatable;
+ use Illuminate\Notifications\Notifiable;
+@@ -36,6 +37,11 @@ public function posts(): HasMany
+         return $this->hasMany(Post::class, 'author_id');
+     }
+ 
++    public function teams(): BelongsToMany
++    {
++        return $this->belongsToMany(Team::class);
++    }
++
+     protected static function newFactory()
+     {
+         return UserFactory::new();
+diff --git a/tests/src/Support/Services/RelationshipJoinerTest.php b/tests/src/Support/Services/RelationshipJoinerTest.php
+new file mode 100644
+index 00000000000..bae862a7272
+--- /dev/null
++++ b/tests/src/Support/Services/RelationshipJoinerTest.php
+@@ -0,0 +1,88 @@
++<?php
++
++use Filament\Support\Services\RelationshipJoiner;
++use Filament\Tests\Models\Team;
++use Filament\Tests\Models\User;
++use Filament\Tests\TestCase;
++use Illuminate\Database\Query\Expression;
++
++uses(TestCase::class);
++
++it('can prepare query for no constraints for a BelongsToMany relationship', function () {
++    $user = User::factory()->create();
++
++    expect($user->teams()->toBase())
++        ->distinct->toBeFalse()
++        ->getColumns()->toBe([])
++        ->orders->toBeNull();
++
++    $preparedQuery = app(RelationshipJoiner::class)->prepareQueryForNoConstraints($user->teams());
++
++    expect($preparedQuery->toBase())
++        ->distinct->toBeTrue()
++        ->getColumns()->toBe(['teams.*'])
++        ->orders->toBeNull();
++
++    $preparedQuery = app(RelationshipJoiner::class)->prepareQueryForNoConstraints(
++        $user
++            ->teams()
++            ->orderBy('id')
++            ->orderBy((new Team)->qualifyColumn('name'))
++            ->orderBy('team_user.role')
++    );
++
++    expect($preparedQuery->toBase())
++        ->distinct->toBeTrue()
++        ->getColumns()->toBe([
++            (new Team)->qualifyColumn('*'), // Default select...
++            'id', // Select without a qualified table also included just to be sure...
++            // Select for `team.name` not included as that is already included in the `team.*`...
++            'team_user.role', // Select for a qualitified other table included...
++        ])
++        ->orders->toBe([
++            [
++                'column' => 'id',
++                'direction' => 'asc',
++            ],
++            [
++                'column' => 'teams.name',
++                'direction' => 'asc',
++            ],
++            [
++                'column' => 'team_user.role',
++                'direction' => 'asc',
++            ],
++        ]);
++
++    $preparedQuery = app(RelationshipJoiner::class)->prepareQueryForNoConstraints(
++        $user->teams()->orderByRaw("CASE WHEN role = 'admin' THEN 1 ELSE 2 END")
++    );
++
++    expect($preparedQuery->toBase())
++        ->distinct->toBeTrue()
++        ->getColumns()->toBe([
++            (new Team)->qualifyColumn('*'),
++            "CASE WHEN role = 'admin' THEN 1 ELSE 2 END", // Select added from `orderByRaw`...
++        ])
++        ->orders->toBe([
++            [
++                'type' => 'Raw',
++                'sql' => "CASE WHEN role = 'admin' THEN 1 ELSE 2 END",
++            ],
++        ]);
++
++    $preparedQuery = app(RelationshipJoiner::class)->prepareQueryForNoConstraints(
++        $user->teams()->orderBy(new Expression("CASE WHEN role = 'some_other_role' THEN 1 ELSE 2 END"))
++    );
++
++    expect($preparedQuery->toBase())
++        ->distinct->toBeTrue()
++        ->getColumns()->toBe([
++            (new Team)->qualifyColumn('*'),
++            "CASE WHEN role = 'some_other_role' THEN 1 ELSE 2 END", // Select added from `orderByRaw`...
++        ])
++        ->orders->toHaveCount(1)
++        ->and($preparedQuery->toBase()->orders[0])
++        ->column->getValue($user->teams()->getGrammar())->toBe("CASE WHEN role = 'some_other_role' THEN 1 ELSE 2 END")
++        ->direction->toBe('asc');
++});

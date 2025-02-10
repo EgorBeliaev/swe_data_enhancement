@@ -1,0 +1,390 @@
+diff --git a/.changeset/eight-humans-sip.md b/.changeset/eight-humans-sip.md
+new file mode 100644
+index 000000000000..dd54579cf8e5
+--- /dev/null
++++ b/.changeset/eight-humans-sip.md
+@@ -0,0 +1,7 @@
++---
++"@rocket.chat/meteor": minor
++"@rocket.chat/i18n": minor
++"@rocket.chat/rest-typings": minor
++---
++
++Allows agents and managers to close Omnichannel rooms that for some reason ended up in a bad state. This "bad state" could be a room that appears open but it's closed. Now, the endpoint `livechat/room.closeByUser` will accept an optional `forceClose` parameter that will allow users to bypass most state checks we do on rooms and perform the room closing again so its state can be recovered.
+diff --git a/apps/meteor/app/lib/server/functions/closeLivechatRoom.ts b/apps/meteor/app/lib/server/functions/closeLivechatRoom.ts
+index 1e7672005867..56b4b48ba29f 100644
+--- a/apps/meteor/app/lib/server/functions/closeLivechatRoom.ts
++++ b/apps/meteor/app/lib/server/functions/closeLivechatRoom.ts
+@@ -1,11 +1,9 @@
+ import type { IUser, IRoom, IOmnichannelRoom } from '@rocket.chat/core-typings';
+-import { isOmnichannelRoom } from '@rocket.chat/core-typings';
+ import { LivechatRooms, Subscriptions } from '@rocket.chat/models';
+ 
+ import { hasPermissionAsync } from '../../../authorization/server/functions/hasPermission';
+ import { Livechat } from '../../../livechat/server/lib/LivechatTyped';
+ import type { CloseRoomParams } from '../../../livechat/server/lib/localTypes';
+-import { notifyOnSubscriptionChanged } from '../lib/notifyListener';
+ 
+ export const closeLivechatRoom = async (
+ 	user: IUser,
+@@ -15,6 +13,7 @@ export const closeLivechatRoom = async (
+ 		tags,
+ 		generateTranscriptPdf,
+ 		transcriptEmail,
++		forceClose = false,
+ 	}: {
+ 		comment?: string;
+ 		tags?: string[];
+@@ -27,25 +26,14 @@ export const closeLivechatRoom = async (
+ 					sendToVisitor: true;
+ 					requestData: Pick<NonNullable<IOmnichannelRoom['transcriptRequest']>, 'email' | 'subject'>;
+ 			  };
++		forceClose?: boolean;
+ 	},
+ ): Promise<void> => {
+ 	const room = await LivechatRooms.findOneById(roomId);
+-	if (!room || !isOmnichannelRoom(room)) {
++	if (!room) {
+ 		throw new Error('error-invalid-room');
+ 	}
+ 
+-	if (!room.open) {
+-		const { deletedCount } = await Subscriptions.removeByRoomId(roomId, {
+-			async onTrash(doc) {
+-				void notifyOnSubscriptionChanged(doc, 'removed');
+-			},
+-		});
+-		if (deletedCount) {
+-			return;
+-		}
+-		throw new Error('error-room-already-closed');
+-	}
+-
+ 	const subscription = await Subscriptions.findOneByRoomIdAndUserId(roomId, user._id, { projection: { _id: 1 } });
+ 	if (!subscription && !(await hasPermissionAsync(user._id, 'close-others-livechat-room'))) {
+ 		throw new Error('error-not-authorized');
+@@ -76,7 +64,21 @@ export const closeLivechatRoom = async (
+ 		}),
+ 	};
+ 
+-	await Livechat.closeRoom({
++	if (forceClose) {
++		return Livechat.closeRoom({
++			room,
++			user,
++			options,
++			comment,
++			forceClose,
++		});
++	}
++
++	if (!room.open) {
++		throw new Error('error-room-already-closed');
++	}
++
++	return Livechat.closeRoom({
+ 		room,
+ 		user,
+ 		options,
+diff --git a/apps/meteor/app/livechat/server/api/v1/room.ts b/apps/meteor/app/livechat/server/api/v1/room.ts
+index 63a7c20784c2..fe8aa43b663b 100644
+--- a/apps/meteor/app/livechat/server/api/v1/room.ts
++++ b/apps/meteor/app/livechat/server/api/v1/room.ts
+@@ -25,6 +25,7 @@ import { settings as rcSettings } from '../../../../settings/server';
+ import { normalizeTransferredByData } from '../../lib/Helper';
+ import { Livechat as LivechatTyped } from '../../lib/LivechatTyped';
+ import type { CloseRoomParams } from '../../lib/localTypes';
++import { livechatLogger } from '../../lib/logger';
+ import { findGuest, findRoom, settings, findAgent, onCheckRoomParams } from '../lib/livechat';
+ 
+ const isAgentWithInfo = (agentObj: ILivechatAgent | { hiddenInfo: boolean }): agentObj is ILivechatAgent => !('hiddenInfo' in agentObj);
+@@ -195,9 +196,22 @@ API.v1.addRoute(
+ 	},
+ 	{
+ 		async post() {
+-			const { rid, comment, tags, generateTranscriptPdf, transcriptEmail } = this.bodyParams;
++			const { rid, comment, tags, generateTranscriptPdf, transcriptEmail, forceClose } = this.bodyParams;
+ 
+-			await closeLivechatRoom(this.user, rid, { comment, tags, generateTranscriptPdf, transcriptEmail });
++			const allowForceClose = rcSettings.get<boolean>('Omnichannel_allow_force_close_conversations');
++			const isForceClosing = allowForceClose && forceClose;
++
++			if (isForceClosing) {
++				livechatLogger.warn({ msg: 'Force closing a conversation', user: this.userId, room: rid });
++			}
++
++			await closeLivechatRoom(this.user, rid, {
++				comment,
++				tags,
++				generateTranscriptPdf,
++				transcriptEmail,
++				forceClose: isForceClosing,
++			});
+ 
+ 			return API.v1.success();
+ 		},
+diff --git a/apps/meteor/app/livechat/server/lib/LivechatTyped.ts b/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
+index 6b3a1370c7b9..193f6cdbc60a 100644
+--- a/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
++++ b/apps/meteor/app/livechat/server/lib/LivechatTyped.ts
+@@ -240,10 +240,10 @@ class LivechatClass {
+ 		session: ClientSession,
+ 	): Promise<{ room: IOmnichannelRoom; closedBy: ChatCloser; removedInquiry: ILivechatInquiryRecord | null }> {
+ 		const { comment } = params;
+-		const { room } = params;
++		const { room, forceClose } = params;
+ 
+-		this.logger.debug(`Attempting to close room ${room._id}`);
+-		if (!room || !isOmnichannelRoom(room) || !room.open) {
++		this.logger.debug({ msg: `Attempting to close room`, roomId: room._id, forceClose });
++		if (!room || !isOmnichannelRoom(room) || (!forceClose && !room.open)) {
+ 			this.logger.debug(`Room ${room._id} is not open`);
+ 			throw new Error('error-room-closed');
+ 		}
+@@ -292,25 +292,27 @@ class LivechatClass {
+ 
+ 		const inquiry = await LivechatInquiry.findOneByRoomId(rid, { session });
+ 		const removedInquiry = await LivechatInquiry.removeByRoomId(rid, { session });
+-		if (removedInquiry && removedInquiry.deletedCount !== 1) {
++		if (!params.forceClose && removedInquiry && removedInquiry.deletedCount !== 1) {
+ 			throw new Error('Error removing inquiry');
+ 		}
+ 
+ 		const updatedRoom = await LivechatRooms.closeRoomById(rid, closeData, { session });
+-		if (!updatedRoom || updatedRoom.modifiedCount !== 1) {
++		if (!params.forceClose && (!updatedRoom || updatedRoom.modifiedCount !== 1)) {
+ 			throw new Error('Error closing room');
+ 		}
+ 
+ 		const subs = await Subscriptions.countByRoomId(rid, { session });
+-		const removedSubs = await Subscriptions.removeByRoomId(rid, {
+-			async onTrash(doc) {
+-				void notifyOnSubscriptionChanged(doc, 'removed');
+-			},
+-			session,
+-		});
++		if (subs) {
++			const removedSubs = await Subscriptions.removeByRoomId(rid, {
++				async onTrash(doc) {
++					void notifyOnSubscriptionChanged(doc, 'removed');
++				},
++				session,
++			});
+ 
+-		if (removedSubs.deletedCount !== subs) {
+-			throw new Error('Error removing subscriptions');
++			if (!params.forceClose && removedSubs.deletedCount !== subs) {
++				throw new Error('Error removing subscriptions');
++			}
+ 		}
+ 
+ 		this.logger.debug(`DB updated for room ${room._id}`);
+diff --git a/apps/meteor/app/livechat/server/lib/localTypes.ts b/apps/meteor/app/livechat/server/lib/localTypes.ts
+index 93ac3dbb71d6..b82ad13b0531 100644
+--- a/apps/meteor/app/livechat/server/lib/localTypes.ts
++++ b/apps/meteor/app/livechat/server/lib/localTypes.ts
+@@ -3,6 +3,7 @@ import type { IOmnichannelRoom, IUser, ILivechatVisitor, IMessage, MessageAttach
+ type GenericCloseRoomParams = {
+ 	room: IOmnichannelRoom;
+ 	comment?: string;
++	forceClose?: boolean;
+ 	options?: {
+ 		clientAction?: boolean;
+ 		tags?: string[];
+diff --git a/apps/meteor/server/settings/omnichannel.ts b/apps/meteor/server/settings/omnichannel.ts
+index 37701cea8c41..4f77e7be7456 100644
+--- a/apps/meteor/server/settings/omnichannel.ts
++++ b/apps/meteor/server/settings/omnichannel.ts
+@@ -173,6 +173,15 @@ export const createOmniSettings = () =>
+ 			enableQuery: omnichannelEnabledQuery,
+ 		});
+ 
++		await this.add('Omnichannel_allow_force_close_conversations', false, {
++			type: 'boolean',
++			group: 'Omnichannel',
++			section: 'API',
++			public: true,
++			enableQuery: omnichannelEnabledQuery,
++			alert: 'Omnichannel_allow_force_close_conversations_alert',
++		});
++
+ 		await this.add('Livechat_conversation_finished_message', '', {
+ 			type: 'string',
+ 			group: 'Omnichannel',
+diff --git a/apps/meteor/tests/end-to-end/api/livechat/00-rooms.ts b/apps/meteor/tests/end-to-end/api/livechat/00-rooms.ts
+index 947d3dfde7c0..d1f783913e87 100644
+--- a/apps/meteor/tests/end-to-end/api/livechat/00-rooms.ts
++++ b/apps/meteor/tests/end-to-end/api/livechat/00-rooms.ts
+@@ -2371,6 +2371,41 @@ describe('LIVECHAT - rooms', () => {
+ 			expect(sub.body.subscription).to.be.null;
+ 		});
+ 
++		describe('Force closing', () => {
++			after(async () => {
++				await updateSetting('Omnichannel_allow_force_close_conversations', false);
++			});
++			it('should not allow force closing if setting Omnichannel_allow_force_close_conversations is off', async () => {
++				const visitor = await createVisitor();
++				const { _id } = await createLivechatRoom(visitor.token);
++				await request.post(api('livechat/room.closeByUser')).set(credentials).send({ rid: _id, comment: 'test' });
++
++				// Room closed, try to close again should return an error
++				const result = await request
++					.post(api('livechat/room.closeByUser'))
++					.set(credentials)
++					.send({ rid: _id, comment: 'test', forceClose: true });
++
++				expect(result.body).to.have.property('success', false);
++				expect(result.body).to.have.property('error', 'error-room-already-closed');
++			});
++			it('should allow to force close a conversation (even if the conversation is already closed)', async () => {
++				await updateSetting('Omnichannel_allow_force_close_conversations', true);
++
++				const visitor = await createVisitor();
++				const { _id } = await createLivechatRoom(visitor.token);
++				await request.post(api('livechat/room.closeByUser')).set(credentials).send({ rid: _id, comment: 'test' });
++
++				// Room closed, try to force close again should work
++				const result = await request
++					.post(api('livechat/room.closeByUser'))
++					.set(credentials)
++					.send({ rid: _id, comment: 'test', forceClose: true });
++
++				expect(result.body).to.have.property('success', true);
++			});
++		});
++
+ 		(IS_EE ? it : it.skip)('should close room and generate transcript pdf', async () => {
+ 			const {
+ 				room: { _id: roomId },
+diff --git a/apps/meteor/tests/unit/app/lib/server/functions/closeLivechatRoom.tests.ts b/apps/meteor/tests/unit/app/lib/server/functions/closeLivechatRoom.tests.ts
+index b40b971128bc..307885f7a92f 100644
+--- a/apps/meteor/tests/unit/app/lib/server/functions/closeLivechatRoom.tests.ts
++++ b/apps/meteor/tests/unit/app/lib/server/functions/closeLivechatRoom.tests.ts
+@@ -59,57 +59,6 @@ describe('closeLivechatRoom', () => {
+ 		expect(subscriptionsStub.removeByRoomId.notCalled).to.be.true;
+ 	});
+ 
+-	it('should not perform any operation when a non-livechat room is provided', async () => {
+-		livechatRoomsStub.findOneById.resolves({ ...room, t: 'c' });
+-		subscriptionsStub.findOneByRoomIdAndUserId.resolves(subscription);
+-		hasPermissionStub.resolves(true);
+-
+-		await expect(closeLivechatRoom(user, room._id, {})).to.be.rejectedWith('error-invalid-room');
+-		expect(livechatStub.closeRoom.notCalled).to.be.true;
+-		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
+-		expect(subscriptionsStub.findOneByRoomIdAndUserId.notCalled).to.be.true;
+-		expect(subscriptionsStub.removeByRoomId.notCalled).to.be.true;
+-	});
+-
+-	it('should not perform any operation when a closed room with no subscriptions is provided and the caller is not subscribed to it', async () => {
+-		livechatRoomsStub.findOneById.resolves({ ...room, open: false });
+-		subscriptionsStub.removeByRoomId.resolves({ deletedCount: 0 });
+-		subscriptionsStub.findOneByRoomIdAndUserId.resolves(null);
+-		hasPermissionStub.resolves(true);
+-
+-		await expect(closeLivechatRoom(user, room._id, {})).to.be.rejectedWith('error-room-already-closed');
+-		expect(livechatStub.closeRoom.notCalled).to.be.true;
+-		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
+-		expect(subscriptionsStub.findOneByRoomIdAndUserId.notCalled).to.be.true;
+-		expect(subscriptionsStub.removeByRoomId.calledOnceWith(room._id)).to.be.true;
+-	});
+-
+-	it('should remove dangling subscription when a closed room with subscriptions is provided and the caller is not subscribed to it', async () => {
+-		livechatRoomsStub.findOneById.resolves({ ...room, open: false });
+-		subscriptionsStub.removeByRoomId.resolves({ deletedCount: 1 });
+-		subscriptionsStub.findOneByRoomIdAndUserId.resolves(null);
+-		hasPermissionStub.resolves(true);
+-
+-		await closeLivechatRoom(user, room._id, {});
+-		expect(livechatStub.closeRoom.notCalled).to.be.true;
+-		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
+-		expect(subscriptionsStub.findOneByRoomIdAndUserId.notCalled).to.be.true;
+-		expect(subscriptionsStub.removeByRoomId.calledOnceWith(room._id)).to.be.true;
+-	});
+-
+-	it('should remove dangling subscription when a closed room is provided but the user is still subscribed to it', async () => {
+-		livechatRoomsStub.findOneById.resolves({ ...room, open: false });
+-		subscriptionsStub.findOneByRoomIdAndUserId.resolves(subscription);
+-		subscriptionsStub.removeByRoomId.resolves({ deletedCount: 1 });
+-		hasPermissionStub.resolves(true);
+-
+-		await closeLivechatRoom(user, room._id, {});
+-		expect(livechatStub.closeRoom.notCalled).to.be.true;
+-		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
+-		expect(subscriptionsStub.findOneByRoomIdAndUserId.notCalled).to.be.true;
+-		expect(subscriptionsStub.removeByRoomId.calledOnceWith(room._id)).to.be.true;
+-	});
+-
+ 	it('should not perform any operation when the caller is not subscribed to an open room and does not have the permission to close others rooms', async () => {
+ 		livechatRoomsStub.findOneById.resolves(room);
+ 		subscriptionsStub.findOneByRoomIdAndUserId.resolves(null);
+@@ -145,4 +94,32 @@ describe('closeLivechatRoom', () => {
+ 		expect(subscriptionsStub.findOneByRoomIdAndUserId.calledOnceWith(room._id, user._id)).to.be.true;
+ 		expect(subscriptionsStub.removeByRoomId.notCalled).to.be.true;
+ 	});
++
++	it('should call Livechat.closeRoom directly when forceClose is true even if room is in invalid state', async () => {
++		// Here we're using `open: false` as a way to simulate an invalid state. This should not happen in production. A room like this is effectively a "bad egg"
++		livechatRoomsStub.findOneById.resolves({ ...room, open: false });
++		subscriptionsStub.findOneByRoomIdAndUserId.resolves(subscription);
++		hasPermissionStub.resolves(true);
++
++		await closeLivechatRoom(user, room._id, { forceClose: true });
++
++		expect(
++			livechatStub.closeRoom.calledOnceWith(
++				sinon.match({ room: { ...room, open: false }, user, options: sinon.match({ clientAction: true }), forceClose: true }),
++			),
++		).to.be.true;
++		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
++		expect(subscriptionsStub.findOneByRoomIdAndUserId.calledOnceWith(room._id, user._id)).to.be.true;
++	});
++
++	it('should throw an error if forceClose is false and room is already closed', async () => {
++		livechatRoomsStub.findOneById.resolves({ ...room, open: false });
++		subscriptionsStub.findOneByRoomIdAndUserId.resolves(subscription);
++		hasPermissionStub.resolves(true);
++
++		await expect(closeLivechatRoom(user, room._id, { forceClose: false })).to.be.rejectedWith('error-room-already-closed');
++		expect(livechatStub.closeRoom.notCalled).to.be.true;
++		expect(livechatRoomsStub.findOneById.calledOnceWith(room._id)).to.be.true;
++		expect(subscriptionsStub.findOneByRoomIdAndUserId.calledOnceWith(room._id, user._id)).to.be.true;
++	});
+ });
+diff --git a/packages/i18n/src/locales/en.i18n.json b/packages/i18n/src/locales/en.i18n.json
+index d8fa2449a212..eb3ed4727de8 100644
+--- a/packages/i18n/src/locales/en.i18n.json
++++ b/packages/i18n/src/locales/en.i18n.json
+@@ -3373,6 +3373,9 @@
+   "Omnichannel_placed_chat_on_hold": "Chat On Hold: {{comment}}",
+   "Omnichannel_hide_conversation_after_closing": "Hide conversation after closing",
+   "Omnichannel_hide_conversation_after_closing_description": "After closing the conversation you will be redirected to Home.",
++  "Omnichannel_allow_force_close_conversations": "Force close conversation API",
++  "Omnichannel_allow_force_close_conversations_Description": "Allow agents and managers to force close conversations via API.",
++  "Omnichannel_allow_force_close_conversations_alert": "Only enable if your workspace has issues with rooms with invalid states.",
+   "Livechat_Block_Unknown_Contacts": "Block unknown contacts",
+   "Livechat_Block_Unknown_Contacts_Description": "Conversations from people who are not on the contact list will not be able to be taken.",
+   "Livechat_Block_Unverified_Contacts": "Block unverified contacts",
+diff --git a/packages/rest-typings/src/v1/omnichannel.ts b/packages/rest-typings/src/v1/omnichannel.ts
+index b612a2697aa4..b710d98eb415 100644
+--- a/packages/rest-typings/src/v1/omnichannel.ts
++++ b/packages/rest-typings/src/v1/omnichannel.ts
+@@ -2402,6 +2402,7 @@ type POSTLivechatRoomCloseByUserParams = {
+ 	comment?: string;
+ 	tags?: string[];
+ 	generateTranscriptPdf?: boolean;
++	forceClose?: boolean;
+ 	transcriptEmail?:
+ 		| {
+ 				// Note: if sendToVisitor is false, then any previously requested transcripts (like via livechat:requestTranscript) will be also cancelled
+@@ -2457,6 +2458,9 @@ const POSTLivechatRoomCloseByUserParamsSchema = {
+ 			required: ['sendToVisitor'],
+ 			additionalProperties: false,
+ 		},
++		forceClose: {
++			type: 'boolean',
++		},
+ 	},
+ 	required: ['rid'],
+ 	additionalProperties: false,

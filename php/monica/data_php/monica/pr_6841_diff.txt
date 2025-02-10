@@ -1,0 +1,1067 @@
+diff --git a/app/Console/Kernel.php b/app/Console/Kernel.php
+index c413defb2db..02962e68acf 100644
+--- a/app/Console/Kernel.php
++++ b/app/Console/Kernel.php
+@@ -6,6 +6,7 @@
+ use App\Domains\Contact\Dav\Jobs\CleanSyncToken;
+ use App\Domains\Contact\DavClient\Jobs\UpdateAddressBooks;
+ use App\Domains\Contact\ManageReminders\Jobs\ProcessScheduledContactReminders;
++use App\Logging\CleanLogs;
+ use Illuminate\Console\Scheduling\Schedule;
+ use Illuminate\Foundation\Console\Kernel as ConsoleKernel;
+ use Illuminate\Support\Facades\App;
+@@ -44,6 +45,7 @@ protected function schedule(Schedule $schedule)
+         $this->scheduleJob($schedule, UpdateAddressBooks::class, 'hourly');
+         $this->scheduleJob($schedule, ProcessScheduledContactReminders::class, 'minutes', 1);
+         $this->scheduleJob($schedule, CleanSyncToken::class, 'daily');
++        $this->scheduleJob($schedule, CleanLogs::class, 'daily');
+     }
+ 
+     /**
+diff --git a/app/Domains/Contact/Dav/Jobs/UpdateVCard.php b/app/Domains/Contact/Dav/Jobs/UpdateVCard.php
+index c6b16991e6d..045f916123e 100644
+--- a/app/Domains/Contact/Dav/Jobs/UpdateVCard.php
++++ b/app/Domains/Contact/Dav/Jobs/UpdateVCard.php
+@@ -65,7 +65,7 @@ public function execute(array $data): void
+             $newtag = $this->updateCard($this->data['uri'], $this->data['card']);
+ 
+             if ($newtag !== null && ($etag = Arr::get($this->data, 'etag')) !== null && $newtag !== $etag) {
+-                Log::warning(__CLASS__.' '.__FUNCTION__." wrong etag when updating contact. Expected [$etag], got [$newtag]", [
++                Log::channel('database')->warning(__CLASS__.' '.__FUNCTION__." wrong etag when updating contact. Expected [$etag], got [$newtag]", [
+                     'contacturl' => $this->data['uri'],
+                     'carddata' => $this->data['card'],
+                 ]);
+@@ -99,7 +99,7 @@ private function updateCard(string $uri, mixed $card): ?string
+                 ]);
+             }
+         } catch (\Exception $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
++            Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
+                 'uri' => $uri,
+                 'carddata' => $card,
+                 $e,
+diff --git a/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php b/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php
+index c9d77be5ae5..761c0325f95 100644
+--- a/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php
++++ b/app/Domains/Contact/Dav/Web/Backend/CardDAV/CardDAVBackend.php
+@@ -204,7 +204,7 @@ public function prepareCard(VCardResource $resource): array
+                 'lastmodified' => $resource->updated_at->timestamp,
+             ];
+         } catch (\Exception $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
++            Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
+                 'carddata' => $carddata,
+                 'id' => $resource->id,
+                 $e,
+diff --git a/app/Domains/Contact/DavClient/Jobs/DeleteLocalVCard.php b/app/Domains/Contact/DavClient/Jobs/DeleteLocalVCard.php
+new file mode 100644
+index 00000000000..87abdc4b241
+--- /dev/null
++++ b/app/Domains/Contact/DavClient/Jobs/DeleteLocalVCard.php
+@@ -0,0 +1,54 @@
++<?php
++
++namespace App\Domains\Contact\DavClient\Jobs;
++
++use App\Domains\Contact\Dav\Web\Backend\CardDAV\CardDAVBackend;
++use App\Models\AddressBookSubscription;
++use Illuminate\Bus\Batchable;
++use Illuminate\Bus\Queueable;
++use Illuminate\Contracts\Queue\ShouldQueue;
++use Illuminate\Queue\InteractsWithQueue;
++use Illuminate\Queue\SerializesModels;
++use Illuminate\Support\Facades\Log;
++
++class DeleteLocalVCard implements ShouldQueue
++{
++    use Batchable, InteractsWithQueue, Queueable, SerializesModels;
++
++    /**
++     * Create a new job instance.
++     */
++    public function __construct(
++        private AddressBookSubscription $subscription,
++        private string $uri
++    ) {
++        $this->subscription = $subscription->withoutRelations();
++    }
++
++    /**
++     * Send Delete contact.
++     */
++    public function handle(): void
++    {
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
++    {
++        Log::channel('database')->debug("Delete local card {$this->uri}");
++
++        $backend = app(CardDAVBackend::class)->withUser($this->subscription->user);
++        $backend->deleteCard($this->subscription->vault_id, $this->uri);
++    }
++}
+diff --git a/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php b/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php
+index c968649ecfc..c1ac3191226 100644
+--- a/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php
++++ b/app/Domains/Contact/DavClient/Jobs/DeleteMultipleVCard.php
+@@ -8,6 +8,7 @@
+ use Illuminate\Contracts\Queue\ShouldQueue;
+ use Illuminate\Queue\InteractsWithQueue;
+ use Illuminate\Queue\SerializesModels;
++use Illuminate\Support\Facades\Log;
+ 
+ class DeleteMultipleVCard implements ShouldQueue
+ {
+@@ -32,8 +33,26 @@ public function handle(): void
+             return; // @codeCoverageIgnore
+         }
+ 
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
++    {
+         $jobs = collect($this->hrefs)
+-            ->map(fn (string $href): DeleteVCard => $this->deleteVCard($href));
++            ->map(fn (string $href): DeleteLocalVCard => $this->deleteVCard($href));
++
++        Log::channel('database')->info("Delete {$jobs->count()} card(s) from distant server...");
+ 
+         $this->batch()->add($jobs);
+     }
+@@ -41,8 +60,8 @@ public function handle(): void
+     /**
+      * Delete the contact.
+      */
+-    private function deleteVCard(string $href): DeleteVCard
++    private function deleteVCard(string $href): DeleteLocalVCard
+     {
+-        return new DeleteVCard($this->subscription, $href);
++        return new DeleteLocalVCard($this->subscription, $href);
+     }
+ }
+diff --git a/app/Domains/Contact/DavClient/Jobs/DeleteVCard.php b/app/Domains/Contact/DavClient/Jobs/DeleteVCard.php
+index 8a19f19ea16..fd1b71df6e9 100644
+--- a/app/Domains/Contact/DavClient/Jobs/DeleteVCard.php
++++ b/app/Domains/Contact/DavClient/Jobs/DeleteVCard.php
+@@ -8,6 +8,7 @@
+ use Illuminate\Contracts\Queue\ShouldQueue;
+ use Illuminate\Queue\InteractsWithQueue;
+ use Illuminate\Queue\SerializesModels;
++use Illuminate\Support\Facades\Log;
+ 
+ class DeleteVCard implements ShouldQueue
+ {
+@@ -28,6 +29,24 @@ public function __construct(
+      */
+     public function handle(): void
+     {
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
++    {
++        Log::channel('database')->debug("Delete card {$this->uri}");
++
+         $this->subscription->getClient()
+             ->request('DELETE', $this->uri);
+     }
+diff --git a/app/Domains/Contact/DavClient/Jobs/GetMultipleVCard.php b/app/Domains/Contact/DavClient/Jobs/GetMultipleVCard.php
+index 11d1e31a460..9ed22cbe537 100644
+--- a/app/Domains/Contact/DavClient/Jobs/GetMultipleVCard.php
++++ b/app/Domains/Contact/DavClient/Jobs/GetMultipleVCard.php
+@@ -10,6 +10,7 @@
+ use Illuminate\Queue\InteractsWithQueue;
+ use Illuminate\Queue\SerializesModels;
+ use Illuminate\Support\Arr;
++use Illuminate\Support\Facades\Log;
+ use Sabre\CardDAV\Plugin as CardDav;
+ 
+ class GetMultipleVCard implements ShouldQueue
+@@ -35,6 +36,22 @@ public function handle(): void
+             return; // @codeCoverageIgnore
+         }
+ 
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
++    {
+         $data = $this->addressbookMultiget();
+ 
+         $jobs = collect($data)
+@@ -42,6 +59,8 @@ public function handle(): void
+             ->map(fn (array $contact, string $href): ?UpdateVCard => $this->updateVCard($contact, $href))
+             ->filter();
+ 
++        Log::channel('database')->info("Get {$jobs->count()} card(s) from distant server...");
++
+         $this->batch()->add($jobs);
+     }
+ 
+diff --git a/app/Domains/Contact/DavClient/Jobs/GetVCard.php b/app/Domains/Contact/DavClient/Jobs/GetVCard.php
+index 60bf16a1665..a1f159ae41e 100644
+--- a/app/Domains/Contact/DavClient/Jobs/GetVCard.php
++++ b/app/Domains/Contact/DavClient/Jobs/GetVCard.php
+@@ -10,6 +10,7 @@
+ use Illuminate\Contracts\Queue\ShouldQueue;
+ use Illuminate\Queue\InteractsWithQueue;
+ use Illuminate\Queue\SerializesModels;
++use Illuminate\Support\Facades\Log;
+ 
+ class GetVCard implements ShouldQueue
+ {
+@@ -34,6 +35,24 @@ public function handle(): void
+             return; // @codeCoverageIgnore
+         }
+ 
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
++    {
++        Log::channel('database')->debug("Get card {$this->contact->uri}");
++
+         $response = $this->subscription->getClient()
+             ->request('GET', $this->contact->uri);
+ 
+diff --git a/app/Domains/Contact/DavClient/Jobs/PushVCard.php b/app/Domains/Contact/DavClient/Jobs/PushVCard.php
+index 39a2e6817d6..c75183c5933 100644
+--- a/app/Domains/Contact/DavClient/Jobs/PushVCard.php
++++ b/app/Domains/Contact/DavClient/Jobs/PushVCard.php
+@@ -45,6 +45,22 @@ public function __construct(
+      * Push VCard data to the distance server.
+      */
+     public function handle(): void
++    {
++        Log::shareContext([
++            'addressbook_subscription_id' => $this->subscription->id,
++        ]);
++
++        try {
++            $this->run();
++        } finally {
++            Log::flushSharedContext();
++        }
++    }
++
++    /**
++     * Run the job.
++     */
++    private function run(): void
+     {
+         $contact = Contact::where('vault_id', $this->subscription->vault_id)
+             ->findOrFail($this->contactId);
+@@ -64,6 +80,8 @@ public function handle(): void
+     private function pushDistant(int $depth = 1): string
+     {
+         try {
++            Log::channel('database')->debug("Push card {$this->uri}");
++
+             $response = $this->subscription->getClient()
+                 ->request('PUT', $this->uri, $this->card, $this->headers());
+ 
+@@ -75,7 +93,7 @@ private function pushDistant(int $depth = 1): string
+ 
+                 return $this->pushDistant(--$depth);
+             } else {
+-                Log::error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
++                Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
+                     'body' => $e->response->body(),
+                     $e,
+                 ]);
+diff --git a/app/Domains/Contact/DavClient/Jobs/SynchronizeAddressBooks.php b/app/Domains/Contact/DavClient/Jobs/SynchronizeAddressBooks.php
+index 752549db4f4..45bbaa0f63a 100644
+--- a/app/Domains/Contact/DavClient/Jobs/SynchronizeAddressBooks.php
++++ b/app/Domains/Contact/DavClient/Jobs/SynchronizeAddressBooks.php
+@@ -16,6 +16,13 @@ class SynchronizeAddressBooks implements ShouldQueue
+ {
+     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Localizable;
+ 
++    /**
++     * The number of times the job may be attempted.
++     *
++     * @var int
++     */
++    public $tries = 1;
++
+     /**
+      * Create a new job instance.
+      */
+@@ -31,7 +38,19 @@ public function __construct(
+      */
+     public function handle(): void
+     {
+-        $this->withLocale($this->subscription->user->preferredLocale(), fn () => $this->synchronize());
++        try {
++            $logid = $this->subscription->current_logid ?? 0;
++            $this->subscription->current_logid = $logid + 1;
++            $this->subscription->save();
++
++            Log::shareContext([
++                'addressbook_subscription_id' => $this->subscription->id,
++            ]);
++
++            $this->withLocale($this->subscription->user->preferredLocale(), fn () => $this->synchronize());
++        } finally {
++            Log::flushSharedContext();
++        }
+     }
+ 
+     /**
+@@ -39,11 +58,9 @@ public function handle(): void
+      */
+     private function synchronize(): void
+     {
+-        try {
+-            Log::withContext([
+-                'addressbook_subscription_id' => $this->subscription->id,
+-            ]);
++        Log::channel('database')->info("Synchronize addressbook '{$this->subscription->vault->name}'");
+ 
++        try {
+             $batchId = app(SynchronizeAddressBook::class)->execute([
+                 'account_id' => $this->subscription->user->account_id,
+                 'addressbook_subscription_id' => $this->subscription->id,
+@@ -52,13 +69,11 @@ private function synchronize(): void
+ 
+             $this->subscription->last_batch = $batchId;
+         } catch (\Exception $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.':'.$e->getMessage(), [$e]);
++            Log::stack([config('logging.default'), 'database'])->error(__CLASS__.' '.__FUNCTION__.':'.$e->getMessage(), [$e]);
+             $this->fail($e);
+         } finally {
+             $this->subscription->last_synchronized_at = now();
+             $this->subscription->save();
+-
+-            Log::withoutContext();
+         }
+     }
+ }
+diff --git a/app/Domains/Contact/DavClient/Services/SynchronizeAddressBook.php b/app/Domains/Contact/DavClient/Services/SynchronizeAddressBook.php
+index 35b438c9917..cbe3be202a9 100644
+--- a/app/Domains/Contact/DavClient/Services/SynchronizeAddressBook.php
++++ b/app/Domains/Contact/DavClient/Services/SynchronizeAddressBook.php
+@@ -48,7 +48,7 @@ private function synchronize(bool $force): ?string
+                 ->withSubscription($this->subscription)
+                 ->execute($force);
+         } catch (ClientException $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
++            Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [
+                 'body' => $e->hasResponse() ? $e->getResponse()->getBody() : null,
+                 $e,
+             ]);
+diff --git a/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php b/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
+index b700f154ccd..e263e2eb769 100644
+--- a/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
++++ b/app/Domains/Contact/DavClient/Services/Utils/AddressBookGetter.php
+@@ -25,7 +25,7 @@ public function execute(): ?array
+         try {
+             return $this->getAddressBookData();
+         } catch (ClientException $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [$e]);
++            Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.': '.$e->getMessage(), [$e]);
+             throw $e;
+         }
+     }
+diff --git a/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php b/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php
+index d2ee508546f..e790627d704 100644
+--- a/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php
++++ b/app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php
+@@ -2,6 +2,8 @@
+ 
+ namespace App\Domains\Contact\DavClient\Services\Utils;
+ 
++use App\Domains\Contact\DavClient\Jobs\DeleteVCard;
++use App\Domains\Contact\DavClient\Jobs\PushVCard;
+ use App\Domains\Contact\DavClient\Services\UpdateSubscriptionLocalSyncToken;
+ use App\Domains\Contact\DavClient\Services\Utils\Dav\DavClient;
+ use App\Domains\Contact\DavClient\Services\Utils\Model\ContactDeleteDto;
+@@ -77,11 +79,12 @@ private function sync(): Collection
+             // Get changes to sync
+             $localChanges = $this->getLocalChanges();
+ 
+-            $jobs = $jobs->merge(
+-                app(PrepareJobsContactPush::class)
+-                    ->withSubscription($this->subscription)
+-                    ->execute($localChanges, $changes)
+-            );
++            $pushes = app(PrepareJobsContactPush::class)
++                ->withSubscription($this->subscription)
++                ->execute($localChanges, $changes);
++            $this->logs($pushes);
++
++            $jobs = $jobs->merge($pushes);
+         }
+ 
+         return $jobs;
+@@ -113,11 +116,12 @@ private function forcesync(): Collection
+             // Get changes to sync
+             $localChanges = $this->getLocalChanges();
+ 
+-            $jobs = $jobs->merge(
+-                app(PrepareJobsContactPushMissed::class)
+-                    ->withSubscription($this->subscription)
+-                    ->execute($localChanges, $distContacts, $localContacts)
+-            );
++            $pushes = app(PrepareJobsContactPushMissed::class)
++                ->withSubscription($this->subscription)
++                ->execute($localChanges, $distContacts, $localContacts);
++            $this->logs($pushes);
++
++            $jobs = $jobs->merge($pushes);
+         }
+ 
+         return $jobs;
+@@ -149,7 +153,6 @@ private function getDistantChanges(): Collection
+ 
+         $updated = $data->filter(fn ($contact, $href): bool => $this->filterDistantContacts($contact, $href))
+             ->map(fn (array $contact, string $href): ContactDto => new ContactDto($href, Arr::get($contact, 'properties.200.{DAV:}getetag')));
+-
+         $deleted = $data->filter(fn ($contact): bool => is_array($contact) && $contact['status'] === '404')
+             ->map(fn (array $contact, string $href): ContactDto => new ContactDeleteDto($href));
+ 
+@@ -230,7 +233,7 @@ private function callSyncCollection(): array
+                 $this->subscription->save();
+             }
+         } catch (RequestException $e) {
+-            Log::error(__CLASS__.' '.__FUNCTION__.':'.$e->getMessage(), [$e]);
++            Log::channel('database')->error(__CLASS__.' '.__FUNCTION__.':'.$e->getMessage(), [$e]);
+             $collection = [];
+             $this->subscription->distant_sync_token = null;
+             $this->subscription->save();
+@@ -238,4 +241,16 @@ private function callSyncCollection(): array
+ 
+         return $collection;
+     }
++
++    private function logs(Collection $jobs): void
++    {
++        $counts = $jobs->countBy(fn ($job): string => $job::class);
++
++        if (($updated = $counts->get(PushVCard::class, 0)) > 0) {
++            Log::channel('database')->info("Update or create $updated card(s) to distant server...");
++        }
++        if (($deleted = $counts->get(DeleteVCard::class, 0)) > 0) {
++            Log::channel('database')->info("Delete $deleted card(s) to distant server...");
++        }
++    }
+ }
+diff --git a/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php b/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
+index 89e61764e29..37dd6639146 100644
+--- a/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
++++ b/app/Domains/Contact/DavClient/Services/Utils/Dav/DavClient.php
+@@ -473,7 +473,7 @@ public function request(string $method, string $url = '', mixed $body = null, ar
+ 
+         $url = Str::startsWith($url, 'http') ? $url : $this->path($url);
+ 
+-        Log::debug(__CLASS__.' '.__FUNCTION__.'[request]: '.$method.' '.$url, [
++        Log::channel('database')->debug(__CLASS__.' '.__FUNCTION__.'[request]: '.$method.' '.$url, [
+             'body' => $body,
+             'headers' => $headers,
+             'options' => $options,
+@@ -482,13 +482,13 @@ public function request(string $method, string $url = '', mixed $body = null, ar
+         $response = $request
+             ->send($method, $url, $options)
+             ->throw(function (Response $response) use ($method, $url) {
+-                Log::debug(__CLASS__.' '.__FUNCTION__.'[error]: '.$method.' '.$url.' '.$response->status(), [
++                Log::channel('database')->debug(__CLASS__.' '.__FUNCTION__.'[error]: '.$method.' '.$url.' '.$response->status(), [
+                     'body' => $response->body(),
+                     'headers' => $response->headers(),
+                 ]);
+             });
+ 
+-        Log::debug(__CLASS__.' '.__FUNCTION__.'[response]: '.$method.' '.$url.' '.$response->status(), [
++        Log::channel('database')->debug(__CLASS__.' '.__FUNCTION__.'[response]: '.$method.' '.$url.' '.$response->status(), [
+             'body' => $response->body(),
+             'headers' => $response->headers(),
+         ]);
+@@ -557,7 +557,7 @@ private static function addElementNS(\DOMDocument $dom, ?string $namespace, stri
+     /**
+      * Create a new Element and add it as root's child.
+      */
+-    private static function addElement(\DOMDocument $dom, \DOMNode $root, string $name, string $value = null): \DOMNode
++    private static function addElement(\DOMDocument $dom, \DOMNode $root, string $name, string $value = ''): \DOMNode
+     {
+         return $root->appendChild($dom->createElement($name, $value));
+     }
+diff --git a/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php b/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
+index 77ec6c9969d..eb30d99584f 100644
+--- a/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
++++ b/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactPushMissed.php
+@@ -28,7 +28,8 @@ public function execute(Collection $localChanges, Collection $distContacts, Coll
+         $missings = $this->preparePushMissedContacts($localChanges->get('added', collect()), $distContacts, $localContacts);
+ 
+         return $changes
+-            ->merge($missings);
++            ->merge($missings)
++            ->filter();
+     }
+ 
+     /**
+diff --git a/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdater.php b/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdater.php
+index 543a34fe1c3..d9c5f877ac0 100644
+--- a/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdater.php
++++ b/app/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdater.php
+@@ -2,8 +2,8 @@
+ 
+ namespace App\Domains\Contact\DavClient\Services\Utils;
+ 
++use App\Domains\Contact\DavClient\Jobs\DeleteLocalVCard;
+ use App\Domains\Contact\DavClient\Jobs\DeleteMultipleVCard;
+-use App\Domains\Contact\DavClient\Jobs\DeleteVCard;
+ use App\Domains\Contact\DavClient\Jobs\GetMultipleVCard;
+ use App\Domains\Contact\DavClient\Jobs\GetVCard;
+ use App\Domains\Contact\DavClient\Services\Utils\Model\ContactDeleteDto;
+@@ -11,6 +11,7 @@
+ use App\Domains\Contact\DavClient\Services\Utils\Traits\HasCapability;
+ use App\Domains\Contact\DavClient\Services\Utils\Traits\HasSubscription;
+ use Illuminate\Support\Collection;
++use Illuminate\Support\Facades\Log;
+ 
+ class PrepareJobsContactUpdater
+ {
+@@ -35,14 +36,14 @@ public function execute(Collection $refresh): Collection
+      */
+     private function refreshMultigetContacts(Collection $refresh): Collection
+     {
+-        $refresh = $refresh->groupBy(fn ($item): string => $item instanceof ContactDeleteDto ? 'deleted' : 'updated')
++        $refresh = $refresh->groupBy(fn ($item): string => $item::class)
+             ->map(fn (Collection $items): array => $items->pluck('uri')->toArray());
+ 
+         $jobs = collect();
+-        if (($updated = $refresh->get('updated')) !== null) {
++        if (($updated = $refresh->get(ContactDto::class)) !== null) {
+             $jobs->add(new GetMultipleVCard($this->subscription, $updated));
+         }
+-        if (($deleted = $refresh->get('deleted')) !== null) {
++        if (($deleted = $refresh->get(ContactDeleteDto::class)) !== null) {
+             $jobs->add(new DeleteMultipleVCard($this->subscription, $deleted));
+         }
+ 
+@@ -56,10 +57,24 @@ private function refreshMultigetContacts(Collection $refresh): Collection
+      */
+     private function refreshSimpleGetContacts(Collection $refresh): Collection
+     {
+-        return $refresh
+-            ->map(fn (ContactDto $contact) => $contact instanceof ContactDeleteDto
+-                ? new DeleteVCard($this->subscription, $contact->uri)
+-                : new GetVCard($this->subscription, $contact)
++        $refresh = $refresh->groupBy(fn ($item): string => $item::class);
++
++        $jobs = collect();
++        if (($updated = $refresh->get(ContactDto::class)) !== null) {
++            Log::channel('database')->info("Get {$updated->count()} card(s) from distant server...");
++
++            $jobs = $jobs->merge(
++                $updated->map(fn (ContactDto $contact) => new GetVCard($this->subscription, $contact))
+             );
++        }
++        if (($deleted = $refresh->get(ContactDeleteDto::class)) !== null) {
++            Log::channel('database')->info("Delete {$deleted->count()} card(s) from distant server...");
++
++            $jobs = $jobs->merge(
++                $deleted->map(fn (ContactDto $contact) => new DeleteLocalVCard($this->subscription, $contact->uri))
++            );
++        }
++
++        return $jobs;
+     }
+ }
+diff --git a/app/Logging/CleanLogs.php b/app/Logging/CleanLogs.php
+new file mode 100644
+index 00000000000..0373f2f0999
+--- /dev/null
++++ b/app/Logging/CleanLogs.php
+@@ -0,0 +1,19 @@
++<?php
++
++namespace App\Logging;
++
++use App\Interfaces\ServiceInterface;
++use App\Models\Log;
++use App\Services\QueuableService;
++use Carbon\Carbon;
++
++class CleanLogs extends QueuableService implements ServiceInterface
++{
++    /**
++     * Clean logs list.
++     */
++    public function execute(array $data): void
++    {
++        Log::where('created_at', '<', Carbon::now()->subDays(15))->delete();
++    }
++}
+diff --git a/app/Logging/Loggable.php b/app/Logging/Loggable.php
+new file mode 100644
+index 00000000000..d9bfac8df52
+--- /dev/null
++++ b/app/Logging/Loggable.php
+@@ -0,0 +1,17 @@
++<?php
++
++namespace App\Logging;
++
++use Illuminate\Database\Eloquent\Relations\MorphMany;
++
++/**
++ * @property string $id
++ * @property ?string $current_logid
++ */
++interface Loggable
++{
++    /**
++     * Get the associated logs.
++     */
++    public function logs(): MorphMany;
++}
+diff --git a/app/Logging/LoggingHandler.php b/app/Logging/LoggingHandler.php
+new file mode 100644
+index 00000000000..91d6e4ebe08
+--- /dev/null
++++ b/app/Logging/LoggingHandler.php
+@@ -0,0 +1,43 @@
++<?php
++
++namespace App\Logging;
++
++use App\Models\AddressBookSubscription;
++use App\Models\Log;
++use Illuminate\Database\Eloquent\ModelNotFoundException;
++use Monolog\Handler\AbstractProcessingHandler;
++use Monolog\LogRecord;
++
++class LoggingHandler extends AbstractProcessingHandler
++{
++    protected function write(LogRecord $record): void
++    {
++        $context = $record->context;
++
++        try {
++            if (isset($context['addressbook_subscription_id'])) {
++                $subscription = AddressBookSubscription::findOrFail($context['addressbook_subscription_id']);
++                $this->logRecord($record, $subscription);
++            }
++        } catch (ModelNotFoundException) {
++            // ignore log
++        }
++    }
++
++    private function logRecord(LogRecord $record, Loggable $loggable): void
++    {
++        Log::create([
++            'group_id' => $loggable->current_logid ?? 0,
++            'level' => $record->level->value,
++            'level_name' => $record->level->getName(),
++            'channel' => $record->channel,
++            'message' => $record->message,
++            'context' => count($record->context) > 0 ? $record->context : null,
++            'extra' => count($record->extra) > 0 ? $record->extra : null,
++            'formatted' => (string) $record->formatted,
++            'logged_at' => $record->datetime,
++            'loggable_type' => $loggable::class,
++            'loggable_id' => $loggable->id,
++        ]);
++    }
++}
+diff --git a/app/Models/AddressBookSubscription.php b/app/Models/AddressBookSubscription.php
+index d5392e63723..3810fcff01b 100644
+--- a/app/Models/AddressBookSubscription.php
++++ b/app/Models/AddressBookSubscription.php
+@@ -3,14 +3,16 @@
+ namespace App\Models;
+ 
+ use App\Domains\Contact\DavClient\Services\Utils\Dav\DavClient;
++use App\Logging\Loggable;
+ use Illuminate\Database\Eloquent\Builder;
+ use Illuminate\Database\Eloquent\Casts\Attribute;
+ use Illuminate\Database\Eloquent\Concerns\HasUuids;
+ use Illuminate\Database\Eloquent\Factories\HasFactory;
+ use Illuminate\Database\Eloquent\Model;
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
++use Illuminate\Database\Eloquent\Relations\MorphMany;
+ 
+-class AddressBookSubscription extends Model
++class AddressBookSubscription extends Model implements Loggable
+ {
+     use HasFactory, HasUuids;
+ 
+@@ -39,6 +41,7 @@ class AddressBookSubscription extends Model
+         'password',
+         'sync_way',
+         'distant_sync_token',
++        'current_logid',
+         'frequency',
+         'last_synchronized_at',
+         'active',
+@@ -62,6 +65,7 @@ class AddressBookSubscription extends Model
+         'last_synchronized_at' => 'datetime',
+         'active' => 'boolean',
+         'capabilities' => 'array',
++        'current_logid' => 'integer',
+     ];
+ 
+     /**
+@@ -105,6 +109,14 @@ public function localSyncToken(): BelongsTo
+         return $this->belongsTo(SyncToken::class);
+     }
+ 
++    /**
++     * Get the subscription's logs.
++     */
++    public function logs(): MorphMany
++    {
++        return $this->morphMany(Log::class, 'loggable');
++    }
++
+     /**
+      * Get password.
+      *
+diff --git a/app/Models/Log.php b/app/Models/Log.php
+new file mode 100644
+index 00000000000..716bda2d106
+--- /dev/null
++++ b/app/Models/Log.php
+@@ -0,0 +1,50 @@
++<?php
++
++namespace App\Models;
++
++use Illuminate\Database\Eloquent\Factories\HasFactory;
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Database\Eloquent\Relations\MorphTo;
++
++class Log extends Model
++{
++    use HasFactory;
++
++    /**
++     * The attributes that are mass assignable.
++     *
++     * @var array<string>
++     */
++    protected $fillable = [
++        'group_id',
++        'level',
++        'level_name',
++        'channel',
++        'message',
++        'context',
++        'extra',
++        'formatted',
++        'logged_at',
++        'loggable_type',
++        'loggable_id',
++    ];
++
++    /**
++     * The attributes that should be cast.
++     *
++     * @var array<string,string>
++     */
++    protected $casts = [
++        'context' => 'json',
++        'extra' => 'json',
++        'logged_at' => 'datetime',
++    ];
++
++    /**
++     * Get the loggable entry.
++     */
++    public function loggable(): MorphTo
++    {
++        return $this->morphTo();
++    }
++}
+diff --git a/config/logging.php b/config/logging.php
+index 35b312d95fb..e86879171a3 100644
+--- a/config/logging.php
++++ b/config/logging.php
+@@ -119,6 +119,12 @@
+         'emergency' => [
+             'path' => storage_path('logs/laravel.log'),
+         ],
++
++        'database' => [
++            'driver' => 'monolog',
++            'handler' => App\Logging\LoggingHandler::class,
++            'level' => 'debug',
++        ],
+     ],
+ 
+ ];
+diff --git a/database/migrations/2023_07_03_230200_create_addressbook_subscription.php b/database/migrations/2023_07_03_230200_create_addressbook_subscription.php
+index c17f20856e2..6e5010afd49 100644
+--- a/database/migrations/2023_07_03_230200_create_addressbook_subscription.php
++++ b/database/migrations/2023_07_03_230200_create_addressbook_subscription.php
+@@ -29,6 +29,7 @@ public function up()
+             $table->string('capabilities', 2048);
+             $table->string('distant_sync_token', 512)->nullable();
+             $table->string('last_batch')->nullable();
++            $table->unsignedBigInteger('current_logid')->nullable();
+             $table->foreignIdFor(SyncToken::class)->nullable()->constrained()->nullOnDelete();
+             $table->smallInteger('frequency')->default(180); // 3 hours
+             $table->timestamp('last_synchronized_at', 0)->nullable();
+diff --git a/database/migrations/2023_08_30_202650_create_logs_table.php b/database/migrations/2023_08_30_202650_create_logs_table.php
+new file mode 100644
+index 00000000000..6feb1fee9fe
+--- /dev/null
++++ b/database/migrations/2023_08_30_202650_create_logs_table.php
+@@ -0,0 +1,37 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::create('logs', function (Blueprint $table) {
++            $table->id();
++            $table->unsignedBigInteger('group_id')->index();
++            $table->string('level')->index();
++            $table->string('level_name');
++            $table->string('channel')->index();
++            $table->longText('message')->nullable();
++            $table->longText('context')->nullable();
++            $table->longText('extra')->nullable();
++            $table->longText('formatted')->nullable();
++            $table->morphs('loggable');
++            $table->dateTime('logged_at');
++            $table->timestamps();
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::dropIfExists('logs');
++    }
++};
+diff --git a/database/migrations/2023_08_30_202650_fix_addressbook_currentlogid.php b/database/migrations/2023_08_30_202650_fix_addressbook_currentlogid.php
+new file mode 100644
+index 00000000000..ac4a96a14ff
+--- /dev/null
++++ b/database/migrations/2023_08_30_202650_fix_addressbook_currentlogid.php
+@@ -0,0 +1,20 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        if (! Schema::hasColumn('addressbook_subscriptions', 'current_logid')) {
++            Schema::table('addressbook_subscriptions', function (Blueprint $table) {
++                $table->unsignedBigInteger('current_logid')->after('last_batch')->nullable();
++            });
++        }
++    }
++};
+diff --git a/phpstan.neon b/phpstan.neon
+index 2e609e908fc..8b59b5567ea 100644
+--- a/phpstan.neon
++++ b/phpstan.neon
+@@ -43,3 +43,6 @@ parameters:
+           path: */app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php
+         - message: '#Access to an undefined property App\\Models\\AddressBookSubscription::\$isWayGet\.#'
+           path: */app/Domains/Contact/DavClient/Services/Utils/AddressBookSynchronizer.php
++
++        - message: '#Access to an undefined property App\\Logging\\Loggable::\$id\.#'
++          path: */app/Logging/LoggingHandler.php
+diff --git a/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteLocalVCardTest.php b/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteLocalVCardTest.php
+new file mode 100644
+index 00000000000..a908dfca5cd
+--- /dev/null
++++ b/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteLocalVCardTest.php
+@@ -0,0 +1,73 @@
++<?php
++
++namespace Tests\Unit\Domains\Contact\DavClient\Jobs;
++
++use App\Domains\Contact\Dav\Web\Backend\CardDAV\CardDAVBackend;
++use App\Domains\Contact\DavClient\Jobs\DeleteLocalVCard;
++use App\Domains\Contact\ManageContact\Services\DestroyContact;
++use App\Models\AddressBookSubscription;
++use App\Models\Contact;
++use App\Models\Vault;
++use Illuminate\Bus\DatabaseBatchRepository;
++use Illuminate\Bus\PendingBatch;
++use Illuminate\Foundation\Testing\DatabaseTransactions;
++use Illuminate\Support\Facades\Bus;
++use Mockery\MockInterface;
++use Tests\TestCase;
++
++class DeleteLocalVCardTest extends TestCase
++{
++    use DatabaseTransactions;
++
++    /** @test */
++    public function it_delete_card_mock()
++    {
++        $fake = Bus::fake();
++
++        $this->mock(CardDAVBackend::class, function (MockInterface $mock) {
++            $mock->shouldReceive('withUser')->andReturnSelf();
++            $mock->shouldReceive('deleteCard')->andReturnTrue();
++        });
++
++        $addressBookSubscription = AddressBookSubscription::factory()->create();
++
++        $pendingBatch = $fake->batch([
++            $job = new DeleteLocalVCard($addressBookSubscription, 'https://test/dav/uri'),
++        ]);
++        $batch = $pendingBatch->dispatch();
++
++        $fake->assertBatched(function (PendingBatch $pendingBatch) {
++            $this->assertCount(1, $pendingBatch->jobs);
++            $this->assertInstanceOf(DeleteLocalVCard::class, $pendingBatch->jobs->first());
++
++            return true;
++        });
++
++        $batch = app(DatabaseBatchRepository::class)->store($pendingBatch);
++        $job->withBatchId($batch->id)->handle();
++    }
++
++    /** @test */
++    public function it_delete_card_contact()
++    {
++        $fake = Bus::fake();
++
++        $subscription = AddressBookSubscription::factory()->create();
++        $this->setPermissionInVault($subscription->user, Vault::PERMISSION_EDIT, $subscription->vault);
++
++        $contact = Contact::factory()->create([
++            'vault_id' => $subscription->vault_id,
++            'first_name' => 'Test',
++            'id' => 'affacde9-b2fe-4371-9acb-6612aaee6971',
++            'updated_at' => now(),
++        ]);
++
++        (new DeleteLocalVCard($subscription, $contact->id))->handle();
++
++        $fake->assertDispatched(function (DestroyContact $job) use ($contact) {
++            $this->assertEquals($contact->id, $job->contact->id);
++
++            return true;
++        });
++    }
++}
+diff --git a/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteMultipleVCardTest.php b/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteMultipleVCardTest.php
+index b582988764f..d3a34f44d31 100644
+--- a/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteMultipleVCardTest.php
++++ b/tests/Unit/Domains/Contact/DavClient/Jobs/DeleteMultipleVCardTest.php
+@@ -2,8 +2,8 @@
+ 
+ namespace Tests\Unit\Domains\Contact\DavClient\Jobs;
+ 
++use App\Domains\Contact\DavClient\Jobs\DeleteLocalVCard;
+ use App\Domains\Contact\DavClient\Jobs\DeleteMultipleVCard;
+-use App\Domains\Contact\DavClient\Jobs\DeleteVCard;
+ use App\Models\AddressBookSubscription;
+ use Illuminate\Bus\DatabaseBatchRepository;
+ use Illuminate\Bus\PendingBatch;
+@@ -37,7 +37,7 @@ public function it_delete_cards()
+         $batch = app(DatabaseBatchRepository::class)->store($pendingBatch);
+         $job->withBatchId($batch->id)->handle();
+ 
+-        $fake->assertDispatched(function (DeleteVCard $updateVCard) {
++        $fake->assertDispatched(function (DeleteLocalVCard $updateVCard) {
+             $uri = $this->getPrivateValue($updateVCard, 'uri');
+             $this->assertEquals('https://test/dav/uri', $uri);
+ 
+diff --git a/tests/Unit/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdaterTest.php b/tests/Unit/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdaterTest.php
+index 89747b2dc25..649df0809b0 100644
+--- a/tests/Unit/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdaterTest.php
++++ b/tests/Unit/Domains/Contact/DavClient/Services/Utils/PrepareJobsContactUpdaterTest.php
+@@ -3,8 +3,8 @@
+ namespace Tests\Unit\Domains\Contact\DavClient\Services\Utils;
+ 
+ use App\Domains\Contact\Dav\Web\Backend\CardDAV\CardDAVBackend;
++use App\Domains\Contact\DavClient\Jobs\DeleteLocalVCard;
+ use App\Domains\Contact\DavClient\Jobs\DeleteMultipleVCard;
+-use App\Domains\Contact\DavClient\Jobs\DeleteVCard;
+ use App\Domains\Contact\DavClient\Jobs\GetMultipleVCard;
+ use App\Domains\Contact\DavClient\Jobs\GetVCard;
+ use App\Domains\Contact\DavClient\Services\Utils\Model\ContactDeleteDto;
+@@ -192,7 +192,7 @@ public function it_sync_deleted_simple()
+ 
+         $this->assertCount(1, $batchs);
+         $batch = $batchs->first();
+-        $this->assertInstanceOf(DeleteVCard::class, $batch);
++        $this->assertInstanceOf(DeleteLocalVCard::class, $batch);
+         $uri = $this->getPrivateValue($batch, 'uri');
+         $this->assertEquals('https://test/dav/uuid2', $uri);
+     }

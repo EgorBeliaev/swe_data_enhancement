@@ -1,0 +1,2598 @@
+diff --git a/packages/shared/src/features/batchAction/types.ts b/packages/shared/src/features/batchAction/types.ts
+new file mode 100644
+index 000000000000..0e2abb43d12d
+--- /dev/null
++++ b/packages/shared/src/features/batchAction/types.ts
+@@ -0,0 +1,38 @@
++import z from "zod";
++import { singleFilter } from "../../interfaces/filters";
++import { orderBy } from "../../interfaces/orderBy";
++import { BatchExportTableName } from "../batchExport/types";
++
++/* eslint-disable no-unused-vars */
++export enum BatchActionType {
++  Create = "create",
++  Delete = "delete",
++}
++
++const ActionIdSchema = z.enum([
++  "trace-delete",
++  "trace-add-to-annotation-queue",
++]);
++
++export type ActionId = z.infer<typeof ActionIdSchema>;
++
++export const BatchActionQuerySchema = z.object({
++  filter: z.array(singleFilter).nullable(),
++  orderBy,
++});
++
++export type BatchActionQuery = z.infer<typeof BatchActionQuerySchema>;
++
++export const CreateBatchActionSchema = z.object({
++  projectId: z.string(),
++  actionId: ActionIdSchema,
++  targetId: z.string().optional(),
++  query: BatchActionQuerySchema,
++  tableName: z.nativeEnum(BatchExportTableName),
++});
++
++export const GetIsBatchActionInProgressSchema = z.object({
++  projectId: z.string(),
++  actionId: ActionIdSchema,
++  tableName: z.nativeEnum(BatchExportTableName),
++});
+diff --git a/packages/shared/src/index.ts b/packages/shared/src/index.ts
+index 32ce2391560a..f3b71d72b80b 100644
+--- a/packages/shared/src/index.ts
++++ b/packages/shared/src/index.ts
+@@ -21,7 +21,10 @@ export * from "./server/llm/types";
+ 
+ // evals
+ export * from "./features/evals/types";
++
++// table actions
+ export * from "./features/batchExport/types";
++export * from "./features/batchAction/types";
+ 
+ // annotation
+ export * from "./features/annotation/types";
+diff --git a/packages/shared/src/server/index.ts b/packages/shared/src/server/index.ts
+index 6dadce86adce..8fdcd01ffa09 100644
+--- a/packages/shared/src/server/index.ts
++++ b/packages/shared/src/server/index.ts
+@@ -29,6 +29,7 @@ export * from "./redis/traceDelete";
+ export * from "./redis/projectDelete";
+ export * from "./redis/datasetRunItemUpsert";
+ export * from "./redis/batchExport";
++export * from "./redis/batchActionQueue";
+ export * from "./redis/ingestionQueue";
+ export * from "./redis/postHogIntegrationQueue";
+ export * from "./redis/postHogIntegrationProcessingQueue";
+diff --git a/packages/shared/src/server/queues.ts b/packages/shared/src/server/queues.ts
+index f8ddeb66441a..3c2c752c5279 100644
+--- a/packages/shared/src/server/queues.ts
++++ b/packages/shared/src/server/queues.ts
+@@ -1,5 +1,10 @@
+ import { z } from "zod";
+ import { eventTypes } from ".";
++import {
++  BatchActionQuerySchema,
++  BatchActionType,
++} from "../features/batchAction/types";
++import { BatchExportTableName } from "../features/batchExport/types";
+ 
+ export const IngestionEvent = z.object({
+   data: z.object({
+@@ -55,6 +60,15 @@ export const DataRetentionProcessingEventSchema = z.object({
+   projectId: z.string(),
+   retention: z.number(),
+ });
++export const BatchActionProcessingEventSchema = z.object({
++  projectId: z.string(),
++  actionId: z.string(),
++  query: BatchActionQuerySchema,
++  tableName: z.nativeEnum(BatchExportTableName),
++  cutoffCreatedAt: z.date(),
++  targetId: z.string().optional(),
++  type: z.nativeEnum(BatchActionType),
++});
+ 
+ export type BatchExportJobType = z.infer<typeof BatchExportJobSchema>;
+ export type TraceQueueEventType = z.infer<typeof TraceQueueEventSchema>;
+@@ -74,6 +88,9 @@ export type PostHogIntegrationProcessingEventType = z.infer<
+ export type DataRetentionProcessingEventType = z.infer<
+   typeof DataRetentionProcessingEventSchema
+ >;
++export type BatchActionProcessingEventType = z.infer<
++  typeof BatchActionProcessingEventSchema
++>;
+ 
+ export enum QueueName {
+   TraceUpsert = "trace-upsert", // Ingestion pipeline adds events on each Trace upsert
+@@ -92,6 +109,7 @@ export enum QueueName {
+   MeteringDataPostgresExportQueue = "metering-data-postgres-export-queue",
+   DataRetentionQueue = "data-retention-queue",
+   DataRetentionProcessingQueue = "data-retention-processing-queue",
++  BatchActionQueue = "batch-action-queue",
+ }
+ 
+ export enum QueueJobs {
+@@ -111,6 +129,7 @@ export enum QueueJobs {
+   MeteringDataPostgresExportJob = "metering-data-postgres-export-job",
+   DataRetentionJob = "data-retention-job",
+   DataRetentionProcessingJob = "data-retention-processing-job",
++  BatchActionProcessingJob = "batch-action-processing-job",
+ }
+ 
+ export type TQueueJobTypes = {
+@@ -180,4 +199,10 @@ export type TQueueJobTypes = {
+     payload: DataRetentionProcessingEventType;
+     name: QueueJobs.DataRetentionProcessingJob;
+   };
++  [QueueName.BatchActionQueue]: {
++    timestamp: Date;
++    id: string;
++    payload: BatchActionProcessingEventType;
++    name: QueueJobs.BatchActionProcessingJob;
++  };
+ };
+diff --git a/packages/shared/src/server/redis/batchActionQueue.ts b/packages/shared/src/server/redis/batchActionQueue.ts
+new file mode 100644
+index 000000000000..1dd3c02bc5b1
+--- /dev/null
++++ b/packages/shared/src/server/redis/batchActionQueue.ts
+@@ -0,0 +1,45 @@
++import { Queue } from "bullmq";
++import { QueueName, TQueueJobTypes } from "../queues";
++import { createNewRedisInstance, redisQueueRetryOptions } from "./redis";
++import { logger } from "../logger";
++
++export class BatchActionQueue {
++  private static instance: Queue<
++    TQueueJobTypes[QueueName.BatchActionQueue]
++  > | null = null;
++
++  public static getInstance(): Queue<
++    TQueueJobTypes[QueueName.BatchActionQueue]
++  > | null {
++    if (BatchActionQueue.instance) return BatchActionQueue.instance;
++
++    const newRedis = createNewRedisInstance({
++      enableOfflineQueue: false,
++      ...redisQueueRetryOptions,
++    });
++
++    BatchActionQueue.instance = newRedis
++      ? new Queue<TQueueJobTypes[QueueName.BatchActionQueue]>(
++          QueueName.BatchActionQueue,
++          {
++            connection: newRedis,
++            defaultJobOptions: {
++              removeOnComplete: true,
++              removeOnFail: 10_000,
++              attempts: 2,
++              backoff: {
++                type: "exponential",
++                delay: 5000,
++              },
++            },
++          },
++        )
++      : null;
++
++    BatchActionQueue.instance?.on("error", (err) => {
++      logger.error("BatchActionQueue error", err);
++    });
++
++    return BatchActionQueue.instance;
++  }
++}
+diff --git a/packages/shared/src/server/redis/getQueue.ts b/packages/shared/src/server/redis/getQueue.ts
+index bc0a636624a6..159795194f97 100644
+--- a/packages/shared/src/server/redis/getQueue.ts
++++ b/packages/shared/src/server/redis/getQueue.ts
+@@ -15,6 +15,7 @@ import { CoreDataS3ExportQueue } from "./coreDataS3ExportQueue";
+ import { MeteringDataPostgresExportQueue } from "./meteringDataPostgresExportQueue";
+ import { DataRetentionQueue } from "./dataRetentionQueue";
+ import { DataRetentionProcessingQueue } from "./dataRetentionProcessingQueue";
++import { BatchActionQueue } from "./batchActionQueue";
+ 
+ export function getQueue(queueName: QueueName): Queue | null {
+   switch (queueName) {
+@@ -50,6 +51,8 @@ export function getQueue(queueName: QueueName): Queue | null {
+       return DataRetentionQueue.getInstance();
+     case QueueName.DataRetentionProcessingQueue:
+       return DataRetentionProcessingQueue.getInstance();
++    case QueueName.BatchActionQueue:
++      return BatchActionQueue.getInstance();
+     default:
+       const exhaustiveCheckDefault: never = queueName;
+       throw new Error(`Queue ${queueName} not found`);
+diff --git a/web/src/components/table/data-table-multi-select-actions/data-table-select-all-banner.tsx b/web/src/components/table/data-table-multi-select-actions/data-table-select-all-banner.tsx
+new file mode 100644
+index 000000000000..123e7e3693f8
+--- /dev/null
++++ b/web/src/components/table/data-table-multi-select-actions/data-table-select-all-banner.tsx
+@@ -0,0 +1,45 @@
++import { type MultiSelect } from "@/src/components/table/data-table-toolbar";
++import { Button } from "@/src/components/ui/button";
++
++export function DataTableSelectAllBanner({
++  selectAll,
++  setSelectAll,
++  setRowSelection,
++  pageSize,
++  totalCount,
++}: MultiSelect) {
++  return (
++    <div className="my-2 flex flex-wrap items-center justify-center gap-2 rounded-sm bg-input p-2 @container">
++      {selectAll ? (
++        <span className="text-sm">
++          All <span className="font-semibold">{totalCount}</span> items are
++          selected.{" "}
++          <Button
++            variant="ghost"
++            className="h-auto p-0 font-semibold text-accent-dark-blue hover:text-accent-dark-blue/80"
++            onClick={() => {
++              setSelectAll(false);
++              setRowSelection({});
++            }}
++          >
++            Clear selection
++          </Button>
++        </span>
++      ) : (
++        <span className="text-sm">
++          All <span className="font-semibold">{pageSize}</span> items on this
++          page are selected.{" "}
++          <Button
++            variant="ghost"
++            className="h-auto p-0 font-semibold text-accent-dark-blue hover:text-accent-dark-blue/80"
++            onClick={() => {
++              setSelectAll(true);
++            }}
++          >
++            Select all {totalCount} items
++          </Button>
++        </span>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/components/table/data-table-multi-select-actions/trace-table-multi-select-action.tsx b/web/src/components/table/data-table-multi-select-actions/trace-table-multi-select-action.tsx
+deleted file mode 100644
+index aaa001b6d5a4..000000000000
+--- a/web/src/components/table/data-table-multi-select-actions/trace-table-multi-select-action.tsx
++++ /dev/null
+@@ -1,260 +0,0 @@
+-import { ChevronDown, ClipboardPen, Trash } from "lucide-react";
+-
+-import {
+-  DropdownMenu,
+-  DropdownMenuTrigger,
+-  DropdownMenuContent,
+-  DropdownMenuItem,
+-} from "@/src/components/ui/dropdown-menu";
+-import { Button } from "@/src/components/ui/button";
+-import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+-import { api } from "@/src/utils/api";
+-
+-import {
+-  Dialog,
+-  DialogContent,
+-  DialogDescription,
+-  DialogFooter,
+-  DialogHeader,
+-  DialogTitle,
+-} from "@/src/components/ui/dialog";
+-import { useState } from "react";
+-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+-import {
+-  Select,
+-  SelectTrigger,
+-  SelectContent,
+-  SelectItem,
+-  SelectValue,
+-} from "@/src/components/ui/select";
+-import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
+-import {
+-  Form,
+-  FormControl,
+-  FormField,
+-  FormItem,
+-  FormMessage,
+-} from "@/src/components/ui/form";
+-import { zodResolver } from "@hookform/resolvers/zod";
+-import { useForm } from "react-hook-form";
+-import { z } from "zod";
+-import { useSession } from "next-auth/react";
+-import { useHasEntitlement } from "@/src/features/entitlements/hooks";
+-
+-const addToQueueFormSchema = z.object({
+-  queueId: z.string(),
+-});
+-
+-export function TraceTableMultiSelectAction({
+-  selectedTraceIds,
+-  projectId,
+-  onDeleteSuccess,
+-}: {
+-  selectedTraceIds: string[];
+-  projectId: string;
+-  onDeleteSuccess: () => void;
+-}) {
+-  const utils = api.useUtils();
+-  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+-  const [addToQueueDialogOpen, setAddToQueueDialogOpen] = useState(false);
+-  const session = useSession();
+-  const capture = usePostHogClientCapture();
+-
+-  const hasDeleteAccess = useHasProjectAccess({
+-    projectId,
+-    scope: "traces:delete",
+-  });
+-  const mutDeleteTraces = api.traces.deleteMany.useMutation({
+-    onSuccess: () => {
+-      onDeleteSuccess();
+-      void utils.traces.all.invalidate();
+-    },
+-  });
+-
+-  const hasAnnotationEntitlement = useHasEntitlement("annotation-queues");
+-  const hasTraceDeletionEntitlement = useHasEntitlement("trace-deletion");
+-  const hasAddToQueueAccess = useHasProjectAccess({
+-    projectId,
+-    scope: "annotationQueues:CUD",
+-  });
+-  const mutAddToQueue = api.annotationQueueItems.createMany.useMutation({
+-    onSuccess: (data) => {
+-      showSuccessToast({
+-        title: "Traces added to queue",
+-        description: `${selectedTraceIds.length} traces added to queue "${data.queueName}".`,
+-        link: {
+-          href: `/project/${projectId}/annotation-queues/${data.queueId}`,
+-          text: `View queue "${data.queueName}"`,
+-        },
+-      });
+-    },
+-  });
+-
+-  const form = useForm<z.infer<typeof addToQueueFormSchema>>({
+-    resolver: zodResolver(addToQueueFormSchema),
+-  });
+-
+-  const queues = api.annotationQueues.allNamesAndIds.useQuery(
+-    {
+-      projectId,
+-    },
+-    { enabled: session.status === "authenticated" && hasAnnotationEntitlement },
+-  );
+-
+-  return (
+-    <>
+-      <DropdownMenu>
+-        <DropdownMenuTrigger asChild>
+-          <Button disabled={selectedTraceIds.length < 1}>
+-            Actions ({selectedTraceIds.length} selected)
+-            <ChevronDown className="h-5 w-5" />
+-          </Button>
+-        </DropdownMenuTrigger>
+-        <DropdownMenuContent>
+-          {hasTraceDeletionEntitlement && (
+-            <DropdownMenuItem
+-              disabled={!hasDeleteAccess}
+-              onClick={() => {
+-                capture("trace:delete_form_open", {
+-                  count: selectedTraceIds.length,
+-                  source: "table-multi-select",
+-                });
+-                setDeleteDialogOpen(true);
+-              }}
+-            >
+-              <Trash className="mr-2 h-4 w-4" />
+-              <span>Delete</span>
+-            </DropdownMenuItem>
+-          )}
+-          {hasAnnotationEntitlement && (
+-            <DropdownMenuItem
+-              disabled={!hasAddToQueueAccess}
+-              onClick={() => {
+-                setAddToQueueDialogOpen(true);
+-              }}
+-            >
+-              <ClipboardPen className="mr-2 h-4 w-4" />
+-              <span>Add to Annotation Queue</span>
+-            </DropdownMenuItem>
+-          )}
+-        </DropdownMenuContent>
+-      </DropdownMenu>
+-
+-      <Dialog
+-        open={deleteDialogOpen}
+-        onOpenChange={(isOpen) => {
+-          if (!isOpen) {
+-            setDeleteDialogOpen(false);
+-          }
+-        }}
+-      >
+-        <DialogContent className="sm:max-w-md">
+-          <DialogHeader>
+-            <DialogTitle>Delete traces</DialogTitle>
+-            <DialogDescription>
+-              This action cannot be undone and removes all the data associated
+-              with these traces.
+-            </DialogDescription>
+-          </DialogHeader>
+-          <DialogFooter className="sm:justify-start">
+-            <Button
+-              type="button"
+-              variant="destructive"
+-              loading={mutDeleteTraces.isLoading}
+-              disabled={mutDeleteTraces.isLoading}
+-              onClick={() => {
+-                void mutDeleteTraces
+-                  .mutateAsync({
+-                    traceIds: selectedTraceIds,
+-                    projectId,
+-                  })
+-                  .then(() => {
+-                    setDeleteDialogOpen(false);
+-                  });
+-                capture("trace:delete_form_submit", {
+-                  count: selectedTraceIds.length,
+-                  source: "table-multi-select",
+-                });
+-              }}
+-            >
+-              Delete {selectedTraceIds.length} trace(s)
+-            </Button>
+-          </DialogFooter>
+-        </DialogContent>
+-      </Dialog>
+-
+-      <Dialog
+-        open={addToQueueDialogOpen}
+-        onOpenChange={(isOpen) => {
+-          if (!isOpen) {
+-            setAddToQueueDialogOpen(false);
+-          }
+-        }}
+-      >
+-        <DialogContent className="sm:max-w-md">
+-          <Form {...form}>
+-            <form
+-              className="space-y-6"
+-              onSubmit={form.handleSubmit((data) => {
+-                if (data.queueId) {
+-                  void mutAddToQueue
+-                    .mutateAsync({
+-                      projectId,
+-                      queueId: data.queueId,
+-                      objectIds: selectedTraceIds,
+-                      objectType: "TRACE",
+-                    })
+-                    .then(() => {
+-                      setAddToQueueDialogOpen(false);
+-                    });
+-                }
+-              })}
+-            >
+-              <DialogHeader>
+-                <DialogTitle>Add to Annotation Queue</DialogTitle>
+-                <DialogDescription>
+-                  Select an annotation queue to add the selected traces to.
+-                </DialogDescription>
+-              </DialogHeader>
+-              <FormField
+-                control={form.control}
+-                name="queueId"
+-                render={({ field }) => (
+-                  <FormItem>
+-                    <Select
+-                      onValueChange={field.onChange}
+-                      defaultValue={field.value}
+-                    >
+-                      <FormControl>
+-                        <SelectTrigger>
+-                          <SelectValue placeholder="Select a queue" />
+-                        </SelectTrigger>
+-                      </FormControl>
+-                      <SelectContent>
+-                        {queues?.data?.map((queue) => (
+-                          <SelectItem key={queue.id} value={queue.id}>
+-                            {queue.name}
+-                          </SelectItem>
+-                        ))}
+-                      </SelectContent>
+-                    </Select>
+-                    <FormMessage />
+-                  </FormItem>
+-                )}
+-              />
+-              <DialogFooter className="sm:justify-start">
+-                <Button
+-                  type="submit"
+-                  loading={mutAddToQueue.isLoading}
+-                  disabled={mutAddToQueue.isLoading}
+-                >
+-                  Add {selectedTraceIds.length} trace(s) to queue
+-                </Button>
+-              </DialogFooter>
+-            </form>
+-          </Form>
+-        </DialogContent>
+-      </Dialog>
+-    </>
+-  );
+-}
+diff --git a/web/src/components/table/data-table-toolbar.tsx b/web/src/components/table/data-table-toolbar.tsx
+index 307bdb53458b..bb3fd1374507 100644
+--- a/web/src/components/table/data-table-toolbar.tsx
++++ b/web/src/components/table/data-table-toolbar.tsx
+@@ -6,6 +6,7 @@ import { type FilterState } from "@langfuse/shared";
+ import { PopoverFilterBuilder } from "@/src/features/filters/components/filter-builder";
+ import { type ColumnDefinition } from "@langfuse/shared";
+ import {
++  type RowSelectionState,
+   type ColumnOrderState,
+   type VisibilityState,
+ } from "@tanstack/react-table";
+@@ -21,6 +22,17 @@ import {
+   type TableDateRange,
+   type TableDateRangeOptions,
+ } from "@/src/utils/date-range-utils";
++import { DataTableSelectAllBanner } from "@/src/components/table/data-table-multi-select-actions/data-table-select-all-banner";
++
++export interface MultiSelect {
++  selectAll: boolean;
++  setSelectAll: Dispatch<SetStateAction<boolean>>;
++  selectedRowIds: string[];
++  setRowSelection: Dispatch<SetStateAction<RowSelectionState>>;
++  pageSize: number;
++  pageIndex: number;
++  totalCount: number | null;
++}
+ 
+ interface SearchConfig {
+   placeholder: string;
+@@ -49,6 +61,7 @@ interface DataTableToolbarProps<TData, TValue> {
+     option: TableDateRangeOptions,
+     date?: TableDateRange,
+   ) => void;
++  multiSelect?: MultiSelect;
+ }
+ 
+ export function DataTableToolbar<TData, TValue>({
+@@ -67,6 +80,7 @@ export function DataTableToolbar<TData, TValue>({
+   columnsWithCustomSelect,
+   selectedOption,
+   setDateRangeAndOption,
++  multiSelect,
+ }: DataTableToolbarProps<TData, TValue>) {
+   const [searchString, setSearchString] = useState(
+     searchConfig?.currentQuery ?? "",
+@@ -74,66 +88,73 @@ export function DataTableToolbar<TData, TValue>({
+   const capture = usePostHogClientCapture();
+ 
+   return (
+-    <div className="my-2 flex flex-wrap items-center gap-2 @container">
+-      {searchConfig && (
+-        <div className="flex max-w-md items-center">
+-          <Input
+-            autoFocus
+-            placeholder={searchConfig.placeholder}
+-            value={searchString}
+-            onChange={(event) => setSearchString(event.currentTarget.value)}
+-            onKeyDown={(event) => {
+-              if (event.key === "Enter") {
++    <>
++      <div className="my-2 flex flex-wrap items-center gap-2 @container">
++        {searchConfig && (
++          <div className="flex max-w-md items-center">
++            <Input
++              autoFocus
++              placeholder={searchConfig.placeholder}
++              value={searchString}
++              onChange={(event) => setSearchString(event.currentTarget.value)}
++              onKeyDown={(event) => {
++                if (event.key === "Enter") {
++                  capture("table:search_submit");
++                  searchConfig.updateQuery(searchString);
++                }
++              }}
++              className="w-[150px] rounded-r-none @6xl:w-[250px]"
++            />
++            <Button
++              variant="outline"
++              onClick={() => {
+                 capture("table:search_submit");
+                 searchConfig.updateQuery(searchString);
+-              }
+-            }}
+-            className="w-[150px] rounded-r-none @6xl:w-[250px]"
+-          />
+-          <Button
+-            variant="outline"
+-            onClick={() => {
+-              capture("table:search_submit");
+-              searchConfig.updateQuery(searchString);
+-            }}
+-            className="rounded-l-none border-l-0 p-3"
+-          >
+-            <Search className="h-4 w-4" />
+-          </Button>
+-        </div>
+-      )}
+-      {!!filterColumnDefinition && !!filterState && !!setFilterState && (
+-        <PopoverFilterBuilder
+-          columns={filterColumnDefinition}
+-          filterState={filterState}
+-          onChange={setFilterState}
+-          columnsWithCustomSelect={columnsWithCustomSelect}
+-        />
+-      )}
+-      {selectedOption && setDateRangeAndOption && (
+-        <TableDateRangeDropdown
+-          selectedOption={selectedOption}
+-          setDateRangeAndOption={setDateRangeAndOption}
+-        />
+-      )}
+-      <div className="flex flex-row flex-wrap gap-2 pr-0.5 @6xl:ml-auto">
+-        {!!columnVisibility && !!setColumnVisibility && (
+-          <DataTableColumnVisibilityFilter
+-            columns={columns}
+-            columnVisibility={columnVisibility}
+-            setColumnVisibility={setColumnVisibility}
+-            columnOrder={columnOrder}
+-            setColumnOrder={setColumnOrder}
++              }}
++              className="rounded-l-none border-l-0 p-3"
++            >
++              <Search className="h-4 w-4" />
++            </Button>
++          </div>
++        )}
++        {!!filterColumnDefinition && !!filterState && !!setFilterState && (
++          <PopoverFilterBuilder
++            columns={filterColumnDefinition}
++            filterState={filterState}
++            onChange={setFilterState}
++            columnsWithCustomSelect={columnsWithCustomSelect}
+           />
+         )}
+-        {!!rowHeight && !!setRowHeight && (
+-          <DataTableRowHeightSwitch
+-            rowHeight={rowHeight}
+-            setRowHeight={setRowHeight}
++        {selectedOption && setDateRangeAndOption && (
++          <TableDateRangeDropdown
++            selectedOption={selectedOption}
++            setDateRangeAndOption={setDateRangeAndOption}
+           />
+         )}
+-        {actionButtons}
++        <div className="flex flex-row flex-wrap gap-2 pr-0.5 @6xl:ml-auto">
++          {!!columnVisibility && !!setColumnVisibility && (
++            <DataTableColumnVisibilityFilter
++              columns={columns}
++              columnVisibility={columnVisibility}
++              setColumnVisibility={setColumnVisibility}
++              columnOrder={columnOrder}
++              setColumnOrder={setColumnOrder}
++            />
++          )}
++          {!!rowHeight && !!setRowHeight && (
++            <DataTableRowHeightSwitch
++              rowHeight={rowHeight}
++              setRowHeight={setRowHeight}
++            />
++          )}
++          {actionButtons}
++        </div>
+       </div>
+-    </div>
++      {multiSelect &&
++        multiSelect.pageIndex === 0 &&
++        multiSelect.selectedRowIds.length === multiSelect.pageSize && (
++          <DataTableSelectAllBanner {...multiSelect} />
++        )}
++    </>
+   );
+ }
+diff --git a/web/src/components/table/use-cases/traces.tsx b/web/src/components/table/use-cases/traces.tsx
+index d9b86a90cff2..7f10e4c4d4ae 100644
+--- a/web/src/components/table/use-cases/traces.tsx
++++ b/web/src/components/table/use-cases/traces.tsx
+@@ -1,12 +1,10 @@
+ import { StarTraceToggle } from "@/src/components/star-toggle";
+ import { DataTable } from "@/src/components/table/data-table";
+-import { TraceTableMultiSelectAction } from "@/src/components/table/data-table-multi-select-actions/trace-table-multi-select-action";
+ import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
+ import TableLink from "@/src/components/table/table-link";
+ import { type LangfuseColumnDef } from "@/src/components/table/types";
+ import { TagTracePopover } from "@/src/features/tag/components/TagTracePopver";
+ import { TokenUsageBadge } from "@/src/components/token-usage-badge";
+-import { Checkbox } from "@/src/components/ui/checkbox";
+ import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
+ import { useQueryFilterState } from "@/src/features/filters/hooks/useFilterState";
+ import { api } from "@/src/utils/api";
+@@ -38,6 +36,8 @@ import {
+   tracesTableColsWithOptions,
+   type ObservationLevel,
+   BatchExportTableName,
++  AnnotationQueueObjectType,
++  BatchActionType,
+ } from "@langfuse/shared";
+ import { useRowHeightLocalStorage } from "@/src/components/table/data-table-row-height-switch";
+ import { IOTableCell } from "@/src/components/ui/CodeJsonViewer";
+@@ -58,7 +58,12 @@ import { InfoIcon } from "lucide-react";
+ import { useHasEntitlement } from "@/src/features/entitlements/hooks";
+ import { Separator } from "@/src/components/ui/separator";
+ import React from "react";
++import { TableActionMenu } from "@/src/features/table/components/TableActionMenu";
++import { useSelectAll } from "@/src/features/table/hooks/useSelectAll";
+ import { LocalIsoDate } from "@/src/components/LocalIsoDate";
++import { TableSelectionManager } from "@/src/features/table/components/TableSelectionManager";
++import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
++import { type TableAction } from "@/src/features/table/types";
+ 
+ export type TracesTableRow = {
+   bookmarked: boolean;
+@@ -156,6 +161,7 @@ export default function TracesTable({
+     pageIndex: withDefault(NumberParam, 0),
+     pageSize: withDefault(NumberParam, 50),
+   });
++  const { selectAll, setSelectAll } = useSelectAll(projectId, "traces");
+ 
+   const tracesAllCountFilter = {
+     projectId,
+@@ -252,42 +258,108 @@ export default function TracesTable({
+ 
+   const hasTraceDeletionEntitlement = useHasEntitlement("trace-deletion");
+ 
+-  const columns: LangfuseColumnDef<TracesTableRow>[] = [
++  const { selectActionColumn } = TableSelectionManager<TracesTableRow>({
++    projectId,
++    tableName: "traces",
++    setSelectedRows,
++  });
++
++  const traceDeleteMutation = api.traces.deleteMany.useMutation({
++    onSuccess: () => {
++      showSuccessToast({
++        title: "Traces deleted",
++        description: "Selected traces will be deleted. This may take a minute.",
++      });
++    },
++    onSettled: () => {
++      void utils.traces.all.invalidate();
++    },
++  });
++
++  const addToQueueMutation = api.annotationQueueItems.createMany.useMutation({
++    onSuccess: (data) => {
++      showSuccessToast({
++        title: "Traces added to queue",
++        description: `Selected traces will be added to queue "${data.queueName}". This may take a minute.`,
++        link: {
++          href: `/project/${projectId}/annotation-queues/${data.queueId}`,
++          text: `View queue "${data.queueName}"`,
++        },
++      });
++    },
++  });
++
++  const handleDeleteTraces = async ({ projectId }: { projectId: string }) => {
++    const selectedTraceIds = Object.keys(selectedRows).filter((traceId) =>
++      traces.data?.traces.map((t) => t.id).includes(traceId),
++    );
++
++    await traceDeleteMutation.mutateAsync({
++      projectId,
++      traceIds: selectedTraceIds,
++      query: {
++        filter: filterState,
++        orderBy: orderByState,
++      },
++      isBatchAction: selectAll,
++    });
++    setSelectedRows({});
++  };
++
++  const handleAddToAnnotationQueue = async ({
++    projectId,
++    targetId,
++  }: {
++    projectId: string;
++    targetId: string;
++  }) => {
++    const selectedTraceIds = Object.keys(selectedRows).filter((traceId) =>
++      traces.data?.traces.map((t) => t.id).includes(traceId),
++    );
++
++    await addToQueueMutation.mutateAsync({
++      projectId,
++      objectIds: selectedTraceIds,
++      objectType: AnnotationQueueObjectType.TRACE,
++      queueId: targetId,
++      isBatchAction: selectAll,
++      query: {
++        filter: filterState,
++        orderBy: orderByState,
++      },
++    });
++    setSelectedRows({});
++  };
++
++  const tableActions: TableAction[] = [
+     {
+-      id: "select",
+-      accessorKey: "select",
+-      size: 30,
+-      isPinned: true,
+-      header: ({ table }) => (
+-        <div className="flex h-full items-center">
+-          <Checkbox
+-            checked={
+-              table.getIsAllPageRowsSelected()
+-                ? true
+-                : table.getIsSomePageRowsSelected()
+-                  ? "indeterminate"
+-                  : false
+-            }
+-            onCheckedChange={(value) => {
+-              table.toggleAllPageRowsSelected(!!value);
+-              if (!value) {
+-                setSelectedRows({});
+-              }
+-            }}
+-            aria-label="Select all"
+-            className="opacity-60"
+-          />
+-        </div>
+-      ),
+-      cell: ({ row }) => (
+-        <Checkbox
+-          checked={row.getIsSelected()}
+-          onCheckedChange={(value) => row.toggleSelected(!!value)}
+-          aria-label="Select row"
+-          className="opacity-60"
+-        />
+-      ),
++      id: "trace-delete",
++      type: BatchActionType.Delete,
++      label: "Delete Traces",
++      description:
++        "This action permanently deletes traces and cannot be undone.",
++      accessCheck: {
++        scope: "traces:delete",
++        entitlement: "trace-deletion",
++      },
++      execute: handleDeleteTraces,
+     },
++    {
++      id: "trace-add-to-annotation-queue",
++      type: BatchActionType.Create,
++      label: "Add to Annotation Queue",
++      description: "Add selected traces to an annotation queue.",
++      targetLabel: "Annotation Queue",
++      execute: handleAddToAnnotationQueue,
++      accessCheck: {
++        scope: "annotationQueues:CUD",
++        entitlement: "annotation-queues",
++      },
++    },
++  ];
++
++  const columns: LangfuseColumnDef<TracesTableRow>[] = [
++    selectActionColumn,
+     {
+       accessorKey: "bookmarked",
+       header: undefined,
+@@ -839,15 +911,11 @@ export default function TracesTable({
+           Object.keys(selectedRows).filter((traceId) =>
+             traces.data?.traces.map((t) => t.id).includes(traceId),
+           ).length > 0 ? (
+-            <TraceTableMultiSelectAction
+-              // Exclude traces that are not in the current page
+-              selectedTraceIds={Object.keys(selectedRows).filter((traceId) =>
+-                traces.data?.traces.map((t) => t.id).includes(traceId),
+-              )}
++            <TableActionMenu
++              key="traces-multi-select-actions"
+               projectId={projectId}
+-              onDeleteSuccess={() => {
+-                setSelectedRows({});
+-              }}
++              actions={tableActions}
++              tableName={BatchExportTableName.Traces}
+             />
+           ) : null,
+           <BatchExportTableButton
+@@ -864,6 +932,16 @@ export default function TracesTable({
+         setRowHeight={setRowHeight}
+         selectedOption={selectedOption}
+         setDateRangeAndOption={setDateRangeAndOption}
++        multiSelect={{
++          selectAll,
++          setSelectAll,
++          selectedRowIds: Object.keys(selectedRows).filter((traceId) =>
++            traces.data?.traces.map((t) => t.id).includes(traceId),
++          ),
++          setRowSelection: setSelectedRows,
++          totalCount,
++          ...paginationState,
++        }}
+       />
+       <DataTable
+         columns={columns}
+diff --git a/web/src/components/useSessionStorage.tsx b/web/src/components/useSessionStorage.tsx
+index ddc494ed4f27..b7bae88e1e91 100644
+--- a/web/src/components/useSessionStorage.tsx
++++ b/web/src/components/useSessionStorage.tsx
+@@ -1,4 +1,8 @@
+-import { useState, useEffect } from "react";
++import { useState, useEffect, useCallback } from "react";
++
++function isClient() {
++  return typeof window !== "undefined";
++}
+ 
+ /**
+  * useSessionStorage is a hook for managing data with the sessionStorage API.
+@@ -22,18 +26,18 @@ function useSessionStorage<T>(
+   sessionStorageKey: string,
+   initialValue: T,
+ ): [T, React.Dispatch<React.SetStateAction<T>>, () => void] {
+-  const [value, setValue] = useState<T>(() => {
+-    if (typeof window === "undefined") {
+-      return initialValue;
+-    }
++  const readValue = useCallback((): T => {
++    if (!isClient()) return initialValue; // Fallback for SSR
+     try {
+       const storedValue = sessionStorage.getItem(sessionStorageKey);
+-      return storedValue ? (JSON.parse(storedValue) as T) : initialValue;
++      return storedValue ? JSON.parse(storedValue) : initialValue;
+     } catch (error) {
+       console.error("Error reading from session storage", error);
+       return initialValue;
+     }
+-  });
++  }, [sessionStorageKey, initialValue]);
++
++  const [storedValue, setStoredValue] = useState<T>(readValue);
+ 
+   const clearValue = () => {
+     try {
+@@ -44,15 +48,38 @@ function useSessionStorage<T>(
+     }
+   };
+ 
++  const setValue = useCallback(
++    (value: T | ((prev: T) => T)) => {
++      try {
++        const newValue = value instanceof Function ? value(storedValue) : value;
++        setStoredValue(newValue);
++        if (isClient()) {
++          sessionStorage.setItem(sessionStorageKey, JSON.stringify(newValue));
++          window.dispatchEvent(new Event("session-storage"));
++        }
++      } catch (error) {
++        console.error("Error reading from session storage", error);
++      }
++    },
++    [sessionStorageKey, storedValue],
++  );
++
++  // Sync state with sessionStorage changes across tabs
+   useEffect(() => {
+-    try {
+-      sessionStorage.setItem(sessionStorageKey, JSON.stringify(value));
+-    } catch (error) {
+-      console.error("Error writing to session storage", error);
+-    }
+-  }, [sessionStorageKey, value]);
++    const handleStorageChange = () => {
++      setStoredValue(readValue());
++    };
++
++    window.addEventListener("session-storage", handleStorageChange);
++    window.addEventListener("storage", handleStorageChange);
++
++    return () => {
++      window.removeEventListener("session-storage", handleStorageChange);
++      window.removeEventListener("storage", handleStorageChange);
++    };
++  }, [readValue]);
+ 
+-  return [value, setValue, clearValue] as const;
++  return [storedValue, setValue, clearValue] as const;
+ }
+ 
+ export default useSessionStorage;
+diff --git a/web/src/ee/features/annotation-queues/server/annotationQueueItems.ts b/web/src/ee/features/annotation-queues/server/annotationQueueItems.ts
+index 625668e1634e..3750e26237d3 100644
+--- a/web/src/ee/features/annotation-queues/server/annotationQueueItems.ts
++++ b/web/src/ee/features/annotation-queues/server/annotationQueueItems.ts
+@@ -1,6 +1,7 @@
+ import { auditLog } from "@/src/features/audit-logs/auditLog";
+ import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
+ import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
++import { createBatchActionJob } from "@/src/features/table/server/createBatchActionJob";
+ import {
+   createTRPCRouter,
+   protectedProjectProcedure,
+@@ -9,6 +10,9 @@ import {
+   type AnnotationQueueItem,
+   AnnotationQueueObjectType,
+   AnnotationQueueStatus,
++  BatchActionQuerySchema,
++  BatchActionType,
++  BatchExportTableName,
+   paginationZod,
+   Prisma,
+ } from "@langfuse/shared";
+@@ -248,6 +252,8 @@ export const queueItemRouter = createTRPCRouter({
+           .array(z.string())
+           .min(1, "Minimum 1 object_id is required."),
+         objectType: z.nativeEnum(AnnotationQueueObjectType),
++        query: BatchActionQuerySchema.optional(),
++        isBatchAction: z.boolean().default(false),
+       }),
+     )
+     .mutation(async ({ input, ctx }) => {
+@@ -264,37 +270,52 @@ export const queueItemRouter = createTRPCRouter({
+           scope: "annotationQueues:CUD",
+         });
+ 
+-        const { count } = await ctx.prisma.annotationQueueItem.createMany({
+-          data: input.objectIds.map((objectId) => ({
+-            projectId: input.projectId,
+-            queueId: input.queueId,
+-            objectId,
+-            objectType: input.objectType,
+-          })),
+-          skipDuplicates: true,
+-        });
++        let createdCount = 0;
+ 
+-        const createdItems = await ctx.prisma.annotationQueueItem.findMany({
+-          where: {
++        if (input.isBatchAction && input.query) {
++          await createBatchActionJob({
+             projectId: input.projectId,
+-            queueId: input.queueId,
+-            objectId: { in: input.objectIds },
+-            objectType: input.objectType,
+-          },
+-          orderBy: { createdAt: "desc" },
+-        });
++            actionId: "trace-add-to-annotation-queue",
++            actionType: BatchActionType.Create,
++            tableName: BatchExportTableName.Traces,
++            session: ctx.session,
++            query: input.query,
++            targetId: input.queueId,
++          });
++        } else {
++          const { count } = await ctx.prisma.annotationQueueItem.createMany({
++            data: input.objectIds.map((objectId) => ({
++              projectId: input.projectId,
++              queueId: input.queueId,
++              objectId,
++              objectType: input.objectType,
++            })),
++            skipDuplicates: true,
++          });
++          createdCount = count;
+ 
+-        for (const item of createdItems) {
+-          await auditLog(
+-            {
+-              session: ctx.session,
+-              resourceType: "annotationQueueItem",
+-              resourceId: item.id,
+-              action: "create",
+-              after: item,
++          const createdItems = await ctx.prisma.annotationQueueItem.findMany({
++            where: {
++              projectId: input.projectId,
++              queueId: input.queueId,
++              objectId: { in: input.objectIds },
++              objectType: input.objectType,
+             },
+-            ctx.prisma,
+-          );
++            orderBy: { createdAt: "desc" },
++          });
++
++          for (const item of createdItems) {
++            await auditLog(
++              {
++                session: ctx.session,
++                resourceType: "annotationQueueItem",
++                resourceId: item.id,
++                action: "create",
++                after: item,
++              },
++              ctx.prisma,
++            );
++          }
+         }
+ 
+         const queue = await ctx.prisma.annotationQueue.findUnique({
+@@ -309,7 +330,7 @@ export const queueItemRouter = createTRPCRouter({
+         });
+ 
+         return {
+-          createdCount: count,
++          createdCount,
+           queueName: queue?.name,
+           queueId: queue?.id,
+         };
+diff --git a/web/src/features/audit-logs/auditLog.ts b/web/src/features/audit-logs/auditLog.ts
+index 37506bac2141..31349b9ab24b 100644
+--- a/web/src/features/audit-logs/auditLog.ts
++++ b/web/src/features/audit-logs/auditLog.ts
+@@ -26,6 +26,7 @@ export type AuditableResource =
+   | "llmApiKey"
+   | "batchExport"
+   | "stripeCheckoutSession"
++  | "batchAction"
+   // legacy resources
+   | "membership";
+ 
+diff --git a/web/src/features/table/components/TableActionDialog.tsx b/web/src/features/table/components/TableActionDialog.tsx
+new file mode 100644
+index 000000000000..03d75fed285a
+--- /dev/null
++++ b/web/src/features/table/components/TableActionDialog.tsx
+@@ -0,0 +1,160 @@
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/src/components/ui/dialog";
++import {
++  Form,
++  FormControl,
++  FormField,
++  FormItem,
++  FormMessage,
++} from "@/src/components/ui/form";
++import {
++  Select,
++  SelectContent,
++  SelectTrigger,
++  SelectValue,
++} from "@/src/components/ui/select";
++import { useForm } from "react-hook-form";
++import { type TableAction } from "@/src/features/table/types";
++import { TableActionTargetOptions } from "@/src/features/table/components/TableActionTargetOptions";
++import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
++import { ActionButton } from "@/src/components/ActionButton";
++import { useHasEntitlement } from "@/src/features/entitlements/hooks";
++import { useSelectAll } from "@/src/features/table/hooks/useSelectAll";
++import { type BatchExportTableName } from "@langfuse/shared";
++import { api } from "@/src/utils/api";
++import { Loader2 } from "lucide-react";
++
++type TableActionDialogProps = {
++  isOpen: boolean;
++  onClose: () => void;
++  action: TableAction;
++  projectId: string;
++  tableName: BatchExportTableName;
++};
++
++export function TableActionDialog({
++  isOpen,
++  onClose,
++  action,
++  projectId,
++  tableName,
++}: TableActionDialogProps) {
++  const hasAccess = useHasProjectAccess({
++    projectId,
++    scope: action.accessCheck.scope,
++  });
++  const { setSelectAll } = useSelectAll(projectId, tableName);
++  const hasEntitlement = useHasEntitlement(action.accessCheck.entitlement);
++  const form = useForm({ defaultValues: { targetId: "" } });
++
++  const isInProgress = api.table.getIsBatchActionInProgress.useQuery(
++    {
++      projectId,
++      tableName,
++      actionId: action.id,
++    },
++    {
++      refetchInterval: 2 * 60 * 1000, // 2 minutes
++    },
++  );
++
++  const handleConfirm = async () => {
++    await action.execute({ projectId, targetId: form.getValues().targetId });
++    setSelectAll(false);
++    onClose();
++  };
++
++  return (
++    <Dialog open={isOpen} onOpenChange={onClose}>
++      <DialogContent className="sm:max-w-md">
++        <DialogHeader>
++          <DialogTitle>{action.label}</DialogTitle>
++          <DialogDescription>{action.description}</DialogDescription>
++        </DialogHeader>
++
++        {action.type === "create" && (
++          <Form {...form}>
++            <form
++              className="space-y-6"
++              onSubmit={form.handleSubmit(handleConfirm)}
++            >
++              <FormField
++                control={form.control}
++                name="targetId"
++                render={({ field }) => (
++                  <FormItem>
++                    <Select
++                      onValueChange={field.onChange}
++                      defaultValue={field.value}
++                    >
++                      <FormControl>
++                        <SelectTrigger>
++                          <SelectValue placeholder="Select..." />
++                        </SelectTrigger>
++                      </FormControl>
++                      <SelectContent>
++                        <TableActionTargetOptions
++                          action={action}
++                          projectId={projectId}
++                        />
++                      </SelectContent>
++                    </Select>
++                    <FormMessage />
++                  </FormItem>
++                )}
++              />
++              <DialogFooter>
++                {isInProgress.data && (
++                  <div className="flex items-center gap-1">
++                    <Loader2 className="h-3 w-3 animate-spin" />
++                    <p className="text-sm text-muted-foreground">
++                      Batch action is in progress, please wait.
++                    </p>
++                  </div>
++                )}
++                <ActionButton
++                  type="submit"
++                  hasAccess={hasAccess}
++                  hasEntitlement={hasEntitlement}
++                  loading={isInProgress.isLoading}
++                  disabled={isInProgress.data}
++                >
++                  Confirm
++                </ActionButton>
++              </DialogFooter>
++            </form>
++          </Form>
++        )}
++
++        {action.type === "delete" && (
++          <DialogFooter>
++            {isInProgress.data && (
++              <div className="flex items-center gap-1">
++                <Loader2 className="h-3 w-3 animate-spin" />
++                <p className="text-sm text-muted-foreground">
++                  Batch action is in progress, please wait.
++                </p>
++              </div>
++            )}
++            <ActionButton
++              variant="destructive"
++              hasAccess={hasAccess}
++              hasEntitlement={hasEntitlement}
++              loading={isInProgress.isLoading}
++              disabled={isInProgress.data}
++              onClick={handleConfirm}
++            >
++              Confirm
++            </ActionButton>
++          </DialogFooter>
++        )}
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/web/src/features/table/components/TableActionMenu.tsx b/web/src/features/table/components/TableActionMenu.tsx
+new file mode 100644
+index 000000000000..412df08fd061
+--- /dev/null
++++ b/web/src/features/table/components/TableActionMenu.tsx
+@@ -0,0 +1,81 @@
++import { useState } from "react";
++import {
++  DropdownMenu,
++  DropdownMenuTrigger,
++  DropdownMenuContent,
++  DropdownMenuItem,
++} from "@/src/components/ui/dropdown-menu";
++import { Button } from "@/src/components/ui/button";
++import { ChevronDown, Trash } from "lucide-react";
++import { Plus } from "lucide-react";
++import { type TableAction } from "@/src/features/table/types";
++import { TableActionDialog } from "@/src/features/table/components/TableActionDialog";
++import { type BatchExportTableName } from "@langfuse/shared";
++
++type TableActionMenuProps = {
++  projectId: string;
++  actions: TableAction[];
++  tableName: BatchExportTableName;
++};
++
++const getDefaultIcon = (type: TableAction["type"]) => {
++  if (type === "create") {
++    return <Plus className="mr-2 h-4 w-4" />;
++  }
++  return <Trash className="mr-2 h-4 w-4" />;
++};
++
++export function TableActionMenu({
++  projectId,
++  actions,
++  tableName,
++}: TableActionMenuProps) {
++  const [selectedAction, setSelectedAction] = useState<TableAction | null>(
++    null,
++  );
++  const [isDialogOpen, setDialogOpen] = useState(false);
++
++  const handleActionSelect = (action: TableAction) => {
++    setSelectedAction(action);
++    setDialogOpen(true);
++  };
++
++  const handleClose = () => {
++    setSelectedAction(null);
++    setDialogOpen(false);
++  };
++
++  return (
++    <>
++      <DropdownMenu>
++        <DropdownMenuTrigger asChild>
++          <Button>
++            Actions
++            <ChevronDown className="h-5 w-5" />
++          </Button>
++        </DropdownMenuTrigger>
++        <DropdownMenuContent>
++          {actions.map((action) => (
++            <DropdownMenuItem
++              key={action.id}
++              onClick={() => handleActionSelect(action)}
++            >
++              {action.icon || getDefaultIcon(action.type)}
++              <span>{action.label}</span>
++            </DropdownMenuItem>
++          ))}
++        </DropdownMenuContent>
++      </DropdownMenu>
++
++      {selectedAction && (
++        <TableActionDialog
++          isOpen={isDialogOpen}
++          onClose={handleClose}
++          action={selectedAction}
++          projectId={projectId}
++          tableName={tableName}
++        />
++      )}
++    </>
++  );
++}
+diff --git a/web/src/features/table/components/TableActionTargetOptions.tsx b/web/src/features/table/components/TableActionTargetOptions.tsx
+new file mode 100644
+index 000000000000..13bb5aea03ed
+--- /dev/null
++++ b/web/src/features/table/components/TableActionTargetOptions.tsx
+@@ -0,0 +1,29 @@
++import { SelectItem } from "@/src/components/ui/select";
++import { useHasEntitlement } from "@/src/features/entitlements/hooks";
++import { targetOptionsQueryMap } from "@/src/features/table/components/targetOptionsQueryMap";
++import { type TableAction } from "@/src/features/table/types";
++import { useSession } from "next-auth/react";
++
++export function TableActionTargetOptions({
++  action,
++  projectId,
++}: {
++  action: TableAction;
++  projectId: string;
++}) {
++  const session = useSession();
++  const hasEntitlement = useHasEntitlement(action.accessCheck.entitlement);
++  const useTargetOptionsQuery =
++    targetOptionsQueryMap[action.id as keyof typeof targetOptionsQueryMap];
++
++  const targetOptions = useTargetOptionsQuery(
++    { projectId },
++    { enabled: session.status === "authenticated" && hasEntitlement },
++  );
++
++  return targetOptions.data?.map((option: { id: string; name: string }) => (
++    <SelectItem key={option.id} value={option.id}>
++      {option.name}
++    </SelectItem>
++  ));
++}
+diff --git a/web/src/features/table/components/TableSelectionManager.tsx b/web/src/features/table/components/TableSelectionManager.tsx
+new file mode 100644
+index 000000000000..2940ac4db723
+--- /dev/null
++++ b/web/src/features/table/components/TableSelectionManager.tsx
+@@ -0,0 +1,63 @@
++import { Checkbox } from "@/src/components/ui/checkbox";
++import {
++  type Table,
++  type Row,
++  type RowSelectionState,
++} from "@tanstack/react-table";
++import { useSelectAll } from "@/src/features/table/hooks/useSelectAll";
++
++interface TableSelectionManagerProps {
++  projectId: string;
++  tableName: string;
++  setSelectedRows: (rows: RowSelectionState) => void;
++}
++
++export function TableSelectionManager<TData>({
++  projectId,
++  tableName,
++  setSelectedRows,
++}: TableSelectionManagerProps) {
++  const { setSelectAll } = useSelectAll(projectId, tableName);
++
++  return {
++    selectActionColumn: {
++      id: "select",
++      accessorKey: "select",
++      size: 30,
++      isPinned: true,
++      header: ({ table }: { table: Table<TData> }) => (
++        <div className="flex h-full items-center">
++          <Checkbox
++            checked={
++              table.getIsAllPageRowsSelected()
++                ? true
++                : table.getIsSomePageRowsSelected()
++                  ? "indeterminate"
++                  : false
++            }
++            onCheckedChange={(value) => {
++              table.toggleAllPageRowsSelected(!!value);
++              if (!value) {
++                setSelectedRows({});
++                setSelectAll(false);
++              }
++            }}
++            aria-label="Select all"
++            className="opacity-60"
++          />
++        </div>
++      ),
++      cell: ({ row }: { row: Row<TData> }) => (
++        <Checkbox
++          checked={row.getIsSelected()}
++          onCheckedChange={(value) => {
++            row.toggleSelected(!!value);
++            if (!value) setSelectAll(false);
++          }}
++          aria-label="Select row"
++          className="opacity-60"
++        />
++      ),
++    },
++  };
++}
+diff --git a/web/src/features/table/components/targetOptionsQueryMap.tsx b/web/src/features/table/components/targetOptionsQueryMap.tsx
+new file mode 100644
+index 000000000000..c31828f9f9d0
+--- /dev/null
++++ b/web/src/features/table/components/targetOptionsQueryMap.tsx
+@@ -0,0 +1,5 @@
++import { api } from "@/src/utils/api";
++
++export const targetOptionsQueryMap = {
++  "trace-add-to-annotation-queue": api.annotationQueues.allNamesAndIds.useQuery,
++} as const;
+diff --git a/web/src/features/table/hooks/useSelectAll.ts b/web/src/features/table/hooks/useSelectAll.ts
+new file mode 100644
+index 000000000000..d70820fc098f
+--- /dev/null
++++ b/web/src/features/table/hooks/useSelectAll.ts
+@@ -0,0 +1,32 @@
++import useSessionStorage from "@/src/components/useSessionStorage";
++import { useRouter } from "next/router";
++import { useEffect } from "react";
++
++export function useSelectAll(projectId: string, tableName: string) {
++  const router = useRouter();
++  // Read initial value from session storage
++  const storageKey = `selectAll-${projectId}-${tableName}`;
++  const initialValue =
++    typeof window !== "undefined"
++      ? window.sessionStorage.getItem(storageKey) === "true"
++      : false;
++
++  const [selectAll, setSelectAll] = useSessionStorage<boolean>(
++    storageKey,
++    initialValue,
++  );
++
++  useEffect(() => {
++    const handleRouteChange = () => {
++      setSelectAll(false);
++    };
++
++    router.events.on("routeChangeStart", handleRouteChange);
++
++    return () => {
++      router.events.off("routeChangeStart", handleRouteChange);
++    };
++  }, [router.events, setSelectAll]);
++
++  return { selectAll, setSelectAll };
++}
+diff --git a/web/src/features/table/server/createBatchActionJob.ts b/web/src/features/table/server/createBatchActionJob.ts
+new file mode 100644
+index 000000000000..0f2c236e1c95
+--- /dev/null
++++ b/web/src/features/table/server/createBatchActionJob.ts
+@@ -0,0 +1,90 @@
++import { auditLog } from "@/src/features/audit-logs/auditLog";
++import { generateBatchActionId } from "@/src/features/table/server/helpers";
++import {
++  type Role,
++  type BatchExportTableName,
++  type BatchActionQuery,
++  type ActionId,
++  type BatchActionType,
++} from "@langfuse/shared";
++import {
++  BatchActionQueue,
++  logger,
++  QueueJobs,
++} from "@langfuse/shared/src/server";
++import { TRPCError } from "@trpc/server";
++
++type CreateBatchActionJob = {
++  projectId: string;
++  actionId: ActionId;
++  tableName: BatchExportTableName;
++  actionType: BatchActionType;
++  session: {
++    user: {
++      id: string;
++    };
++    orgId: string;
++    orgRole: Role;
++    projectId?: string;
++    projectRole?: Role;
++  };
++  query: BatchActionQuery;
++  targetId?: string;
++};
++
++/**
++ * ⚠️ Only use after verifying that the user has the necessary permissions to perform the action.
++ */
++export const createBatchActionJob = async ({
++  projectId,
++  actionId,
++  tableName,
++  actionType,
++  session,
++  query,
++  targetId,
++}: CreateBatchActionJob) => {
++  const batchActionId = generateBatchActionId(projectId, actionId, tableName);
++
++  const batchActionQueue = BatchActionQueue.getInstance();
++  if (!batchActionQueue) {
++    logger.warn(`BatchActionQueue not initialized`);
++    throw new TRPCError({
++      code: "INTERNAL_SERVER_ERROR",
++      message: "Select All action failed to process.",
++    });
++  }
++
++  // Create audit log >> generate based on actionId
++  await auditLog({
++    session,
++    resourceType: "batchAction",
++    resourceId: batchActionId,
++    projectId: projectId,
++    action: actionType as string,
++  });
++
++  // Notify worker
++  await batchActionQueue.add(
++    QueueJobs.BatchActionProcessingJob,
++    {
++      id: batchActionId, // Use the selectAllId to deduplicate when the same job is sent multiple times
++      name: QueueJobs.BatchActionProcessingJob,
++      timestamp: new Date(),
++      payload: {
++        projectId,
++        actionId,
++        tableName,
++        cutoffCreatedAt: new Date(),
++        query,
++        targetId: targetId,
++        type: actionType,
++      },
++    },
++    {
++      jobId: batchActionId,
++    },
++  );
++
++  return;
++};
+diff --git a/web/src/features/table/server/helpers.ts b/web/src/features/table/server/helpers.ts
+new file mode 100644
+index 000000000000..ac90ac37c4e8
+--- /dev/null
++++ b/web/src/features/table/server/helpers.ts
+@@ -0,0 +1,7 @@
++export const generateBatchActionId = (
++  projectId: string,
++  actionId: string,
++  tableName: string,
++) => {
++  return `${projectId}-${tableName}-${actionId}`;
++};
+diff --git a/web/src/features/table/server/tableRouter.ts b/web/src/features/table/server/tableRouter.ts
+new file mode 100644
+index 000000000000..670d50a1cd40
+--- /dev/null
++++ b/web/src/features/table/server/tableRouter.ts
+@@ -0,0 +1,38 @@
++import { generateBatchActionId } from "./helpers";
++import {
++  createTRPCRouter,
++  protectedProjectProcedure,
++} from "@/src/server/api/trpc";
++import { GetIsBatchActionInProgressSchema } from "@langfuse/shared";
++import { BatchActionQueue, logger } from "@langfuse/shared/src/server";
++import { TRPCError } from "@trpc/server";
++
++const WAITING_JOBS = ["waiting", "delayed", "active"];
++
++export const tableRouter = createTRPCRouter({
++  getIsBatchActionInProgress: protectedProjectProcedure
++    .input(GetIsBatchActionInProgressSchema)
++    .query(async ({ input }) => {
++      const { projectId, tableName, actionId } = input;
++      const batchActionId = generateBatchActionId(
++        projectId,
++        actionId,
++        tableName,
++      );
++
++      const batchActionQueue = BatchActionQueue.getInstance();
++
++      if (!batchActionQueue) {
++        logger.warn(`BatchActionQueue not initialized`);
++        throw new TRPCError({
++          code: "INTERNAL_SERVER_ERROR",
++          message: "Bulk Action action failed to process.",
++        });
++      }
++
++      const jobState = await batchActionQueue.getJobState(batchActionId);
++      const isInProgress = WAITING_JOBS.includes(jobState);
++
++      return isInProgress;
++    }),
++});
+diff --git a/web/src/features/table/types.ts b/web/src/features/table/types.ts
+new file mode 100644
+index 000000000000..5bb0190324fb
+--- /dev/null
++++ b/web/src/features/table/types.ts
+@@ -0,0 +1,34 @@
++import { type Entitlement } from "@/src/features/entitlements/constants/entitlements";
++import { type ProjectScope } from "@/src/features/rbac/constants/projectAccessRights";
++import { type BatchActionType, type ActionId } from "@langfuse/shared";
++import { type ReactElement } from "react";
++
++type BaseTableAction = {
++  id: ActionId;
++  label: string;
++  description: string;
++  icon?: ReactElement;
++  accessCheck: {
++    scope: ProjectScope;
++    entitlement: Entitlement;
++  };
++};
++
++export type CreateTableAction = BaseTableAction & {
++  type: BatchActionType.Create;
++  targetLabel: string;
++  execute: ({
++    projectId,
++    targetId,
++  }: {
++    projectId: string;
++    targetId: string;
++  }) => Promise<void>;
++};
++
++type DeleteTableAction = BaseTableAction & {
++  type: BatchActionType.Delete;
++  execute: ({ projectId }: { projectId: string }) => Promise<void>;
++};
++
++export type TableAction = CreateTableAction | DeleteTableAction;
+diff --git a/web/src/server/api/root.ts b/web/src/server/api/root.ts
+index 0bee608bdc2c..5f7b32425a78 100644
+--- a/web/src/server/api/root.ts
++++ b/web/src/server/api/root.ts
+@@ -30,6 +30,7 @@ import { experimentsRouter } from "@/src/ee/features/experiments/server/router";
+ import { mediaRouter } from "@/src/server/api/routers/media";
+ import { backgroundMigrationsRouter } from "@/src/features/background-migrations/server/background-migrations-router";
+ import { auditLogsRouter } from "./routers/auditLogs";
++import { tableRouter } from "@/src/features/table/server/tableRouter";
+ 
+ /**
+  * This is the primary router for your server.
+@@ -68,6 +69,7 @@ export const appRouter = createTRPCRouter({
+   media: mediaRouter,
+   backgroundMigrations: backgroundMigrationsRouter,
+   auditLogs: auditLogsRouter,
++  table: tableRouter,
+ });
+ 
+ // export type definition of API
+diff --git a/web/src/server/api/routers/traces.ts b/web/src/server/api/routers/traces.ts
+index 6947e00f3968..4ba7233a7e97 100644
+--- a/web/src/server/api/routers/traces.ts
++++ b/web/src/server/api/routers/traces.ts
+@@ -9,6 +9,9 @@ import {
+   protectedProjectProcedure,
+ } from "@/src/server/api/trpc";
+ import {
++  BatchActionQuerySchema,
++  BatchExportTableName,
++  BatchActionType,
+   filterAndValidateDbScoreList,
+   orderBy,
+   paginationZod,
+@@ -40,6 +43,8 @@ import {
+ } from "@langfuse/shared/src/server";
+ import { TRPCError } from "@trpc/server";
+ import { randomUUID } from "crypto";
++import { createBatchActionJob } from "@/src/features/table/server/createBatchActionJob";
++import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
+ 
+ const TraceFilterOptions = z.object({
+   projectId: z.string(), // Required for protectedProjectProcedure
+@@ -269,6 +274,8 @@ export const traceRouter = createTRPCRouter({
+       z.object({
+         traceIds: z.array(z.string()).min(1, "Minimum 1 trace_Id is required."),
+         projectId: z.string(),
++        query: BatchActionQuerySchema.optional(),
++        isBatchAction: z.boolean().default(false),
+       }),
+     )
+     .mutation(async ({ input, ctx }) => {
+@@ -278,82 +285,100 @@ export const traceRouter = createTRPCRouter({
+         scope: "traces:delete",
+       });
+ 
+-      const traceDeleteQueue = TraceDeleteQueue.getInstance();
++      throwIfNoEntitlement({
++        entitlement: "trace-deletion",
++        projectId: input.projectId,
++        sessionUser: ctx.session.user,
++      });
+ 
+-      for (const traceId of input.traceIds) {
+-        await auditLog({
+-          resourceType: "trace",
+-          resourceId: traceId,
+-          action: "delete",
++      if (input.isBatchAction && input.query) {
++        await createBatchActionJob({
++          projectId: input.projectId,
++          actionId: "trace-delete",
++          actionType: BatchActionType.Delete,
++          tableName: BatchExportTableName.Traces,
+           session: ctx.session,
++          query: input.query,
+         });
+-      }
++        return;
++      } else {
++        const traceDeleteQueue = TraceDeleteQueue.getInstance();
+ 
+-      if (!traceDeleteQueue) {
+-        logger.warn(
+-          `TraceDeleteQueue not initialized. Try synchronous deletion for ${input.traceIds.length} traces.`,
+-        );
+-        await ctx.prisma.$transaction([
+-          ctx.prisma.trace.deleteMany({
+-            where: {
+-              id: {
+-                in: input.traceIds,
++        for (const traceId of input.traceIds) {
++          await auditLog({
++            resourceType: "trace",
++            resourceId: traceId,
++            action: "delete",
++            session: ctx.session,
++          });
++        }
++
++        if (!traceDeleteQueue) {
++          logger.warn(
++            `TraceDeleteQueue not initialized. Try synchronous deletion for ${input.traceIds.length} traces.`,
++          );
++          await ctx.prisma.$transaction([
++            ctx.prisma.trace.deleteMany({
++              where: {
++                id: {
++                  in: input.traceIds,
++                },
++                projectId: input.projectId,
+               },
+-              projectId: input.projectId,
+-            },
+-          }),
+-          ctx.prisma.observation.deleteMany({
+-            where: {
+-              traceId: {
+-                in: input.traceIds,
++            }),
++            ctx.prisma.observation.deleteMany({
++              where: {
++                traceId: {
++                  in: input.traceIds,
++                },
++                projectId: input.projectId,
+               },
+-              projectId: input.projectId,
+-            },
+-          }),
+-          ctx.prisma.score.deleteMany({
+-            where: {
+-              traceId: {
+-                in: input.traceIds,
++            }),
++            ctx.prisma.score.deleteMany({
++              where: {
++                traceId: {
++                  in: input.traceIds,
++                },
++                projectId: input.projectId,
+               },
+-              projectId: input.projectId,
+-            },
+-          }),
+-          // given traces and observations live in ClickHouse we cannot enforce a fk relationship and onDelete: setNull
+-          ctx.prisma.jobExecution.updateMany({
+-            where: {
+-              jobInputTraceId: { in: input.traceIds },
+-              projectId: input.projectId,
+-            },
+-            data: {
+-              jobInputTraceId: {
+-                set: null,
++            }),
++            // given traces and observations live in ClickHouse we cannot enforce a fk relationship and onDelete: setNull
++            ctx.prisma.jobExecution.updateMany({
++              where: {
++                jobInputTraceId: { in: input.traceIds },
++                projectId: input.projectId,
+               },
+-              jobInputObservationId: {
+-                set: null,
++              data: {
++                jobInputTraceId: {
++                  set: null,
++                },
++                jobInputObservationId: {
++                  set: null,
++                },
+               },
+-            },
+-          }),
+-        ]);
+-
+-        if (env.CLICKHOUSE_URL) {
+-          await Promise.all([
+-            deleteTraces(input.projectId, input.traceIds),
+-            deleteObservationsByTraceIds(input.projectId, input.traceIds),
+-            deleteScoresByTraceIds(input.projectId, input.traceIds),
++            }),
+           ]);
++
++          if (env.CLICKHOUSE_URL) {
++            await Promise.all([
++              deleteTraces(input.projectId, input.traceIds),
++              deleteObservationsByTraceIds(input.projectId, input.traceIds),
++              deleteScoresByTraceIds(input.projectId, input.traceIds),
++            ]);
++          }
++          return;
+         }
+-        return;
+-      }
+ 
+-      await traceDeleteQueue.add(QueueJobs.TraceDelete, {
+-        timestamp: new Date(),
+-        id: randomUUID(),
+-        payload: {
+-          projectId: input.projectId,
+-          traceIds: input.traceIds,
+-        },
+-        name: QueueJobs.TraceDelete,
+-      });
++        await traceDeleteQueue.add(QueueJobs.TraceDelete, {
++          timestamp: new Date(),
++          id: randomUUID(),
++          payload: {
++            projectId: input.projectId,
++            traceIds: input.traceIds,
++          },
++          name: QueueJobs.TraceDelete,
++        });
++      }
+     }),
+   bookmark: protectedProjectProcedure
+     .input(
+diff --git a/worker/src/__tests__/batchAction.test.ts b/worker/src/__tests__/batchAction.test.ts
+new file mode 100644
+index 000000000000..df5ccb72c2a8
+--- /dev/null
++++ b/worker/src/__tests__/batchAction.test.ts
+@@ -0,0 +1,120 @@
++import { BatchExportTableName } from "@langfuse/shared";
++import { expect, describe, it, vi } from "vitest";
++import { randomUUID } from "crypto";
++import { handleBatchActionJob } from "../features/batchAction/handleBatchActionJob";
++import { getDatabaseReadStream } from "../features/batchExport/handleBatchExportJob";
++import {
++  createOrgProjectAndApiKey,
++  createTrace,
++  createTracesCh,
++} from "@langfuse/shared/src/server";
++
++describe("select all test suite", () => {
++  it("should process items in chunks", async () => {
++    const { projectId } = await createOrgProjectAndApiKey();
++
++    // Create test traces
++    const traces = Array.from({ length: 2500 }).map(() =>
++      createTrace({
++        project_id: projectId,
++        id: randomUUID(),
++        timestamp: new Date("2024-01-01").getTime(),
++      }),
++    );
++
++    await createTracesCh(traces);
++
++    const selectAllJob = {
++      data: {
++        payload: {
++          projectId,
++          actionId: "trace-delete",
++          tableName: BatchExportTableName.Traces,
++          query: {
++            filter: [],
++            orderBy: { column: "timestamp", order: "DESC" },
++          },
++          cutoffCreatedAt: new Date("2024-01-02"),
++        },
++      },
++    } as any;
++
++    await handleBatchActionJob(selectAllJob);
++
++    // Verify traces were deleted
++    const stream = await getDatabaseReadStream({
++      projectId,
++      tableName: BatchExportTableName.Traces,
++      cutoffCreatedAt: new Date("2024-01-02"),
++      filter: [],
++      orderBy: { column: "timestamp", order: "DESC" },
++    });
++
++    const remainingRows: any[] = [];
++    for await (const chunk of stream) {
++      remainingRows.push(chunk);
++    }
++    expect(remainingRows).toHaveLength(0);
++  });
++
++  it("should handle filtered queries", async () => {
++    const { projectId } = await createOrgProjectAndApiKey();
++
++    const traces = [
++      createTrace({
++        project_id: projectId,
++        id: randomUUID(),
++        user_id: "user1",
++        timestamp: new Date("2024-01-01").getTime(),
++      }),
++      createTrace({
++        project_id: projectId,
++        id: randomUUID(),
++        user_id: "user2",
++        timestamp: new Date("2024-01-01").getTime(),
++      }),
++    ];
++
++    await createTracesCh(traces);
++
++    const selectAllJob = {
++      data: {
++        payload: {
++          projectId,
++          actionId: "trace-delete",
++          tableName: BatchExportTableName.Traces,
++          query: {
++            filter: [
++              {
++                type: "string",
++                operator: "=",
++                column: "User ID",
++                value: "user1",
++              },
++            ],
++            orderBy: { column: "timestamp", order: "DESC" },
++          },
++          cutoffCreatedAt: new Date("2024-01-02"),
++        },
++      },
++    } as any;
++
++    await handleBatchActionJob(selectAllJob);
++
++    // Verify only filtered traces were processed
++    const stream = await getDatabaseReadStream({
++      projectId,
++      tableName: BatchExportTableName.Traces,
++      cutoffCreatedAt: new Date("2024-01-02"),
++      filter: [],
++      orderBy: { column: "timestamp", order: "DESC" },
++    });
++
++    const remainingRows: any[] = [];
++    for await (const chunk of stream) {
++      remainingRows.push(chunk);
++    }
++    expect(remainingRows).toHaveLength(1);
++    expect(remainingRows[0].userId).toBe("user2");
++  });
++});
+diff --git a/worker/src/app.ts b/worker/src/app.ts
+index c22b1a9d3267..16cb167d4b0a 100644
+--- a/worker/src/app.ts
++++ b/worker/src/app.ts
+@@ -43,6 +43,7 @@ import {
+   dataRetentionProcessingProcessor,
+   dataRetentionProcessor,
+ } from "./queues/dataRetentionQueue";
++import { batchActionQueueProcessor } from "./queues/batchActionQueue";
+ 
+ const app = express();
+ 
+@@ -155,6 +156,20 @@ if (env.QUEUE_CONSUMER_BATCH_EXPORT_QUEUE_IS_ENABLED === "true") {
+   });
+ }
+ 
++if (env.QUEUE_CONSUMER_BATCH_ACTION_QUEUE_IS_ENABLED === "true") {
++  WorkerManager.register(
++    QueueName.BatchActionQueue,
++    batchActionQueueProcessor,
++    {
++      concurrency: 1, // only 1 job at a time
++      limiter: {
++        max: 1,
++        duration: 5_000,
++      },
++    },
++  );
++}
++
+ if (env.QUEUE_CONSUMER_INGESTION_QUEUE_IS_ENABLED === "true") {
+   WorkerManager.register(
+     QueueName.IngestionQueue,
+diff --git a/worker/src/env.ts b/worker/src/env.ts
+index 2d6ff0712e8e..6fbe96e1d4a4 100644
+--- a/worker/src/env.ts
++++ b/worker/src/env.ts
+@@ -44,6 +44,7 @@ const EnvSchema = z.object({
+     .number()
+     .positive()
+     .default(24),
++  BATCH_ACTION_EXPORT_ROW_LIMIT: z.coerce.number().positive().default(50_000),
+   EMAIL_FROM_ADDRESS: z.string().optional(),
+   SMTP_CONNECTION_URL: z.string().optional(),
+   LANGFUSE_INGESTION_QUEUE_PROCESSING_CONCURRENCY: z.coerce
+@@ -132,6 +133,9 @@ const EnvSchema = z.object({
+   QUEUE_CONSUMER_BATCH_EXPORT_QUEUE_IS_ENABLED: z
+     .enum(["true", "false"])
+     .default("true"),
++  QUEUE_CONSUMER_BATCH_ACTION_QUEUE_IS_ENABLED: z
++    .enum(["true", "false"])
++    .default("true"),
+   QUEUE_CONSUMER_EVAL_EXECUTION_QUEUE_IS_ENABLED: z
+     .enum(["true", "false"])
+     .default("true"),
+diff --git a/worker/src/features/batchAction/handleBatchActionJob.ts b/worker/src/features/batchAction/handleBatchActionJob.ts
+new file mode 100644
+index 000000000000..214bf85f1d51
+--- /dev/null
++++ b/worker/src/features/batchAction/handleBatchActionJob.ts
+@@ -0,0 +1,115 @@
++import {
++  BatchActionProcessingEventType,
++  logger,
++  QueueName,
++  TQueueJobTypes,
++} from "@langfuse/shared/src/server";
++import {
++  BatchActionQuery,
++  BatchActionType,
++  BatchExportTableName,
++  FilterCondition,
++} from "@langfuse/shared";
++import { getDatabaseReadStream } from "../batchExport/handleBatchExportJob";
++import { processClickhouseTraceDelete } from "../traces/processClickhouseTraceDelete";
++import { env } from "../../env";
++import { Job } from "bullmq";
++import { processAddToQueue } from "./processAddToQueue";
++import { processPostgresTraceDelete } from "../traces/processPostgresTraceDelete";
++
++const CHUNK_SIZE = 1000;
++const convertDatesInQuery = (query: BatchActionQuery) => {
++  if (!query.filter) return query;
++
++  return {
++    ...query,
++    filter: query.filter.map((f: FilterCondition) =>
++      f.type === "datetime" ? { ...f, value: new Date(f.value) } : f,
++    ),
++  };
++};
++
++/**
++ * ⚠️ All operations must be idempotent. In case of failure, the job should be retried.
++ * If it does, chunks that have already been processed might be processed again.
++ */
++async function processActionChunk(
++  actionId: string,
++  chunkIds: string[],
++  projectId: string,
++  targetId?: string,
++): Promise<void> {
++  try {
++    switch (actionId) {
++      case "trace-delete":
++        await processPostgresTraceDelete(projectId, chunkIds);
++        await processClickhouseTraceDelete(projectId, chunkIds);
++        break;
++
++      case "trace-add-to-annotation-queue":
++        await processAddToQueue(projectId, chunkIds, targetId as string);
++        break;
++
++      default:
++        throw new Error(`Unknown action: ${actionId}`);
++    }
++  } catch (error) {
++    logger.error(`Failed to process chunk`, { error, chunkIds });
++    throw error;
++  }
++}
++
++export const handleBatchActionJob = async (
++  batchActionJob: Job<TQueueJobTypes[QueueName.BatchActionQueue]>,
++) => {
++  const batchActionEvent: BatchActionProcessingEventType =
++    batchActionJob.data.payload;
++  const {
++    projectId,
++    actionId,
++    tableName,
++    query,
++    cutoffCreatedAt,
++    targetId,
++    type,
++  } = batchActionEvent;
++
++  if (type === BatchActionType.Create && !targetId) {
++    throw new Error(`Target ID is required for create action`);
++  }
++
++  const dbReadStream = await getDatabaseReadStream({
++    projectId: projectId,
++    cutoffCreatedAt: new Date(cutoffCreatedAt),
++    ...convertDatesInQuery(query),
++    tableName: tableName as unknown as BatchExportTableName,
++    exportLimit: env.BATCH_ACTION_EXPORT_ROW_LIMIT,
++  });
++
++  // Process stream in database-sized batches
++  // 1. Read all records
++  const records: any[] = [];
++  for await (const record of dbReadStream) {
++    if (record?.id) {
++      records.push(record);
++    }
++  }
++
++  // 2. Process in chunks
++  for (let i = 0; i < records.length; i += CHUNK_SIZE) {
++    const batch = records.slice(i, i + CHUNK_SIZE);
++
++    await processActionChunk(
++      actionId,
++      batch.map((r) => r.id),
++      projectId,
++      targetId,
++    );
++  }
++
++  logger.info("Batch action job completed", {
++    projectId,
++    actionId,
++    tableName,
++  });
++};
+diff --git a/worker/src/features/batchAction/processAddToQueue.ts b/worker/src/features/batchAction/processAddToQueue.ts
+new file mode 100644
+index 000000000000..89f92ba9aac0
+--- /dev/null
++++ b/worker/src/features/batchAction/processAddToQueue.ts
+@@ -0,0 +1,51 @@
++import { logger, traceException } from "@langfuse/shared/src/server";
++import { prisma } from "@langfuse/shared/src/db";
++
++export const processAddToQueue = async (
++  projectId: string,
++  traceIds: string[],
++  targetId: string,
++) => {
++  logger.info(
++    `Adding traces ${JSON.stringify(traceIds)} to annotation queue ${targetId} in project ${projectId}`,
++  );
++  try {
++    // cannot use prisma `createMany` operation as we do not have unique constraint enforced on schema level
++    // conflict must be handled on query level by reading existing items and filtering out traces that already exist
++
++    // First get existing items
++    const existingItems = await prisma.annotationQueueItem.findMany({
++      where: {
++        projectId,
++        queueId: targetId,
++        objectId: { in: traceIds },
++        objectType: "TRACE",
++      },
++      select: { objectId: true },
++    });
++
++    // Filter out traces that already exist
++    const existingTraceIds = new Set(
++      existingItems.map((item) => item.objectId),
++    );
++    const newTraceIds = traceIds.filter((id) => !existingTraceIds.has(id));
++
++    if (newTraceIds.length > 0) {
++      await prisma.annotationQueueItem.createMany({
++        data: newTraceIds.map((traceId) => ({
++          projectId,
++          queueId: targetId,
++          objectId: traceId,
++          objectType: "TRACE",
++        })),
++      });
++    }
++  } catch (e) {
++    logger.error(
++      `Error adding traces ${JSON.stringify(traceIds)} to annotation queue ${targetId} in project ${projectId}`,
++      e,
++    );
++    traceException(e);
++    throw e;
++  }
++};
+diff --git a/worker/src/features/batchExport/handleBatchExportJob.ts b/worker/src/features/batchExport/handleBatchExportJob.ts
+index fc7a236b6e51..b69f14a0d84d 100644
+--- a/worker/src/features/batchExport/handleBatchExportJob.ts
++++ b/worker/src/features/batchExport/handleBatchExportJob.ts
+@@ -90,9 +90,11 @@ export const getDatabaseReadStream = async ({
+   filter,
+   orderBy,
+   cutoffCreatedAt,
++  exportLimit = env.BATCH_EXPORT_ROW_LIMIT,
+ }: {
+   projectId: string;
+   cutoffCreatedAt: Date;
++  exportLimit?: number;
+ } & BatchExportQueryType): Promise<DatabaseReadStream<unknown>> => {
+   // Set createdAt cutoff to prevent exporting data that was created after the job was queued
+   const createdAtCutoffFilter: FilterCondition = {
+@@ -166,7 +168,7 @@ export const getDatabaseReadStream = async ({
+           });
+         },
+         1000,
+-        env.BATCH_EXPORT_ROW_LIMIT,
++        exportLimit,
+       );
+     case "generations": {
+       let emptyScoreColumns: Record<string, null>;
+@@ -219,7 +221,7 @@ export const getDatabaseReadStream = async ({
+           return getChunkWithFlattenedScores(chunk, emptyScoreColumns);
+         },
+         1000,
+-        env.BATCH_EXPORT_ROW_LIMIT,
++        exportLimit,
+       );
+     }
+     case "traces": {
+@@ -320,7 +322,7 @@ export const getDatabaseReadStream = async ({
+           return getChunkWithFlattenedScores(chunk, emptyScoreColumns);
+         },
+         1000,
+-        env.BATCH_EXPORT_ROW_LIMIT,
++        exportLimit,
+       );
+     }
+     default:
+diff --git a/worker/src/features/traces/processClickhouseTraceDelete.ts b/worker/src/features/traces/processClickhouseTraceDelete.ts
+new file mode 100644
+index 000000000000..673cc799e61e
+--- /dev/null
++++ b/worker/src/features/traces/processClickhouseTraceDelete.ts
+@@ -0,0 +1,30 @@
++import {
++  deleteObservationsByTraceIds,
++  deleteScoresByTraceIds,
++  deleteTraces,
++  logger,
++  traceException,
++} from "@langfuse/shared/src/server";
++
++export const processClickhouseTraceDelete = async (
++  projectId: string,
++  traceIds: string[],
++) => {
++  logger.info(
++    `Deleting traces ${JSON.stringify(traceIds)} in project ${projectId} from Clickhouse`,
++  );
++  try {
++    await Promise.all([
++      deleteTraces(projectId, traceIds),
++      deleteObservationsByTraceIds(projectId, traceIds),
++      deleteScoresByTraceIds(projectId, traceIds),
++    ]);
++  } catch (e) {
++    logger.error(
++      `Error deleting trace ${JSON.stringify(traceIds)} in project ${projectId} from Clickhouse`,
++      e,
++    );
++    traceException(e);
++    throw e;
++  }
++};
+diff --git a/worker/src/features/traces/processPostgresTraceDelete.ts b/worker/src/features/traces/processPostgresTraceDelete.ts
+new file mode 100644
+index 000000000000..b2187cf15714
+--- /dev/null
++++ b/worker/src/features/traces/processPostgresTraceDelete.ts
+@@ -0,0 +1,63 @@
++import { prisma } from "@langfuse/shared/src/db";
++import { logger, traceException } from "@langfuse/shared/src/server";
++
++export const processPostgresTraceDelete = async (
++  projectId: string,
++  traceIds: string[],
++) => {
++  logger.info(
++    `Deleting traces ${JSON.stringify(traceIds)} in project ${projectId} from Postgres`,
++  );
++  try {
++    await prisma.$transaction([
++      prisma.trace.deleteMany({
++        where: {
++          id: {
++            in: traceIds,
++          },
++          projectId: projectId,
++        },
++      }),
++      prisma.observation.deleteMany({
++        where: {
++          traceId: {
++            in: traceIds,
++          },
++          projectId: projectId,
++        },
++      }),
++      prisma.score.deleteMany({
++        where: {
++          traceId: {
++            in: traceIds,
++          },
++          projectId: projectId,
++        },
++      }),
++      // given traces and observations live in ClickHouse we cannot enforce a fk relationship and onDelete: setNull
++      prisma.jobExecution.updateMany({
++        where: {
++          jobInputTraceId: {
++            in: traceIds,
++          },
++          projectId: projectId,
++        },
++        data: {
++          jobInputTraceId: {
++            set: null,
++          },
++          jobInputObservationId: {
++            set: null,
++          },
++        },
++      }),
++    ]);
++  } catch (e) {
++    logger.error(
++      `Error deleting trace ${JSON.stringify(traceIds)} in project ${projectId} from Postgres`,
++      e,
++    );
++    traceException(e);
++    throw e;
++  }
++};
+diff --git a/worker/src/queues/batchActionQueue.ts b/worker/src/queues/batchActionQueue.ts
+new file mode 100644
+index 000000000000..7070537ec77e
+--- /dev/null
++++ b/worker/src/queues/batchActionQueue.ts
+@@ -0,0 +1,20 @@
++import { Job } from "bullmq";
++import { traceException, logger } from "@langfuse/shared/src/server";
++import { QueueName, TQueueJobTypes } from "@langfuse/shared/src/server";
++import { handleBatchActionJob } from "../features/batchAction/handleBatchActionJob";
++
++export const batchActionQueueProcessor = async (
++  job: Job<TQueueJobTypes[QueueName.BatchActionQueue]>,
++) => {
++  try {
++    logger.info("Executing Batch Action Job", job.data.payload);
++    await handleBatchActionJob(job);
++    logger.info("Finished Batch Action Job", job.data.payload);
++
++    return true;
++  } catch (e) {
++    logger.error(`Failed Batch Action job for id ${job.id}`, e);
++    traceException(e);
++    throw e;
++  }
++};
+diff --git a/worker/src/queues/traceDelete.ts b/worker/src/queues/traceDelete.ts
+index cd6e0378356b..36fd50854b54 100644
+--- a/worker/src/queues/traceDelete.ts
++++ b/worker/src/queues/traceDelete.ts
+@@ -1,15 +1,9 @@
+ import { Job, Processor } from "bullmq";
+-import {
+-  deleteObservationsByTraceIds,
+-  deleteScoresByTraceIds,
+-  deleteTraces,
+-  logger,
+-  QueueName,
+-  TQueueJobTypes,
+-  traceException,
+-} from "@langfuse/shared/src/server";
+-import { prisma } from "@langfuse/shared/src/db";
++import { QueueName, TQueueJobTypes } from "@langfuse/shared/src/server";
++
+ import { env } from "../env";
++import { processClickhouseTraceDelete } from "../features/traces/processClickhouseTraceDelete";
++import { processPostgresTraceDelete } from "../features/traces/processPostgresTraceDelete";
+ 
+ export const traceDeleteProcessor: Processor = async (
+   job: Job<TQueueJobTypes[QueueName.TraceDelete]>,
+@@ -20,76 +14,9 @@ export const traceDeleteProcessor: Processor = async (
+       ? job.data.payload.traceIds
+       : [job.data.payload.traceId];
+ 
+-  logger.info(
+-    `Deleting traces ${JSON.stringify(traceIds)} in project ${projectId}`,
+-  );
+-  try {
+-    await prisma.$transaction([
+-      prisma.trace.deleteMany({
+-        where: {
+-          id: {
+-            in: traceIds,
+-          },
+-          projectId: projectId,
+-        },
+-      }),
+-      prisma.observation.deleteMany({
+-        where: {
+-          traceId: {
+-            in: traceIds,
+-          },
+-          projectId: projectId,
+-        },
+-      }),
+-      prisma.score.deleteMany({
+-        where: {
+-          traceId: {
+-            in: traceIds,
+-          },
+-          projectId: projectId,
+-        },
+-      }),
+-      // given traces and observations live in ClickHouse we cannot enforce a fk relationship and onDelete: setNull
+-      prisma.jobExecution.updateMany({
+-        where: {
+-          jobInputTraceId: {
+-            in: traceIds,
+-          },
+-          projectId: projectId,
+-        },
+-        data: {
+-          jobInputTraceId: {
+-            set: null,
+-          },
+-          jobInputObservationId: {
+-            set: null,
+-          },
+-        },
+-      }),
+-    ]);
+-  } catch (e) {
+-    logger.error(
+-      `Error deleting trace ${JSON.stringify(traceIds)} in project ${projectId} from Postgres`,
+-      e,
+-    );
+-    traceException(e);
+-    throw e;
+-  }
++  await processPostgresTraceDelete(projectId, traceIds);
+ 
+   if (env.CLICKHOUSE_URL) {
+-    try {
+-      await Promise.all([
+-        deleteTraces(projectId, traceIds),
+-        deleteObservationsByTraceIds(projectId, traceIds),
+-        deleteScoresByTraceIds(projectId, traceIds),
+-      ]);
+-    } catch (e) {
+-      logger.error(
+-        `Error deleting trace ${JSON.stringify(traceIds)} in project ${projectId} from Clickhouse`,
+-        e,
+-      );
+-      traceException(e);
+-      throw e;
+-    }
++    await processClickhouseTraceDelete(projectId, traceIds);
+   }
+ };

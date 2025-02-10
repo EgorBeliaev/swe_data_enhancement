@@ -1,0 +1,376 @@
+diff --git a/app/Models/Entry.php b/app/Models/Entry.php
+index f8694812281..fe0cf7429dc 100644
+--- a/app/Models/Entry.php
++++ b/app/Models/Entry.php
+@@ -673,6 +673,26 @@ public function matches(FreshRSS_BooleanSearch $booleanSearch): bool {
+ 						$ok &= preg_match($title, $this->title) === 0;
+ 					}
+ 				}
++				if ($ok && $filter->getIntext() !== null) {
++					foreach ($filter->getIntext() as $content) {
++						$ok &= stripos($this->content, $content) !== false;
++					}
++				}
++				if ($ok && $filter->getIntextRegex() !== null) {
++					foreach ($filter->getIntextRegex() as $content) {
++						$ok &= preg_match($content, $this->content) === 1;
++					}
++				}
++				if ($ok && $filter->getNotIntext() !== null) {
++					foreach ($filter->getNotIntext() as $content) {
++						$ok &= stripos($this->content, $content) === false;
++					}
++				}
++				if ($ok && $filter->getNotIntextRegex() !== null) {
++					foreach ($filter->getNotIntextRegex() as $content) {
++						$ok &= preg_match($content, $this->content) === 0;
++					}
++				}
+ 				if ($ok && $filter->getTags() !== null) {
+ 					foreach ($filter->getTags() as $tag2) {
+ 						$found = false;
+diff --git a/app/Models/EntryDAO.php b/app/Models/EntryDAO.php
+index af229df541e..a234dce9193 100644
+--- a/app/Models/EntryDAO.php
++++ b/app/Models/EntryDAO.php
+@@ -981,6 +981,30 @@ public static function sqlBooleanSearch(string $alias, FreshRSS_BooleanSearch $f
+ 					$sub_search .= 'AND ' . static::sqlRegex($alias . 'title', $title, $values) . ' ';
+ 				}
+ 			}
++			if ($filter->getIntext() !== null) {
++				if (static::isCompressed()) {	// MySQL-only
++					foreach ($filter->getIntext() as $content) {
++						$sub_search .= "AND UNCOMPRESS({$alias}content_bin) LIKE ? ";
++						$values[] = "%{$content}%";
++					}
++				} else {
++					foreach ($filter->getIntext() as $content) {
++						$sub_search .= 'AND ' . $alias . 'content LIKE ? ';
++						$values[] = "%{$content}%";
++					}
++				}
++			}
++			if ($filter->getIntextRegex() !== null) {
++				if (static::isCompressed()) {	// MySQL-only
++					foreach ($filter->getIntextRegex() as $content) {
++						$sub_search .= 'AND ' . static::sqlRegex("UNCOMPRESS({$alias}content_bin)", $content, $values) . ') ';
++					}
++				} else {
++					foreach ($filter->getIntextRegex() as $content) {
++						$sub_search .= 'AND ' . static::sqlRegex($alias . 'content', $content, $values) . ' ';
++					}
++				}
++			}
+ 			if ($filter->getTags() !== null) {
+ 				foreach ($filter->getTags() as $tag) {
+ 					$sub_search .= 'AND ' . static::sqlConcat('TRIM(' . $alias . 'tags) ', " ' #'") . ' LIKE ? ';
+@@ -1026,6 +1050,30 @@ public static function sqlBooleanSearch(string $alias, FreshRSS_BooleanSearch $f
+ 					$sub_search .= 'AND NOT ' . static::sqlRegex($alias . 'title', $title, $values) . ' ';
+ 				}
+ 			}
++			if ($filter->getNotIntext() !== null) {
++				if (static::isCompressed()) {	// MySQL-only
++					foreach ($filter->getNotIntext() as $content) {
++						$sub_search .= "AND UNCOMPRESS({$alias}content_bin) NOT LIKE ? ";
++						$values[] = "%{$content}%";
++					}
++				} else {
++					foreach ($filter->getNotIntext() as $content) {
++						$sub_search .= 'AND ' . $alias . 'content NOT LIKE ? ';
++						$values[] = "%{$content}%";
++					}
++				}
++			}
++			if ($filter->getNotIntextRegex() !== null) {
++				if (static::isCompressed()) {	// MySQL-only
++					foreach ($filter->getNotIntextRegex() as $content) {
++						$sub_search .= 'AND NOT ' . static::sqlRegex("UNCOMPRESS({$alias}content_bin)", $content, $values) . ') ';
++					}
++				} else {
++					foreach ($filter->getNotIntextRegex() as $content) {
++						$sub_search .= 'AND NOT ' . static::sqlRegex($alias . 'content', $content, $values) . ' ';
++					}
++				}
++			}
+ 			if ($filter->getNotTags() !== null) {
+ 				foreach ($filter->getNotTags() as $tag) {
+ 					$sub_search .= 'AND ' . static::sqlConcat('TRIM(' . $alias . 'tags) ', " ' #'") . ' NOT LIKE ? ';
+diff --git a/app/Models/Search.php b/app/Models/Search.php
+index 5b88b1f3b1f..d425fcee8c4 100644
+--- a/app/Models/Search.php
++++ b/app/Models/Search.php
+@@ -29,6 +29,10 @@ class FreshRSS_Search implements \Stringable {
+ 	private ?array $intitle = null;
+ 	/** @var list<string>|null */
+ 	private ?array $intitle_regex = null;
++	/** @var list<string>|null */
++	private ?array $intext = null;
++	/** @var list<string>|null */
++	private ?array $intext_regex = null;
+ 	/** @var int|false|null */
+ 	private $min_date = null;
+ 	/** @var int|false|null */
+@@ -66,6 +70,10 @@ class FreshRSS_Search implements \Stringable {
+ 	private ?array $not_intitle = null;
+ 	/** @var list<string>|null */
+ 	private ?array $not_intitle_regex = null;
++	/** @var list<string>|null */
++	private ?array $not_intext = null;
++	/** @var list<string>|null */
++	private ?array $not_intext_regex = null;
+ 	/** @var int|false|null */
+ 	private $not_min_date = null;
+ 	/** @var int|false|null */
+@@ -106,6 +114,7 @@ public function __construct(string $input) {
+ 		$input = $this->parseNotDateSearch($input);
+ 
+ 		$input = $this->parseNotIntitleSearch($input);
++		$input = $this->parseNotIntextSearch($input);
+ 		$input = $this->parseNotAuthorSearch($input);
+ 		$input = $this->parseNotInurlSearch($input);
+ 		$input = $this->parseNotTagsSearch($input);
+@@ -119,6 +128,7 @@ public function __construct(string $input) {
+ 		$input = $this->parseDateSearch($input);
+ 
+ 		$input = $this->parseIntitleSearch($input);
++		$input = $this->parseIntextSearch($input);
+ 		$input = $this->parseAuthorSearch($input);
+ 		$input = $this->parseInurlSearch($input);
+ 		$input = $this->parseTagsSearch($input);
+@@ -189,6 +199,23 @@ public function getNotIntitleRegex(): ?array {
+ 		return $this->not_intitle_regex;
+ 	}
+ 
++	/** @return list<string>|null */
++	public function getIntext(): ?array {
++		return $this->intext;
++	}
++	/** @return list<string>|null */
++	public function getIntextRegex(): ?array {
++		return $this->intext_regex;
++	}
++	/** @return list<string>|null */
++	public function getNotIntext(): ?array {
++		return $this->not_intext;
++	}
++	/** @return list<string>|null */
++	public function getNotIntextRegex(): ?array {
++		return $this->not_intext_regex;
++	}
++
+ 	public function getMinDate(): ?int {
+ 		return $this->min_date ?: null;
+ 	}
+@@ -494,7 +521,6 @@ private function parseNotLabelNames(string $input): string {
+ 
+ 	/**
+ 	 * Parse the search string to find intitle keyword and the search related to it.
+-	 * The search is the first word following the keyword.
+ 	 */
+ 	private function parseIntitleSearch(string $input): string {
+ 		if (preg_match_all('#\\bintitle:(?P<search>/.*?(?<!\\\\)/[im]*)#', $input, $matches)) {
+@@ -536,6 +562,49 @@ private function parseNotIntitleSearch(string $input): string {
+ 		return $input;
+ 	}
+ 
++	/**
++	 * Parse the search string to find intext keyword and the search related to it.
++	 */
++	private function parseIntextSearch(string $input): string {
++		if (preg_match_all('#\\bintext:(?P<search>/.*?(?<!\\\\)/[im]*)#', $input, $matches)) {
++			$this->intext_regex = self::htmlspecialchars_decodes($matches['search']);
++			$input = str_replace($matches[0], '', $input);
++		}
++		if (preg_match_all('/\\bintext:(?P<delim>[\'"])(?P<search>.*)(?P=delim)/U', $input, $matches)) {
++			$this->intext = $matches['search'];
++			$input = str_replace($matches[0], '', $input);
++		}
++		if (preg_match_all('/\\bintext:(?P<search>[^\s"]*)/', $input, $matches)) {
++			$this->intext = array_merge($this->intext ?? [], $matches['search']);
++			$input = str_replace($matches[0], '', $input);
++		}
++		$this->intext = self::removeEmptyValues($this->intext);
++		if (empty($this->intext)) {
++			$this->intext = null;
++		}
++		return $input;
++	}
++
++	private function parseNotIntextSearch(string $input): string {
++		if (preg_match_all('#(?<=[\\s(]|^)[!-]intext:(?P<search>/.*?(?<!\\\\)/[im]*)#', $input, $matches)) {
++			$this->not_intext_regex = self::htmlspecialchars_decodes($matches['search']);
++			$input = str_replace($matches[0], '', $input);
++		}
++		if (preg_match_all('/(?<=[\\s(]|^)[!-]intext:(?P<delim>[\'"])(?P<search>.*)(?P=delim)/U', $input, $matches)) {
++			$this->not_intext = $matches['search'];
++			$input = str_replace($matches[0], '', $input);
++		}
++		if (preg_match_all('/(?<=[\\s(]|^)[!-]intext:(?P<search>[^\s"]*)/', $input, $matches)) {
++			$this->not_intext = array_merge($this->not_intext ?? [], $matches['search']);
++			$input = str_replace($matches[0], '', $input);
++		}
++		$this->not_intext = self::removeEmptyValues($this->not_intext);
++		if (empty($this->not_intext)) {
++			$this->not_intext = null;
++		}
++		return $input;
++	}
++
+ 	/**
+ 	 * Parse the search string to find author keyword and the search related to it.
+ 	 * The search is the first word following the keyword except when using
+diff --git a/docs/en/users/10_filter.md b/docs/en/users/10_filter.md
+index 0aecfbaa0db..7ca1aefff53 100644
+--- a/docs/en/users/10_filter.md
++++ b/docs/en/users/10_filter.md
+@@ -48,6 +48,7 @@ You can use the search field to further refine results:
+ * by feed ID: `f:123` or multiple feed IDs (*or*): `f:123,234,345`
+ * by author: `author:name` or `author:'composed name'`
+ * by title: `intitle:keyword` or `intitle:'composed keyword'`
++* by text (content): `intext:keyword` or `intext:'composed keyword'`
+ * by URL: `inurl:keyword` or `inurl:'composed keyword'`
+ * by tag: `#tag` or `#tag+with+whitespace` or `#'tag with whitespace'`
+ * by free-text: `keyword` or `'composed keyword'`
+@@ -97,7 +98,7 @@ Some operators can be used negatively, to exclude articles, with the same syntax
+ `!f:234`, `-author:name`, `-intitle:keyword`, `-inurl:keyword`, `-#tag`, `!keyword`, `!date:2019`, `!date:P1W`, `!pubdate:P3d/`.
+ 
+ It is also possible to combine keywords to create a more precise filter.
+-For example, you can enter multiple instances of `f:`, `author:`, `intitle:`, `inurl:`, `#`, and free-text.
++For example, you can enter multiple instances of `f:`, `author:`, `intitle:`, `intext:`, `inurl:`, `#`, and free-text.
+ 
+ Combining several search criteria implies a logical *and*, but the keyword ` OR `
+ can be used to combine several search criteria with a logical *or* instead: `author:Dupont OR author:Dupond`
+@@ -132,6 +133,8 @@ Supports multiline mode with `m` modifier, like: `/^Alice/m`
+ 
+ Example to search entries, which title starts with the *Lol* word, with any number of *o*: `intitle:/^Lo+l/i`
+ 
++Example to search empty entries (where the body of articles is blank): `intext:/^\s*$/`
++
+ As opposed to normal searches, special XML characters `<&">` are not escaped in regex searches, to allow searching HTML code, like: `/Hello <span>world<\/span>/`
+ 
+ > ℹ️ A literal slash needs to be escaped, like `\/`
+diff --git a/docs/fr/users/03_Main_view.md b/docs/fr/users/03_Main_view.md
+index e1be4ca3d90..8e8444dd289 100644
+--- a/docs/fr/users/03_Main_view.md
++++ b/docs/fr/users/03_Main_view.md
+@@ -207,6 +207,7 @@ Il est possible d’utiliser le champ de recherche pour raffiner les résultats
+ * par ID de flux : `f:123` ou plusieurs flux (*ou*) : `f:123,234,345`
+ * par auteur : `author:nom` ou `author:'nom composé'`
+ * par titre : `intitle:mot` ou `intitle:'mot composé'`
++* par texte (contenu) : `intext:mot` ou `intext:'mot composé'`
+ * par URL : `inurl:mot` ou `inurl:'mot composé'`
+ * par tag : `#tag` ou `#'tag avec espace'`
+ * par texte libre : `mot` ou `'mot composé'`
+@@ -291,6 +292,8 @@ Le mode multilignes peut être activé avec l’option de recherche `m` comme :
+ 
+ Exemple pour rechercher des articles dont le titre commence par le mot *Lol* avec un nombre indéterminé de *o*: `intitle:/^Lo+l/i`
+ 
++Exemple pour rechercher des articles dont le contenu est vide : `intext:/^\s*$/`
++
+ Contrairement aux recherches normales, les caractères spéciaux XML `<&">` ne sont pas encodés dans les recherches regex, afin de permettre de chercher du code HTML, comme : `/Bonjour <span>à tous<\/span>/`
+ 
+ > ℹ️ Une barre oblique (slash) doit être échappée comme suit : `\/`
+diff --git a/tests/app/Models/SearchTest.php b/tests/app/Models/SearchTest.php
+index 81b4ac1fb08..a62e255de20 100644
+--- a/tests/app/Models/SearchTest.php
++++ b/tests/app/Models/SearchTest.php
+@@ -70,6 +70,27 @@ public static function provideIntitleSearch(): array {
+ 		];
+ 	}
+ 
++	/**
++	 * @param array<string>|null $intext_value
++	 * @param array<string>|null $search_value
++	 */
++	#[DataProvider('provideIntextSearch')]
++	public static function test__construct_whenInputContainsIntext(string $input, ?array $intext_value, ?array $search_value): void {
++		$search = new FreshRSS_Search($input);
++		self::assertSame($intext_value, $search->getIntext());
++		self::assertSame($search_value, $search->getSearch());
++	}
++
++	/**
++	 * @return list<list<mixed>>
++	 */
++	public static function provideIntextSearch(): array {
++		return [
++			['intext:word1', ['word1'], null],
++			['intext:"word1 word2"', ['word1 word2'], null],
++		];
++	}
++
+ 	/**
+ 	 * @param array<string>|null $author_value
+ 	 * @param array<string>|null $search_value
+@@ -379,6 +400,11 @@ public static function provideParentheses(): array {
+ 				'(e.title LIKE ? )',
+ 				['%"hello world"%'],
+ 			],
++			[
++				'intext:\'"hello world"\'',
++				'(e.content LIKE ? )',
++				['%"hello world"%'],
++			],
+ 			[
+ 				'(ab) OR (cd) OR (ef)',
+ 				'(((e.title LIKE ? OR e.content LIKE ?) )) OR (((e.title LIKE ? OR e.content LIKE ?) )) OR (((e.title LIKE ? OR e.content LIKE ?) ))',
+@@ -469,6 +495,11 @@ public static function provideParentheses(): array {
+ 				'(e.title ~ ? )',
+ 				['^(ab|cd)']
+ 			],
++			[
++				'intext:/^(ab|cd)/',
++				'(e.content ~ ? )',
++				['^(ab|cd)']
++			],
+ 		];
+ 	}
+ 
+@@ -505,6 +536,11 @@ public static function provideRegexPostreSQL(): array {
+ 				'(e.title ~ ? )',
+ 				['^ab\\M']
+ 			],
++			[
++				'intext:/^ab\\M/',
++				'(e.content ~ ? )',
++				['^ab\\M']
++			],
+ 			[
+ 				'author:/^ab$/',
+ 				"(REPLACE(e.author, ';', '\n') ~ ? )",
+@@ -573,6 +609,11 @@ public static function provideRegexMariaDB(): array {
+ 				"(e.title REGEXP ? )",
+ 				['(?-i)(?m)^ab$']
+ 			],
++			[
++				'intext:/^ab$/m',
++				'(UNCOMPRESS(e.content_bin) REGEXP ?) )',
++				['(?-i)(?m)^ab$']
++			],
+ 		];
+ 	}
+ 
+@@ -606,6 +647,11 @@ public static function provideRegexMySQL(): array {
+ 				"(REGEXP_LIKE(e.title,?,'mc') )",
+ 				['^ab$']
+ 			],
++			[
++				'intext:/^ab$/m',
++				"(REGEXP_LIKE(UNCOMPRESS(e.content_bin),?,'mc')) )",
++				['^ab$']
++			],
+ 		];
+ 	}
+ 
+@@ -642,6 +688,11 @@ public static function provideRegexSQLite(): array {
+ 				'(e.title REGEXP ? )',
+ 				['/^ab\\b/']
+ 			],
++			[
++				'intext:/^ab\\b/',
++				'(e.content REGEXP ? )',
++				['/^ab\\b/']
++			],
+ 		];
+ 	}
+ }

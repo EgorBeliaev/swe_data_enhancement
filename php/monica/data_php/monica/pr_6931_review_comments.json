@@ -1,0 +1,92 @@
+[
+    {
+        "title": "fix: misc bugfixes to reminders"
+    },
+    {
+        "author": {
+            "login": "PR Description"
+        },
+        "body": "- Updating an existing reminder no longer deletes the user's notification channels\r\n- Finishing the setup of a Telegram connection now triggers a scheduling of the user's notifications, making behavior consistent with how email verification works\r\n\r\nIt's been about 7 years since I've touched any code that uses Laravel, happy to make any updates you feel would improve the quality of this PR \ud83d\ude42 \r\n\r\nFixes #6776"
+    },
+    {
+        "author": {
+            "login": "NixFey"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "asbiin"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "asbiin"
+        },
+        "body": ""
+    },
+    {
+        "author": {
+            "login": "CLAassistant"
+        },
+        "body": "[![CLA assistant check](https://cla-assistant.io/pull/badge/signed)](https://cla-assistant.io/monicahq/monica?pullRequest=6931) <br/>All committers have signed the CLA."
+    },
+    {
+        "author": {
+            "login": "NixFey"
+        },
+        "body": "@djaiss @asbiin Thanks for all the work you do on this project! The issue that I opened for these bugs got closed, so I figured I'd try to implement a fix on my own.\r\n\r\nThe combination of these two issues made the experience of using Telegram reminders in Chandler very frustrating. Please review this small PR at your earliest convenience \ud83d\ude42 "
+    },
+    {
+        "author": {
+            "login": "github-actions"
+        },
+        "body": ":tada: This PR is included in version 5.0.0-beta.4 :tada:\n\nThe release is available on [GitHub release](https://github.com/monicahq/monica/releases/tag/v5.0.0-beta.4)\n\nYour **[semantic-release](https://github.com/semantic-release/semantic-release)** bot :package::rocket:"
+    },
+    {
+        "data": {
+            "repository": {
+                "issue": {
+                    "title": "Chandler bug: Updating a Reminder Removes Associated `user_notification_channels`",
+                    "body": "**Describe the bug**\r\nUsing the most recent build of Chandler, a pretty major issue occurs when updating a contact reminder which has been scheduled for a notification channel. While going through the update handler, all notification channels which that reminder is using are removed. Note: Not just the `contact_reminder_scheduled` records, but the overall `user_notification_channel` records. This is most definitely not the expected behavior. DB Engine: MySQL, hosting: Docker\r\n\r\n**Screenshots**\r\n<img width=\"801\" alt=\"image\" src=\"https://github.com/monicahq/monica/assets/3743825/410cefb5-ab17-470d-be99-03bf9d19f73a\">\r\n<img width=\"528\" alt=\"image\" src=\"https://github.com/monicahq/monica/assets/3743825/5aade0a1-a5a8-49d0-9567-b63b050191f2\">\r\n\r\n\r\n**Additional context**\r\nRelevant code snippet: https://github.com/monicahq/monica/blob/chandler/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php#L84-L87\r\n",
+                    "state": "CLOSED",
+                    "comments": {
+                        "nodes": [
+                            {
+                                "author": {
+                                    "login": "djaiss"
+                                },
+                                "body": "This is really bad indeed. I'll fix this. Thanks so much for raising this bug."
+                            },
+                            {
+                                "author": {
+                                    "login": "djaiss"
+                                },
+                                "body": "Hang on. This is actually working as expected.\r\nYes, all the notifications channels for the given reminder are deleted. BUT right after, they are all generated again. \r\n\r\nThe reason is that it's actually easier to delete all the notif channels and generate them all again rather than going through them one by one and modify them.\r\n\r\nSee https://github.com/monicahq/monica/blob/main/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php#L89C7-L89C7 for reference."
+                            },
+                            {
+                                "author": {
+                                    "login": "djaiss"
+                                },
+                                "body": "I'll close it but feel free to open it again if you feel this is still not right."
+                            },
+                            {
+                                "author": {
+                                    "login": "NixFey"
+                                },
+                                "body": "Please reopen \ud83d\ude42 \r\n\r\nThanks for looking into this @djaiss! I know what you're getting at when you say that, but I think there's a bit of a misunderstanding. When that bit of code runs, it completely wipes out the Telegram connection that I have set up, I need to go back in to the settings and set up Telegram from scratch. It seems that Laravel is not just deleting the record in the pivot table, but actually going one level deeper and deleting that too, if that makes sense?\r\n\r\nThe code was refactored back in September 2022, and I have a hunch it might have been broken since then https://github.com/monicahq/monica/commit/3fa0691453f200e004836326d37bb5f3ec4d2291#diff-5320638e148e1d8cac8cd9f8c6d7b02590b459bf3a8315e95efe882a14ba0225L94-R93\r\n\r\nI've included below the full set of patches I had to make to Monica to get Telegram working. I considered opening a PR with this but I wasn't confident enough that this was all that needed to be done\r\n\r\n```\r\ndiff --git a/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php b/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php\r\nindex e15752ec2..c6747f2cf 100644\r\n--- a/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php\r\n+++ b/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php\r\n@@ -6,6 +6,7 @@ use App\\Interfaces\\ServiceInterface;\r\n use App\\Models\\ContactReminder;\r\n use App\\Services\\BaseService;\r\n use Carbon\\Carbon;\r\n+use Illuminate\\Support\\Facades\\DB;\r\n\r\n class UpdateContactReminder extends BaseService implements ServiceInterface\r\n {\r\n@@ -83,7 +84,7 @@ class UpdateContactReminder extends BaseService implements ServiceInterface\r\n\r\n     private function deleteOldScheduledReminders(): void\r\n     {\r\n-        $this->reminder->userNotificationChannels->each->delete();\r\n+        DB::table('contact_reminder_scheduled')->where('contact_reminder_id', $this->reminder->id)->delete();\r\n     }\r\n\r\n     private function scheduledReminderForAllUsersInVault(): void\r\ndiff --git a/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php b/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php\r\nindex 509e58d42..93156164a 100644\r\n--- a/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php\r\n+++ b/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php\r\n@@ -4,9 +4,11 @@ namespace App\\Domains\\Settings\\ManageNotificationChannels\\Web\\Controllers;\r\n\r\n use App\\Http\\Controllers\\Controller;\r\n use App\\Models\\UserNotificationChannel;\r\n+use App\\Domains\\Settings\\ManageNotificationChannels\\Services\\ScheduleAllContactRemindersForNotificationChannel;\r\n use Exception;\r\n use Illuminate\\Http\\Request;\r\n use Illuminate\\Support\\Str;\r\n+use Illuminate\\Support\\Facades\\Auth;\r\n\r\n class TelegramWebhookController extends Controller\r\n {\r\n@@ -52,6 +54,12 @@ class TelegramWebhookController extends Controller\r\n         $channel->active = true;\r\n         $channel->save();\r\n\r\n+\t(new ScheduleAllContactRemindersForNotificationChannel())->execute([\r\n+            'account_id' => $channel->user->account_id,\r\n+            'author_id' => $channel->user->id,\r\n+            'user_notification_channel_id' => $channel->id,\r\n+        ]);\r\n+\r\n         return response('Success', 200);\r\n     }\r\n }\r\n\r\n```"
+                            },
+                            {
+                                "author": {
+                                    "login": "github-actions"
+                                },
+                                "body": ":tada: This issue has been resolved in version 5.0.0-beta.4 :tada:\n\nThe release is available on [GitHub release](https://github.com/monicahq/monica/releases/tag/v5.0.0-beta.4)\n\nYour **[semantic-release](https://github.com/semantic-release/semantic-release)** bot :package::rocket:"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+]

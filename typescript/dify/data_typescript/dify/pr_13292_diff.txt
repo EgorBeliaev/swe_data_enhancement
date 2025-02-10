@@ -1,0 +1,116 @@
+diff --git a/api/configs/feature/__init__.py b/api/configs/feature/__init__.py
+index 9e2ba417801477..ba3542baf34c65 100644
+--- a/api/configs/feature/__init__.py
++++ b/api/configs/feature/__init__.py
+@@ -498,6 +498,11 @@ class AuthConfig(BaseSettings):
+         default=86400,
+     )
+ 
++    FORGOT_PASSWORD_LOCKOUT_DURATION: PositiveInt = Field(
++        description="Time (in seconds) a user must wait before retrying password reset after exceeding the rate limit.",
++        default=86400,
++    )
++
+ 
+ class ModerationConfig(BaseSettings):
+     """
+diff --git a/api/controllers/console/auth/error.py b/api/controllers/console/auth/error.py
+index 8ef10c7bbb11cd..b40934dbf51367 100644
+--- a/api/controllers/console/auth/error.py
++++ b/api/controllers/console/auth/error.py
+@@ -59,3 +59,9 @@ class EmailCodeAccountDeletionRateLimitExceededError(BaseHTTPException):
+     error_code = "email_code_account_deletion_rate_limit_exceeded"
+     description = "Too many account deletion emails have been sent. Please try again in 5 minutes."
+     code = 429
++
++
++class EmailPasswordResetLimitError(BaseHTTPException):
++    error_code = "email_password_reset_limit"
++    description = "Too many failed password reset attempts. Please try again in 24 hours."
++    code = 429
+diff --git a/api/controllers/console/auth/forgot_password.py b/api/controllers/console/auth/forgot_password.py
+index a9c4300b9a27c3..241ecdbd5341e8 100644
+--- a/api/controllers/console/auth/forgot_password.py
++++ b/api/controllers/console/auth/forgot_password.py
+@@ -6,7 +6,13 @@
+ 
+ from constants.languages import languages
+ from controllers.console import api
+-from controllers.console.auth.error import EmailCodeError, InvalidEmailError, InvalidTokenError, PasswordMismatchError
++from controllers.console.auth.error import (
++    EmailCodeError,
++    EmailPasswordResetLimitError,
++    InvalidEmailError,
++    InvalidTokenError,
++    PasswordMismatchError,
++)
+ from controllers.console.error import AccountInFreezeError, AccountNotFound, EmailSendIpLimitError
+ from controllers.console.wraps import setup_required
+ from events.tenant_event import tenant_was_created
+@@ -62,6 +68,10 @@ def post(self):
+ 
+         user_email = args["email"]
+ 
++        is_forgot_password_error_rate_limit = AccountService.is_forgot_password_error_rate_limit(args["email"])
++        if is_forgot_password_error_rate_limit:
++            raise EmailPasswordResetLimitError()
++
+         token_data = AccountService.get_reset_password_data(args["token"])
+         if token_data is None:
+             raise InvalidTokenError()
+@@ -70,8 +80,10 @@ def post(self):
+             raise InvalidEmailError()
+ 
+         if args["code"] != token_data.get("code"):
++            AccountService.add_forgot_password_error_rate_limit(args["email"])
+             raise EmailCodeError()
+ 
++        AccountService.reset_forgot_password_error_rate_limit(args["email"])
+         return {"is_valid": True, "email": token_data.get("email")}
+ 
+ 
+diff --git a/api/services/account_service.py b/api/services/account_service.py
+index dd1cc5f94f4746..5388e1878ed842 100644
+--- a/api/services/account_service.py
++++ b/api/services/account_service.py
+@@ -77,6 +77,7 @@ class AccountService:
+         prefix="email_code_account_deletion_rate_limit", max_attempts=1, time_window=60 * 1
+     )
+     LOGIN_MAX_ERROR_LIMITS = 5
++    FORGOT_PASSWORD_MAX_ERROR_LIMITS = 5
+ 
+     @staticmethod
+     def _get_refresh_token_key(refresh_token: str) -> str:
+@@ -503,6 +504,32 @@ def reset_login_error_rate_limit(email: str):
+         key = f"login_error_rate_limit:{email}"
+         redis_client.delete(key)
+ 
++    @staticmethod
++    def add_forgot_password_error_rate_limit(email: str) -> None:
++        key = f"forgot_password_error_rate_limit:{email}"
++        count = redis_client.get(key)
++        if count is None:
++            count = 0
++        count = int(count) + 1
++        redis_client.setex(key, dify_config.FORGOT_PASSWORD_LOCKOUT_DURATION, count)
++
++    @staticmethod
++    def is_forgot_password_error_rate_limit(email: str) -> bool:
++        key = f"forgot_password_error_rate_limit:{email}"
++        count = redis_client.get(key)
++        if count is None:
++            return False
++
++        count = int(count)
++        if count > AccountService.FORGOT_PASSWORD_MAX_ERROR_LIMITS:
++            return True
++        return False
++
++    @staticmethod
++    def reset_forgot_password_error_rate_limit(email: str):
++        key = f"forgot_password_error_rate_limit:{email}"
++        redis_client.delete(key)
++
+     @staticmethod
+     def is_email_send_ip_limit(ip_address: str):
+         minute_key = f"email_send_ip_limit_minute:{ip_address}"

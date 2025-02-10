@@ -1,0 +1,123 @@
+diff --git a/.changeset/friendly-kings-poke.md b/.changeset/friendly-kings-poke.md
+new file mode 100644
+index 000000000000..b7299f4ebaa7
+--- /dev/null
++++ b/.changeset/friendly-kings-poke.md
+@@ -0,0 +1,6 @@
++---
++"@rocket.chat/meteor": patch
++"@rocket.chat/rest-typings": patch
++---
++
++Allows users to fetch the `packageValue` of settings when calling `/settings` endpoint via `includeDefaults` query param.
+diff --git a/apps/meteor/app/api/server/v1/settings.ts b/apps/meteor/app/api/server/v1/settings.ts
+index 1c09e8c72937..6d2bbab89afd 100644
+--- a/apps/meteor/app/api/server/v1/settings.ts
++++ b/apps/meteor/app/api/server/v1/settings.ts
+@@ -12,6 +12,7 @@ import {
+ 	isSettingsUpdatePropsActions,
+ 	isSettingsUpdatePropsColor,
+ 	isSettingsPublicWithPaginationProps,
++	isSettingsGetParams,
+ } from '@rocket.chat/rest-typings';
+ import { Meteor } from 'meteor/meteor';
+ import type { FindOptions } from 'mongodb';
+@@ -131,9 +132,10 @@ API.v1.addRoute(
+ 
+ API.v1.addRoute(
+ 	'settings',
+-	{ authRequired: true },
++	{ authRequired: true, validateParams: isSettingsGetParams },
+ 	{
+ 		async get() {
++			const { includeDefaults } = this.queryParams;
+ 			const { offset, count } = await getPaginationItems(this.queryParams);
+ 			const { sort, fields, query } = await this.parseJsonQuery();
+ 
+@@ -147,6 +149,11 @@ API.v1.addRoute(
+ 
+ 			ourQuery = Object.assign({}, query, ourQuery);
+ 
++			// Note: change this when `fields` gets removed
++			if (includeDefaults) {
++				fields.packageValue = 1;
++			}
++
+ 			const { settings, totalCount: total } = await fetchSettings(ourQuery, sort, offset, count, fields);
+ 
+ 			return API.v1.success({
+diff --git a/apps/meteor/tests/end-to-end/api/settings.ts b/apps/meteor/tests/end-to-end/api/settings.ts
+index 973d21e84f94..0873190b7ba8 100644
+--- a/apps/meteor/tests/end-to-end/api/settings.ts
++++ b/apps/meteor/tests/end-to-end/api/settings.ts
+@@ -100,6 +100,20 @@ describe('[Settings]', () => {
+ 				})
+ 				.end(done);
+ 		});
++		it('should return the default values of the settings when includeDefaults is true', async () => {
++			return request
++				.get(api('settings'))
++				.query({ includeDefaults: true })
++				.set(credentials)
++				.expect('Content-Type', 'application/json')
++				.expect(200)
++				.expect((res) => {
++					expect(res.body).to.have.property('success', true);
++					expect(res.body).to.have.property('settings');
++					expect(res.body).to.have.property('count');
++					expect(res.body.settings[0]).to.have.property('packageValue');
++				});
++		});
+ 	});
+ 
+ 	describe('[/settings/:_id]', () => {
+diff --git a/packages/rest-typings/src/v1/settings.ts b/packages/rest-typings/src/v1/settings.ts
+index 7aec62fdfceb..a7bf38c8145e 100644
+--- a/packages/rest-typings/src/v1/settings.ts
++++ b/packages/rest-typings/src/v1/settings.ts
+@@ -57,6 +57,36 @@ const SettingsPublicWithPaginationSchema = {
+ 
+ export const isSettingsPublicWithPaginationProps = ajv.compile<SettingsPublicWithPaginationProps>(SettingsPublicWithPaginationSchema);
+ 
++type SettingsGetParams = PaginatedRequest<{ includeDefaults?: boolean; query?: string }>;
++
++const SettingsGetSchema = {
++	type: 'object',
++	properties: {
++		includeDefaults: {
++			type: 'boolean',
++		},
++		count: {
++			type: 'number',
++		},
++		offset: {
++			type: 'number',
++		},
++		sort: {
++			type: 'string',
++		},
++		fields: {
++			type: 'string',
++		},
++		query: {
++			type: 'string',
++		},
++	},
++	required: [],
++	additionalProperties: false,
++};
++
++export const isSettingsGetParams = ajv.compile<SettingsGetParams>(SettingsGetSchema);
++
+ export type SettingsEndpoints = {
+ 	'/v1/settings.public': {
+ 		GET: (params: SettingsPublicWithPaginationProps) => PaginatedResult & {
+@@ -75,7 +105,7 @@ export type SettingsEndpoints = {
+ 	};
+ 
+ 	'/v1/settings': {
+-		GET: () => {
++		GET: (params: SettingsGetParams) => {
+ 			settings: ISetting[];
+ 		};
+ 	};

@@ -1,0 +1,288 @@
+diff --git a/apps/frontend/src/components/launches/calendar.tsx b/apps/frontend/src/components/launches/calendar.tsx
+index 984a57c9c..9c0618e22 100644
+--- a/apps/frontend/src/components/launches/calendar.tsx
++++ b/apps/frontend/src/components/launches/calendar.tsx
+@@ -27,6 +27,7 @@ import { groupBy, sortBy } from 'lodash';
+ import Image from 'next/image';
+ import { extend } from 'dayjs';
+ import { isUSCitizen } from './helpers/isuscitizen.utils';
++import removeMd from 'remove-markdown';
+ extend(isSameOrAfter);
+ extend(isSameOrBefore);
+ 
+@@ -604,7 +605,7 @@ const CalendarItem: FC<{
+       </div>
+       <div className="whitespace-pre-wrap line-clamp-3">
+         {state === 'DRAFT' ? 'Draft: ' : ''}
+-        {post.content}
++        {removeMd(post.content).replace(/\n/g, ' ')}
+       </div>
+     </div>
+   );
+diff --git a/apps/frontend/src/components/launches/general.preview.component.tsx b/apps/frontend/src/components/launches/general.preview.component.tsx
+index e6eae31ce..912416353 100644
+--- a/apps/frontend/src/components/launches/general.preview.component.tsx
++++ b/apps/frontend/src/components/launches/general.preview.component.tsx
+@@ -3,10 +3,9 @@ import { useMediaDirectory } from '@gitroom/react/helpers/use.media.directory';
+ import { useFormatting } from '@gitroom/frontend/components/launches/helpers/use.formatting';
+ import clsx from 'clsx';
+ import { VideoOrImage } from '@gitroom/react/helpers/video.or.image';
+-import { Chakra_Petch } from 'next/font/google';
+ import { FC } from 'react';
+ import { textSlicer } from '@gitroom/helpers/utils/count.length';
+-const chakra = Chakra_Petch({ weight: '400', subsets: ['latin'] });
++import interClass from '@gitroom/react/helpers/inter.font';
+ 
+ export const GeneralPreviewComponent: FC<{maximumCharacters?: number}> = (props) => {
+   const { value: topValue, integration } = useIntegration();
+@@ -64,7 +63,7 @@ export const GeneralPreviewComponent: FC<{maximumCharacters?: number}> = (props)
+                   {integration?.display || '@username'}
+                 </div>
+               </div>
+-              <pre className={clsx('text-wrap', chakra.className)} dangerouslySetInnerHTML={{__html: value.text}} />
++              <pre className={clsx('text-wrap', interClass)} dangerouslySetInnerHTML={{__html: value.text}} />
+               {!!value?.images?.length && (
+                 <div className={clsx("w-full rounded-[16px] overflow-hidden mt-[12px]", value?.images?.length > 3 ? 'grid grid-cols-2 gap-[4px]' : 'flex gap-[4px]')}>
+                   {value.images.map((image, index) => (
+diff --git a/apps/frontend/src/components/launches/helpers/linkedin.component.tsx b/apps/frontend/src/components/launches/helpers/linkedin.component.tsx
+index 7870013ea..cc218851b 100644
+--- a/apps/frontend/src/components/launches/helpers/linkedin.component.tsx
++++ b/apps/frontend/src/components/launches/helpers/linkedin.component.tsx
+@@ -13,6 +13,7 @@ import {
+ import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
+ import { Input } from '@gitroom/react/form/input';
+ import { Button } from '@gitroom/react/form/button';
++import { useToaster } from '@gitroom/react/toaster/toaster';
+ 
+ const postUrlEmitter = new EventEmitter();
+ 
+@@ -76,26 +77,32 @@ export const LinkedinCompany: FC<{
+   const { onClose, onSelect, id } = props;
+   const fetch = useFetch();
+   const [company, setCompany] = useState<any>(null);
++  const toast = useToaster();
+ 
+   const getCompany = async () => {
+     if (!company) {
+-      return ;
++      return;
++    }
++
++    try {
++      const { options } = await (
++        await fetch('/integrations/function', {
++          method: 'POST',
++          body: JSON.stringify({
++            id,
++            name: 'company',
++            data: {
++              url: company,
++            },
++          }),
++        })
++      ).json();
++
++      onSelect(options.value);
++      onClose();
++    } catch (e) {
++      toast.show('Failed to load profile', 'warning');
+     }
+-    const {options} = await (
+-      await fetch('/integrations/function', {
+-        method: 'POST',
+-        body: JSON.stringify({
+-          id,
+-          name: 'company',
+-          data: {
+-            url: company,
+-          },
+-        }),
+-      })
+-    ).json();
+-
+-    onSelect(options.value);
+-    onClose();
+   };
+ 
+   return (
+diff --git a/apps/frontend/src/components/launches/helpers/use.formatting.ts b/apps/frontend/src/components/launches/helpers/use.formatting.ts
+index be759f003..8c2e71a15 100644
+--- a/apps/frontend/src/components/launches/helpers/use.formatting.ts
++++ b/apps/frontend/src/components/launches/helpers/use.formatting.ts
+@@ -26,6 +26,9 @@ export const useFormatting = (
+       if (params.removeMarkdown) {
+         newText = removeMd(newText);
+       }
++      newText = newText.replace(/@\w{1,15}/g, function(match) {
++        return `<strong>${match}</strong>`;
++      });
+       if (params.saveBreaklines) {
+         newText = newText.replace('𝔫𝔢𝔴𝔩𝔦𝔫𝔢', '\n');
+       }
+diff --git a/apps/frontend/src/components/launches/providers/high.order.provider.tsx b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+index a6d209522..86b67569e 100644
+--- a/apps/frontend/src/components/launches/providers/high.order.provider.tsx
++++ b/apps/frontend/src/components/launches/providers/high.order.provider.tsx
+@@ -28,12 +28,16 @@ import { newImage } from '@gitroom/frontend/components/launches/helpers/new.imag
+ import { postSelector } from '@gitroom/frontend/components/post-url-selector/post.url.selector';
+ import { UpDownArrow } from '@gitroom/frontend/components/launches/up.down.arrow';
+ import { arrayMoveImmutable } from 'array-move';
+-import { linkedinCompany } from '@gitroom/frontend/components/launches/helpers/linkedin.component';
++import {
++  LinkedinCompany,
++  linkedinCompany,
++} from '@gitroom/frontend/components/launches/helpers/linkedin.component';
+ import { Editor } from '@gitroom/frontend/components/launches/editor';
+ import { useCopilotAction, useCopilotReadable } from '@copilotkit/react-core';
+ import { AddPostButton } from '@gitroom/frontend/components/launches/add.post.button';
+ import { GeneralPreviewComponent } from '@gitroom/frontend/components/launches/general.preview.component';
+ import { capitalize } from 'lodash';
++import { useModals } from '@mantine/modals';
+ 
+ // Simple component to change back to settings on after changing tab
+ export const SetTab: FC<{ changeTab: () => void }> = (props) => {
+@@ -69,8 +73,8 @@ export const EditorWrapper: FC<{ children: ReactNode }> = ({ children }) => {
+ };
+ 
+ export const withProvider = function <T extends object>(
+-  SettingsComponent: FC<{values?: any}> | null,
+-  CustomPreviewComponent?: FC<{maximumCharacters?: number}>,
++  SettingsComponent: FC<{ values?: any }> | null,
++  CustomPreviewComponent?: FC<{ maximumCharacters?: number }>,
+   dto?: any,
+   checkValidity?: (
+     value: Array<Array<{ path: string }>>,
+@@ -91,6 +95,8 @@ export const withProvider = function <T extends object>(
+   }) => {
+     const existingData = useExistingData();
+     const { integration, date } = useIntegration();
++    const [showLinkedinPopUp, setShowLinkedinPopUp] = useState<any>(false);
++
+     useCopilotReadable({
+       description:
+         integration?.type === 'social'
+@@ -255,6 +261,21 @@ export const withProvider = function <T extends object>(
+       },
+     });
+ 
++    const tagPersonOrCompany = useCallback(
++      (integration: string, editor: (value: string) => void) => () => {
++        setShowLinkedinPopUp(
++          <LinkedinCompany
++            onSelect={(tag) => {
++              editor(tag);
++            }}
++            id={integration}
++            onClose={() => setShowLinkedinPopUp(false)}
++          />
++        );
++      },
++      []
++    );
++
+     // this is a trick to prevent the data from being deleted, yet we don't render the elements
+     if (!props.show) {
+       return null;
+@@ -263,6 +284,7 @@ export const withProvider = function <T extends object>(
+     return (
+       <FormProvider {...form}>
+         <SetTab changeTab={() => setShowTab(0)} />
++        {showLinkedinPopUp ? showLinkedinPopUp : null}
+         <div className="mt-[15px] w-full flex flex-col flex-1">
+           {!props.hideMenu && (
+             <div className="flex gap-[4px]">
+@@ -319,6 +341,20 @@ export const withProvider = function <T extends object>(
+                       <div>
+                         <div className="flex gap-[4px]">
+                           <div className="flex-1 text-textColor editor">
++                            {integration?.identifier === 'linkedin' && (
++                              <Button
++                                className="mb-[5px]"
++                                onClick={tagPersonOrCompany(
++                                  integration.id,
++                                  (newValue: string) =>
++                                    changeValue(index)(
++                                      val.content + newValue
++                                    )
++                                )}
++                              >
++                                Tag a company
++                              </Button>
++                            )}
+                             <Editor
+                               order={index}
+                               height={InPlaceValue.length > 1 ? 200 : 250}
+diff --git a/libraries/nestjs-libraries/src/integrations/social/linkedin.provider.ts b/libraries/nestjs-libraries/src/integrations/social/linkedin.provider.ts
+index e1a1f8ba7..bff406777 100644
+--- a/libraries/nestjs-libraries/src/integrations/social/linkedin.provider.ts
++++ b/libraries/nestjs-libraries/src/integrations/social/linkedin.provider.ts
+@@ -156,7 +156,7 @@ export class LinkedinProvider extends SocialAbstract implements SocialProvider {
+   async company(token: string, data: { url: string }) {
+     const { url } = data;
+     const getCompanyVanity = url.match(
+-      /^https?:\/\/?www\.?linkedin\.com\/company\/([^/]+)\/$/
++      /^https?:\/\/(?:www\.)?linkedin\.com\/company\/([^/]+)\/?$/
+     );
+     if (!getCompanyVanity || !getCompanyVanity?.length) {
+       throw new Error('Invalid LinkedIn company URL');
+@@ -282,6 +282,32 @@ export class LinkedinProvider extends SocialAbstract implements SocialProvider {
+     }
+   }
+ 
++  private fixText(text: string) {
++    const pattern = /@\[.+?]\(urn:li:organization.+?\)/g;
++    const matches = text.match(pattern) || [];
++    const splitAll = text.split(pattern);
++    const splitTextReformat = splitAll.map((p) => {
++      return p
++        .replace(/\*/g, '\\*')
++        .replace(/\(/g, '\\(')
++        .replace(/\)/g, '\\)')
++        .replace(/\{/g, '\\{')
++        .replace(/}/g, '\\}')
++        .replace(/@/g, '\\@');
++    });
++
++    const connectAll = splitTextReformat.reduce((all, current) => {
++      const match = matches.shift();
++      all.push(current);
++      if (match) {
++        all.push(match);
++      }
++      return all;
++    }, [] as string[]);
++
++    return connectAll.join('');
++  }
++
+   async post(
+     id: string,
+     accessToken: string,
+@@ -340,12 +366,7 @@ export class LinkedinProvider extends SocialAbstract implements SocialProvider {
+           type === 'personal'
+             ? `urn:li:person:${id}`
+             : `urn:li:organization:${id}`,
+-        commentary: firstPost.message
+-          .replace(/\*/g, '\\*')
+-          .replace(/\(/g, '\\(')
+-          .replace(/\)/g, '\\)')
+-          .replace(/\{/g, '\\{')
+-          .replace(/}/g, '\\}'),
++        commentary: this.fixText(firstPost.message),
+         visibility: 'PUBLIC',
+         distribution: {
+           feedDistribution: 'MAIN_FEED',
+@@ -410,12 +431,7 @@ export class LinkedinProvider extends SocialAbstract implements SocialProvider {
+                   ? `urn:li:person:${id}`
+                   : `urn:li:organization:${id}`,
+               object: topPostId,
+-              message: post.message
+-                .replace(/\*/g, '\\*')
+-                .replace(/\(/g, '\\(')
+-                .replace(/\)/g, '\\)')
+-                .replace(/\{/g, '\\{')
+-                .replace(/}/g, '\\}'),
++              message: this.fixText(post.message),
+             }),
+           }
+         )

@@ -1,0 +1,1041 @@
+diff --git a/apps/backend/src/api/routes/integrations.controller.ts b/apps/backend/src/api/routes/integrations.controller.ts
+index e19e86685..52c655c8f 100644
+--- a/apps/backend/src/api/routes/integrations.controller.ts
++++ b/apps/backend/src/api/routes/integrations.controller.ts
+@@ -5,6 +5,7 @@ import {
+   Get,
+   Param,
+   Post,
++  Put,
+   Query,
+   UseFilters,
+ } from '@nestjs/common';
+@@ -48,6 +49,37 @@ export class IntegrationsController {
+     return this._integrationManager.getAllIntegrations();
+   }
+ 
++  @Get('/customers')
++  getCustomers(@GetOrgFromRequest() org: Organization) {
++    return this._integrationService.customers(org.id);
++  }
++
++  @Put('/:id/group')
++  async updateIntegrationGroup(
++    @GetOrgFromRequest() org: Organization,
++    @Param('id') id: string,
++    @Body() body: { group: string }
++  ) {
++    return this._integrationService.updateIntegrationGroup(
++      org.id,
++      id,
++      body.group
++    );
++  }
++
++  @Put('/:id/customer-name')
++  async updateOnCustomerName(
++    @GetOrgFromRequest() org: Organization,
++    @Param('id') id: string,
++    @Body() body: { name: string }
++  ) {
++    return this._integrationService.updateOnCustomerName(
++      org.id,
++      id,
++      body.name
++    );
++  }
++
+   @Get('/list')
+   async getIntegrationList(@GetOrgFromRequest() org: Organization) {
+     return {
+@@ -71,6 +103,7 @@ export class IntegrationsController {
+           time: JSON.parse(p.postingTimes),
+           changeProfilePicture: !!findIntegration?.changeProfilePicture,
+           changeNickName: !!findIntegration?.changeNickname,
++          customer: p.customer,
+         };
+       }),
+     };
+diff --git a/apps/frontend/src/app/global.scss b/apps/frontend/src/app/global.scss
+index ac18deaa6..885b1e7d3 100644
+--- a/apps/frontend/src/app/global.scss
++++ b/apps/frontend/src/app/global.scss
+@@ -384,3 +384,14 @@ div div .set-font-family {
+   font-style: normal !important;
+   font-weight: 400 !important;
+ }
++
++.col-calendar:hover:before {
++  content: "Date passed";
++  color: white;
++  position: absolute;
++  left: 50%;
++  top: 50%;
++  transform: translate(-50%, -50%);
++  white-space: nowrap;
++  opacity: 30%;
++}
+\ No newline at end of file
+diff --git a/apps/frontend/src/components/launches/add.edit.model.tsx b/apps/frontend/src/components/launches/add.edit.model.tsx
+index 807d249b2..38c434def 100644
+--- a/apps/frontend/src/components/launches/add.edit.model.tsx
++++ b/apps/frontend/src/components/launches/add.edit.model.tsx
+@@ -50,6 +50,8 @@ import { useUser } from '@gitroom/frontend/components/layout/user.context';
+ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
+ import Image from 'next/image';
+ import { weightedLength } from '@gitroom/helpers/utils/count.length';
++import { uniqBy } from 'lodash';
++import { Select } from '@gitroom/react/form/select';
+ 
+ function countCharacters(text: string, type: string): number {
+   if (type !== 'x') {
+@@ -65,17 +67,36 @@ export const AddEditModal: FC<{
+   reopenModal: () => void;
+   mutate: () => void;
+ }> = (props) => {
+-  const { date, integrations, reopenModal, mutate } = props;
+-  const [dateState, setDateState] = useState(date);
+-
+-  // hook to open a new modal
+-  const modal = useModals();
++  const { date, integrations: ints, reopenModal, mutate } = props;
++  const [customer, setCustomer] = useState('');
+ 
+   // selected integrations to allow edit
+   const [selectedIntegrations, setSelectedIntegrations] = useStateCallback<
+     Integrations[]
+   >([]);
+ 
++  const integrations = useMemo(() => {
++    if (!customer) {
++      return ints;
++    }
++
++    const list = ints.filter((f) => f?.customer?.id === customer);
++    if (list.length === 1) {
++      setSelectedIntegrations([list[0]]);
++    }
++
++    return list;
++  }, [customer, ints]);
++
++  const totalCustomers = useMemo(() => {
++    return uniqBy(ints, (i) => i?.customer?.id).length;
++  }, [ints]);
++
++  const [dateState, setDateState] = useState(date);
++
++  // hook to open a new modal
++  const modal = useModals();
++
+   // value of each editor
+   const [value, setValue] = useState<
+     Array<{
+@@ -286,11 +307,12 @@ export const AddEditModal: FC<{
+         }
+ 
+         if (
+-          key.value.some(
+-            (p) => {
+-              return countCharacters(p.content, key?.integration?.identifier || '') > (key.maximumCharacters || 1000000);
+-            }
+-          )
++          key.value.some((p) => {
++            return (
++              countCharacters(p.content, key?.integration?.identifier || '') >
++              (key.maximumCharacters || 1000000)
++            );
++          })
+         ) {
+           if (
+             !(await deleteDialog(
+@@ -417,6 +439,26 @@ export const AddEditModal: FC<{
+                   information={data}
+                   onChange={setPostFor}
+                 />
++                {totalCustomers > 1 && (
++                  <Select
++                    hideErrors={true}
++                    label=""
++                    name="customer"
++                    value={customer}
++                    onChange={(e) => {
++                      setCustomer(e.target.value);
++                      setSelectedIntegrations([]);
++                    }}
++                    disableForm={true}
++                  >
++                    <option value="">Selected Customer</option>
++                    {uniqBy(ints, (u) => u?.customer?.name).map((p) => (
++                      <option key={p.customer?.id} value={p.customer?.id}>
++                        Customer: {p.customer?.name}
++                      </option>
++                    ))}
++                  </Select>
++                )}
+                 <DatePicker onChange={setDateState} date={dateState} />
+               </div>
+             </TopTitle>
+diff --git a/apps/frontend/src/components/launches/calendar.context.tsx b/apps/frontend/src/components/launches/calendar.context.tsx
+index 1bad55b01..574981f41 100644
+--- a/apps/frontend/src/components/launches/calendar.context.tsx
++++ b/apps/frontend/src/components/launches/calendar.context.tsx
+@@ -62,6 +62,10 @@ export interface Integrations {
+   changeProfilePicture: boolean;
+   changeNickName: boolean;
+   time: { time: number }[];
++  customer?: {
++    name?: string;
++    id?: string;
++  }
+ }
+ 
+ function getWeekNumber(date: Date) {
+diff --git a/apps/frontend/src/components/launches/calendar.tsx b/apps/frontend/src/components/launches/calendar.tsx
+index 91c016b4c..984a57c9c 100644
+--- a/apps/frontend/src/components/launches/calendar.tsx
++++ b/apps/frontend/src/components/launches/calendar.tsx
+@@ -13,7 +13,6 @@ import clsx from 'clsx';
+ import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
+ import { ExistingDataContextProvider } from '@gitroom/frontend/components/launches/helpers/use.existing.data';
+ import { useDrag, useDrop } from 'react-dnd';
+-import { DNDProvider } from '@gitroom/frontend/components/launches/helpers/dnd.provider';
+ import { Integration, Post, State } from '@prisma/client';
+ import { useAddProvider } from '@gitroom/frontend/components/launches/add.provider.component';
+ import { CommentComponent } from '@gitroom/frontend/components/launches/comments/comment.component';
+@@ -33,11 +32,11 @@ extend(isSameOrBefore);
+ 
+ const convertTimeFormatBasedOnLocality = (time: number) => {
+   if (isUSCitizen()) {
+-    return `${time === 12 ? 12 : time%12}:00 ${time >= 12 ? "PM" : "AM"}`
++    return `${time === 12 ? 12 : time % 12}:00 ${time >= 12 ? 'PM' : 'AM'}`;
+   } else {
+-    return `${time}:00`
++    return `${time}:00`;
+   }
+-}
++};
+ 
+ export const days = [
+   'Monday',
+@@ -100,7 +99,7 @@ export const DayView = () => {
+               .startOf('day')
+               .add(option[0].time, 'minute')
+               .local()
+-              .format(isUSCitizen() ? "hh:mm A": "HH:mm")}
++              .format(isUSCitizen() ? 'hh:mm A' : 'HH:mm')}
+           </div>
+           <div
+             key={option[0].time}
+@@ -241,7 +240,7 @@ export const Calendar = () => {
+   const { display } = useCalendar();
+ 
+   return (
+-    <DNDProvider>
++    <>
+       {display === 'day' ? (
+         <DayView />
+       ) : display === 'week' ? (
+@@ -249,7 +248,7 @@ export const Calendar = () => {
+       ) : (
+         <MonthView />
+       )}
+-    </DNDProvider>
++    </>
+   );
+ };
+ 
+@@ -443,8 +442,9 @@ export const CalendarColumn: FC<{
+       )}
+       <div
+         className={clsx(
+-          'relative flex flex-col flex-1',
+-          canDrop && 'bg-white/80'
++          'relative flex flex-col flex-1 text-white',
++          canDrop && 'bg-white/80',
++          isBeforeNow && postList.length === 0 && 'cursor-not-allowed'
+         )}
+       >
+         <div
+@@ -455,8 +455,9 @@ export const CalendarColumn: FC<{
+               }
+             : {})}
+           className={clsx(
+-            'flex-col text-[12px] pointer w-full cursor-pointer overflow-hidden overflow-x-auto flex scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary',
+-            isBeforeNow && 'bg-customColor23 flex-1',
++            'flex-col text-[12px] pointer w-full overflow-hidden overflow-x-auto flex scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary',
++            isBeforeNow ? 'bg-customColor23 flex-1' : 'cursor-pointer',
++            isBeforeNow && postList.length === 0 && 'col-calendar',
+             canBeTrending && 'bg-customColor24'
+           )}
+         >
+diff --git a/apps/frontend/src/components/launches/customer.modal.tsx b/apps/frontend/src/components/launches/customer.modal.tsx
+new file mode 100644
+index 000000000..109632250
+--- /dev/null
++++ b/apps/frontend/src/components/launches/customer.modal.tsx
+@@ -0,0 +1,88 @@
++import { TopTitle } from '@gitroom/frontend/components/launches/helpers/top.title.component';
++import React, { FC, useCallback, useEffect, useState } from 'react';
++import { useModals } from '@mantine/modals';
++import { Integration } from '@prisma/client';
++import { Autocomplete } from '@mantine/core';
++import useSWR from 'swr';
++import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
++import { Button } from '@gitroom/react/form/button';
++
++export const CustomerModal: FC<{
++  integration: Integration & { customer?: { id: string; name: string } };
++  onClose: () => void;
++}> = (props) => {
++  const fetch = useFetch();
++  const { onClose, integration } = props;
++  const [customer, setCustomer] = useState(
++    integration.customer?.name || undefined
++  );
++  const modal = useModals();
++
++  const loadCustomers = useCallback(async () => {
++    return (await fetch('/integrations/customers')).json();
++  }, []);
++
++  const removeFromCustomer = useCallback(async () => {
++    saveCustomer(true);
++  }, []);
++
++  const saveCustomer = useCallback(async (removeCustomer?: boolean) => {
++    if (!customer) {
++      return;
++    }
++
++    await fetch(`/integrations/${integration.id}/customer-name`, {
++      method: 'PUT',
++      body: JSON.stringify({ name: removeCustomer ? '' : customer }),
++    });
++
++    modal.closeAll();
++    onClose();
++  }, [customer]);
++
++  const { data } = useSWR('/customers', loadCustomers);
++
++  return (
++    <div className="rounded-[4px] border border-customColor6 bg-sixth px-[16px] pb-[16px] relative w-full">
++      <TopTitle title={`Move / Add to customer`} />
++      <button
++        className="outline-none absolute right-[20px] top-[20px] mantine-UnstyledButton-root mantine-ActionIcon-root hover:bg-tableBorder cursor-pointer mantine-Modal-close mantine-1dcetaa"
++        type="button"
++        onClick={() => modal.closeAll()}
++      >
++        <svg
++          viewBox="0 0 15 15"
++          fill="none"
++          xmlns="http://www.w3.org/2000/svg"
++          width="16"
++          height="16"
++        >
++          <path
++            d="M11.7816 4.03157C12.0062 3.80702 12.0062 3.44295 11.7816 3.2184C11.5571 2.99385 11.193 2.99385 10.9685 3.2184L7.50005 6.68682L4.03164 3.2184C3.80708 2.99385 3.44301 2.99385 3.21846 3.2184C2.99391 3.44295 2.99391 3.80702 3.21846 4.03157L6.68688 7.49999L3.21846 10.9684C2.99391 11.193 2.99391 11.557 3.21846 11.7816C3.44301 12.0061 3.80708 12.0061 4.03164 11.7816L7.50005 8.31316L10.9685 11.7816C11.193 12.0061 11.5571 12.0061 11.7816 11.7816C12.0062 11.557 12.0062 11.193 11.7816 10.9684L8.31322 7.49999L11.7816 4.03157Z"
++            fill="currentColor"
++            fillRule="evenodd"
++            clipRule="evenodd"
++          ></path>
++        </svg>
++      </button>
++
++      <div className="mt-[16px]">
++        <Autocomplete
++          value={customer}
++          onChange={setCustomer}
++          classNames={{
++            label: 'text-white',
++          }}
++          label="Select Customer"
++          placeholder="Start typing..."
++          data={data?.map((p: any) => p.name) || []}
++        />
++      </div>
++
++      <div className="my-[16px] flex gap-[10px]">
++        <Button onClick={() => saveCustomer()}>Save</Button>
++        {!!integration?.customer?.name && <Button className="bg-red-700" onClick={removeFromCustomer}>Remove from customer</Button>}
++      </div>
++    </div>
++  );
++};
+diff --git a/apps/frontend/src/components/launches/launches.component.tsx b/apps/frontend/src/components/launches/launches.component.tsx
+index b03566b34..60884a503 100644
+--- a/apps/frontend/src/components/launches/launches.component.tsx
++++ b/apps/frontend/src/components/launches/launches.component.tsx
+@@ -1,9 +1,9 @@
+ 'use client';
+ 
+ import { AddProviderButton } from '@gitroom/frontend/components/launches/add.provider.component';
+-import { useCallback, useEffect, useMemo, useState } from 'react';
++import { FC, useCallback, useEffect, useMemo, useState } from 'react';
+ import Image from 'next/image';
+-import { orderBy } from 'lodash';
++import { groupBy, orderBy } from 'lodash';
+ import { CalendarWeekProvider } from '@gitroom/frontend/components/launches/calendar.context';
+ import { Filters } from '@gitroom/frontend/components/launches/filters';
+ import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
+@@ -18,7 +18,201 @@ import ImageWithFallback from '@gitroom/react/helpers/image.with.fallback';
+ import { useToaster } from '@gitroom/react/toaster/toaster';
+ import { useFireEvents } from '@gitroom/helpers/utils/use.fire.events';
+ import { Calendar } from './calendar';
++import { useDrag, useDrop } from 'react-dnd';
++import { DNDProvider } from '@gitroom/frontend/components/launches/helpers/dnd.provider';
+ 
++interface MenuComponentInterface {
++  refreshChannel: (
++    integration: Integration & { identifier: string }
++  ) => () => void;
++  continueIntegration: (integration: Integration) => () => void;
++  totalNonDisabledChannels: number;
++  mutate: (shouldReload?: boolean) => void;
++  update: (shouldReload: boolean) => void;
++}
++
++export const MenuGroupComponent: FC<
++  MenuComponentInterface & {
++    changeItemGroup: (id: string, group: string) => void;
++    group: {
++      id: string;
++      name: string;
++      values: Array<
++        Integration & {
++          identifier: string;
++          changeProfilePicture: boolean;
++          changeNickName: boolean;
++        }
++      >;
++    };
++  }
++> = (props) => {
++  const {
++    group,
++    mutate,
++    update,
++    continueIntegration,
++    totalNonDisabledChannels,
++    refreshChannel,
++    changeItemGroup,
++  } = props;
++
++  const [collectedProps, drop] = useDrop(() => ({
++    accept: 'menu',
++    drop: (item: { id: string }, monitor) => {
++      changeItemGroup(item.id, group.id);
++    },
++    collect: (monitor) => ({
++      isOver: !!monitor.isOver(),
++    }),
++  }));
++
++  return (
++    <div
++      className="gap-[16px] flex flex-col relative"
++      // @ts-ignore
++      ref={drop}
++    >
++      {collectedProps.isOver && (
++        <div className="absolute left-0 top-0 w-full h-full pointer-events-none">
++          <div className="w-full h-full left-0 top-0 relative">
++            <div className="bg-white/30 w-full h-full p-[8px] box-content rounded-md" />
++          </div>
++        </div>
++      )}
++      {!!group.name && <div>{group.name}</div>}
++      {group.values.map((integration) => (
++        <MenuComponent
++          key={integration.id}
++          integration={integration}
++          mutate={mutate}
++          continueIntegration={continueIntegration}
++          update={update}
++          refreshChannel={refreshChannel}
++          totalNonDisabledChannels={totalNonDisabledChannels}
++        />
++      ))}
++    </div>
++  );
++};
++export const MenuComponent: FC<
++  MenuComponentInterface & {
++    integration: Integration & {
++      identifier: string;
++      changeProfilePicture: boolean;
++      changeNickName: boolean;
++    };
++  }
++> = (props) => {
++  const {
++    totalNonDisabledChannels,
++    continueIntegration,
++    refreshChannel,
++    mutate,
++    update,
++    integration,
++  } = props;
++
++  const user = useUser();
++  const [collected, drag, dragPreview] = useDrag(() => ({
++    type: 'menu',
++    item: { id: integration.id },
++  }));
++
++  return (
++    <div
++      // @ts-ignore
++      ref={dragPreview}
++      {...(integration.refreshNeeded && {
++        onClick: refreshChannel(integration),
++        'data-tooltip-id': 'tooltip',
++        'data-tooltip-content': 'Channel disconnected, click to reconnect.',
++      })}
++      key={integration.id}
++      className={clsx(
++        'flex gap-[8px] items-center',
++        integration.refreshNeeded && 'cursor-pointer'
++      )}
++    >
++      <div
++        className={clsx(
++          'relative w-[34px] h-[34px] rounded-full flex justify-center items-center bg-fifth',
++          integration.disabled && 'opacity-50'
++        )}
++      >
++        {(integration.inBetweenSteps || integration.refreshNeeded) && (
++          <div
++            className="absolute left-0 top-0 w-[39px] h-[46px] cursor-pointer"
++            onClick={
++              integration.refreshNeeded
++                ? refreshChannel(integration)
++                : continueIntegration(integration)
++            }
++          >
++            <div className="bg-red-500 w-[15px] h-[15px] rounded-full -left-[5px] -top-[5px] absolute z-[200] text-[10px] flex justify-center items-center">
++              !
++            </div>
++            <div className="bg-primary/60 w-[39px] h-[46px] left-0 top-0 absolute rounded-full z-[199]" />
++          </div>
++        )}
++        <ImageWithFallback
++          fallbackSrc={`/icons/platforms/${integration.identifier}.png`}
++          src={integration.picture!}
++          className="rounded-full"
++          alt={integration.identifier}
++          width={32}
++          height={32}
++        />
++        {integration.identifier === 'youtube' ? (
++          <img
++            src="/icons/platforms/youtube.svg"
++            className="absolute z-10 -bottom-[5px] -right-[5px]"
++            width={20}
++          />
++        ) : (
++          <Image
++            src={`/icons/platforms/${integration.identifier}.png`}
++            className="rounded-full absolute z-10 -bottom-[5px] -right-[5px] border border-fifth"
++            alt={integration.identifier}
++            width={20}
++            height={20}
++          />
++        )}
++      </div>
++      <div
++        // @ts-ignore
++        ref={drag}
++        {...(integration.disabled &&
++        totalNonDisabledChannels === user?.totalChannels
++          ? {
++              'data-tooltip-id': 'tooltip',
++              'data-tooltip-content':
++                'This channel is disabled, please upgrade your plan to enable it.',
++            }
++          : {})}
++        role="Handle"
++        className={clsx(
++          'flex-1 whitespace-nowrap text-ellipsis overflow-hidden cursor-move',
++          integration.disabled && 'opacity-50'
++        )}
++      >
++        {integration.name}
++      </div>
++      <Menu
++        canChangeProfilePicture={integration.changeProfilePicture}
++        canChangeNickName={integration.changeNickName}
++        mutate={mutate}
++        onChange={update}
++        id={integration.id}
++        canEnable={
++          user?.totalChannels! > totalNonDisabledChannels &&
++          integration.disabled
++        }
++        canDisable={!integration.disabled}
++      />
++    </div>
++  );
++};
+ export const LaunchesComponent = () => {
+   const fetch = useFetch();
+   const router = useRouter();
+@@ -30,7 +224,6 @@ export const LaunchesComponent = () => {
+   const load = useCallback(async (path: string) => {
+     return (await (await fetch(path)).json()).integrations;
+   }, []);
+-  const user = useUser();
+ 
+   const {
+     isLoading,
+@@ -47,6 +240,28 @@ export const LaunchesComponent = () => {
+     );
+   }, [integrations]);
+ 
++  const changeItemGroup = useCallback(
++    async (id: string, group: string) => {
++      mutate(
++        integrations.map((integration: any) => {
++          if (integration.id === id) {
++            return { ...integration, customer: { id: group } };
++          }
++          return integration;
++        }),
++        false
++      );
++
++      await fetch(`/integrations/${id}/group`, {
++        method: 'PUT',
++        body: JSON.stringify({ group }),
++      });
++
++      mutate();
++    },
++    [integrations]
++  );
++
+   const sortedIntegrations = useMemo(() => {
+     return orderBy(
+       integrations,
+@@ -55,6 +270,25 @@ export const LaunchesComponent = () => {
+     );
+   }, [integrations]);
+ 
++  const menuIntegrations = useMemo(() => {
++    return orderBy(
++      Object.values(
++        groupBy(sortedIntegrations, (o) => o?.customer?.id || '')
++      ).map((p) => ({
++        name: (p[0].customer?.name || '') as string,
++        id: (p[0].customer?.id || '') as string,
++        isEmpty: p.length === 0,
++        values: orderBy(
++          p,
++          ['type', 'disabled', 'identifier'],
++          ['desc', 'asc', 'asc']
++        ),
++      })),
++      ['isEmpty', 'name'],
++      ['desc', 'asc']
++    );
++  }, [sortedIntegrations]);
++
+   const update = useCallback(async (shouldReload: boolean) => {
+     if (shouldReload) {
+       setReload(true);
+@@ -112,114 +346,41 @@ export const LaunchesComponent = () => {
+ 
+   // @ts-ignore
+   return (
+-    <CalendarWeekProvider integrations={sortedIntegrations}>
+-      <div className="flex flex-1 flex-col">
+-        <div className="flex flex-1 relative">
+-          <div className="outline-none w-full h-full grid grid-cols[1fr] md:grid-cols-[220px_minmax(0,1fr)] gap-[30px] scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary">
+-            <div className="bg-third p-[16px] flex flex-col gap-[24px] min-h-[100%]">
+-              <h2 className="text-[20px]">Channels</h2>
+-              <div className="gap-[16px] flex flex-col">
+-                {sortedIntegrations.length === 0 && (
+-                  <div className="text-[12px]">No channels</div>
+-                )}
+-                {sortedIntegrations.map((integration) => (
+-                  <div
+-                    {...(integration.refreshNeeded && {
+-                      onClick: refreshChannel(integration),
+-                      'data-tooltip-id': 'tooltip',
+-                      'data-tooltip-content':
+-                        'Channel disconnected, click to reconnect.',
+-                    })}
+-                    key={integration.id}
+-                    className={clsx("flex gap-[8px] items-center", integration.refreshNeeded && 'cursor-pointer')}
+-                  >
+-                    <div
+-                      className={clsx(
+-                        'relative w-[34px] h-[34px] rounded-full flex justify-center items-center bg-fifth',
+-                        integration.disabled && 'opacity-50'
+-                      )}
+-                    >
+-                      {(integration.inBetweenSteps ||
+-                        integration.refreshNeeded) && (
+-                        <div
+-                          className="absolute left-0 top-0 w-[39px] h-[46px] cursor-pointer"
+-                          onClick={
+-                            integration.refreshNeeded
+-                              ? refreshChannel(integration)
+-                              : continueIntegration(integration)
+-                          }
+-                        >
+-                          <div className="bg-red-500 w-[15px] h-[15px] rounded-full -left-[5px] -top-[5px] absolute z-[200] text-[10px] flex justify-center items-center">
+-                            !
+-                          </div>
+-                          <div className="bg-primary/60 w-[39px] h-[46px] left-0 top-0 absolute rounded-full z-[199]" />
+-                        </div>
+-                      )}
+-                      <ImageWithFallback
+-                        fallbackSrc={`/icons/platforms/${integration.identifier}.png`}
+-                        src={integration.picture}
+-                        className="rounded-full"
+-                        alt={integration.identifier}
+-                        width={32}
+-                        height={32}
+-                      />
+-                      {integration.identifier === 'youtube' ? (
+-                        <img
+-                          src="/icons/platforms/youtube.svg"
+-                          className="absolute z-10 -bottom-[5px] -right-[5px]"
+-                          width={20}
+-                        />
+-                      ) : (
+-                        <Image
+-                          src={`/icons/platforms/${integration.identifier}.png`}
+-                          className="rounded-full absolute z-10 -bottom-[5px] -right-[5px] border border-fifth"
+-                          alt={integration.identifier}
+-                          width={20}
+-                          height={20}
+-                        />
+-                      )}
+-                    </div>
+-                    <div
+-                      {...(integration.disabled &&
+-                      totalNonDisabledChannels === user?.totalChannels
+-                        ? {
+-                            'data-tooltip-id': 'tooltip',
+-                            'data-tooltip-content':
+-                              'This channel is disabled, please upgrade your plan to enable it.',
+-                          }
+-                        : {})}
+-                      className={clsx(
+-                        'flex-1 whitespace-nowrap text-ellipsis overflow-hidden',
+-                        integration.disabled && 'opacity-50'
+-                      )}
+-                    >
+-                      {integration.name}
+-                    </div>
+-                    <Menu
+-                      canChangeProfilePicture={integration.changeProfilePicture}
+-                      canChangeNickName={integration.changeNickName}
++    <DNDProvider>
++      <CalendarWeekProvider integrations={sortedIntegrations}>
++        <div className="flex flex-1 flex-col">
++          <div className="flex flex-1 relative">
++            <div className="outline-none w-full h-full grid grid-cols[1fr] md:grid-cols-[220px_minmax(0,1fr)] gap-[30px] scrollbar scrollbar-thumb-tableBorder scrollbar-track-secondary">
++              <div className="bg-third p-[16px] flex flex-col gap-[24px] min-h-[100%]">
++                <h2 className="text-[20px]">Channels</h2>
++                <div className="gap-[16px] flex flex-col select-none">
++                  {sortedIntegrations.length === 0 && (
++                    <div className="text-[12px]">No channels</div>
++                  )}
++                  {menuIntegrations.map((menu) => (
++                    <MenuGroupComponent
++                      changeItemGroup={changeItemGroup}
++                      key={menu.name}
++                      group={menu}
+                       mutate={mutate}
+-                      onChange={update}
+-                      id={integration.id}
+-                      canEnable={
+-                        user?.totalChannels! > totalNonDisabledChannels &&
+-                        integration.disabled
+-                      }
+-                      canDisable={!integration.disabled}
++                      continueIntegration={continueIntegration}
++                      update={update}
++                      refreshChannel={refreshChannel}
++                      totalNonDisabledChannels={totalNonDisabledChannels}
+                     />
+-                  </div>
+-                ))}
++                  ))}
++                </div>
++                <AddProviderButton update={() => update(true)} />
++                {/*{sortedIntegrations?.length > 0 && user?.tier?.ai && <GeneratorComponent />}*/}
++              </div>
++              <div className="flex-1 flex flex-col gap-[14px]">
++                <Filters />
++                <Calendar />
+               </div>
+-              <AddProviderButton update={() => update(true)} />
+-              {/*{sortedIntegrations?.length > 0 && user?.tier?.ai && <GeneratorComponent />}*/}
+-            </div>
+-            <div className="flex-1 flex flex-col gap-[14px]">
+-              <Filters />
+-              <Calendar />
+             </div>
+           </div>
+         </div>
+-      </div>
+-    </CalendarWeekProvider>
++      </CalendarWeekProvider>
++    </DNDProvider>
+   );
+ };
+diff --git a/apps/frontend/src/components/launches/menu/menu.tsx b/apps/frontend/src/components/launches/menu/menu.tsx
+index d6f6b2276..7995e5d2b 100644
+--- a/apps/frontend/src/components/launches/menu/menu.tsx
++++ b/apps/frontend/src/components/launches/menu/menu.tsx
+@@ -8,6 +8,7 @@ import { useModals } from '@mantine/modals';
+ import { TimeTable } from '@gitroom/frontend/components/launches/time.table';
+ import { useCalendar } from '@gitroom/frontend/components/launches/calendar.context';
+ import { BotPicture } from '@gitroom/frontend/components/launches/bot.picture';
++import { CustomerModal } from '@gitroom/frontend/components/launches/customer.modal';
+ 
+ export const Menu: FC<{
+   canEnable: boolean;
+@@ -36,10 +37,13 @@ export const Menu: FC<{
+     setShow(false);
+   });
+ 
+-  const changeShow: MouseEventHandler<HTMLDivElement> = useCallback((e) => {
+-    e.stopPropagation();
+-    setShow(!show);
+-  }, [show]);
++  const changeShow: MouseEventHandler<HTMLDivElement> = useCallback(
++    (e) => {
++      e.stopPropagation();
++      setShow(!show);
++    },
++    [show]
++  );
+ 
+   const disableChannel = useCallback(async () => {
+     if (
+@@ -139,6 +143,34 @@ export const Menu: FC<{
+     setShow(false);
+   }, [integrations]);
+ 
++  const addToCustomer = useCallback(() => {
++    const findIntegration = integrations.find(
++      (integration) => integration.id === id
++    );
++
++    modal.openModal({
++      classNames: {
++        modal: 'w-[100%] max-w-[600px] bg-transparent text-textColor',
++      },
++      size: '100%',
++      withCloseButton: false,
++      closeOnEscape: true,
++      closeOnClickOutside: true,
++      children: (
++        <CustomerModal
++          // @ts-ignore
++          integration={findIntegration}
++          onClose={() => {
++            mutate();
++            toast.show('Customer Updated', 'success');
++          }}
++        />
++      ),
++    });
++
++    setShow(false);
++  }, [integrations]);
++
+   return (
+     <div
+       className="cursor-pointer relative select-none"
+@@ -192,6 +224,23 @@ export const Menu: FC<{
+               </div>
+             </div>
+           )}
++          <div className="flex gap-[12px] items-center" onClick={addToCustomer}>
++            <div>
++              <svg
++                xmlns="http://www.w3.org/2000/svg"
++                width={18}
++                height={18}
++                viewBox="0 0 32 32"
++                fill="none"
++              >
++                <path
++                  d="M31.9997 17C31.9997 17.2652 31.8943 17.5196 31.7068 17.7071C31.5192 17.8946 31.2649 18 30.9997 18H28.9997V20C28.9997 20.2652 28.8943 20.5196 28.7068 20.7071C28.5192 20.8946 28.2649 21 27.9997 21C27.7345 21 27.4801 20.8946 27.2926 20.7071C27.105 20.5196 26.9997 20.2652 26.9997 20V18H24.9997C24.7345 18 24.4801 17.8946 24.2926 17.7071C24.105 17.5196 23.9997 17.2652 23.9997 17C23.9997 16.7348 24.105 16.4804 24.2926 16.2929C24.4801 16.1054 24.7345 16 24.9997 16H26.9997V14C26.9997 13.7348 27.105 13.4804 27.2926 13.2929C27.4801 13.1054 27.7345 13 27.9997 13C28.2649 13 28.5192 13.1054 28.7068 13.2929C28.8943 13.4804 28.9997 13.7348 28.9997 14V16H30.9997C31.2649 16 31.5192 16.1054 31.7068 16.2929C31.8943 16.4804 31.9997 16.7348 31.9997 17ZM24.7659 24.3562C24.9367 24.5595 25.0197 24.8222 24.9967 25.0866C24.9737 25.351 24.8466 25.5955 24.6434 25.7662C24.4402 25.937 24.1775 26.02 23.9131 25.997C23.6486 25.974 23.4042 25.847 23.2334 25.6437C20.7184 22.6487 17.2609 21 13.4997 21C9.73843 21 6.28093 22.6487 3.76593 25.6437C3.59519 25.8468 3.35079 25.9737 3.08648 25.9966C2.82217 26.0194 2.55961 25.9364 2.35655 25.7656C2.15349 25.5949 2.02658 25.3505 2.00372 25.0862C1.98087 24.8219 2.06394 24.5593 2.23468 24.3562C4.10218 22.1337 6.42468 20.555 9.00593 19.71C7.43831 18.7336 6.23133 17.2733 5.56759 15.5498C4.90386 13.8264 4.81949 11.9337 5.32724 10.1581C5.83499 8.38242 6.90724 6.82045 8.38176 5.70847C9.85629 4.59649 11.6529 3.995 13.4997 3.995C15.3465 3.995 17.1431 4.59649 18.6176 5.70847C20.0921 6.82045 21.1644 8.38242 21.6721 10.1581C22.1799 11.9337 22.0955 13.8264 21.4318 15.5498C20.768 17.2733 19.561 18.7336 17.9934 19.71C20.5747 20.555 22.8972 22.1337 24.7659 24.3562ZM13.4997 19C14.7853 19 16.042 18.6188 17.1109 17.9045C18.1798 17.1903 19.0129 16.1752 19.5049 14.9874C19.9969 13.7997 20.1256 12.4928 19.8748 11.2319C19.624 9.97103 19.0049 8.81284 18.0959 7.9038C17.1868 6.99476 16.0286 6.37569 14.7678 6.12489C13.5069 5.87409 12.2 6.00281 11.0122 6.49478C9.82451 6.98675 8.80935 7.81987 8.09512 8.88879C7.38089 9.95771 6.99968 11.2144 6.99968 12.5C7.00166 14.2233 7.68712 15.8754 8.90567 17.094C10.1242 18.3126 11.7764 18.998 13.4997 19Z"
++                  fill="green"
++                />
++              </svg>
++            </div>
++            <div className="text-[12px]">Move / add to customer</div>
++          </div>
+           <div className="flex gap-[12px] items-center" onClick={editTimeTable}>
+             <div>
+               <svg
+diff --git a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.repository.ts b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.repository.ts
+index 0e573dbe2..87d459941 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.repository.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.repository.ts
+@@ -11,6 +11,7 @@ export class IntegrationRepository {
+   private storage = UploadFactory.createStorage();
+   constructor(
+     private _integration: PrismaRepository<'integration'>,
++    private _customers: PrismaRepository<'customer'>,
+     private _posts: PrismaRepository<'post'>
+   ) {}
+ 
+@@ -215,12 +216,79 @@ export class IntegrationRepository {
+     return integration?.integration;
+   }
+ 
++  async updateOnCustomerName(org: string, id: string, name: string) {
++    const customer = !name
++      ? undefined
++      : (await this._customers.model.customer.findFirst({
++          where: {
++            orgId: org,
++            name,
++          },
++        })) ||
++        (await this._customers.model.customer.create({
++          data: {
++            name,
++            orgId: org,
++          },
++        }));
++
++    return this._integration.model.integration.update({
++      where: {
++        id,
++        organizationId: org,
++      },
++      data: {
++        customer: !customer
++          ? { disconnect: true }
++          : {
++              connect: {
++                id: customer.id,
++              },
++            },
++      },
++    });
++  }
++
++  updateIntegrationGroup(org: string, id: string, group: string) {
++    return this._integration.model.integration.update({
++      where: {
++        id,
++        organizationId: org,
++      },
++      data: !group
++        ? {
++            customer: {
++              disconnect: true,
++            },
++          }
++        : {
++            customer: {
++              connect: {
++                id: group,
++              },
++            },
++          },
++    });
++  }
++
++  customers(orgId: string) {
++    return this._customers.model.customer.findMany({
++      where: {
++        orgId,
++        deletedAt: null,
++      },
++    });
++  }
++
+   getIntegrationsList(org: string) {
+     return this._integration.model.integration.findMany({
+       where: {
+         organizationId: org,
+         deletedAt: null,
+       },
++      include: {
++        customer: true,
++      },
+     });
+   }
+ 
+diff --git a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
+index 5302a30aa..c9687bdca 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
++++ b/libraries/nestjs-libraries/src/database/prisma/integrations/integration.service.ts
+@@ -66,6 +66,14 @@ export class IntegrationService {
+     );
+   }
+ 
++  updateIntegrationGroup(org: string, id: string, group: string) {
++    return this._integrationRepository.updateIntegrationGroup(org, id, group);
++  }
++
++  updateOnCustomerName(org: string, id: string, name: string) {
++    return this._integrationRepository.updateOnCustomerName(org, id, name);
++  }
++
+   getIntegrationsList(org: string) {
+     return this._integrationRepository.getIntegrationsList(org);
+   }
+@@ -362,4 +370,8 @@ export class IntegrationService {
+ 
+     return [];
+   }
++
++  customers(orgId: string) {
++    return this._integrationRepository.customers(orgId);
++  }
+ }
+diff --git a/libraries/nestjs-libraries/src/database/prisma/schema.prisma b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+index a28583301..7cd6ac59f 100644
+--- a/libraries/nestjs-libraries/src/database/prisma/schema.prisma
++++ b/libraries/nestjs-libraries/src/database/prisma/schema.prisma
+@@ -29,6 +29,7 @@ model Organization {
+   buyerOrganization MessagesGroup[]
+   usedCodes    UsedCodes[]
+   credits      Credits[]
++  customers    Customer[]
+ }
+ 
+ model User {
+@@ -241,6 +242,19 @@ model Subscription {
+   @@index([deletedAt])
+ }
+ 
++model Customer {
++  id        String   @id @default(uuid())
++  name      String
++  orgId     String
++  organization Organization @relation(fields: [orgId], references: [id])
++  integrations Integration[]
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++  deletedAt DateTime?
++
++  @@unique([orgId, name, deletedAt])
++}
++
+ model Integration {
+   id                    String          @id @default(cuid())
+   internalId            String
+@@ -264,6 +278,8 @@ model Integration {
+   refreshNeeded         Boolean         @default(false)
+   postingTimes          String          @default("[{\"time\":120}, {\"time\":400}, {\"time\":700}]")
+   customInstanceDetails String?
++  customerId            String?
++  customer              Customer?       @relation(fields: [customerId], references: [id])
+ 
+   @@index([updatedAt])
+   @@index([deletedAt])

@@ -1,0 +1,1141 @@
+diff --git a/.env.example b/.env.example
+index 4040b53090e..8ce8ada5f2b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -82,14 +82,20 @@ MAIL_REPLY_TO_ADDRESS=hello@example.com
+ MAIL_REPLY_TO_NAME="${APP_NAME}"
+ 
+ # Search
+-# We use Laravel Scout to do full-text search.
+-# Read config/scout.php for more information.
+-# Note that you have to use Meilisearch, Algolia or the database driver to enable
+-# search in Monica. Searching requires a queue to be configured.
++## We use Laravel Scout to do full-text search.
++## Read config/scout.php for more information.
++## Note that you have to use: 'meilisearch', 'typesense', 'algolia' or the 'database'
++## driver to enable search in Monica. Searching requires a queue to be configured.
+ SCOUT_DRIVER=database
+ SCOUT_QUEUE=true
+-MEILISEARCH_HOST=
++## If you never intend to use the 'database' driver, you can set this value to false:
++FULL_TEXT_INDEX=true
++## Meilisearch settings
++MEILISEARCH_URL=
+ MEILISEARCH_KEY=
++## Typesense settings
++TYPESENSE_HOST=
++TYPESENSE_API_KEY=
+ 
+ # Notification channels
+ TELEGRAM_BOT_TOKEN=
+diff --git a/.env.example.sail b/.env.example.sail
+index 64f0c82864b..84366d02f05 100644
+--- a/.env.example.sail
++++ b/.env.example.sail
+@@ -42,6 +42,6 @@ MAIL_REPLY_TO_NAME="${APP_NAME}"
+ 
+ SCOUT_DRIVER=meilisearch
+ SCOUT_QUEUE=true
+-MEILISEARCH_HOST=http://meilisearch:7700
++MEILISEARCH_URL=http://meilisearch:7700
+ MEILISEARCH_KEY=
+ MEILISEARCH_NO_ANALYTICS=false
+diff --git a/app/Console/Commands/SetupScout.php b/app/Console/Commands/SetupScout.php
+index 297893d8751..17086dbb895 100644
+--- a/app/Console/Commands/SetupScout.php
++++ b/app/Console/Commands/SetupScout.php
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Console\Commands;
+ 
++use App\Helpers\ScoutHelper;
+ use Illuminate\Console\Command;
+ use Illuminate\Console\ConfirmableTrait;
+ use Symfony\Component\Console\Attribute\AsCommand;
+@@ -49,17 +50,18 @@ public function handle(): void
+      */
+     protected function scoutConfigure(): void
+     {
+-        if (config('scout.driver') === 'meilisearch' && config('scout.meilisearch.host') !== '') {
+-            $this->artisan('☐ Updating indexes on Meilisearch', 'scout:sync-index-settings', ['--verbose' => true]);
++        if (ScoutHelper::isIndexed()) {
++            $this->artisan('☐ Updating indexes', 'scout:sync-index-settings', ['--verbose' => true]);
+         }
+     }
+ 
+     /**
+-     * Import models.
++     * Flush indexes.
+      */
+     protected function scoutFlush(): void
+     {
+-        if (config('scout.driver') !== null && $this->option('flush')) {
++        if ($this->option('flush') && ScoutHelper::isIndexed()) {
++            // Using meilisearch config for any driver
+             foreach (config('scout.meilisearch.index-settings') as $index => $settings) {
+                 $name = (new $index)->getTable();
+                 $this->artisan("☐ Flush {$name} index", 'scout:flush', ['model' => $index, '--verbose' => true]);
+@@ -74,7 +76,8 @@ protected function scoutFlush(): void
+      */
+     protected function scoutImport(): void
+     {
+-        if (config('scout.driver') !== null && $this->option('import')) {
++        if ($this->option('import') && ScoutHelper::isIndexed()) {
++            // Using meilisearch config for any driver
+             foreach (config('scout.meilisearch.index-settings') as $index => $settings) {
+                 $name = (new $index)->getTable();
+                 $this->artisan("☐ Import {$name}", 'scout:import', ['model' => $index, '--verbose' => true]);
+diff --git a/app/Helpers/ScoutHelper.php b/app/Helpers/ScoutHelper.php
+index f2d94537a7a..dda8cc01b6e 100644
+--- a/app/Helpers/ScoutHelper.php
++++ b/app/Helpers/ScoutHelper.php
+@@ -2,22 +2,25 @@
+ 
+ namespace App\Helpers;
+ 
++use Illuminate\Database\Eloquent\Model;
++use Illuminate\Support\Facades\DB;
++
+ class ScoutHelper
+ {
+     /**
+      * When updating a model, this method determines if we should update the search index.
+      *
+-     * @return bool
+-     *
+      * @codeCoverageIgnore
+      */
+-    public static function activated()
++    public static function isActivated(): bool
+     {
+         switch (config('scout.driver')) {
+             case 'algolia':
+                 return config('scout.algolia.id') !== '';
+             case 'meilisearch':
+-                return config('scout.meilisearch.host') !== '';
++                return config('scout.meilisearch.key') !== '';
++            case 'typesense':
++                return config('scout.typesense.client-settings.api_key') !== '';
+             case 'database':
+             case 'collection':
+                 return true;
+@@ -25,4 +28,58 @@ public static function activated()
+                 return false;
+         }
+     }
++
++    /**
++     * Test if the driver requires indexes.
++     *
++     * @codeCoverageIgnore
++     */
++    public static function isIndexed(): bool
++    {
++        switch (config('scout.driver')) {
++            case 'algolia':
++                return config('scout.algolia.id') !== '';
++            case 'meilisearch':
++                return config('scout.meilisearch.key') !== '';
++            case 'typesense':
++                return config('scout.typesense.client-settings.api_key') !== '';
++            default:
++                return false;
++        }
++    }
++
++    /**
++     * Test if the driver supports full text indexes.
++     *
++     * @codeCoverageIgnore
++     */
++    public static function isFullTextIndex(): bool
++    {
++        return config('scout.full_text_index') && in_array(DB::connection()->getDriverName(), ['mysql', 'pgsql']);
++    }
++
++    /**
++     * Get id and basic elements of this model.
++     *
++     * @codeCoverageIgnore
++     */
++    public static function id(Model $model): array
++    {
++        if (config('scout.driver') === 'database') {
++            return [];
++        }
++
++        $id = $model->getKey();
++
++        if ($id !== null && $model->getKeyType() === 'string' || config('scout.driver') === 'typesense') {
++            $id = (string) $id;
++        }
++
++        return [
++            'id' => $id,
++            'vault_id' => (string) $model->getAttribute('vault_id'),
++            'created_at' => (int) optional($model->getAttribute(Model::CREATED_AT))->timestamp,
++            'updated_at' => (int) optional($model->getAttribute(Model::UPDATED_AT))->timestamp,
++        ];
++    }
+ }
+diff --git a/app/Models/Contact.php b/app/Models/Contact.php
+index 623015e84ff..e0069ee2b2d 100644
+--- a/app/Models/Contact.php
++++ b/app/Models/Contact.php
+@@ -20,7 +20,6 @@
+ use Illuminate\Support\Arr;
+ use Illuminate\Support\Facades\Auth;
+ use Laravel\Scout\Attributes\SearchUsingFullText;
+-use Laravel\Scout\Attributes\SearchUsingPrefix;
+ use Laravel\Scout\Searchable;
+ 
+ class Contact extends VCardResource
+@@ -83,22 +82,18 @@ class Contact extends VCardResource
+     /**
+      * Get the indexable data array for the model.
+      *
+-     *
+      * @codeCoverageIgnore
+      */
+-    #[SearchUsingPrefix(['id', 'vault_id'])]
+-    #[SearchUsingFullText(['first_name', 'last_name', 'middle_name', 'nickname', 'maiden_name'])]
++    #[SearchUsingFullText(['first_name', 'last_name', 'middle_name', 'nickname', 'maiden_name'], ['expanded' => true])]
+     public function toSearchableArray(): array
+     {
+-        return [
+-            'id' => $this->id,
+-            'vault_id' => $this->vault_id,
+-            'first_name' => $this->first_name,
+-            'last_name' => $this->last_name,
+-            'middle_name' => $this->middle_name,
+-            'nickname' => $this->nickname,
+-            'maiden_name' => $this->maiden_name,
+-        ];
++        return array_merge(ScoutHelper::id($this), [
++            'first_name' => $this->first_name ?? '',
++            'last_name' => $this->last_name ?? '',
++            'middle_name' => $this->middle_name ?? '',
++            'nickname' => $this->nickname ?? '',
++            'maiden_name' => $this->maiden_name ?? '',
++        ]);
+     }
+ 
+     /**
+@@ -120,7 +115,7 @@ public function scopeActive(Builder $query): Builder
+     }
+ 
+     /**
+-     * Used to delete related objects from Meilisearch/Algolia instance.
++     * Used to delete related objects from scout driver instance.
+      */
+     protected static function boot(): void
+     {
+@@ -138,7 +133,7 @@ protected static function boot(): void
+      */
+     public function searchIndexShouldBeUpdated()
+     {
+-        return ScoutHelper::activated();
++        return ScoutHelper::isActivated();
+     }
+ 
+     /**
+diff --git a/app/Models/Group.php b/app/Models/Group.php
+index abebd24f3ea..ddad00f4014 100644
+--- a/app/Models/Group.php
++++ b/app/Models/Group.php
+@@ -12,7 +12,6 @@
+ use Illuminate\Database\Eloquent\Relations\MorphOne;
+ use Illuminate\Database\Eloquent\SoftDeletes;
+ use Laravel\Scout\Attributes\SearchUsingFullText;
+-use Laravel\Scout\Attributes\SearchUsingPrefix;
+ use Laravel\Scout\Searchable;
+ 
+ class Group extends VCardResource
+@@ -53,18 +52,14 @@ public function uniqueIds()
+     /**
+      * Get the indexable data array for the model.
+      *
+-     *
+      * @codeCoverageIgnore
+      */
+-    #[SearchUsingPrefix(['id', 'vault_id'])]
+-    #[SearchUsingFullText(['name'])]
++    #[SearchUsingFullText(['name'], ['expanded' => true])]
+     public function toSearchableArray(): array
+     {
+-        return [
+-            'id' => $this->id,
+-            'vault_id' => $this->vault_id,
+-            'name' => $this->name,
+-        ];
++        return array_merge(ScoutHelper::id($this), [
++            'name' => $this->name ?? '',
++        ]);
+     }
+ 
+     /**
+@@ -74,7 +69,7 @@ public function toSearchableArray(): array
+      */
+     public function searchIndexShouldBeUpdated()
+     {
+-        return ScoutHelper::activated();
++        return ScoutHelper::isActivated();
+     }
+ 
+     /**
+diff --git a/app/Models/Loan.php b/app/Models/Loan.php
+index f48d8192cee..543d661baf7 100644
+--- a/app/Models/Loan.php
++++ b/app/Models/Loan.php
+@@ -57,7 +57,7 @@ class Loan extends Model
+      */
+     public function searchIndexShouldBeUpdated()
+     {
+-        return ScoutHelper::activated();
++        return ScoutHelper::isActivated();
+     }
+ 
+     /**
+diff --git a/app/Models/Note.php b/app/Models/Note.php
+index 7f0fb9fe2f7..14e96ef7c8c 100644
+--- a/app/Models/Note.php
++++ b/app/Models/Note.php
+@@ -8,7 +8,6 @@
+ use Illuminate\Database\Eloquent\Relations\BelongsTo;
+ use Illuminate\Database\Eloquent\Relations\MorphOne;
+ use Laravel\Scout\Attributes\SearchUsingFullText;
+-use Laravel\Scout\Attributes\SearchUsingPrefix;
+ use Laravel\Scout\Searchable;
+ 
+ class Note extends Model
+@@ -33,20 +32,16 @@ class Note extends Model
+     /**
+      * Get the indexable data array for the model.
+      *
+-     *
+      * @codeCoverageIgnore
+      */
+-    #[SearchUsingPrefix(['id', 'vault_id'])]
+-    #[SearchUsingFullText(['title', 'body'])]
++    #[SearchUsingFullText(['title', 'body'], ['expanded' => true])]
+     public function toSearchableArray(): array
+     {
+-        return [
+-            'id' => $this->id,
+-            'vault_id' => $this->vault_id,
+-            'contact_id' => $this->contact_id,
+-            'title' => $this->title,
+-            'body' => $this->body,
+-        ];
++        return array_merge(ScoutHelper::id($this), [
++            'contact_id' => (string) $this->contact_id,
++            'title' => $this->title ?? '',
++            'body' => $this->body ?? '',
++        ]);
+     }
+ 
+     /**
+@@ -56,7 +51,7 @@ public function toSearchableArray(): array
+      */
+     public function searchIndexShouldBeUpdated()
+     {
+-        return ScoutHelper::activated();
++        return ScoutHelper::isActivated();
+     }
+ 
+     /**
+diff --git a/app/Models/Vault.php b/app/Models/Vault.php
+index f5d4916dd8f..48457acb57e 100644
+--- a/app/Models/Vault.php
++++ b/app/Models/Vault.php
+@@ -67,7 +67,7 @@ class Vault extends Model
+     ];
+ 
+     /**
+-     * Used to delete related objects from Meilisearch/Algolia instance.
++     * Used to delete related objects from scout driver instance.
+      */
+     protected static function boot(): void
+     {
+diff --git a/composer.json b/composer.json
+index 7496ac9a949..63de3d0bb6f 100644
+--- a/composer.json
++++ b/composer.json
+@@ -43,6 +43,7 @@
+     "stevebauman/location": "^7.0",
+     "thecodingmachine/safe": "^2.5",
+     "tightenco/ziggy": "2.3.0",
++    "typesense/typesense-php": "^4.9",
+     "uploadcare/uploadcare-php": "^4.1"
+   },
+   "require-dev": {
+diff --git a/composer.lock b/composer.lock
+index c44cb41eecd..54bb2b3bf7a 100644
+--- a/composer.lock
++++ b/composer.lock
+@@ -4,7 +4,7 @@
+         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+         "This file is @generated automatically"
+     ],
+-    "content-hash": "43ec10656d24e660ac57db33fbc2067e",
++    "content-hash": "731430b7610e2c0e19f4f7df7c186309",
+     "packages": [
+         {
+             "name": "asbiin/laravel-sentry-tunnel",
+@@ -365,6 +365,72 @@
+             ],
+             "time": "2024-02-09T16:56:22+00:00"
+         },
++        {
++            "name": "clue/stream-filter",
++            "version": "v1.7.0",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/clue/stream-filter.git",
++                "reference": "049509fef80032cb3f051595029ab75b49a3c2f7"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/clue/stream-filter/zipball/049509fef80032cb3f051595029ab75b49a3c2f7",
++                "reference": "049509fef80032cb3f051595029ab75b49a3c2f7",
++                "shasum": ""
++            },
++            "require": {
++                "php": ">=5.3"
++            },
++            "require-dev": {
++                "phpunit/phpunit": "^9.6 || ^5.7 || ^4.8.36"
++            },
++            "type": "library",
++            "autoload": {
++                "files": [
++                    "src/functions_include.php"
++                ],
++                "psr-4": {
++                    "Clue\\StreamFilter\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Christian Lück",
++                    "email": "christian@clue.engineering"
++                }
++            ],
++            "description": "A simple and modern approach to stream filtering in PHP",
++            "homepage": "https://github.com/clue/stream-filter",
++            "keywords": [
++                "bucket brigade",
++                "callback",
++                "filter",
++                "php_user_filter",
++                "stream",
++                "stream_filter_append",
++                "stream_filter_register"
++            ],
++            "support": {
++                "issues": "https://github.com/clue/stream-filter/issues",
++                "source": "https://github.com/clue/stream-filter/tree/v1.7.0"
++            },
++            "funding": [
++                {
++                    "url": "https://clue.engineering/support",
++                    "type": "custom"
++                },
++                {
++                    "url": "https://github.com/clue",
++                    "type": "github"
++                }
++            ],
++            "time": "2023-12-20T15:40:13+00:00"
++        },
+         {
+             "name": "codezero/browser-locale",
+             "version": "3.4.0",
+@@ -3806,16 +3872,16 @@
+         },
+         {
+             "name": "meilisearch/meilisearch-php",
+-            "version": "v1.10.1",
++            "version": "v1.11.0",
+             "source": {
+                 "type": "git",
+                 "url": "https://github.com/meilisearch/meilisearch-php.git",
+-                "reference": "e3d8a74fdb0c65ecdef6ef9e89c110810c5c1aa0"
++                "reference": "4dd127cb87848f7a7b28e83bb355b4b86d329867"
+             },
+             "dist": {
+                 "type": "zip",
+-                "url": "https://api.github.com/repos/meilisearch/meilisearch-php/zipball/e3d8a74fdb0c65ecdef6ef9e89c110810c5c1aa0",
+-                "reference": "e3d8a74fdb0c65ecdef6ef9e89c110810c5c1aa0",
++                "url": "https://api.github.com/repos/meilisearch/meilisearch-php/zipball/4dd127cb87848f7a7b28e83bb355b4b86d329867",
++                "reference": "4dd127cb87848f7a7b28e83bb355b4b86d329867",
+                 "shasum": ""
+             },
+             "require": {
+@@ -3867,9 +3933,9 @@
+             ],
+             "support": {
+                 "issues": "https://github.com/meilisearch/meilisearch-php/issues",
+-                "source": "https://github.com/meilisearch/meilisearch-php/tree/v1.10.1"
++                "source": "https://github.com/meilisearch/meilisearch-php/tree/v1.11.0"
+             },
+-            "time": "2024-09-15T22:50:45+00:00"
++            "time": "2024-10-28T14:04:37+00:00"
+         },
+         {
+             "name": "mobiledetect/mobiledetectlib",
+@@ -5033,6 +5099,75 @@
+             },
+             "time": "2024-09-04T12:51:01+00:00"
+         },
++        {
++            "name": "php-http/client-common",
++            "version": "2.7.2",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/php-http/client-common.git",
++                "reference": "0cfe9858ab9d3b213041b947c881d5b19ceeca46"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/php-http/client-common/zipball/0cfe9858ab9d3b213041b947c881d5b19ceeca46",
++                "reference": "0cfe9858ab9d3b213041b947c881d5b19ceeca46",
++                "shasum": ""
++            },
++            "require": {
++                "php": "^7.1 || ^8.0",
++                "php-http/httplug": "^2.0",
++                "php-http/message": "^1.6",
++                "psr/http-client": "^1.0",
++                "psr/http-factory": "^1.0",
++                "psr/http-message": "^1.0 || ^2.0",
++                "symfony/options-resolver": "~4.0.15 || ~4.1.9 || ^4.2.1 || ^5.0 || ^6.0 || ^7.0",
++                "symfony/polyfill-php80": "^1.17"
++            },
++            "require-dev": {
++                "doctrine/instantiator": "^1.1",
++                "guzzlehttp/psr7": "^1.4",
++                "nyholm/psr7": "^1.2",
++                "phpspec/phpspec": "^5.1 || ^6.3 || ^7.1",
++                "phpspec/prophecy": "^1.10.2",
++                "phpunit/phpunit": "^7.5.20 || ^8.5.33 || ^9.6.7"
++            },
++            "suggest": {
++                "ext-json": "To detect JSON responses with the ContentTypePlugin",
++                "ext-libxml": "To detect XML responses with the ContentTypePlugin",
++                "php-http/cache-plugin": "PSR-6 Cache plugin",
++                "php-http/logger-plugin": "PSR-3 Logger plugin",
++                "php-http/stopwatch-plugin": "Symfony Stopwatch plugin"
++            },
++            "type": "library",
++            "autoload": {
++                "psr-4": {
++                    "Http\\Client\\Common\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Márk Sági-Kazár",
++                    "email": "mark.sagikazar@gmail.com"
++                }
++            ],
++            "description": "Common HTTP Client implementations and tools for HTTPlug",
++            "homepage": "http://httplug.io",
++            "keywords": [
++                "client",
++                "common",
++                "http",
++                "httplug"
++            ],
++            "support": {
++                "issues": "https://github.com/php-http/client-common/issues",
++                "source": "https://github.com/php-http/client-common/tree/2.7.2"
++            },
++            "time": "2024-09-24T06:21:48+00:00"
++        },
+         {
+             "name": "php-http/discovery",
+             "version": "1.20.0",
+@@ -5112,6 +5247,184 @@
+             },
+             "time": "2024-10-02T11:20:13+00:00"
+         },
++        {
++            "name": "php-http/httplug",
++            "version": "2.4.1",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/php-http/httplug.git",
++                "reference": "5cad731844891a4c282f3f3e1b582c46839d22f4"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/php-http/httplug/zipball/5cad731844891a4c282f3f3e1b582c46839d22f4",
++                "reference": "5cad731844891a4c282f3f3e1b582c46839d22f4",
++                "shasum": ""
++            },
++            "require": {
++                "php": "^7.1 || ^8.0",
++                "php-http/promise": "^1.1",
++                "psr/http-client": "^1.0",
++                "psr/http-message": "^1.0 || ^2.0"
++            },
++            "require-dev": {
++                "friends-of-phpspec/phpspec-code-coverage": "^4.1 || ^5.0 || ^6.0",
++                "phpspec/phpspec": "^5.1 || ^6.0 || ^7.0"
++            },
++            "type": "library",
++            "autoload": {
++                "psr-4": {
++                    "Http\\Client\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Eric GELOEN",
++                    "email": "geloen.eric@gmail.com"
++                },
++                {
++                    "name": "Márk Sági-Kazár",
++                    "email": "mark.sagikazar@gmail.com",
++                    "homepage": "https://sagikazarmark.hu"
++                }
++            ],
++            "description": "HTTPlug, the HTTP client abstraction for PHP",
++            "homepage": "http://httplug.io",
++            "keywords": [
++                "client",
++                "http"
++            ],
++            "support": {
++                "issues": "https://github.com/php-http/httplug/issues",
++                "source": "https://github.com/php-http/httplug/tree/2.4.1"
++            },
++            "time": "2024-09-23T11:39:58+00:00"
++        },
++        {
++            "name": "php-http/message",
++            "version": "1.16.2",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/php-http/message.git",
++                "reference": "06dd5e8562f84e641bf929bfe699ee0f5ce8080a"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/php-http/message/zipball/06dd5e8562f84e641bf929bfe699ee0f5ce8080a",
++                "reference": "06dd5e8562f84e641bf929bfe699ee0f5ce8080a",
++                "shasum": ""
++            },
++            "require": {
++                "clue/stream-filter": "^1.5",
++                "php": "^7.2 || ^8.0",
++                "psr/http-message": "^1.1 || ^2.0"
++            },
++            "provide": {
++                "php-http/message-factory-implementation": "1.0"
++            },
++            "require-dev": {
++                "ergebnis/composer-normalize": "^2.6",
++                "ext-zlib": "*",
++                "guzzlehttp/psr7": "^1.0 || ^2.0",
++                "laminas/laminas-diactoros": "^2.0 || ^3.0",
++                "php-http/message-factory": "^1.0.2",
++                "phpspec/phpspec": "^5.1 || ^6.3 || ^7.1",
++                "slim/slim": "^3.0"
++            },
++            "suggest": {
++                "ext-zlib": "Used with compressor/decompressor streams",
++                "guzzlehttp/psr7": "Used with Guzzle PSR-7 Factories",
++                "laminas/laminas-diactoros": "Used with Diactoros Factories",
++                "slim/slim": "Used with Slim Framework PSR-7 implementation"
++            },
++            "type": "library",
++            "autoload": {
++                "files": [
++                    "src/filters.php"
++                ],
++                "psr-4": {
++                    "Http\\Message\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Márk Sági-Kazár",
++                    "email": "mark.sagikazar@gmail.com"
++                }
++            ],
++            "description": "HTTP Message related tools",
++            "homepage": "http://php-http.org",
++            "keywords": [
++                "http",
++                "message",
++                "psr-7"
++            ],
++            "support": {
++                "issues": "https://github.com/php-http/message/issues",
++                "source": "https://github.com/php-http/message/tree/1.16.2"
++            },
++            "time": "2024-10-02T11:34:13+00:00"
++        },
++        {
++            "name": "php-http/promise",
++            "version": "1.3.1",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/php-http/promise.git",
++                "reference": "fc85b1fba37c169a69a07ef0d5a8075770cc1f83"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/php-http/promise/zipball/fc85b1fba37c169a69a07ef0d5a8075770cc1f83",
++                "reference": "fc85b1fba37c169a69a07ef0d5a8075770cc1f83",
++                "shasum": ""
++            },
++            "require": {
++                "php": "^7.1 || ^8.0"
++            },
++            "require-dev": {
++                "friends-of-phpspec/phpspec-code-coverage": "^4.3.2 || ^6.3",
++                "phpspec/phpspec": "^5.1.2 || ^6.2 || ^7.4"
++            },
++            "type": "library",
++            "autoload": {
++                "psr-4": {
++                    "Http\\Promise\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "MIT"
++            ],
++            "authors": [
++                {
++                    "name": "Joel Wurtz",
++                    "email": "joel.wurtz@gmail.com"
++                },
++                {
++                    "name": "Márk Sági-Kazár",
++                    "email": "mark.sagikazar@gmail.com"
++                }
++            ],
++            "description": "Promise used for asynchronous HTTP requests",
++            "homepage": "http://httplug.io",
++            "keywords": [
++                "promise"
++            ],
++            "support": {
++                "issues": "https://github.com/php-http/promise/issues",
++                "source": "https://github.com/php-http/promise/tree/1.3.1"
++            },
++            "time": "2024-03-15T13:55:21+00:00"
++        },
+         {
+             "name": "phpdocumentor/reflection-common",
+             "version": "2.2.0",
+@@ -10991,6 +11304,75 @@
+             },
+             "time": "2023-12-08T13:03:43+00:00"
+         },
++        {
++            "name": "typesense/typesense-php",
++            "version": "v4.9.3",
++            "source": {
++                "type": "git",
++                "url": "https://github.com/typesense/typesense-php.git",
++                "reference": "50fc2089ff4829c8e0e11d8c674e9da085b49998"
++            },
++            "dist": {
++                "type": "zip",
++                "url": "https://api.github.com/repos/typesense/typesense-php/zipball/50fc2089ff4829c8e0e11d8c674e9da085b49998",
++                "reference": "50fc2089ff4829c8e0e11d8c674e9da085b49998",
++                "shasum": ""
++            },
++            "require": {
++                "ext-json": "*",
++                "monolog/monolog": "^2.1 || ^3.0 || ^3.3",
++                "nyholm/psr7": "^1.3",
++                "php": ">=7.4",
++                "php-http/client-common": "^1.0 || ^2.3",
++                "php-http/discovery": "^1.0",
++                "php-http/httplug": "^1.0 || ^2.2",
++                "psr/http-client-implementation": "^1.0",
++                "psr/http-factory": "^1.0",
++                "psr/http-message": "^1.0 || ^2.0"
++            },
++            "require-dev": {
++                "squizlabs/php_codesniffer": "3.*",
++                "symfony/http-client": "^5.2"
++            },
++            "type": "library",
++            "autoload": {
++                "psr-4": {
++                    "Typesense\\": "src/"
++                }
++            },
++            "notification-url": "https://packagist.org/downloads/",
++            "license": [
++                "Apache-2.0"
++            ],
++            "authors": [
++                {
++                    "name": "Typesense",
++                    "email": "contact@typesense.org",
++                    "homepage": "https://typesense.org",
++                    "role": "Developer"
++                },
++                {
++                    "name": "Abdullah Al-Faqeir",
++                    "email": "abdullah@devloops.net",
++                    "homepage": "https://www.devloops.net",
++                    "role": "Developer"
++                }
++            ],
++            "description": "PHP client for Typesense Search Server: https://github.com/typesense/typesense",
++            "homepage": "https://github.com/typesense/typesense-php",
++            "support": {
++                "docs": "https://typesense.org/api",
++                "issues": "https://github.com/typesense/typesense-php/issues",
++                "source": "https://github.com/typesense/typesense-php"
++            },
++            "funding": [
++                {
++                    "url": "https://github.com/typesense",
++                    "type": "github"
++                }
++            ],
++            "time": "2024-04-29T15:34:34+00:00"
++        },
+         {
+             "name": "uploadcare/uploadcare-php",
+             "version": "v4.2.0",
+@@ -17183,6 +17565,6 @@
+         "ext-fileinfo": "*",
+         "ext-intl": "*"
+     },
+-    "platform-dev": {},
+-    "plugin-api-version": "2.6.0"
++    "platform-dev": [],
++    "plugin-api-version": "2.2.0"
+ }
+diff --git a/config/scout.php b/config/scout.php
+index d2aafd43956..0c20c395626 100644
+--- a/config/scout.php
++++ b/config/scout.php
+@@ -15,7 +15,8 @@
+     | using Laravel Scout. This connection is used when syncing all models
+     | to the search service. You should adjust this based on your needs.
+     |
+-    | Supported: "algolia", "meilisearch", "collection", "null"
++    | Supported: "algolia", "meilisearch", "typesense",
++    |            "database", "collection", "null"
+     |
+     */
+ 
+@@ -122,34 +123,199 @@
+ 
+     /*
+     |--------------------------------------------------------------------------
+-    | MeiliSearch Configuration
++    | Meilisearch Configuration
+     |--------------------------------------------------------------------------
+     |
+-    | Here you may configure your MeiliSearch settings. MeiliSearch is an open
++    | Here you may configure your Meilisearch settings. Meilisearch is an open
+     | source search engine with minimal configuration. Below, you can state
+-    | the host and key information for your own MeiliSearch installation.
++    | the host and key information for your own Meilisearch installation.
+     |
+-    | See: https://docs.meilisearch.com/guides/advanced_guides/configuration.html
++    | See: https://www.meilisearch.com/docs/learn/configuration/instance_options#all-instance-options
+     |
+     */
+ 
+     'meilisearch' => [
+-        'host' => env('MEILISEARCH_HOST', 'http://localhost:7700'),
+-        'key' => env('MEILISEARCH_KEY', null),
++        'host' => env('MEILISEARCH_URL', env('MEILISEARCH_HOST', 'http://localhost:7700')),
++        'key' => env('MEILISEARCH_KEY'),
+         'index-settings' => [
+             Contact::class => [
+                 'filterableAttributes' => ['id', 'vault_id'],
+                 'sortableAttributes' => ['updated_at'],
+             ],
++            Group::class => [
++                'filterableAttributes' => ['id', 'vault_id'],
++                'sortableAttributes' => ['updated_at'],
++            ],
+             Note::class => [
+                 'filterableAttributes' => ['id', 'vault_id', 'contact_id'],
+                 'sortableAttributes' => ['updated_at'],
+             ],
++        ],
++    ],
++
++    /*
++    |--------------------------------------------------------------------------
++    | Typesense Configuration
++    |--------------------------------------------------------------------------
++    |
++    | Here you may configure your Typesense settings. Typesense is an open
++    | source search engine using minimal configuration. Below, you will
++    | state the host, key, and schema configuration for the instance.
++    |
++    */
++
++    'typesense' => [
++        'client-settings' => [
++            'api_key' => env('TYPESENSE_API_KEY'),
++            'nodes' => [
++                [
++                    'host' => env('TYPESENSE_HOST', 'localhost'),
++                    'port' => env('TYPESENSE_PORT', '8108'),
++                    'path' => env('TYPESENSE_PATH', ''),
++                    'protocol' => env('TYPESENSE_PROTOCOL', 'http'),
++                ],
++            ],
++            'nearest_node' => [
++                'host' => env('TYPESENSE_HOST', 'localhost'),
++                'port' => env('TYPESENSE_PORT', '8108'),
++                'path' => env('TYPESENSE_PATH', ''),
++                'protocol' => env('TYPESENSE_PROTOCOL', 'http'),
++            ],
++            'connection_timeout_seconds' => env('TYPESENSE_CONNECTION_TIMEOUT_SECONDS', 2),
++            'healthcheck_interval_seconds' => env('TYPESENSE_HEALTHCHECK_INTERVAL_SECONDS', 30),
++            'num_retries' => env('TYPESENSE_NUM_RETRIES', 3),
++            'retry_interval_seconds' => env('TYPESENSE_RETRY_INTERVAL_SECONDS', 1),
++        ],
++        'model-settings' => [
++            Contact::class => [
++                'collection-schema' => [
++                    'fields' => [
++                        [
++                            'name' => 'id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'vault_id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'first_name',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'last_name',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'middle_name',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'nickname',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'maiden_name',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => '__soft_deleted',
++                            'type' => 'int32',
++                            'optional' => true,
++                        ],
++                        [
++                            'name' => 'updated_at',
++                            'type' => 'int32',
++                        ],
++                    ],
++                    'default_sorting_field' => 'updated_at',
++                ],
++                'search-parameters' => [
++                    'query_by' => 'first_name,last_name,middle_name,nickname,maiden_name',
++                ],
++            ],
+             Group::class => [
+-                'filterableAttributes' => ['id', 'vault_id'],
+-                'sortableAttributes' => ['updated_at'],
++                'collection-schema' => [
++                    'fields' => [
++                        [
++                            'name' => 'id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'vault_id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'name',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => '__soft_deleted',
++                            'type' => 'int32',
++                            'optional' => true,
++                        ],
++                        [
++                            'name' => 'updated_at',
++                            'type' => 'int32',
++                        ],
++                    ],
++                    'default_sorting_field' => 'updated_at',
++                ],
++                'search-parameters' => [
++                    'query_by' => 'name',
++                ],
++            ],
++            Note::class => [
++                'collection-schema' => [
++                    'fields' => [
++                        [
++                            'name' => 'id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'vault_id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'contact_id',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'title',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'body',
++                            'type' => 'string',
++                        ],
++                        [
++                            'name' => 'updated_at',
++                            'type' => 'int32',
++                        ],
++                    ],
++                    'default_sorting_field' => 'updated_at',
++                ],
++                'search-parameters' => [
++                    'query_by' => 'title,body',
++                ],
+             ],
+         ],
+     ],
+ 
++    /*
++    |--------------------------------------------------------------------------
++    | Create full text indexes
++    |--------------------------------------------------------------------------
++    |
++    | The database driver requires full text indexes on some columns. If you never
++    | intend to use the database driver, you may want to deactivate those indexes.
++    | This property is only used during migration of the database.
++    | Be aware that you won't be able to switch back to the database driver if you
++    | deactivate the full text indexes.
++    |
++    | Note: Full text indexes are only available on mysql and postgresql databases.
++    |
++    */
++
++    'full_text_index' => (bool) env('FULL_TEXT_INDEX', true),
+ ];
+diff --git a/database/migrations/2020_04_25_133132_create_contacts_table.php b/database/migrations/2020_04_25_133132_create_contacts_table.php
+index d6540a897ae..b330f6f6bdd 100644
+--- a/database/migrations/2020_04_25_133132_create_contacts_table.php
++++ b/database/migrations/2020_04_25_133132_create_contacts_table.php
+@@ -1,5 +1,6 @@
+ <?php
+ 
++use App\Helpers\ScoutHelper;
+ use App\Models\Company;
+ use App\Models\Contact;
+ use App\Models\Gender;
+@@ -9,7 +10,6 @@
+ use App\Models\Vault;
+ use Illuminate\Database\Migrations\Migration;
+ use Illuminate\Database\Schema\Blueprint;
+-use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Schema;
+ 
+ return new class extends Migration
+@@ -49,7 +49,7 @@ public function up()
+ 
+             $table->index(['vault_id', 'id']);
+ 
+-            if (config('scout.driver') === 'database' && in_array(DB::connection()->getDriverName(), ['mysql', 'pgsql'])) {
++            if (ScoutHelper::isFullTextIndex()) {
+                 $table->fullText('first_name');
+                 $table->fullText('last_name');
+                 $table->fullText('middle_name');
+diff --git a/database/migrations/2021_10_09_204235_create_group_table.php b/database/migrations/2021_10_09_204235_create_group_table.php
+index d3bfd0b94c4..3d8cce17d5f 100644
+--- a/database/migrations/2021_10_09_204235_create_group_table.php
++++ b/database/migrations/2021_10_09_204235_create_group_table.php
+@@ -1,5 +1,6 @@
+ <?php
+ 
++use App\Helpers\ScoutHelper;
+ use App\Models\Account;
+ use App\Models\Contact;
+ use App\Models\Group;
+@@ -8,7 +9,6 @@
+ use App\Models\Vault;
+ use Illuminate\Database\Migrations\Migration;
+ use Illuminate\Database\Schema\Blueprint;
+-use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Schema;
+ 
+ return new class extends Migration
+@@ -53,7 +53,7 @@ public function up()
+             $table->softDeletes();
+             $table->timestamps();
+ 
+-            if (config('scout.driver') === 'database' && in_array(DB::connection()->getDriverName(), ['mysql', 'pgsql'])) {
++            if (ScoutHelper::isFullTextIndex()) {
+                 $table->fullText('name');
+             }
+         });
+diff --git a/database/migrations/2021_10_21_013005_create_notes_table.php b/database/migrations/2021_10_21_013005_create_notes_table.php
+index 5d0d0e94ed9..3f99f0dc684 100644
+--- a/database/migrations/2021_10_21_013005_create_notes_table.php
++++ b/database/migrations/2021_10_21_013005_create_notes_table.php
+@@ -1,12 +1,12 @@
+ <?php
+ 
++use App\Helpers\ScoutHelper;
+ use App\Models\Contact;
+ use App\Models\Emotion;
+ use App\Models\User;
+ use App\Models\Vault;
+ use Illuminate\Database\Migrations\Migration;
+ use Illuminate\Database\Schema\Blueprint;
+-use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Schema;
+ 
+ return new class extends Migration
+@@ -26,7 +26,7 @@ public function up()
+             $table->text('body');
+             $table->timestamps();
+ 
+-            if (config('scout.driver') === 'database' && in_array(DB::connection()->getDriverName(), ['mysql', 'pgsql'])) {
++            if (ScoutHelper::isFullTextIndex()) {
+                 $table->fullText('title');
+                 $table->fullText('body');
+             }

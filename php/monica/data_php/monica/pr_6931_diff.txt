@@ -1,0 +1,86 @@
+diff --git a/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php b/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php
+index e15752ec2f8..4554b8472d9 100644
+--- a/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php
++++ b/app/Domains/Contact/ManageReminders/Services/UpdateContactReminder.php
+@@ -83,7 +83,7 @@ private function update(): void
+ 
+     private function deleteOldScheduledReminders(): void
+     {
+-        $this->reminder->userNotificationChannels->each->delete();
++        $this->reminder->userNotificationChannels()->detach();
+     }
+ 
+     private function scheduledReminderForAllUsersInVault(): void
+diff --git a/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php b/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php
+index 509e58d4233..a53a00dc440 100644
+--- a/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php
++++ b/app/Domains/Settings/ManageNotificationChannels/Web/Controllers/TelegramWebhookController.php
+@@ -2,6 +2,7 @@
+ 
+ namespace App\Domains\Settings\ManageNotificationChannels\Web\Controllers;
+ 
++use App\Domains\Settings\ManageNotificationChannels\Services\ScheduleAllContactRemindersForNotificationChannel;
+ use App\Http\Controllers\Controller;
+ use App\Models\UserNotificationChannel;
+ use Exception;
+@@ -52,6 +53,12 @@ public function store(Request $request)
+         $channel->active = true;
+         $channel->save();
+ 
++        (new ScheduleAllContactRemindersForNotificationChannel())->execute([
++            'account_id' => $channel->user->account_id,
++            'author_id' => $channel->user->id,
++            'user_notification_channel_id' => $channel->id,
++        ]);
++
+         return response('Success', 200);
+     }
+ }
+diff --git a/tests/Unit/Domains/Contact/ManageReminders/Services/UpdateContactReminderTest.php b/tests/Unit/Domains/Contact/ManageReminders/Services/UpdateContactReminderTest.php
+index 609b730f837..4b3cd93d060 100644
+--- a/tests/Unit/Domains/Contact/ManageReminders/Services/UpdateContactReminderTest.php
++++ b/tests/Unit/Domains/Contact/ManageReminders/Services/UpdateContactReminderTest.php
+@@ -33,6 +33,43 @@ public function it_updates_a_reminder(): void
+         $this->executeService($regis, $regis->account, $vault, $contact, $reminder);
+     }
+ 
++    /** @test */
++    public function it_persists_notification_channels(): void
++    {
++        $regis = $this->createUser();
++        $vault = $this->createVault($regis->account);
++        $vault = $this->setPermissionInVault($regis, Vault::PERMISSION_EDIT, $vault);
++        $contact = Contact::factory()->create(['vault_id' => $vault->id]);
++        $reminder = ContactReminder::factory()->create([
++            'contact_id' => $contact->id,
++        ]);
++
++        UserNotificationChannel::factory()->create([
++            'user_id' => $regis->id,
++            'preferred_time' => '18:00',
++        ]);
++
++        $request = [
++            'account_id' => $regis->account->id,
++            'vault_id' => $vault->id,
++            'author_id' => $regis->id,
++            'contact_id' => $contact->id,
++            'contact_reminder_id' => $reminder->id,
++            'label' => 'birthdate',
++            'day' => 29,
++            'month' => 10,
++            'year' => 1981,
++            'type' => ContactReminder::TYPE_ONE_TIME,
++            'frequency_number' => null,
++        ];
++
++        (new UpdateContactReminder())->execute($request);
++
++        $this->assertDatabaseHas('user_notification_channels', [
++            'user_id' => $regis->id,
++        ]);
++    }
++
+     /** @test */
+     public function it_fails_if_wrong_parameters_are_given(): void
+     {

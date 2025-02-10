@@ -1,0 +1,729 @@
+diff --git a/api/subscriptions/get_subscriptions.php b/api/subscriptions/get_subscriptions.php
+index 8a01d1e2e..96fbeb298 100644
+--- a/api/subscriptions/get_subscriptions.php
++++ b/api/subscriptions/get_subscriptions.php
+@@ -69,6 +69,7 @@
+       "category_name": "Entertainment",
+       "payer_user_name": "Jane Doe",
+       "payment_method_name": "Credit Card"
++      "replacement_subscription_id": 1
+     }
+   ],
+   "notes": []
+diff --git a/endpoints/subscription/add.php b/endpoints/subscription/add.php
+index 753dc489b..4d7d550b6 100644
+--- a/endpoints/subscription/add.php
++++ b/endpoints/subscription/add.php
+@@ -121,13 +121,13 @@ function resizeAndUploadLogo($uploadedFile, $uploadDir, $name, $settings)
+             $newHeight = $height;
+ 
+             if ($width > $targetWidth) {
+-                $newWidth = (int)$targetWidth;
+-                $newHeight = (int)(($targetWidth / $width) * $height);
++                $newWidth = (int) $targetWidth;
++                $newHeight = (int) (($targetWidth / $width) * $height);
+             }
+ 
+             if ($newHeight > $targetHeight) {
+-                $newWidth = (int)(($targetHeight / $newHeight) * $newWidth);
+-                $newHeight = (int)$targetHeight;
++                $newWidth = (int) (($targetHeight / $newHeight) * $newWidth);
++                $newHeight = (int) $targetHeight;
+             }
+ 
+             $resizedImage = imagecreatetruecolor($newWidth, $newHeight);
+@@ -178,6 +178,11 @@ function resizeAndUploadLogo($uploadedFile, $uploadDir, $name, $settings)
+         $notifyDaysBefore = $_POST['notify_days_before'];
+         $inactive = isset($_POST['inactive']) ? true : false;
+         $cancellationDate = $_POST['cancellation_date'] ?? null;
++        $replacementSubscriptionId = $_POST['replacement_subscription_id'];
++
++        if ($replacementSubscriptionId == 0 || $inactive == 0) {
++            $replacementSubscriptionId = null;
++        }
+ 
+         if ($logoUrl !== "") {
+             $logo = getLogoFromUrl($logoUrl, '../../images/uploads/logos/', $name, $settings, $i18n);
+@@ -193,23 +198,40 @@ function resizeAndUploadLogo($uploadedFile, $uploadDir, $name, $settings)
+         }
+ 
+         if (!$isEdit) {
+-            $sql = "INSERT INTO subscriptions (name, logo, price, currency_id, next_payment, cycle, frequency, notes, 
+-                        payment_method_id, payer_user_id, category_id, notify, inactive, url, notify_days_before, user_id, cancellation_date) 
+-                        VALUES (:name, :logo, :price, :currencyId, :nextPayment, :cycle, :frequency, :notes, 
+-                        :paymentMethodId, :payerUserId, :categoryId, :notify, :inactive, :url, :notifyDaysBefore, :userId, :cancellationDate)";
++            $sql = "INSERT INTO subscriptions (
++                        name, logo, price, currency_id, next_payment, cycle, frequency, notes, 
++                        payment_method_id, payer_user_id, category_id, notify, inactive, url, 
++                        notify_days_before, user_id, cancellation_date, replacement_subscription_id
++                    ) VALUES (
++                        :name, :logo, :price, :currencyId, :nextPayment, :cycle, :frequency, :notes, 
++                        :paymentMethodId, :payerUserId, :categoryId, :notify, :inactive, :url, 
++                        :notifyDaysBefore, :userId, :cancellationDate, :replacement_subscription_id
++                    )";
+         } else {
+             $id = $_POST['id'];
++            $sql = "UPDATE subscriptions SET 
++                        name = :name, 
++                        price = :price, 
++                        currency_id = :currencyId,
++                        next_payment = :nextPayment, 
++                        cycle = :cycle, 
++                        frequency = :frequency, 
++                        notes = :notes, 
++                        payment_method_id = :paymentMethodId,
++                        payer_user_id = :payerUserId, 
++                        category_id = :categoryId, 
++                        notify = :notify, 
++                        inactive = :inactive, 
++                        url = :url, 
++                        notify_days_before = :notifyDaysBefore, 
++                        cancellation_date = :cancellationDate, 
++                        replacement_subscription_id = :replacement_subscription_id";
++
+             if ($logo != "") {
+-                $sql = "UPDATE subscriptions SET name = :name, logo = :logo, price = :price, currency_id = :currencyId,
+-                     next_payment = :nextPayment, cycle = :cycle, frequency = :frequency, notes = :notes, payment_method_id = :paymentMethodId,
+-                     payer_user_id = :payerUserId, category_id = :categoryId, notify = :notify, inactive = :inactive, 
+-                     url = :url, notify_days_before = :notifyDaysBefore, cancellation_date = :cancellationDate WHERE id = :id AND user_id = :userId";
+-            } else {
+-                $sql = "UPDATE subscriptions SET name = :name, price = :price, currency_id = :currencyId,
+-                     next_payment = :nextPayment, cycle = :cycle, frequency = :frequency, notes = :notes, payment_method_id = :paymentMethodId,
+-                     payer_user_id = :payerUserId, category_id = :categoryId, notify = :notify, inactive = :inactive, 
+-                     url = :url, notify_days_before = :notifyDaysBefore, cancellation_date = :cancellationDate WHERE id = :id AND user_id = :userId";
++                $sql .= ", logo = :logo";
+             }
++
++            $sql .= " WHERE id = :id AND user_id = :userId";
+         }
+ 
+         $stmt = $db->prepare($sql);
+@@ -235,6 +257,7 @@ function resizeAndUploadLogo($uploadedFile, $uploadDir, $name, $settings)
+             $stmt->bindParam(':id', $id, SQLITE3_INTEGER);
+         }
+         $stmt->bindParam(':userId', $userId, SQLITE3_INTEGER);
++        $stmt->bindParam(':replacement_subscription_id', $replacementSubscriptionId, SQLITE3_INTEGER);
+ 
+         if ($stmt->execute()) {
+             $success['status'] = "Success";
+diff --git a/endpoints/subscription/clone.php b/endpoints/subscription/clone.php
+index 9d78164d3..e143fb6d7 100644
+--- a/endpoints/subscription/clone.php
++++ b/endpoints/subscription/clone.php
+@@ -17,7 +17,7 @@
+                 ]));
+             }
+ 
+-            $query = "INSERT INTO subscriptions (name, logo, price, currency_id, next_payment, cycle, frequency, notes, payment_method_id, payer_user_id, category_id, notify, url, inactive, notify_days_before, user_id, cancellation_date) VALUES (:name, :logo, :price, :currency_id, :next_payment, :cycle, :frequency, :notes, :payment_method_id, :payer_user_id, :category_id, :notify, :url, :inactive, :notify_days_before, :user_id, :cancellation_date)";
++            $query = "INSERT INTO subscriptions (name, logo, price, currency_id, next_payment, cycle, frequency, notes, payment_method_id, payer_user_id, category_id, notify, url, inactive, notify_days_before, user_id, cancellation_date, replacement_subscription_id) VALUES (:name, :logo, :price, :currency_id, :next_payment, :cycle, :frequency, :notes, :payment_method_id, :payer_user_id, :category_id, :notify, :url, :inactive, :notify_days_before, :user_id, :cancellation_date, :replacement_subscription_id)";
+             $cloneStmt = $db->prepare($query);
+             $cloneStmt->bindValue(':name', $subscriptionToClone['name'], SQLITE3_TEXT);
+             $cloneStmt->bindValue(':logo', $subscriptionToClone['logo'], SQLITE3_TEXT);
+@@ -36,6 +36,7 @@
+             $cloneStmt->bindValue(':notify_days_before', $subscriptionToClone['notify_days_before'], SQLITE3_INTEGER);
+             $cloneStmt->bindValue(':user_id', $userId, SQLITE3_INTEGER);
+             $cloneStmt->bindValue(':cancellation_date', $subscriptionToClone['cancellation_date'], SQLITE3_TEXT);
++            $cloneStmt->bindValue(':replacement_subscription_id', $subscriptionToClone['replacement_subscription_id'], SQLITE3_INTEGER);
+ 
+             if ($cloneStmt->execute()) {
+                 $response = [
+diff --git a/endpoints/subscription/delete.php b/endpoints/subscription/delete.php
+index 88cfea0ab..bac56ac39 100644
+--- a/endpoints/subscription/delete.php
++++ b/endpoints/subscription/delete.php
+@@ -1,24 +1,30 @@
+ <?php
+-    require_once '../../includes/connect_endpoint.php';
+-    
+-    if (isset($_SESSION['loggedin']) && $_SESSION['loggedin'] === true) {
+-        if ($_SERVER["REQUEST_METHOD"] === "DELETE") {
+-            $subscriptionId = $_GET["id"];
+-            $deleteQuery = "DELETE FROM subscriptions WHERE id = :subscriptionId AND user_id = :userId";
+-            $deleteStmt = $db->prepare($deleteQuery);
+-            $deleteStmt->bindParam(':subscriptionId', $subscriptionId, SQLITE3_INTEGER);
+-            $deleteStmt->bindParam(':userId', $userId, SQLITE3_INTEGER);
+-        
+-            if ($deleteStmt->execute()) {
+-                http_response_code(204);
+-            } else {
+-                http_response_code(500);
+-                echo json_encode(array("message" => translate('error_deleting_subscription', $i18n)));
+-            }
++require_once '../../includes/connect_endpoint.php';
++
++if (isset($_SESSION['loggedin']) && $_SESSION['loggedin'] === true) {
++    if ($_SERVER["REQUEST_METHOD"] === "DELETE") {
++        $subscriptionId = $_GET["id"];
++        $deleteQuery = "DELETE FROM subscriptions WHERE id = :subscriptionId AND user_id = :userId";
++        $deleteStmt = $db->prepare($deleteQuery);
++        $deleteStmt->bindParam(':subscriptionId', $subscriptionId, SQLITE3_INTEGER);
++        $deleteStmt->bindParam(':userId', $userId, SQLITE3_INTEGER);
++
++        if ($deleteStmt->execute()) {
++            $query = "UPDATE subscriptions SET replacement_subscription_id = NULL WHERE replacement_subscription_id = :subscriptionId AND user_id = :userId";
++            $stmt = $db->prepare($query);
++            $stmt->bindParam(':subscriptionId', $subscriptionId, SQLITE3_INTEGER);
++            $stmt->bindParam(':userId', $userId, SQLITE3_INTEGER);
++            $stmt->execute();
++
++            http_response_code(204);
+         } else {
+-            http_response_code(405);
+-            echo json_encode(array("message" => translate('invalid_request_method', $i18n)));
++            http_response_code(500);
++            echo json_encode(array("message" => translate('error_deleting_subscription', $i18n)));
+         }
++    } else {
++        http_response_code(405);
++        echo json_encode(array("message" => translate('invalid_request_method', $i18n)));
+     }
+-    $db->close();
++}
++$db->close();
+ ?>
+\ No newline at end of file
+diff --git a/endpoints/subscription/get.php b/endpoints/subscription/get.php
+index 1ab31d722..0668139bd 100644
+--- a/endpoints/subscription/get.php
++++ b/endpoints/subscription/get.php
+@@ -30,6 +30,7 @@
+             $subscriptionData['url'] = htmlspecialchars_decode($row['url'] ?? "");
+             $subscriptionData['notify_days_before'] = $row['notify_days_before'];
+             $subscriptionData['cancellation_date'] = $row['cancellation_date'];
++            $subscriptionData['replacement_subscription_id'] = $row['replacement_subscription_id'];
+ 
+             $subscriptionJson = json_encode($subscriptionData);
+             header('Content-Type: application/json');
+diff --git a/endpoints/subscriptions/export.php b/endpoints/subscriptions/export.php
+index db76d8249..b00575629 100644
+--- a/endpoints/subscriptions/export.php
++++ b/endpoints/subscriptions/export.php
+@@ -29,7 +29,8 @@
+         'URL' => $row['url'],
+         'State' => $row['inactive'] ? 'Disabled' : 'Enabled',
+         'Notifications' => $row['notify'] ? 'Enabled' : 'Disabled',
+-        'Cancellation Date' => $row['cancellation_date']
++        'Cancellation Date' => $row['cancellation_date'],
++        'Active' => $row['inactive'] ? 'No' : 'Yes',
+     );
+ 
+     $subscriptions[] = $subscriptionDetails;
+diff --git a/endpoints/subscriptions/get.php b/endpoints/subscriptions/get.php
+index 30de06afb..e4e5f3d75 100644
+--- a/endpoints/subscriptions/get.php
++++ b/endpoints/subscriptions/get.php
+@@ -166,6 +166,7 @@
+     $print[$id]['inactive'] = $subscription['inactive'];
+     $print[$id]['url'] = $subscription['url'] ?? "";
+     $print[$id]['notes'] = $subscription['notes'] ?? "";
++    $print[$id]['replacement_subscription_id'] = $subscription['replacement_subscription_id'];
+ 
+     if (isset($settings['convertCurrency']) && $settings['convertCurrency'] === 'true' && $currencyId != $mainCurrencyId) {
+       $print[$id]['price'] = getPriceConverted($print[$id]['price'], $currencyId, $db);
+diff --git a/includes/i18n/de.php b/includes/i18n/de.php
+index a874e6a43..18aace26a 100644
+--- a/includes/i18n/de.php
++++ b/includes/i18n/de.php
+@@ -49,6 +49,8 @@
+     "price" => "Preis",
+     "next_payment" => "Nächste Zahlung",
+     "inactive" => "Abonnement deaktivieren",
++    "replaced_with" => "Ersetzt durch",
++    "none" => "Keine",
+     "member" => "Mitglied",
+     "category" => "Kategorie",
+     "payment_method" => "Zahlungsmethode",
+diff --git a/includes/i18n/el.php b/includes/i18n/el.php
+index 87605d94d..bd2890a75 100644
+--- a/includes/i18n/el.php
++++ b/includes/i18n/el.php
+@@ -49,6 +49,8 @@
+     "price" => "Τιμή",
+     "next_payment" => "Επόμενη πληρωμή",
+     "inactive" => "Απενεργοποίηση συνδρομής",
++    "replaced_with" => "Αντικαταστάθηκε με",
++    "none" =>  "Κανένα",
+     "member" => "Χρήστης",
+     "category" => "Κατηγορία",
+     "payment_method" => "Τρόπος πληρωμής",
+diff --git a/includes/i18n/en.php b/includes/i18n/en.php
+index bc09569dc..a21818220 100644
+--- a/includes/i18n/en.php
++++ b/includes/i18n/en.php
+@@ -49,6 +49,8 @@
+     "price" => "Price",
+     "next_payment" => "Next Payment",
+     "inactive" => "Disable Subscription",
++    "replaced_with" => "Replaced with",
++    "none" => "None",
+     "member" => "Member",
+     "category" => "Category",
+     "payment_method" => "Payment Method",
+@@ -86,7 +88,7 @@
+     "notes" => "Notes",
+     "enable_notifications" => "Enable Notifications for this subscription",
+     "default_value_from_settings" => "Default value from settings",
+-    "cancellation_notification" => "cancellation Notification",
++    "cancellation_notification" => "Cancellation Notification",
+     "delete" => "Delete",
+     "cancel" => "Cancel",
+     "upload_logo" => "Upload Logo",
+diff --git a/includes/i18n/es.php b/includes/i18n/es.php
+index ac25df4bd..37da71b7e 100644
+--- a/includes/i18n/es.php
++++ b/includes/i18n/es.php
+@@ -49,6 +49,8 @@
+     "price" => "Precio",
+     "next_payment" => "Próximo Pago",
+     "inactive" => "Desactivar Suscripción",
++    "replaced_with" => "Reemplazada con",
++    "none" => "Ninguna",
+     "member" => "Miembro",
+     "category" => "Categoría",
+     "payment_method" => "Método de Pago",
+diff --git a/includes/i18n/fr.php b/includes/i18n/fr.php
+index 10b4b5fbd..6aadfbd6e 100644
+--- a/includes/i18n/fr.php
++++ b/includes/i18n/fr.php
+@@ -49,6 +49,8 @@
+     "price" => "Prix",
+     "next_payment" => "Prochain paiement",
+     "inactive" => "Désactiver l'abonnement",
++    "replaced_with" => "Remplacé par",
++    "none" => "Aucun",
+     "member" => "Membre",
+     "category" => "Catégorie",
+     "payment_method" => "Méthode de paiement",
+diff --git a/includes/i18n/it.php b/includes/i18n/it.php
+index 199bd4066..92e951085 100644
+--- a/includes/i18n/it.php
++++ b/includes/i18n/it.php
+@@ -53,6 +53,8 @@
+     "price" => 'Prezzo',
+     "next_payment" => 'Prossimo pagamento',
+     "inactive" => 'Disattiva abbonamento',
++    "replaced_with" => 'Sostituito con',
++    "none" => 'Nessuno',
+     "member" => 'Membro',
+     "category" => 'Categoria',
+     "payment_method" => 'Metodo di pagamento',
+diff --git a/includes/i18n/jp.php b/includes/i18n/jp.php
+index ac8945453..574c005b7 100644
+--- a/includes/i18n/jp.php
++++ b/includes/i18n/jp.php
+@@ -49,6 +49,8 @@
+     "price" => "金額",
+     "next_payment" => "次回支払い",
+     "inactive" => "サブスクリプションを無効にする",
++    "replaced_with" => "置き換えられた",
++    "none" => "なし",
+     "member" => "メンバー",
+     "category" => "カテゴリ",
+     "payment_method" => "支払い方法",
+diff --git a/includes/i18n/ko.php b/includes/i18n/ko.php
+index 4cfc1176f..3a882a92b 100644
+--- a/includes/i18n/ko.php
++++ b/includes/i18n/ko.php
+@@ -49,6 +49,8 @@
+     "price" => "가격",
+     "next_payment" => "다음 결제일",
+     "inactive" => "구독 비활성화",
++    "replaced_with" => "다음 구독으로 대체됨",
++    "none" => "없음",
+     "member" => "구성원",
+     "category" => "카테고리",
+     "payment_method" => "지불 수단",
+diff --git a/includes/i18n/pl.php b/includes/i18n/pl.php
+index 3855e23e2..4ccf45152 100644
+--- a/includes/i18n/pl.php
++++ b/includes/i18n/pl.php
+@@ -49,6 +49,8 @@
+     "price" => "Cena",
+     "next_payment" => "Następna płatność",
+     "inactive" => "Wyłącz subskrypcję",
++    "replaced_with" => "Zastąpione przez",
++    "none" => "Brak",
+     "member" => "Użytkownik",
+     "category" => "Kategoria",
+     "payment_method" => "Metoda płatności",
+diff --git a/includes/i18n/pt.php b/includes/i18n/pt.php
+index c219960c6..f49369506 100644
+--- a/includes/i18n/pt.php
++++ b/includes/i18n/pt.php
+@@ -49,6 +49,8 @@
+     "price" => "Preço",
+     "next_payment" => "Próximo Pagamento",
+     "inactive" => "Desactivar Subscrição",
++    "replaced_with" => "Substituída por",
++    "none" => "Nenhuma",
+     "member" => "Membro",
+     "category" => "Categoria",
+     "payment_method" => "Metodo de Pagamento",
+diff --git a/includes/i18n/pt_br.php b/includes/i18n/pt_br.php
+index 05ff1369d..06399fce3 100644
+--- a/includes/i18n/pt_br.php
++++ b/includes/i18n/pt_br.php
+@@ -49,6 +49,8 @@
+     "price" => "Preço",
+     "next_payment" => "Próximo pagamento",
+     "inactive" => "Assinatura inativa",
++    "replaced_with" => "Substituída por",
++    "none" => "Nenhuma",
+     "member" => "Membro",
+     "category" => "Categoria",
+     "payment_method" => "Método de Pagamento",
+diff --git a/includes/i18n/ru.php b/includes/i18n/ru.php
+index 3d8827675..f5871969b 100644
+--- a/includes/i18n/ru.php
++++ b/includes/i18n/ru.php
+@@ -49,6 +49,8 @@
+     "price" => "Стоимость",
+     "next_payment" => "Следующий платеж",
+     "inactive" => "Отключить подписку",
++    "replaced_with" => "Заменена на",
++    "none" => "Нет",
+     "member" => "Член семьи",
+     "category" => "Категория",
+     "payment_method" => "Способ оплаты",
+diff --git a/includes/i18n/sl.php b/includes/i18n/sl.php
+index 3cda5381a..2bbba4028 100644
+--- a/includes/i18n/sl.php
++++ b/includes/i18n/sl.php
+@@ -49,6 +49,8 @@
+     "price" => "Cena",
+     "next_payment" => "Naslednje plačilo",
+     "inactive" => "Onemogoči naročnino",
++    "replaced_with" => "Zamenjano z",
++    "none" => "brez",
+     "member" => "Član",
+     "category" => "Kategorija",
+     "payment_method" => "Način plačila",
+diff --git a/includes/i18n/sr.php b/includes/i18n/sr.php
+index fcce5adbc..b589b5f69 100644
+--- a/includes/i18n/sr.php
++++ b/includes/i18n/sr.php
+@@ -49,6 +49,8 @@
+     "price" => "Цена",
+     "next_payment" => "Следећа уплата",
+     "inactive" => "Онемогући претплату",
++    "replaced_with" => "Замењено са",
++    "none" => "Ништа",
+     "member" => "Члан",
+     "category" => "Категорија",
+     "payment_method" => "Начин плаћања",
+diff --git a/includes/i18n/sr_lat.php b/includes/i18n/sr_lat.php
+index 0e8a2bec7..3b1da0cda 100644
+--- a/includes/i18n/sr_lat.php
++++ b/includes/i18n/sr_lat.php
+@@ -49,6 +49,8 @@
+     "price" => "Cena",
+     "next_payment" => "Sledeća uplata",
+     "inactive" => "Onemogući pretplatu",
++    "replaced_with" => "Zamenjeno sa",
++    "none" => "Nijedna",
+     "member" => "Član",
+     "category" => "Kategorija",
+     "payment_method" => "Način plaćanja",
+diff --git a/includes/i18n/tr.php b/includes/i18n/tr.php
+index e9c67b713..50e93e74f 100644
+--- a/includes/i18n/tr.php
++++ b/includes/i18n/tr.php
+@@ -49,6 +49,8 @@
+     "price" => "Fiyat",
+     "next_payment" => "Sonraki Ödeme",
+     "inactive" => "Aboneliği Devre Dışı Bırak",
++    "replaced_with" => "Şununla değiştirildi",
++    "none" => "Yok",
+     "member" => "Üye",
+     "category" => "Kategori",
+     "payment_method" => "Ödeme Yöntemi",
+diff --git a/includes/i18n/vi.php b/includes/i18n/vi.php
+index fdd72ce50..ee8e72a03 100644
+--- a/includes/i18n/vi.php
++++ b/includes/i18n/vi.php
+@@ -49,6 +49,8 @@
+     "price" => "Giá",
+     "next_payment" => "Thanh toán tiếp theo",
+     "inactive" => "Vô hiệu hóa đăng ký",
++    "replaced_with" => "Thay thế bằng",
++    "none" => "Không",
+     "member" => "Thành viên",
+     "category" => "Danh mục",
+     "payment_method" => "Phương thức thanh toán",
+diff --git a/includes/i18n/zh_cn.php b/includes/i18n/zh_cn.php
+index 927a15caf..d747ab748 100644
+--- a/includes/i18n/zh_cn.php
++++ b/includes/i18n/zh_cn.php
+@@ -53,6 +53,8 @@
+     "price" => "价格",
+     "next_payment" => "下次支付时间",
+     "inactive" => "停用订阅",
++    "replaced_with" => "替换为",
++    "none" => "无",
+     "member" => "成员",
+     "category" => "分类",
+     "payment_method" => "支付方式",
+diff --git a/includes/i18n/zh_tw.php b/includes/i18n/zh_tw.php
+index d57037b57..87652b061 100644
+--- a/includes/i18n/zh_tw.php
++++ b/includes/i18n/zh_tw.php
+@@ -49,6 +49,8 @@
+     "price" => "價格",
+     "next_payment" => "下次付款時間",
+     "inactive" => "停用訂閱",
++    "replaced_with" => "替換為",
++    "none" => "無",
+     "member" => "成員",
+     "category" => "分類",
+     "payment_method" => "付款方式",
+diff --git a/includes/version.php b/includes/version.php
+index 9f22fc4f0..f9c07a770 100644
+--- a/includes/version.php
++++ b/includes/version.php
+@@ -1,3 +1,3 @@
+ <?php
+-$version = "v2.32.0";
++$version = "v2.33.0";
+ ?>
+\ No newline at end of file
+diff --git a/index.php b/index.php
+index 7ce56908b..e3795db0f 100644
+--- a/index.php
++++ b/index.php
+@@ -347,6 +347,7 @@
+       $print[$id]['inactive'] = $subscription['inactive'];
+       $print[$id]['url'] = $subscription['url'];
+       $print[$id]['notes'] = $subscription['notes'];
++      $print[$id]['replacement_subscription_id'] = $subscription['replacement_subscription_id'];
+ 
+       if (isset($settings['convertCurrency']) && $settings['convertCurrency'] === 'true' && $currencyId != $mainCurrencyId) {
+         $print[$id]['price'] = getPriceConverted($print[$id]['price'], $currencyId, $db);
+@@ -519,9 +520,9 @@
+       </select>
+     </div>
+ 
+-    <div class="form-group-inline">
++    <div class="form-group-inline grow">
+       <input type="checkbox" id="notifications" name="notifications" onchange="toggleNotificationDays()">
+-      <label for="notifications"><?= translate('enable_notifications', $i18n) ?></label>
++      <label for="notifications" class="grow"><?= translate('enable_notifications', $i18n) ?></label>
+     </div>
+ 
+     <div class="form-group">
+@@ -555,9 +556,28 @@
+       <input type="text" id="notes" name="notes" placeholder="<?= translate('notes', $i18n) ?>">
+     </div>
+ 
+-    <div class="form-group-inline">
+-      <input type="checkbox" id="inactive" name="inactive">
+-      <label for="inactive"><?= translate('inactive', $i18n) ?></label>
++    <div class="form-group">
++      <div class="inline grow">
++        <input type="checkbox" id="inactive" name="inactive" onchange="toggleReplacementSub()">
++        <label for="inactive" class="grow"><?= translate('inactive', $i18n) ?></label>
++      </div>
++    </div>
++
++    <div class="form-group hide" id="replacement_subscritpion">
++      <label for="replacement_subscription_id"><?= translate('replaced_with', $i18n) ?>:</label>
++      <select id="replacement_subscription_id" name="replacement_subscription_id">
++        <option value="0"><?= translate('none', $i18n) ?></option>
++        <?php
++        foreach ($subscriptions as $sub) {
++          if ($sub['inactive'] == 0) {
++            ?>
++            <option value="<?= htmlspecialchars($sub['id']) ?>"><?= htmlspecialchars($sub['name']) ?>
++            </option>
++            <?php
++          }
++        }
++        ?>
++      </select>
+     </div>
+ 
+     <div class="buttons">
+diff --git a/migrations/000031.php b/migrations/000031.php
+new file mode 100644
+index 000000000..2f7540c5c
+--- /dev/null
++++ b/migrations/000031.php
+@@ -0,0 +1,14 @@
++<?php
++// This migration adds a "replacement_subscription_id" column to the subscriptions table
++// to allow users to track savings by replacing one subscription with another
++
++/** @noinspection PhpUndefinedVariableInspection */
++$columnQuery = $db->query("SELECT * FROM pragma_table_info('subscriptions') where name='replacement_subscription_id'");
++$columnRequired = $columnQuery->fetchArray(SQLITE3_ASSOC) === false;
++
++if ($columnRequired) {
++    $db->exec('ALTER TABLE subscriptions ADD COLUMN replacement_subscription_id INTEGER DEFAULT NULL');
++}
++
++
++?>
+\ No newline at end of file
+diff --git a/scripts/dashboard.js b/scripts/dashboard.js
+index 7db691691..d29ffb336 100644
+--- a/scripts/dashboard.js
++++ b/scripts/dashboard.js
+@@ -35,6 +35,10 @@ function resetForm() {
+   submitButton.disabled = false;
+   const notifyDaysBefore = document.querySelector("#notify_days_before");
+   notifyDaysBefore.disabled = true;
++  const replacementSubscriptionIdSelect = document.querySelector("#replacement_subscription_id");
++  replacementSubscriptionIdSelect.value = "0";
++  const replacementSubscription = document.querySelector(`#replacement_subscritpion`);
++  replacementSubscription.classList.add("hide");
+   const form = document.querySelector("#subs-form");
+   form.reset();
+   closeLogoSearch();
+@@ -92,11 +96,21 @@ function fillEditFormFields(subscription) {
+   }
+ 
+   const notifyDaysBefore = document.querySelector("#notify_days_before");
+-  notifyDaysBefore.value = subscription.notify_days_before;
++  notifyDaysBefore.value = subscription.notify_days_before ?? 0;
+   if (subscription.notify === 1) {
+     notifyDaysBefore.disabled = false;
+   }
+ 
++  const replacementSubscriptionIdSelect = document.querySelector("#replacement_subscription_id");
++  replacementSubscriptionIdSelect.value = subscription.replacement_subscription_id ?? 0;
++
++  const replacementSubscription = document.querySelector(`#replacement_subscritpion`);
++  if (subscription.inactive) {
++    replacementSubscription.classList.remove("hide");
++  } else {
++    replacementSubscription.classList.add("hide");
++  }
++
+   const deleteButton = document.querySelector("#deletesub");
+   deleteButton.style = 'display: block';
+   deleteButton.setAttribute("onClick", `deleteSubscription(event, ${subscription.id})`);
+@@ -514,6 +528,17 @@ function toggleSubMenu(subMenu) {
+   }
+ }
+ 
++function toggleReplacementSub() {
++  const checkbox = document.getElementById('inactive');
++  const replacementSubscription = document.querySelector(`#replacement_subscritpion`);
++
++  if (checkbox.checked) {
++    replacementSubscription.classList.remove("hide");
++  } else {
++    replacementSubscription.classList.add("hide");
++  }
++}
++
+ document.querySelectorAll('.filter-item').forEach(function (item) {
+   item.addEventListener('click', function (e) {
+     const searchInput = document.querySelector("#search");
+diff --git a/stats.php b/stats.php
+index 66195ecd7..bd147dfb5 100644
+--- a/stats.php
++++ b/stats.php
+@@ -94,9 +94,10 @@ function getPriceConverted($price, $currency, $database, $userId)
+ $amountDueThisMonth = 0;
+ $totalCostPerMonth = 0;
+ $totalSavingsPerMonth = 0;
++$totalCostsInReplacementsPerMonth = 0;
+ 
+ $statsSubtitleParts = [];
+-$query = "SELECT name, price, logo, frequency, cycle, currency_id, next_payment, payer_user_id, category_id, payment_method_id, inactive FROM subscriptions";
++$query = "SELECT name, price, logo, frequency, cycle, currency_id, next_payment, payer_user_id, category_id, payment_method_id, inactive, replacement_subscription_id FROM subscriptions";
+ $conditions = [];
+ $params = [];
+ 
+@@ -140,6 +141,8 @@ function getPriceConverted($price, $currency, $database, $userId)
+     $subscriptions[] = $row;
+   }
+   if (isset($subscriptions)) {
++    $replacementSubscriptions = array();
++
+     foreach ($subscriptions as $subscription) {
+       $name = $subscription['name'];
+       $price = $subscription['price'];
+@@ -155,6 +158,7 @@ function getPriceConverted($price, $currency, $database, $userId)
+       $categoryId = $subscription['category_id'];
+       $paymentMethodId = $subscription['payment_method_id'];
+       $inactive = $subscription['inactive'];
++      $replacementSubscriptionId = $subscription['replacement_subscription_id'];
+       $originalSubscriptionPrice = getPriceConverted($price, $currency, $db, $userId);
+       $price = getPricePerMonth($cycle, $frequency, $originalSubscriptionPrice);
+ 
+@@ -192,10 +196,29 @@ function getPriceConverted($price, $currency, $database, $userId)
+       } else {
+         $inactiveSubscriptions++;
+         $totalSavingsPerMonth += $price;
++
++        // Check if it has a replacement subscription and if it was not already counted
++        if ($replacementSubscriptionId && !in_array($replacementSubscriptionId, $replacementSubscriptions)) {
++          $query = "SELECT price, currency_id, cycle, frequency FROM subscriptions WHERE id = :replacementSubscriptionId";
++          $stmt = $db->prepare($query);
++          $stmt->bindValue(':replacementSubscriptionId', $replacementSubscriptionId, SQLITE3_INTEGER);
++          $result = $stmt->execute();
++          $replacementSubscription = $result->fetchArray(SQLITE3_ASSOC);
++          if ($replacementSubscription) {
++            $replacementSubscriptionPrice = getPriceConverted($replacementSubscription['price'], $replacementSubscription['currency_id'], $db, $userId);
++            $replacementSubscriptionPrice = getPricePerMonth($replacementSubscription['cycle'], $replacementSubscription['frequency'], $replacementSubscriptionPrice);
++            $totalCostsInReplacementsPerMonth += $replacementSubscriptionPrice;
++          }
++        }
++
++        $replacementSubscriptions[] = $replacementSubscriptionId;
+       }
+ 
+     }
+ 
++    // Subtract the total cost of replacement subscriptions from the total savings
++    $totalSavingsPerMonth -= $totalCostsInReplacementsPerMonth;
++
+     // Calculate yearly price
+     $totalCostPerYear = $totalCostPerMonth * 12;
+ 
+@@ -423,15 +446,20 @@ function getPriceConverted($price, $currency, $database, $userId)
+         <span><?= $inactiveSubscriptions ?></span>
+         <div class="title"><?= translate('inactive_subscriptions', $i18n) ?></div>
+       </div>
+-      <div class="statistic">
+-        <span><?= CurrencyFormatter::format($totalSavingsPerMonth, $code) ?></span>
+-        <div class="title"><?= translate('monthly_savings', $i18n) ?></div>
+-      </div>
+-      <div class="statistic">
+-        <span><?= CurrencyFormatter::format($totalSavingsPerMonth * 12, $code) ?></span>
+-        <div class="title"><?= translate('yearly_savings', $i18n) ?></div>
+-      </div>
+       <?php
++      if ($totalSavingsPerMonth > 0) {
++        $numberOfElements += 2;
++        ?>
++        <div class="statistic">
++          <span><?= CurrencyFormatter::format($totalSavingsPerMonth, $code) ?></span>
++          <div class="title"><?= translate('monthly_savings', $i18n) ?></div>
++        </div>
++        <div class="statistic">
++          <span><?= CurrencyFormatter::format($totalSavingsPerMonth * 12, $code) ?></span>
++          <div class="title"><?= translate('yearly_savings', $i18n) ?></div>
++        </div>
++        <?php
++      }
+     }
+ 
+     if (($numberOfElements + 1) % 3 == 0) {
+diff --git a/styles/styles.css b/styles/styles.css
+index cd0cb7ea1..6a3ad32ff 100644
+--- a/styles/styles.css
++++ b/styles/styles.css
+@@ -1110,6 +1110,11 @@ header #avatar {
+   flex-basis: 50%;
+ }
+ 
++.form-group.hide,
++.form-group-inline.hide {
++  display: none;
++}
++
+ .inline-row {
+   display: flex;
+   flex-direction: row;

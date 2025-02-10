@@ -1,0 +1,152 @@
+diff --git a/packages/tables/.stubs.php b/packages/tables/.stubs.php
+index 9dd7ebd2c73..aca33e01afb 100644
+--- a/packages/tables/.stubs.php
++++ b/packages/tables/.stubs.php
+@@ -167,6 +167,10 @@ public function removeTableFilter(string $filter, ?string $field = null): static
+ 
+         public function removeTableFilters(): static {}
+ 
++        public function assertTableFilterVisible(string $name): static {}
++
++        public function assertTableFilterHidden(string $name): static {}
++
+         public function assertTableFilterExists(string $name, ?Closure $checkFilterUsing = null): static {}
+ 
+         public function assertCanSeeTableRecords(array | Collection $records, bool $inOrder = false): static {}
+diff --git a/packages/tables/docs/12-testing.md b/packages/tables/docs/12-testing.md
+index 301ed36b4e2..038b22f6f67 100644
+--- a/packages/tables/docs/12-testing.md
++++ b/packages/tables/docs/12-testing.md
+@@ -349,7 +349,20 @@ it('can remove all table filters', function () {
+ });
+ ```
+ 
+-### Existence
++### Hidden filters
++
++To ensure that a particular user cannot see a filter, you can use the `assertTableFilterVisible()` and `assertTableFilterHidden()` methods:
++
++```php
++use function Pest\Livewire\livewire;
++
++it('shows the correct filters', function () {
++    livewire(PostsTable::class)
++        ->assertTableFilterVisible('created_at')
++        ->assertTableFilterHidden('author');
++```
++
++### Filter existence
+ 
+ To ensure that a filter exists, you can use the `assertTableFilterExists()` method:
+ 
+diff --git a/packages/tables/src/Table/Concerns/HasFilters.php b/packages/tables/src/Table/Concerns/HasFilters.php
+index 2dcd5efa0d3..4540557ab8d 100644
+--- a/packages/tables/src/Table/Concerns/HasFilters.php
++++ b/packages/tables/src/Table/Concerns/HasFilters.php
+@@ -145,17 +145,21 @@ public function persistFiltersInSession(bool | Closure $condition = true): stati
+     /**
+      * @return array<string, BaseFilter>
+      */
+-    public function getFilters(): array
++    public function getFilters(bool $withHidden = false): array
+     {
++        if ($withHidden) {
++            return $this->filters;
++        }
++
+         return array_filter(
+             $this->filters,
+             fn (BaseFilter $filter): bool => $filter->isVisible(),
+         );
+     }
+ 
+-    public function getFilter(string $name): ?BaseFilter
++    public function getFilter(string $name, bool $withHidden = false): ?BaseFilter
+     {
+-        return $this->getFilters()[$name] ?? null;
++        return $this->getFilters($withHidden)[$name] ?? null;
+     }
+ 
+     public function getFiltersForm(): Form
+diff --git a/packages/tables/src/Testing/TestsFilters.php b/packages/tables/src/Testing/TestsFilters.php
+index b62fdc61daf..3ce6fd5ea79 100644
+--- a/packages/tables/src/Testing/TestsFilters.php
++++ b/packages/tables/src/Testing/TestsFilters.php
+@@ -106,4 +106,46 @@ public function assertTableFilterExists(): Closure
+             return $this;
+         };
+     }
++
++    public function assertTableFilterVisible(): Closure
++    {
++        return function (string $name): static {
++            $name = $this->instance()->parseTableFilterName($name);
++
++            $filter = $this->instance()->getTable()->getFilter(
++                name: $name,
++                withHidden: true,
++            );
++
++            $livewireClass = $this->instance()::class;
++
++            Assert::assertTrue(
++                $filter->isVisible(),
++                message: "Failed asserting that a table filter with name [{$name}] is visible on the [{$livewireClass}] component."
++            );
++
++            return $this;
++        };
++    }
++
++    public function assertTableFilterHidden(): Closure
++    {
++        return function (string $name): static {
++            $name = $this->instance()->parseTableFilterName($name);
++
++            $filter = $this->instance()->getTable()->getFilter(
++                name: $name,
++                withHidden: true,
++            );
++
++            $livewireClass = $this->instance()::class;
++
++            Assert::assertTrue(
++                $filter->isHidden(),
++                message: "Failed asserting that a table filter with name [{$name}] is hidden on the [{$livewireClass}] component."
++            );
++
++            return $this;
++        };
++    }
+ }
+diff --git a/tests/src/Tables/Filters/FilterTest.php b/tests/src/Tables/Filters/FilterTest.php
+index 484cab05db3..11f00739cd2 100644
+--- a/tests/src/Tables/Filters/FilterTest.php
++++ b/tests/src/Tables/Filters/FilterTest.php
+@@ -109,3 +109,13 @@
+             return $filter->getLabel() === 'Is published';
+         });
+ });
++
++it('can check if a filter is visible', function (): void {
++    livewire(PostsTable::class)
++        ->assertTableFilterVisible('is_published');
++});
++
++it('can check if a filter is hidden', function (): void {
++    livewire(PostsTable::class)
++        ->assertTableFilterHidden('hidden_filter');
++});
+diff --git a/tests/src/Tables/Fixtures/PostsTable.php b/tests/src/Tables/Fixtures/PostsTable.php
+index 9f85c7657c3..e5bb7e4a5a9 100644
+--- a/tests/src/Tables/Fixtures/PostsTable.php
++++ b/tests/src/Tables/Fixtures/PostsTable.php
+@@ -103,6 +103,8 @@ public function table(Table $table): Table
+                     ])
+                     ->attribute('is_published'),
+                 Tables\Filters\TrashedFilter::make(),
++                Tables\Filters\SelectFilter::make('hidden_filter')
++                    ->hidden(),
+             ])
+             ->persistFiltersInSession()
+             ->headerActions([

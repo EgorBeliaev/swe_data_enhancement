@@ -1,0 +1,2766 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 366ffc86993..28ef78641ab 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,12 @@ This is the Developer Changelog for Matomo platform developers. All changes in o
+ 
+ The Product Changelog at **[matomo.org/changelog](https://matomo.org/changelog)** lets you see more details about any Matomo release, such as the list of new guides and FAQs, security fixes, and links to all closed issues. 
+ 
++## Matomo 5.3.0
++
++### Breaking Changes
++
++* When requesting goals for multiple sites at once using `Goals.getGoals`, the result will no longer be indexed by `idgoal`. Requesting the goals for a single site will still return them indexed by `idgoal`.
++
+ ## Matomo 5.2.0
+ 
+ ### Breaking Changes
+diff --git a/plugins/Goals/API.php b/plugins/Goals/API.php
+index e48219fe046..65a8c09739c 100644
+--- a/plugins/Goals/API.php
++++ b/plugins/Goals/API.php
+@@ -82,10 +82,17 @@ public function getGoal($idSite, $idGoal)
+      * @param string|array $idSite Array or Comma separated list of website IDs to request the goals for
+      * @param bool $orderByName
+      *
+-     * @return array Array of Goal attributes
++     * @return array Array of Goal attributes,
++     *               indexed by "idgoal" when requesting a single site,
++     *               no specific index when requesting multiple sites
+      */
+     public function getGoals($idSite, bool $orderByName = false): array
+     {
++        if (is_array($idSite)) {
++            $idSite = array_map('intval', $idSite);
++            $idSite = implode(',', $idSite);
++        }
++
+         $cacheId = self::getCacheId($idSite);
+         $cache = $this->getGoalsInfoStaticCache();
+         if (!$cache->contains($cacheId)) {
+@@ -101,10 +108,15 @@ public function getGoals($idSite, bool $orderByName = false): array
+             Piwik::checkUserHasViewAccess($idSite);
+ 
+             $goals = $this->getModel()->getActiveGoals($idSite);
++            $cleanedGoals = [];
++            $indexByIdGoal = 1 === count($idSite);
+ 
+-            $cleanedGoals = array();
+             foreach ($goals as &$goal) {
+-                $cleanedGoals[$goal['idgoal']] = $this->formatGoal($goal);
++                if ($indexByIdGoal) {
++                    $cleanedGoals[$goal['idgoal']] = $this->formatGoal($goal);
++                } else {
++                    $cleanedGoals[] = $this->formatGoal($goal);
++                }
+             }
+ 
+             $cache->save($cacheId, $cleanedGoals);
+diff --git a/plugins/Goals/tests/Integration/APITest.php b/plugins/Goals/tests/Integration/APITest.php
+index 5cac4d7912f..8b4fcf4f7cc 100644
+--- a/plugins/Goals/tests/Integration/APITest.php
++++ b/plugins/Goals/tests/Integration/APITest.php
+@@ -27,15 +27,23 @@ class APITest extends IntegrationTestCase
+      */
+     private $api;
+ 
+-    private $idSite = 1;
++    /**
++     * @var int
++     */
++    private $idSite;
++
++    /**
++     * @var int
++     */
++    private $idSiteTwo;
+ 
+     public function setUp(): void
+     {
+         parent::setUp();
+         $this->api = API::getInstance();
+ 
+-        Fixture::createWebsite('2014-01-01 00:00:00');
+-        Fixture::createWebsite('2014-01-01 00:00:00');
++        $this->idSite = Fixture::createWebsite('2014-01-01 00:00:00');
++        $this->idSiteTwo = Fixture::createWebsite('2014-01-01 00:00:00');
+     }
+ 
+     /**
+@@ -262,6 +270,32 @@ public function testGetGoalShouldReturnExistingGoal()
+         ), $goal);
+     }
+ 
++    /**
++     * @param string|array $idSite
++     *
++     * @dataProvider getTestDataForMultipleSites
++     */
++    public function testGetGoalsShouldReturnGoalsForMultipleSites($idSite): void
++    {
++        $idGoal = $this->api->addGoal($this->idSite, 'Goal Site One', 'url', 'http://site.one', 'exact');
++        $idGoalTwo = $this->api->addGoal($this->idSiteTwo, 'Goal Site Two', 'url', 'http://site.two', 'exact');
++        $goals = $this->api->getGoals($idSite);
++
++        $this->assertEqualsCanonicalizing(
++            [
++                $this->api->getGoal($this->idSite, $idGoal),
++                $this->api->getGoal($this->idSiteTwo, $idGoalTwo)
++            ],
++            $goals
++        );
++    }
++
++    public function getTestDataForMultipleSites(): iterable
++    {
++        yield 'comma separated string' => ['1,2'];
++        yield 'array' => [[1, 2]];
++    }
++
+     private function assertHasGoals()
+     {
+         $goals = $this->getGoals();
+diff --git a/plugins/MultiSites/Controller.php b/plugins/MultiSites/Controller.php
+index bdd7e85c5e3..97b11369ee3 100644
+--- a/plugins/MultiSites/Controller.php
++++ b/plugins/MultiSites/Controller.php
+@@ -15,6 +15,8 @@
+ use Piwik\Piwik;
+ use Piwik\Plugins\FeatureFlags\FeatureFlagManager;
+ use Piwik\Plugins\MultiSites\FeatureFlags\ImprovedAllWebsitesDashboard;
++use Piwik\Plugins\Goals\API as GoalsAPI;
++use Piwik\Plugins\SitesManager\API as SitesManagerAPI;
+ use Piwik\Translation\Translator;
+ use Piwik\View;
+ 
+@@ -65,7 +67,7 @@ public function getSitesInfo($isWidgetized = false)
+         }
+ 
+         $view->isWidgetized         = $isWidgetized;
+-        $view->displayRevenueColumn = Common::isGoalPluginEnabled();
++        $view->displayRevenueColumn = $this->shouldDisplayRevenueColumn();
+         $view->limit                = Config::getInstance()->General['all_websites_website_per_page'];
+         $view->show_sparklines      = Config::getInstance()->General['show_multisites_sparklines'];
+ 
+@@ -104,4 +106,34 @@ public function getEvolutionGraph($columns = false)
+         $view->requestConfig->totals = 0;
+         return $this->renderView($view);
+     }
++
++    private function shouldDisplayRevenueColumn(): bool
++    {
++        if (!Common::isGoalPluginEnabled()) {
++            return false;
++        }
++
++        if (!$this->featureFlagManager->isFeatureActive(ImprovedAllWebsitesDashboard::class)) {
++            return true;
++        }
++
++        $sites = SitesManagerAPI::getInstance()->getSitesWithAtLeastViewAccess();
++
++        foreach ($sites as $site) {
++            if ($site['ecommerce']) {
++                return true;
++            }
++        }
++
++        $idSites = array_column($sites, 'idsite');
++        $goals = GoalsAPI::getInstance()->getGoals($idSites);
++
++        foreach ($goals as $goal) {
++            if (0.0 < $goal['revenue'] || true === (bool) $goal['event_value_as_revenue']) {
++                return true;
++            }
++        }
++
++        return false;
++    }
+ }
+diff --git a/plugins/MultiSites/tests/Fixtures/ManySitesWithVisits.php b/plugins/MultiSites/tests/Fixtures/ManySitesWithVisits.php
+index 442673623b0..9ada85eb14b 100644
+--- a/plugins/MultiSites/tests/Fixtures/ManySitesWithVisits.php
++++ b/plugins/MultiSites/tests/Fixtures/ManySitesWithVisits.php
+@@ -10,6 +10,7 @@
+ namespace Piwik\Plugins\MultiSites\tests\Fixtures;
+ 
+ use Piwik\Date;
++use Piwik\Plugins\Goals\API as GoalsAPI;
+ use Piwik\Tests\Framework\Fixture;
+ 
+ /**
+@@ -20,17 +21,25 @@
+ class ManySitesWithVisits extends Fixture
+ {
+     public $dateTime = '2013-01-23 01:23:45';
+-    public $idSite = 1;
++
++    public $idSiteEcommerce;
++    public $idSiteGoalDefaultValue;
++    public $idSiteGoalEventValue;
++    public $idSiteGoalWithoutValue;
++
++    public $idGoalDefaultValue;
++    public $idGoalEventValue;
++    public $idGoalWithoutValue;
+ 
+     public function setUp(): void
+     {
+-        $this->setUpWebsite();
+-        $this->trackFirstVisit($this->idSite);
+-        $this->trackSecondVisit($this->idSite);
+-        $this->trackFirstVisit($siteId = 2);
+-        $this->trackSecondVisit($siteId = 3);
+-        $this->trackSecondVisit($siteId = 3);
+-        $this->trackSecondVisit($siteId = 4);
++        $this->setUpWebsites();
++        $this->setUpGoals();
++
++        $this->trackVisitsForSite($this->idSiteEcommerce, 6);
++        $this->trackVisitsForSite($this->idSiteGoalDefaultValue, 3);
++        $this->trackVisitsForSite($this->idSiteGoalEventValue, 2);
++        $this->trackVisitsForSite($this->idSiteGoalWithoutValue, 1);
+     }
+ 
+     public function tearDown(): void
+@@ -38,48 +47,87 @@ public function tearDown(): void
+         // empty
+     }
+ 
+-    private function setUpWebsite()
++    private function setUpGoals(): void
+     {
+-        for ($i = 1; $i <= 15; $i++) {
+-            if (!self::siteCreated($i)) {
+-                $idSite = self::createWebsite($this->dateTime, $ecommerce = 1, 'Site ' . $i);
+-                $this->assertSame($i, $idSite);
+-            }
+-        }
++        $goalsApi = GoalsAPI::getInstance();
++
++        $this->idGoalDefaultValue = $goalsApi->addGoal(
++            $this->idSiteGoalDefaultValue,
++            'Goal With Value',
++            'manually',
++            '',
++            '',
++            false,
++            50.0
++        );
++
++        $this->idGoalEventValue = $goalsApi->addGoal(
++            $this->idSiteGoalEventValue,
++            'Goal Event Value',
++            'event_action',
++            'track value',
++            'exact',
++            false,
++            false,
++            false,
++            '',
++            true
++        );
++
++        $this->idGoalWithoutValue = $goalsApi->addGoal(
++            $this->idSiteGoalWithoutValue,
++            'Goal Without Value',
++            'manually',
++            '',
++            ''
++        );
+     }
+ 
+-    protected function trackFirstVisit($idSite)
++    private function setUpWebsites(): void
+     {
+-        $t = self::getTracker($idSite, $this->dateTime, $defaultInit = true);
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.1)->getDatetime());
+-        $t->setUrl('http://example.com/');
+-        self::checkResponse($t->doTrackPageView('Viewing homepage'));
++        $this->idSiteEcommerce = self::createWebsite($this->dateTime, 1, 'Site Ecommerce');
++        $this->idSiteGoalDefaultValue = self::createWebsite($this->dateTime, 0, 'Site Goal Default Value');
++        $this->idSiteGoalEventValue = self::createWebsite($this->dateTime, 0, 'Site Goal Event Value');
++        $this->idSiteGoalWithoutValue = self::createWebsite($this->dateTime, 0, 'Site Goal Without Value');
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.2)->getDatetime());
+-        $t->setUrl('http://example.com/sub/page');
+-        self::checkResponse($t->doTrackPageView('Second page view'));
++        // create 11 empty websites
++        for ($i = 5; $i <= 15; $i++) {
++            $idSite = self::createWebsite($this->dateTime, 0, 'Site ' . $i);
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.25)->getDatetime());
+-        $t->addEcommerceItem($sku = 'SKU_ID', $name = 'Test item!', $category = 'Test & Category', $price = 777, $quantity = 33);
+-        self::checkResponse($t->doTrackEcommerceOrder('TestingOrder', $grandTotal = 33 * 77));
++            self::assertSame($i, $idSite);
++        }
+     }
+ 
+-    protected function trackSecondVisit($idSite)
++    private function trackVisitsForSite(int $idSite, int $visitCount): void
+     {
+-        $t = self::getTracker($idSite, $this->dateTime, $defaultInit = true);
+-        $t->setIp('56.11.55.73');
++        for ($visit = 1; $visit <= $visitCount; $visit++) {
++            $visitDate = Date::factory($this->dateTime)->addHour($visit);
++            $tracker = self::getTracker($idSite, $visitDate->getDatetime());
++            $tracker->setUrl('http://example.com/');
++
++            self::checkResponse($tracker->doTrackPageView('Viewing homepage'));
++
++            $tracker->setForceVisitDateTime($visitDate->addHour(0.25)->getDatetime());
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.1)->getDatetime());
+-        $t->setUrl('http://example.com/sub/page');
+-        self::checkResponse($t->doTrackPageView('Viewing homepage'));
++            switch ($idSite) {
++                case $this->idSiteEcommerce:
++                    $tracker->addEcommerceItem('SKU_ID', 'Test item!', 'Test & Category', 299.95, $visit);
++                    self::checkResponse($tracker->doTrackEcommerceOrder('Order ' . $visit, 299.95 * $visit));
++                    break;
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.2)->getDatetime());
+-        $t->setUrl('http://example.com/?search=this is a site search query');
+-        self::checkResponse($t->doTrackPageView('Site search query'));
++                case $this->idSiteGoalDefaultValue:
++                    self::checkResponse($tracker->doTrackGoal($this->idGoalDefaultValue));
++                    break;
+ 
+-        $t->setForceVisitDateTime(Date::factory($this->dateTime)->addHour(0.3)->getDatetime());
+-        $t->addEcommerceItem($sku = 'SKU_ID2', $name = 'A durable item', $category = 'Best seller', $price = 321);
+-        self::checkResponse($t->doTrackEcommerceCartUpdate($grandTotal = 33 * 77));
++                case $this->idSiteGoalEventValue:
++                    self::checkResponse($tracker->doTrackEvent('value event', 'track value', false, 1337.0));
++                    break;
++
++                case $this->idSiteGoalWithoutValue:
++                    self::checkResponse($tracker->doTrackGoal($this->idGoalWithoutValue));
++                    break;
++            }
++        }
+     }
+ }
+diff --git a/plugins/MultiSites/tests/System/expected/test___MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test___MultiSites.getAllWithGroups_day.xml
+index 495125d0c34..732ea5251dc 100644
+--- a/plugins/MultiSites/tests/System/expected/test___MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test___MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>15</numSites>
+ 	<totals>
+-		<nb_pageviews>8</nb_pageviews>
+-		<nb_visits>5</nb_visits>
+-		<hits>12</hits>
+-		<nb_actions>12</nb_actions>
+-		<revenue>5,082</revenue>
++		<nb_pageviews>12</nb_pageviews>
++		<nb_visits>12</nb_visits>
++		<hits>14</hits>
++		<nb_actions>14</nb_actions>
++		<revenue>9,122.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,15 +16,15 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Ecommerce</label>
++			<nb_visits>6</nb_visits>
++			<nb_actions>6</nb_actions>
++			<nb_pageviews>6</nb_pageviews>
++			<hits>6</hits>
++			<revenue>$6,298.95</revenue>
++			<nb_conversions>6</nb_conversions>
++			<orders>6</orders>
++			<ecommerce_revenue>6298.95</ecommerce_revenue>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -58,15 +58,13 @@
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 2</label>
+-			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
+-			<nb_pageviews>2</nb_pageviews>
+-			<hits>2</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Goal Default Value</label>
++			<nb_visits>3</nb_visits>
++			<nb_actions>3</nb_actions>
++			<nb_pageviews>3</nb_pageviews>
++			<hits>3</hits>
++			<revenue>$150</revenue>
++			<nb_conversions>3</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -79,10 +77,6 @@
+ 			<revenue_evolution_trend>1</revenue_evolution_trend>
+ 			<nb_conversions_evolution>100%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+-			<orders_evolution>100%</orders_evolution>
+-			<orders_evolution_trend>1</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>100%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>1</ecommerce_revenue_evolution_trend>
+ 			<idsite>2</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,21 +88,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 3</label>
+-			<nb_visits>1</nb_visits>
++			<label>Site Goal Event Value</label>
++			<nb_visits>2</nb_visits>
+ 			<nb_actions>4</nb_actions>
+ 			<nb_pageviews>2</nb_pageviews>
+ 			<hits>4</hits>
+-			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<revenue>$2,674</revenue>
++			<nb_conversions>2</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -117,14 +107,10 @@
+ 			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+ 			<hits_evolution>100%</hits_evolution>
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>0%</revenue_evolution>
+-			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<revenue_evolution>100%</revenue_evolution>
++			<revenue_evolution_trend>1</revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>3</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,21 +122,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 4</label>
++			<label>Site Goal Without Value</label>
+ 			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
++			<nb_actions>1</nb_actions>
+ 			<nb_pageviews>1</nb_pageviews>
+-			<hits>2</hits>
++			<hits>1</hits>
+ 			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<nb_conversions>1</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -161,12 +143,8 @@
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+ 			<revenue_evolution>0%</revenue_evolution>
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>4</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +156,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +167,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +179,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>5</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +190,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -233,8 +201,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -247,10 +213,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>6</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -262,8 +224,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -275,8 +235,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -289,10 +247,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>7</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -304,8 +258,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -317,8 +269,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -331,10 +281,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>8</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -346,8 +292,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -359,8 +303,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -373,10 +315,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>9</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -388,8 +326,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -401,8 +337,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -415,10 +349,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>10</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -430,8 +360,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -443,8 +371,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -457,10 +383,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>11</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -472,8 +394,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -485,8 +405,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -499,10 +417,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>12</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -514,8 +428,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -527,8 +439,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -541,10 +451,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>13</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -556,8 +462,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -569,8 +473,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -583,10 +485,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>14</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -598,8 +496,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -611,8 +507,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -625,10 +519,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>15</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -640,8 +530,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test__filtered__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test__filtered__MultiSites.getAllWithGroups_day.xml
+index abbfc186adb..6833579cd16 100644
+--- a/plugins/MultiSites/tests/System/expected/test__filtered__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test__filtered__MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>13</numSites>
+ 	<totals>
+-		<nb_pageviews>6</nb_pageviews>
+-		<nb_visits>4</nb_visits>
+-		<hits>10</hits>
+-		<nb_actions>10</nb_actions>
+-		<revenue>2,541</revenue>
++		<nb_pageviews>9</nb_pageviews>
++		<nb_visits>9</nb_visits>
++		<hits>11</hits>
++		<nb_actions>11</nb_actions>
++		<revenue>8,972.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,15 +16,15 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Ecommerce</label>
++			<nb_visits>6</nb_visits>
++			<nb_actions>6</nb_actions>
++			<nb_pageviews>6</nb_pageviews>
++			<hits>6</hits>
++			<revenue>$6,298.95</revenue>
++			<nb_conversions>6</nb_conversions>
++			<orders>6</orders>
++			<ecommerce_revenue>6298.95</ecommerce_revenue>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -58,15 +58,13 @@
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 3</label>
+-			<nb_visits>1</nb_visits>
++			<label>Site Goal Event Value</label>
++			<nb_visits>2</nb_visits>
+ 			<nb_actions>4</nb_actions>
+ 			<nb_pageviews>2</nb_pageviews>
+ 			<hits>4</hits>
+-			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<revenue>$2,674</revenue>
++			<nb_conversions>2</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -75,14 +73,10 @@
+ 			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+ 			<hits_evolution>100%</hits_evolution>
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>0%</revenue_evolution>
+-			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<revenue_evolution>100%</revenue_evolution>
++			<revenue_evolution_trend>1</revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>3</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,21 +88,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 4</label>
++			<label>Site Goal Without Value</label>
+ 			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
++			<nb_actions>1</nb_actions>
+ 			<nb_pageviews>1</nb_pageviews>
+-			<hits>2</hits>
++			<hits>1</hits>
+ 			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<nb_conversions>1</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -119,12 +109,8 @@
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+ 			<revenue_evolution>0%</revenue_evolution>
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>4</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,8 +122,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -149,8 +133,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,10 +145,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>5</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +156,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +167,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +179,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>6</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +190,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -233,8 +201,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -247,10 +213,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>7</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -262,8 +224,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -275,8 +235,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -289,10 +247,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>8</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -304,8 +258,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -317,8 +269,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -331,10 +281,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>9</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -346,8 +292,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -359,8 +303,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -373,10 +315,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>11</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -388,8 +326,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -401,8 +337,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -415,10 +349,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>12</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -430,8 +360,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -443,8 +371,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -457,10 +383,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>13</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -472,8 +394,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -485,8 +405,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -499,10 +417,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>14</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -514,8 +428,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -527,8 +439,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -541,10 +451,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>15</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -556,8 +462,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limitedWithOffset__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limitedWithOffset__MultiSites.getAllWithGroups_day.xml
+index b6eb965999f..29d6fc38b08 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limitedWithOffset__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limitedWithOffset__MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>15</numSites>
+ 	<totals>
+-		<nb_pageviews>8</nb_pageviews>
+-		<nb_visits>5</nb_visits>
+-		<hits>12</hits>
+-		<nb_actions>12</nb_actions>
+-		<revenue>5,082</revenue>
++		<nb_pageviews>12</nb_pageviews>
++		<nb_visits>12</nb_visits>
++		<hits>14</hits>
++		<nb_actions>14</nb_actions>
++		<revenue>9,122.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -23,8 +23,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -37,10 +35,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>5</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -52,8 +46,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -65,8 +57,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -79,10 +69,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>6</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,8 +80,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -107,8 +91,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -121,10 +103,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>7</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,8 +114,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -149,8 +125,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,10 +137,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>8</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +148,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +159,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +171,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>9</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +182,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limitedWithOffset_filtered__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limitedWithOffset_filtered__MultiSites.getAllWithGroups_day.xml
+index 5e05b2b3dbb..bcb76155136 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limitedWithOffset_filtered__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limitedWithOffset_filtered__MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>13</numSites>
+ 	<totals>
+-		<nb_pageviews>6</nb_pageviews>
+-		<nb_visits>4</nb_visits>
+-		<hits>10</hits>
+-		<nb_actions>10</nb_actions>
+-		<revenue>2,541</revenue>
++		<nb_pageviews>9</nb_pageviews>
++		<nb_visits>9</nb_visits>
++		<hits>11</hits>
++		<nb_actions>11</nb_actions>
++		<revenue>8,972.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -23,8 +23,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -37,10 +35,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>6</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -52,8 +46,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -65,8 +57,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -79,10 +69,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>7</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,8 +80,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -107,8 +91,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -121,10 +103,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>8</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,8 +114,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -149,8 +125,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,10 +137,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>9</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +148,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +159,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +171,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>11</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +182,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limitedWithPattern__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limitedWithPattern__MultiSites.getAllWithGroups_day.xml
+index 6789a789f83..a9b44798847 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limitedWithPattern__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limitedWithPattern__MultiSites.getAllWithGroups_day.xml
+@@ -1,12 +1,12 @@
+ <?xml version="1.0" encoding="utf-8" ?>
+ <result>
+-	<numSites>7</numSites>
++	<numSites>6</numSites>
+ 	<totals>
+-		<nb_pageviews>8</nb_pageviews>
+-		<nb_visits>5</nb_visits>
+-		<hits>12</hits>
+-		<nb_actions>12</nb_actions>
+-		<revenue>5,082</revenue>
++		<nb_pageviews>12</nb_pageviews>
++		<nb_visits>12</nb_visits>
++		<hits>14</hits>
++		<nb_actions>14</nb_actions>
++		<revenue>9,122.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,32 +16,26 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
+-			<visits_evolution>100%</visits_evolution>
+-			<visits_evolution_trend>1</visits_evolution_trend>
+-			<actions_evolution>100%</actions_evolution>
+-			<actions_evolution_trend>1</actions_evolution_trend>
+-			<pageviews_evolution>100%</pageviews_evolution>
+-			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+-			<hits_evolution>100%</hits_evolution>
+-			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>100%</revenue_evolution>
+-			<revenue_evolution_trend>1</revenue_evolution_trend>
+-			<nb_conversions_evolution>100%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+-			<orders_evolution>100%</orders_evolution>
+-			<orders_evolution_trend>1</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>100%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>1</ecommerce_revenue_evolution_trend>
+-			<idsite>1</idsite>
++			<label>Site 10</label>
++			<nb_visits>0</nb_visits>
++			<nb_actions>0</nb_actions>
++			<nb_pageviews>0</nb_pageviews>
++			<hits>0</hits>
++			<revenue>$0</revenue>
++			<nb_conversions>0</nb_conversions>
++			<visits_evolution>0%</visits_evolution>
++			<visits_evolution_trend>0</visits_evolution_trend>
++			<actions_evolution>0%</actions_evolution>
++			<actions_evolution_trend>0</actions_evolution_trend>
++			<pageviews_evolution>0%</pageviews_evolution>
++			<pageviews_evolution_trend>0</pageviews_evolution_trend>
++			<hits_evolution>0%</hits_evolution>
++			<hits_evolution_trend>0</hits_evolution_trend>
++			<revenue_evolution>0%</revenue_evolution>
++			<revenue_evolution_trend>0</revenue_evolution_trend>
++			<nb_conversions_evolution>0%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
++			<idsite>10</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -52,21 +46,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 10</label>
++			<label>Site 11</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -79,11 +69,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>10</idsite>
++			<idsite>11</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -94,21 +80,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 11</label>
++			<label>Site 12</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -121,11 +103,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>11</idsite>
++			<idsite>12</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -136,21 +114,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 12</label>
++			<label>Site 13</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,11 +137,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>12</idsite>
++			<idsite>13</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -178,21 +148,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 13</label>
++			<label>Site 14</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,11 +171,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>13</idsite>
++			<idsite>14</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -220,8 +182,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limitedWithPattern_filtered__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limitedWithPattern_filtered__MultiSites.getAllWithGroups_day.xml
+index 8d480cef022..f3c66fb6268 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limitedWithPattern_filtered__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limitedWithPattern_filtered__MultiSites.getAllWithGroups_day.xml
+@@ -1,12 +1,12 @@
+ <?xml version="1.0" encoding="utf-8" ?>
+ <result>
+-	<numSites>6</numSites>
++	<numSites>5</numSites>
+ 	<totals>
+-		<nb_pageviews>6</nb_pageviews>
+-		<nb_visits>4</nb_visits>
+-		<hits>10</hits>
+-		<nb_actions>10</nb_actions>
+-		<revenue>2,541</revenue>
++		<nb_pageviews>9</nb_pageviews>
++		<nb_visits>9</nb_visits>
++		<hits>11</hits>
++		<nb_actions>11</nb_actions>
++		<revenue>8,972.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,32 +16,26 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
+-			<visits_evolution>100%</visits_evolution>
+-			<visits_evolution_trend>1</visits_evolution_trend>
+-			<actions_evolution>100%</actions_evolution>
+-			<actions_evolution_trend>1</actions_evolution_trend>
+-			<pageviews_evolution>100%</pageviews_evolution>
+-			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+-			<hits_evolution>100%</hits_evolution>
+-			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>100%</revenue_evolution>
+-			<revenue_evolution_trend>1</revenue_evolution_trend>
+-			<nb_conversions_evolution>100%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+-			<orders_evolution>100%</orders_evolution>
+-			<orders_evolution_trend>1</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>100%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>1</ecommerce_revenue_evolution_trend>
+-			<idsite>1</idsite>
++			<label>Site 11</label>
++			<nb_visits>0</nb_visits>
++			<nb_actions>0</nb_actions>
++			<nb_pageviews>0</nb_pageviews>
++			<hits>0</hits>
++			<revenue>$0</revenue>
++			<nb_conversions>0</nb_conversions>
++			<visits_evolution>0%</visits_evolution>
++			<visits_evolution_trend>0</visits_evolution_trend>
++			<actions_evolution>0%</actions_evolution>
++			<actions_evolution_trend>0</actions_evolution_trend>
++			<pageviews_evolution>0%</pageviews_evolution>
++			<pageviews_evolution_trend>0</pageviews_evolution_trend>
++			<hits_evolution>0%</hits_evolution>
++			<hits_evolution_trend>0</hits_evolution_trend>
++			<revenue_evolution>0%</revenue_evolution>
++			<revenue_evolution_trend>0</revenue_evolution_trend>
++			<nb_conversions_evolution>0%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
++			<idsite>11</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -52,21 +46,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 11</label>
++			<label>Site 12</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -79,11 +69,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>11</idsite>
++			<idsite>12</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -94,21 +80,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 12</label>
++			<label>Site 13</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -121,11 +103,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>12</idsite>
++			<idsite>13</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -136,21 +114,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 13</label>
++			<label>Site 14</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,11 +137,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>13</idsite>
++			<idsite>14</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -178,21 +148,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 14</label>
++			<label>Site 15</label>
+ 			<nb_visits>0</nb_visits>
+ 			<nb_actions>0</nb_actions>
+ 			<nb_pageviews>0</nb_pageviews>
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,11 +171,7 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+-			<idsite>14</idsite>
++			<idsite>15</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+ 			<previous_nb_visits>0</previous_nb_visits>
+@@ -220,8 +182,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limited__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limited__MultiSites.getAllWithGroups_day.xml
+index 7501de92b3c..bf93b10909f 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limited__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limited__MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>15</numSites>
+ 	<totals>
+-		<nb_pageviews>8</nb_pageviews>
+-		<nb_visits>5</nb_visits>
+-		<hits>12</hits>
+-		<nb_actions>12</nb_actions>
+-		<revenue>5,082</revenue>
++		<nb_pageviews>12</nb_pageviews>
++		<nb_visits>12</nb_visits>
++		<hits>14</hits>
++		<nb_actions>14</nb_actions>
++		<revenue>9,122.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,15 +16,15 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Ecommerce</label>
++			<nb_visits>6</nb_visits>
++			<nb_actions>6</nb_actions>
++			<nb_pageviews>6</nb_pageviews>
++			<hits>6</hits>
++			<revenue>$6,298.95</revenue>
++			<nb_conversions>6</nb_conversions>
++			<orders>6</orders>
++			<ecommerce_revenue>6298.95</ecommerce_revenue>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -58,15 +58,13 @@
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 2</label>
+-			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
+-			<nb_pageviews>2</nb_pageviews>
+-			<hits>2</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Goal Default Value</label>
++			<nb_visits>3</nb_visits>
++			<nb_actions>3</nb_actions>
++			<nb_pageviews>3</nb_pageviews>
++			<hits>3</hits>
++			<revenue>$150</revenue>
++			<nb_conversions>3</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -79,10 +77,6 @@
+ 			<revenue_evolution_trend>1</revenue_evolution_trend>
+ 			<nb_conversions_evolution>100%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+-			<orders_evolution>100%</orders_evolution>
+-			<orders_evolution_trend>1</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>100%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>1</ecommerce_revenue_evolution_trend>
+ 			<idsite>2</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,21 +88,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 3</label>
+-			<nb_visits>1</nb_visits>
++			<label>Site Goal Event Value</label>
++			<nb_visits>2</nb_visits>
+ 			<nb_actions>4</nb_actions>
+ 			<nb_pageviews>2</nb_pageviews>
+ 			<hits>4</hits>
+-			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<revenue>$2,674</revenue>
++			<nb_conversions>2</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -117,14 +107,10 @@
+ 			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+ 			<hits_evolution>100%</hits_evolution>
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>0%</revenue_evolution>
+-			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<revenue_evolution>100%</revenue_evolution>
++			<revenue_evolution_trend>1</revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>3</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,21 +122,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 4</label>
++			<label>Site Goal Without Value</label>
+ 			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
++			<nb_actions>1</nb_actions>
+ 			<nb_pageviews>1</nb_pageviews>
+-			<hits>2</hits>
++			<hits>1</hits>
+ 			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<nb_conversions>1</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -161,12 +143,8 @@
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+ 			<revenue_evolution>0%</revenue_evolution>
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>4</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +156,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +167,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +179,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>5</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +190,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/System/expected/test_limited_filtered__MultiSites.getAllWithGroups_day.xml b/plugins/MultiSites/tests/System/expected/test_limited_filtered__MultiSites.getAllWithGroups_day.xml
+index 76cc6d8277d..cfd46e69e1a 100644
+--- a/plugins/MultiSites/tests/System/expected/test_limited_filtered__MultiSites.getAllWithGroups_day.xml
++++ b/plugins/MultiSites/tests/System/expected/test_limited_filtered__MultiSites.getAllWithGroups_day.xml
+@@ -2,11 +2,11 @@
+ <result>
+ 	<numSites>13</numSites>
+ 	<totals>
+-		<nb_pageviews>6</nb_pageviews>
+-		<nb_visits>4</nb_visits>
+-		<hits>10</hits>
+-		<nb_actions>10</nb_actions>
+-		<revenue>2,541</revenue>
++		<nb_pageviews>9</nb_pageviews>
++		<nb_visits>9</nb_visits>
++		<hits>11</hits>
++		<nb_actions>11</nb_actions>
++		<revenue>8,972.95</revenue>
+ 		<previous_nb_pageviews>0</previous_nb_pageviews>
+ 		<previous_nb_visits>0</previous_nb_visits>
+ 		<previous_hits>0</previous_hits>
+@@ -16,15 +16,15 @@
+ 	<lastDate>2013-01-22</lastDate>
+ 	<sites>
+ 		<row>
+-			<label>Site 1</label>
+-			<nb_visits>2</nb_visits>
+-			<nb_actions>4</nb_actions>
+-			<nb_pageviews>3</nb_pageviews>
+-			<hits>4</hits>
+-			<revenue>$2,541</revenue>
+-			<nb_conversions>1</nb_conversions>
+-			<orders>1</orders>
+-			<ecommerce_revenue>2541</ecommerce_revenue>
++			<label>Site Ecommerce</label>
++			<nb_visits>6</nb_visits>
++			<nb_actions>6</nb_actions>
++			<nb_pageviews>6</nb_pageviews>
++			<hits>6</hits>
++			<revenue>$6,298.95</revenue>
++			<nb_conversions>6</nb_conversions>
++			<orders>6</orders>
++			<ecommerce_revenue>6298.95</ecommerce_revenue>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -58,15 +58,13 @@
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 3</label>
+-			<nb_visits>1</nb_visits>
++			<label>Site Goal Event Value</label>
++			<nb_visits>2</nb_visits>
+ 			<nb_actions>4</nb_actions>
+ 			<nb_pageviews>2</nb_pageviews>
+ 			<hits>4</hits>
+-			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<revenue>$2,674</revenue>
++			<nb_conversions>2</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -75,14 +73,10 @@
+ 			<pageviews_evolution_trend>1</pageviews_evolution_trend>
+ 			<hits_evolution>100%</hits_evolution>
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+-			<revenue_evolution>0%</revenue_evolution>
+-			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<revenue_evolution>100%</revenue_evolution>
++			<revenue_evolution_trend>1</revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>3</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -94,21 +88,17 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+ 		<row>
+-			<label>Site 4</label>
++			<label>Site Goal Without Value</label>
+ 			<nb_visits>1</nb_visits>
+-			<nb_actions>2</nb_actions>
++			<nb_actions>1</nb_actions>
+ 			<nb_pageviews>1</nb_pageviews>
+-			<hits>2</hits>
++			<hits>1</hits>
+ 			<revenue>$0</revenue>
+-			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
++			<nb_conversions>1</nb_conversions>
+ 			<visits_evolution>100%</visits_evolution>
+ 			<visits_evolution_trend>1</visits_evolution_trend>
+ 			<actions_evolution>100%</actions_evolution>
+@@ -119,12 +109,8 @@
+ 			<hits_evolution_trend>1</hits_evolution_trend>
+ 			<revenue_evolution>0%</revenue_evolution>
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+-			<nb_conversions_evolution>0%</nb_conversions_evolution>
+-			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
++			<nb_conversions_evolution>100%</nb_conversions_evolution>
++			<nb_conversions_evolution_trend>1</nb_conversions_evolution_trend>
+ 			<idsite>4</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -136,8 +122,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -149,8 +133,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -163,10 +145,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>5</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -178,8 +156,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+@@ -191,8 +167,6 @@
+ 			<hits>0</hits>
+ 			<revenue>$0</revenue>
+ 			<nb_conversions>0</nb_conversions>
+-			<orders>0</orders>
+-			<ecommerce_revenue>0</ecommerce_revenue>
+ 			<visits_evolution>0%</visits_evolution>
+ 			<visits_evolution_trend>0</visits_evolution_trend>
+ 			<actions_evolution>0%</actions_evolution>
+@@ -205,10 +179,6 @@
+ 			<revenue_evolution_trend>0</revenue_evolution_trend>
+ 			<nb_conversions_evolution>0%</nb_conversions_evolution>
+ 			<nb_conversions_evolution_trend>0</nb_conversions_evolution_trend>
+-			<orders_evolution>0%</orders_evolution>
+-			<orders_evolution_trend>0</orders_evolution_trend>
+-			<ecommerce_revenue_evolution>0%</ecommerce_revenue_evolution>
+-			<ecommerce_revenue_evolution_trend>0</ecommerce_revenue_evolution_trend>
+ 			<idsite>6</idsite>
+ 			<ratio>1</ratio>
+ 			<currencySymbol>$</currencySymbol>
+@@ -220,8 +190,6 @@
+ 			<previous_hits>0</previous_hits>
+ 			<previous_revenue>$0</previous_revenue>
+ 			<previous_nb_conversions>0</previous_nb_conversions>
+-			<previous_orders>0</previous_orders>
+-			<previous_ecommerce_revenue>0</previous_ecommerce_revenue>
+ 			<group />
+ 			<main_url>http://piwik.net</main_url>
+ 		</row>
+diff --git a/plugins/MultiSites/tests/UI/AllWebsitesDashboard_spec.js b/plugins/MultiSites/tests/UI/AllWebsitesDashboard_spec.js
+index 8713e112677..22481754eb2 100644
+--- a/plugins/MultiSites/tests/UI/AllWebsitesDashboard_spec.js
++++ b/plugins/MultiSites/tests/UI/AllWebsitesDashboard_spec.js
+@@ -63,13 +63,6 @@ describe('AllWebsitesDashboard', function () {
+     describe('Rendering', function () {
+         this.title = parentSuite.title; // to make sure the screenshot prefix is the same
+ 
+-        afterEach(function() {
+-            delete testEnvironment.configOverride.General.show_multisites_sparklines;
+-            delete testEnvironment.pluginsToUnload;
+-
+-            testEnvironment.save();
+-        });
+-
+         it('should load the all websites dashboard correctly', async function () {
+             await page.goto(dashboardUrl);
+             await page.waitForNetworkIdle();
+@@ -84,24 +77,26 @@ describe('AllWebsitesDashboard', function () {
+             expect(await page.screenshotSelector('#main')).to.matchImage('widgetized');
+         });
+ 
+-        it('should not display revenue if disabled', async function () {
+-            testEnvironment.pluginsToUnload = ['Goals'];
+-            testEnvironment.save();
++        describe('with deactivated show_multisites_sparklines configuration', function () {
++            this.title = parentSuite.title; // to make sure the screenshot prefix is the same
+ 
+-            await page.goto(dashboardUrl);
+-            await page.waitForNetworkIdle();
++            before(function () {
++                testEnvironment.overrideConfig('General', 'show_multisites_sparklines', 0);
++                testEnvironment.save();
++            });
+ 
+-            expect(await page.screenshotSelector('#main')).to.matchImage('no_revenue');
+-        });
++            after(function () {
++                delete testEnvironment.configOverride.General.show_multisites_sparklines;
+ 
+-        it('should not display sparklines if disabled', async function () {
+-            testEnvironment.overrideConfig('General', 'show_multisites_sparklines', 0);
+-            testEnvironment.save();
++                testEnvironment.save();
++            });
+ 
+-            await page.goto(dashboardUrl);
+-            await page.waitForNetworkIdle();
++            it('should not display sparklines', async function () {
++                await page.goto(dashboardUrl);
++                await page.waitForNetworkIdle();
+ 
+-            expect(await page.screenshotSelector('#main')).to.matchImage('no_sparklines');
++                expect(await page.screenshotSelector('#main')).to.matchImage('no_sparklines');
++            });
+         });
+ 
+         it('should correctly display a KPI badge when added through event', async function () {
+@@ -144,6 +139,65 @@ describe('AllWebsitesDashboard', function () {
+         });
+     });
+ 
++    describe('Revenue Column', function () {
++        describe('Deactivated Goals plugin', function () {
++            this.title = parentSuite.title; // to make sure the screenshot prefix is the same
++
++            before(function () {
++                testEnvironment.pluginsToUnload = ['Goals'];
++                testEnvironment.save();
++            });
++
++            after(function () {
++              delete testEnvironment.pluginsToUnload;
++
++                testEnvironment.save();
++            });
++
++            it('should not display revenue column with deactivated Goals plugin', async function () {
++                await page.goto(dashboardUrl);
++                await page.waitForNetworkIdle();
++
++                expect(await page.screenshotSelector('#main')).to.matchImage('no_revenue');
++            });
++        });
++
++        describe('Site/Goal Configuration', function () {
++            afterEach(function () {
++                delete testEnvironment.idSitesViewAccess;
++
++                testEnvironment.save();
++            });
++
++            [
++                [1, 'Site Ecommerce', true],
++                [2, 'Site Goal Default Value', true],
++                [3, 'Site Goal Event Value', true],
++                [4, 'Site Goal Without Value', false],
++            ].forEach(async function ([siteId, siteName, shouldDisplayRevenue]) {
++                it(`${shouldDisplayRevenue ? 'should' : 'should not'} display revenue column (${siteName})`, async function () {
++                    const testUrl = dashboardUrl.replace(/idSite=\d+/, `idSite=${siteId}`);
++
++                    testEnvironment.idSitesViewAccess = [siteId];
++                    testEnvironment.save();
++
++                    await page.goto(testUrl);
++                    await page.waitForNetworkIdle();
++
++                    expect(await getSitesTableCell(1, 1)).to.equal(siteName);
++
++                    const revenueHeader = await page.jQuery('th:contains("Revenue")');
++
++                    if (shouldDisplayRevenue) {
++                        expect(revenueHeader).to.be.ok;
++                    } else {
++                        expect(revenueHeader).to.be.null;
++                    }
++                });
++            });
++        });
++    });
++
+     describe('Dashboard Controls', function () {
+         it('should link to the SitesManager', async function () {
+             await page.goto(dashboardUrl);
+@@ -158,7 +212,7 @@ describe('AllWebsitesDashboard', function () {
+             await page.goto(dashboardUrl);
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 1');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site Ecommerce');
+             expect(await getSitesPagination()).to.equal('1–10 of 15');
+ 
+             await page.type('.siteSearch input', 'Site 15');
+@@ -211,7 +265,7 @@ describe('AllWebsitesDashboard', function () {
+             await page.waitForNetworkIdle();
+ 
+             expect(await getPeriodSelectorTitle()).to.equal('2013-01-23');
+-            expect(await getSitesTableCell(1, 2)).to.equal('2');
++            expect(await getSitesTableCell(1, 2)).to.equal('6');
+ 
+             await page.click('.periodSelector .move-period-prev');
+             await page.waitForNetworkIdle();
+@@ -228,16 +282,16 @@ describe('AllWebsitesDashboard', function () {
+             await page.goto(dashboardUrl);
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 1');
+-            expect(await getSitesTableCell(1, 2)).to.equal('2');
+-            expect(await getSitesTableCell(2, 1)).to.equal('Site 2');
+-            expect(await getSitesTableCell(2, 2)).to.equal('1');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site Ecommerce');
++            expect(await getSitesTableCell(1, 2)).to.equal('6');
++            expect(await getSitesTableCell(2, 1)).to.equal('Site Goal Default Value');
++            expect(await getSitesTableCell(2, 2)).to.equal('3');
+ 
+             // reverse default "visits" sorting
+             await page.click('.sitesTableSort.sitesTableSortDesc');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.not.equal('Site 1');
++            expect(await getSitesTableCell(1, 1)).to.not.equal('Site Ecommerce');
+             expect(await getSitesTableCell(1, 2)).to.equal('0');
+         });
+ 
+@@ -246,18 +300,18 @@ describe('AllWebsitesDashboard', function () {
+             await page.click('.sitesTable th:nth-child(1)');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 1');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site 5');
+ 
+             await page.click('.sitesTablePagination .dataTableNext');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 11');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site 15');
+             expect(await getSitesPagination()).to.equal('11–15 of 15');
+ 
+             await page.click('.sitesTablePagination .dataTablePrevious');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 1');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site 5');
+             expect(await getSitesPagination()).to.equal('1–10 of 15');
+         });
+ 
+@@ -266,16 +320,16 @@ describe('AllWebsitesDashboard', function () {
+             await page.click('.sitesTable th:nth-child(4)');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.equal('Site 1');
+-            expect(await getSitesTableCell(1, 4)).to.equal('4');
+-            expect(await getSitesTableCell(2, 1)).to.equal('Site 3');
++            expect(await getSitesTableCell(1, 1)).to.equal('Site Ecommerce');
++            expect(await getSitesTableCell(1, 4)).to.equal('6');
++            expect(await getSitesTableCell(2, 1)).to.equal('Site Goal Event Value');
+             expect(await getSitesTableCell(2, 4)).to.equal('4');
+ 
+             // reverse sorting
+             await page.click('.sitesTable th:nth-child(4)');
+             await page.waitForNetworkIdle();
+ 
+-            expect(await getSitesTableCell(1, 1)).to.not.equal('Site 1');
++            expect(await getSitesTableCell(1, 1)).to.not.equal('Site Ecommerce');
+             expect(await getSitesTableCell(1, 4)).to.equal('0');
+         });
+ 
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard.png
+index c5dbc90d312..b9a0fbd1553 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:63d7f56ecbed997a4990851b4a8b99990ea3d8442e8daa5c775618727e9fbad3
+-size 76046
++oid sha256:32f9cfc783203a2aa3ea1e23addb9e7646a904e97ef0b79bdc5d2de67f4c62dd
++size 81927
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_all_badges.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_all_badges.png
+index 2a5ae578578..238ab8e6d1c 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_all_badges.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_all_badges.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:48849f4d586e8201f17d4a3a88300d516e1490e97bee3d7c2a22ada8227186b4
+-size 85676
++oid sha256:c5ed76aaa1d894899726836e87b56c221b12680a84bae7a5a102ff7b7cff8e47
++size 91748
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_kpi_badge.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_kpi_badge.png
+index 09d3010ae87..000704cc653 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_kpi_badge.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_kpi_badge.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:0f312a21143303dad091da59d93af6134b843a7b4cb3b900f7459d8caf1c954b
+-size 79009
++oid sha256:5907af0b9c2249cb75a6db74238e50eb916f5857dda5b217637530aa8958d8fb
++size 84983
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile.png
+index 07d082956d9..7c4cb0b71e1 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:5d0f7f97d80d54a7b574532865af7016b46a330247006cd59431524e57f1f734
+-size 66471
++oid sha256:515b5e48f0a60eda2e4c1571ee38aa854c3b6d5ad2879548cb27c1785ed22a35
++size 70357
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile_no_revenue.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile_no_revenue.png
+index f3a1dfb4765..dfdf44c66e3 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile_no_revenue.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_mobile_no_revenue.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:215e3dc475e4e87f170163af0246fb04ff2a14dc97eda736f91f988ba730a000
+-size 55979
++oid sha256:d33d229ffc86f39e2e677d3b6eb06d60b3ac7d3fdf2831ddaa9966b914f03ecf
++size 59647
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet.png
+index 250193efb7f..c54e805058a 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:c0055b90c80e71c2dee09531e2c6271e493b6b39799e963099ff153fb29f0ac8
+-size 79804
++oid sha256:0b01eaed2a6694e394327785c743f8910452216130d8ae4a72467695913931f2
++size 83137
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet_no_revenue.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet_no_revenue.png
+index 3c2fbba9e7d..0d84b722558 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet_no_revenue.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_dashboard_tablet_no_revenue.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:020958883aeb136ebb159c47dd560dc3ac6f6d54a60873441cecc7c15a293de7
+-size 67996
++oid sha256:166d70643310069e1f2573171c47f5360b5e045fa541c6b3d61d499733e31ff0
++size 71602
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_evolution_change.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_evolution_change.png
+index a5b2e5d755c..026b51cab76 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_evolution_change.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_evolution_change.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:a6b3abbb6faaab796a4bdb616a1cff50ef1db369ce7d5e13ca9c89ac25d707c1
+-size 75383
++oid sha256:0bdfbbf8fc1a6fd7bdc563697ff022c42879694ba2ee7479b318f71494428a38
++size 81492
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_revenue.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_revenue.png
+index fe8c35853df..70d8c7de444 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_revenue.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_revenue.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:e8d1673564ec967e56e854f7150c35c6b143282503f698a59788a6f3064ba0a9
+-size 57947
++oid sha256:316845259cfd4e5e6fe08caaae9a43ab8b74d65fe013df94d7a545832c43df55
++size 63357
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_sparklines.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_sparklines.png
+index 32b39631a2e..505b7ba63c2 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_sparklines.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_no_sparklines.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:442b5e3058e464395970873be04d23497c8f9b9d2fb3ada49d6be18d26978592
+-size 74437
++oid sha256:6a07ea0b86bcd45d347781caed1a579229a8d693cb2f9734505fc52d3189e71c
++size 80379
+diff --git a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_widgetized.png b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_widgetized.png
+index 59a42d1cd2d..2fff7baab53 100644
+--- a/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_widgetized.png
++++ b/plugins/MultiSites/tests/UI/expected-screenshots/AllWebsitesDashboard_widgetized.png
+@@ -1,3 +1,3 @@
+ version https://git-lfs.github.com/spec/v1
+-oid sha256:08c0e07bbcd3f9c0c76f7b79ae6f30a7c6b4692d5784584feb4d1c24972eec71
+-size 68457
++oid sha256:5e476f9e82a310df08aa23c353d58e3b2659427a6e9a02c8eff74474df1de1b8
++size 74269

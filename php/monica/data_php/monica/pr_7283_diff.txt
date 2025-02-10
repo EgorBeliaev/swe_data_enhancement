@@ -1,0 +1,395 @@
+diff --git a/app/Console/Commands/TestReminders.php b/app/Console/Commands/TestReminders.php
+index 2c36eaf4765..e3f008c2763 100644
+--- a/app/Console/Commands/TestReminders.php
++++ b/app/Console/Commands/TestReminders.php
+@@ -53,12 +53,10 @@ public function handle(): void
+                 $contactName = NameHelper::formatContactName($channel->user, $contact);
+ 
+                 Notification::route('mail', $channel->content)
+-                    ->notify(new ReminderTriggered($channel, $contactReminder->label, $contactName));
+-            }
+-
+-            if ($channel->type === UserNotificationChannel::TYPE_TELEGRAM) {
++                    ->notify((new ReminderTriggered($channel, $contactReminder->label, $contactName))->locale($channel->user->locale));
++            } elseif ($channel->type === UserNotificationChannel::TYPE_TELEGRAM) {
+                 Notification::route('telegram', $channel->content)
+-                    ->notify(new ReminderTriggered($channel, $contactReminder->label, ''));
++                    ->notify((new ReminderTriggered($channel, $contactReminder->label, ''))->locale($channel->user->locale));
+             }
+ 
+             try {
+diff --git a/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php b/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php
+index 6db9e863291..90d5671eafd 100644
+--- a/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php
++++ b/app/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactReminders.php
+@@ -4,8 +4,10 @@
+ 
+ use App\Domains\Contact\ManageReminders\Services\RescheduleContactReminderForChannel;
+ use App\Helpers\NameHelper;
++use App\Models\Contact;
+ use App\Models\ContactReminder;
+ use App\Models\UserNotificationChannel;
++use App\Models\UserNotificationSent;
+ use App\Notifications\ReminderTriggered;
+ use Carbon\Carbon;
+ use Illuminate\Bus\Queueable;
+@@ -13,6 +15,7 @@
+ use Illuminate\Foundation\Bus\Dispatchable;
+ use Illuminate\Queue\InteractsWithQueue;
+ use Illuminate\Support\Facades\DB;
++use Illuminate\Support\Facades\Log;
+ use Illuminate\Support\Facades\Notification;
+ 
+ class ProcessScheduledContactReminders implements ShouldQueue
+@@ -39,30 +42,39 @@ public function handle()
+         foreach ($scheduledContactReminders as $scheduledReminder) {
+             $userNotificationChannel = UserNotificationChannel::findOrFail($scheduledReminder->user_notification_channel_id);
+ 
+-            $contactReminder = ContactReminder::find($scheduledReminder->contact_reminder_id);
+-            $contact = $contactReminder->contact;
++            try {
++                $contactReminder = ContactReminder::find($scheduledReminder->contact_reminder_id);
++                $contact = $contactReminder->contact;
+ 
+-            if ($contact !== null) {
+-                $contactName = NameHelper::formatContactName($userNotificationChannel->user, $contact);
+-
+-                if ($userNotificationChannel->type === UserNotificationChannel::TYPE_EMAIL) {
+-                    Notification::route('mail', $userNotificationChannel->content)
+-                        ->notify(new ReminderTriggered($userNotificationChannel, $contactReminder->label, $contactName));
+-                } elseif ($userNotificationChannel->type === UserNotificationChannel::TYPE_TELEGRAM) {
+-                    Notification::route('telegram', $userNotificationChannel->content)
+-                        ->notify(new ReminderTriggered($userNotificationChannel, $contactReminder->label, $contactName));
++                if ($contact !== null) {
++                    $this->triggerNotification($userNotificationChannel, $contact, $contactReminder, $scheduledReminder);
+                 }
+ 
+-                $this->updateNumberOfTimesTriggered($scheduledReminder->contact_reminder_id);
+-
+-                (new RescheduleContactReminderForChannel())->execute([
+-                    'contact_reminder_id' => $scheduledReminder->contact_reminder_id,
+-                    'user_notification_channel_id' => $scheduledReminder->user_notification_channel_id,
+-                    'contact_reminder_scheduled_id' => $scheduledReminder->id,
++                $this->updateScheduledContactReminderTriggeredAt($scheduledReminder);
++            } catch (\Exception $e) {
++                // we don't want to stop the process if one of the notifications fails
++                // we just want to log the error and continue with the next scheduled reminder
++                Log::error('Error sending reminder', [
++                    'message' => $e->getMessage(),
++                    'scheduledReminder' => $scheduledReminder,
+                 ]);
+-            }
++                UserNotificationSent::create([
++                    'user_notification_channel_id' => $userNotificationChannel->id,
++                    'sent_at' => Carbon::now(),
++                    'subject_line' => '',
++                    'error' => $e->getMessage(),
++                ]);
++
++                $userNotificationChannel->refresh();
++                $userNotificationChannel->fails += 1;
+ 
+-            $this->updateScheduledContactReminderTriggeredAt($scheduledReminder);
++                if ($userNotificationChannel->fails >= config('monica.max_notification_failures', 10)) {
++                    $userNotificationChannel->active = false;
++                    $userNotificationChannel->contactReminders->each->delete();
++                }
++
++                $userNotificationChannel->save();
++            }
+         }
+     }
+ 
+@@ -79,4 +91,36 @@ private function updateNumberOfTimesTriggered(int $id): void
+             ->where('id', $id)
+             ->increment('number_times_triggered');
+     }
++
++    private function triggerNotification(UserNotificationChannel $channel, Contact $contact, ContactReminder $contactReminder, $scheduledReminder)
++    {
++        if (! $channel->active) {
++            return;
++        }
++
++        $contactName = NameHelper::formatContactName($channel->user, $contact);
++
++        switch ($channel->type) {
++            case UserNotificationChannel::TYPE_EMAIL:
++                $type = 'mail';
++                break;
++            case UserNotificationChannel::TYPE_TELEGRAM:
++                $type = 'telegram';
++                break;
++            default:
++                // type unknown
++                return;
++        }
++
++        Notification::route($type, $channel->content)
++            ->notify((new ReminderTriggered($channel, $contactReminder->label, $contactName))->locale($channel->user->locale));
++
++        $this->updateNumberOfTimesTriggered($scheduledReminder->contact_reminder_id);
++
++        (new RescheduleContactReminderForChannel())->execute([
++            'contact_reminder_id' => $scheduledReminder->contact_reminder_id,
++            'user_notification_channel_id' => $scheduledReminder->user_notification_channel_id,
++            'contact_reminder_scheduled_id' => $scheduledReminder->id,
++        ]);
++    }
+ }
+diff --git a/app/Domains/Settings/ManageNotificationChannels/Services/SendTestTelegramNotification.php b/app/Domains/Settings/ManageNotificationChannels/Services/SendTestTelegramNotification.php
+index 33d7aa56410..cd269ef244d 100644
+--- a/app/Domains/Settings/ManageNotificationChannels/Services/SendTestTelegramNotification.php
++++ b/app/Domains/Settings/ManageNotificationChannels/Services/SendTestTelegramNotification.php
+@@ -69,6 +69,6 @@ private function send(): void
+         $content = trans('This is a test notification for :name', ['name' => $this->author->name]);
+ 
+         Notification::route('telegram', $this->userNotificationChannel->content)
+-            ->notify(new ReminderTriggered($this->userNotificationChannel, $content, 'Test'));
++            ->notify((new ReminderTriggered($this->userNotificationChannel, $content, 'Test'))->locale($this->userNotificationChannel->user->locale));
+     }
+ }
+diff --git a/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php b/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php
+index ad70bc6966c..c13adb0da26 100644
+--- a/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php
++++ b/app/Domains/Settings/ManageNotificationChannels/Services/ToggleUserNotificationChannel.php
+@@ -57,6 +57,9 @@ private function validate(): void
+     private function toggle(): void
+     {
+         $this->userNotificationChannel->active = ! $this->userNotificationChannel->active;
++        if ($this->userNotificationChannel->active) {
++            $this->userNotificationChannel->fails = 0;
++        }
+         $this->userNotificationChannel->save();
+     }
+ 
+diff --git a/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsLogIndexViewHelper.php b/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsLogIndexViewHelper.php
+index 4fce57426c6..02a471d0368 100644
+--- a/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsLogIndexViewHelper.php
++++ b/app/Domains/Settings/ManageNotificationChannels/Web/ViewHelpers/NotificationsLogIndexViewHelper.php
+@@ -17,6 +17,7 @@ public static function data(UserNotificationChannel $channel, User $user): array
+                 'id' => $notification->id,
+                 'sent_at' => DateHelper::format($notification->sent_at, $user),
+                 'subject_line' => $notification->subject_line,
++                'error' => $notification->error,
+             ];
+         });
+ 
+diff --git a/app/Models/UserNotificationSent.php b/app/Models/UserNotificationSent.php
+index e519556c443..10948b89363 100644
+--- a/app/Models/UserNotificationSent.php
++++ b/app/Models/UserNotificationSent.php
+@@ -22,6 +22,7 @@ class UserNotificationSent extends Model
+         'sent_at',
+         'subject_line',
+         'payload',
++        'error',
+     ];
+ 
+     /**
+diff --git a/app/Notifications/ReminderTriggered.php b/app/Notifications/ReminderTriggered.php
+index 6651324dc26..0ef50edea88 100644
+--- a/app/Notifications/ReminderTriggered.php
++++ b/app/Notifications/ReminderTriggered.php
+@@ -34,12 +34,11 @@ public function __construct(
+      */
+     public function via($notifiable)
+     {
+-        if ($this->channel->type === UserNotificationChannel::TYPE_EMAIL) {
+-            return ['mail'];
+-        }
+-
+-        if ($this->channel->type === UserNotificationChannel::TYPE_TELEGRAM) {
+-            return ['telegram'];
++        switch ($this->channel->type) {
++            case UserNotificationChannel::TYPE_EMAIL:
++                return ['mail'];
++            case UserNotificationChannel::TYPE_TELEGRAM:
++                return ['telegram'];
+         }
+ 
+         return [];
+@@ -83,8 +82,8 @@ public function toTelegram($notifiable)
+         ]);
+ 
+         return TelegramMessage::create()
+-            ->to($this->channel->content)
+-            ->content($content);
++            ->content($content)
++            ->to($this->channel->content);
+     }
+ 
+     /**
+diff --git a/config/monica.php b/config/monica.php
+index 479ecf2b2ee..3dfc8e473d9 100644
+--- a/config/monica.php
++++ b/config/monica.php
+@@ -120,6 +120,17 @@
+ 
+     'repository' => 'https://github.com/monicahq/monica/',
+ 
++    /*
++    |--------------------------------------------------------------------------
++    | Max notification failures
++    |--------------------------------------------------------------------------
++    |
++    | When this number of failures is reached, we disable the notification channel.
++    |
++    */
++
++    'max_notification_failures' => 10,
++
+     /*
+     |--------------------------------------------------------------------------
+     | HELP CENTER URL
+diff --git a/database/factories/UserNotificationChannelFactory.php b/database/factories/UserNotificationChannelFactory.php
+index 18c5349114c..076c217a911 100644
+--- a/database/factories/UserNotificationChannelFactory.php
++++ b/database/factories/UserNotificationChannelFactory.php
+@@ -26,6 +26,7 @@ public function definition()
+             'label' => $this->faker->word(),
+             'content' => 'admin@admin.com',
+             'active' => true,
++            'fails' => 0,
+             'verified_at' => null,
+             'preferred_time' => '09:00:00',
+         ];
+diff --git a/database/migrations/2024_05_12_170430_add_fails_to_notification_channels.php b/database/migrations/2024_05_12_170430_add_fails_to_notification_channels.php
+new file mode 100644
+index 00000000000..fcacfed871c
+--- /dev/null
++++ b/database/migrations/2024_05_12_170430_add_fails_to_notification_channels.php
+@@ -0,0 +1,36 @@
++<?php
++
++use Illuminate\Database\Migrations\Migration;
++use Illuminate\Database\Schema\Blueprint;
++use Illuminate\Support\Facades\Schema;
++
++return new class extends Migration
++{
++    /**
++     * Run the migrations.
++     */
++    public function up(): void
++    {
++        Schema::table('user_notification_channels', function (Blueprint $table) {
++            $table->integer('fails')->default(0)->after('active');
++        });
++
++        Schema::table('user_notification_sent', function (Blueprint $table) {
++            $table->longText('error')->nullable()->after('payload');
++        });
++    }
++
++    /**
++     * Reverse the migrations.
++     */
++    public function down(): void
++    {
++        Schema::table('user_notification_channels', function (Blueprint $table) {
++            $table->dropColumn('fails');
++        });
++
++        Schema::table('user_notification_sent', function (Blueprint $table) {
++            $table->dropColumn('error');
++        });
++    }
++};
+diff --git a/resources/js/Pages/Settings/Notifications/Logs/Index.vue b/resources/js/Pages/Settings/Notifications/Logs/Index.vue
+index f150a475623..e0dcbdddaf2 100644
+--- a/resources/js/Pages/Settings/Notifications/Logs/Index.vue
++++ b/resources/js/Pages/Settings/Notifications/Logs/Index.vue
+@@ -99,7 +99,12 @@
+             :key="notification.id"
+             class="item-list border-b border-gray-200 px-5 py-2 hover:bg-slate-50 dark:border-gray-700 dark:bg-slate-900 hover:dark:bg-slate-800">
+             <span class="me-2 text-sm text-gray-500">{{ notification.sent_at }}</span>
+-            <span>{{ notification.subject_line }}</span>
++            <span class="text-sm text-red-600 dark:text-red-400" v-if="notification.error !== ''">
++              {{ notification.error }}
++            </span>
++            <span v-else>
++              {{ notification.subject_line }}
++            </span>
+           </li>
+         </ul>
+ 
+diff --git a/tests/Unit/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactRemindersTest.php b/tests/Unit/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactRemindersTest.php
+index a66095d71b1..21a68364cd6 100644
+--- a/tests/Unit/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactRemindersTest.php
++++ b/tests/Unit/Domains/Contact/ManageReminders/Jobs/ProcessScheduledContactRemindersTest.php
+@@ -10,15 +10,14 @@
+ use Illuminate\Support\Carbon;
+ use Illuminate\Support\Facades\DB;
+ use Illuminate\Support\Facades\Notification;
++use PHPUnit\Framework\Attributes\Test;
+ use Tests\TestCase;
+ 
+ class ProcessScheduledContactRemindersTest extends TestCase
+ {
+     use DatabaseTransactions;
+ 
+-    /**
+-     * @test
+-     */
++    #[Test]
+     public function it_processes_all_the_scheduled_contact_reminders(): void
+     {
+         Notification::fake();
+@@ -52,9 +51,7 @@ function ($notification, $channels, $notifiable) {
+         );
+     }
+ 
+-    /**
+-     * @test
+-     */
++    #[Test]
+     public function it_cant_process_the_scheduled_contact_reminders(): void
+     {
+         Notification::fake();
+@@ -82,9 +79,7 @@ public function it_cant_process_the_scheduled_contact_reminders(): void
+         Notification::assertNothingSent();
+     }
+ 
+-    /**
+-     * @test
+-     */
++    #[Test]
+     public function it_does_not_process_reminders_for_deleted_contacts(): void
+     {
+         Notification::fake();
+@@ -114,4 +109,34 @@ public function it_does_not_process_reminders_for_deleted_contacts(): void
+ 
+         Notification::assertNothingSent();
+     }
++
++    #[Test]
++    public function it_does_not_reschudle_a_failing_reminder(): void
++    {
++        config(['services.telegram-bot-api.token' => null]);
++
++        Carbon::setTestNow(Carbon::create(2018, 1, 1, 0, 0, 0));
++
++        $contactReminder = ContactReminder::factory()->create([
++            'type' => ContactReminder::TYPE_RECURRING_DAY,
++            'label' => 'test',
++        ]);
++        $channel = UserNotificationChannel::factory()->create([
++            'type' => UserNotificationChannel::TYPE_TELEGRAM,
++            'content' => '0',
++            'fails' => 10,
++        ]);
++        DB::table('contact_reminder_scheduled')->insertGetId([
++            'user_notification_channel_id' => $channel->id,
++            'contact_reminder_id' => $contactReminder->id,
++            'scheduled_at' => Carbon::now(),
++            'triggered_at' => null,
++        ]);
++
++        $job = new ProcessScheduledContactReminders();
++        $job->dispatch();
++        $job->handle();
++
++        $this->assertFalse($channel->fresh()->active);
++    }
+ }
